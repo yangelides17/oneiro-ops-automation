@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900;
+  }
+
+  /* Better tap targets on mobile */
+  button, a, select, input[type="checkbox"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer components {
+  /* Card shell */
+  .card {
+    @apply bg-white rounded-xl border border-slate-200 shadow-sm;
+  }
+
+  /* Section header inside a card */
+  .section-label {
+    @apply text-[11px] font-extrabold uppercase tracking-widest text-navy mb-3;
+  }
+
+  /* Form input / select / textarea */
+  .field-input {
+    @apply w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg
+           bg-white text-slate-900 outline-none transition-all duration-150
+           focus:border-navy focus:ring-2 focus:ring-navy/10;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+
+  .field-label {
+    @apply block text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-1;
+  }
+
+  /* Buttons */
+  .btn-primary {
+    @apply bg-navy text-white font-semibold rounded-xl px-5 py-3
+           transition-all duration-150 active:opacity-80 disabled:opacity-40
+           disabled:cursor-not-allowed;
+  }
+
+  .btn-outline {
+    @apply bg-white text-navy font-semibold rounded-xl px-5 py-3
+           border border-slate-200 transition-all duration-150
+           hover:bg-slate-50 active:bg-slate-100;
+  }
+
+  .btn-ghost {
+    @apply bg-transparent text-navy font-semibold rounded-lg px-3 py-2
+           border border-slate-200 text-sm transition-all duration-150
+           hover:bg-slate-50 active:bg-slate-100;
+  }
+
+  /* Nav link */
+  .nav-link {
+    @apply text-white/70 text-sm font-medium px-3 py-1.5 rounded-lg
+           transition-all duration-150 hover:text-white hover:bg-white/10;
+  }
+  .nav-link.active {
+    @apply text-white bg-white/15;
+  }
+}
+
+/* Custom scrollbar (desktop) */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }

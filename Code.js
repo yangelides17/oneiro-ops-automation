@@ -1378,6 +1378,12 @@ function doPost(e) {
       return handleUploadPdf_(body);
     } else if (action === 'write_wo') {
       return handleWriteWO_(body);
+    } else if (action === 'get_active_wos') {
+      return handleGetActiveWOs_();
+    } else if (action === 'submit_field_report') {
+      return handleSubmitFieldReport_(body);
+    } else if (action === 'get_dashboard_data') {
+      return handleGetDashboardData_();
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -1582,4 +1588,314 @@ function jsonResponse_(obj, statusCode) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 9. WEB APP — Crew Field Report
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Serves the crew field report single-page web app.
+ *
+ * Deploy settings (Apps Script → Deploy → New Deployment → Web App):
+ *   Execute as:  Me (script owner)
+ *   Who has access: Anyone with the link
+ *
+ * The Apps Script URL is the app's only security layer.
+ * The UPLOAD_SECRET key is injected at serve time so the browser
+ * can authenticate its doPost calls without it appearing in source.
+ */
+function doGet(e) {
+  const template = HtmlService.createTemplateFromFile('FieldReport');
+  template.scriptUrl = ScriptApp.getService().getUrl();
+  template.apiKey    = PropertiesService.getScriptProperties()
+                         .getProperty('UPLOAD_SECRET') || '';
+  return template.evaluate()
+    .setTitle('Oneiro — Field Report')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0, maximum-scale=1.0');
+}
+
+
+// ── action: get_active_wos ────────────────────────────────────
+
+/**
+ * Returns all non-complete Work Orders from the WO Tracker.
+ * Used to populate the WO dropdown in the field report form.
+ * Sorted: In Progress → Dispatched → Received.
+ */
+function handleGetActiveWOs_() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+
+  const ORDER = { 'in progress': 0, 'dispatched': 1, 'received': 2 };
+
+  const wos = allRows.slice(1)
+    .filter(r => r[0] && String(r[15]).toLowerCase() !== 'complete')
+    .map(r => ({
+      id:              String(r[0]),
+      contractor:      String(r[1]),
+      contract_number: String(r[2]),
+      borough:         String(r[3]),
+      location:        String(r[5]),
+      from_street:     String(r[6]),
+      to_street:       String(r[7]),
+      due_date:        String(r[8]),
+      priority:        String(r[9]),
+      work_type:       String(r[10]),
+      status:          String(r[15]),
+      dispatch_date:   String(r[16] || ''),
+      work_start_date: String(r[17] || '')
+    }))
+    .sort((a, b) => {
+      const aO = ORDER[a.status.toLowerCase()] ?? 99;
+      const bO = ORDER[b.status.toLowerCase()] ?? 99;
+      return aO - bO;
+    });
+
+  return jsonResponse_({ wos });
+}
+
+
+// ── action: submit_field_report ───────────────────────────────
+
+/**
+ * Writes a crew field report:
+ *   1. Appends one row per crew member to Daily Sign-In Data
+ *   2. Updates WO Tracker operational columns (Status, Dispatch, Start/End
+ *      dates, Marking Types, SQFT, Paint/Material, Issues, Photos)
+ *
+ * Expected body.data fields:
+ *   wo_id           — Work Order # (e.g. "PT-11930")
+ *   date            — Date of work (YYYY-MM-DD)
+ *   dispatch_date   — Dispatch Date (YYYY-MM-DD, optional)
+ *   work_start_date — Work Start Date (YYYY-MM-DD, optional)
+ *   work_end_date   — Work End Date (YYYY-MM-DD, optional)
+ *   wo_complete     — boolean — marks WO complete, sets Work End Date
+ *   marking_types   — string ("Crosswalk: 500 SF, Stop Bar: 10 LF")
+ *   sqft_completed  — number
+ *   paint_material  — string
+ *   issues          — string (appended to existing issues with date prefix)
+ *   photos_uploaded — boolean
+ *   crew            — [{name, classification, time_in, time_out, hours, overtime}]
+ *
+ * Daily Sign-In Data columns (0-indexed, 18 total):
+ *   0  Date                8  Time In           16  Admin Reviewed?
+ *   1  Work Order #        9  Time Out           17  Review Notes
+ *   2  Prime Contractor   10  Hours Worked
+ *   3  Contract #         11  Overtime Hours
+ *   4  Borough            12  SQFT Completed
+ *   5  Location           13  Paint/Material
+ *   6  Employee Name      14  WO Complete?
+ *   7  Classification     15  Issues/Notes
+ *
+ * WO Tracker columns updated (0-indexed):
+ *   15  Status             19  Marking Types      23  Photos Uploaded?
+ *   16  Dispatch Date      20  SQFT Completed
+ *   17  Work Start Date    21  Paint/Material Used
+ *   18  Work End Date      22  Issues Reported
+ */
+function handleSubmitFieldReport_(body) {
+  const d = body.data || {};
+
+  if (!d.wo_id) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (!d.date)  return jsonResponse_({ error: 'Missing date' }, 400);
+  if (!Array.isArray(d.crew) || d.crew.length === 0) {
+    return jsonResponse_({ error: 'At least one crew member is required' }, 400);
+  }
+
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+
+  // Find WO row — allRows[0] is header (sheet row 1), data starts at allRows[1]
+  const woRowIdx = allRows.findIndex((r, i) => i > 0 && String(r[0]) === String(d.wo_id));
+  if (woRowIdx === -1) {
+    return jsonResponse_({ error: 'Work Order not found: ' + d.wo_id }, 404);
+  }
+  const woRow = allRows[woRowIdx];
+
+  // ── Derive updated WO Tracker values ─────────────────────────
+
+  // Status: Received → Dispatched → In Progress → Complete
+  const currentStatus    = String(woRow[15] || 'Received');
+  const currentDispatch  = woRow[16] ? String(woRow[16]) : '';
+  const currentWorkStart = woRow[17] ? String(woRow[17]) : '';
+  const currentWorkEnd   = woRow[18] ? String(woRow[18]) : '';
+  const currentIssues    = String(woRow[22] || '').trim();
+
+  // Only set dates if not already recorded
+  const newDispatch  = currentDispatch  || d.dispatch_date   || '';
+  const newWorkStart = currentWorkStart || d.work_start_date || '';
+  const newWorkEnd   = d.wo_complete
+    ? (d.work_end_date || d.date)
+    : currentWorkEnd;
+
+  // Progress status forward (never backward)
+  let newStatus = currentStatus;
+  if (d.wo_complete) {
+    newStatus = 'Complete';
+  } else if (newWorkStart && (currentStatus === 'Received' || currentStatus === 'Dispatched')) {
+    newStatus = 'In Progress';
+  } else if (newDispatch && currentStatus === 'Received') {
+    newStatus = 'Dispatched';
+  }
+
+  // Append new issues with date prefix; preserve existing
+  let newIssues = currentIssues;
+  if (d.issues && d.issues.trim()) {
+    const issueLine = d.date + ': ' + d.issues.trim();
+    newIssues = currentIssues ? currentIssues + '\n' + issueLine : issueLine;
+  }
+
+  // Photos: once "Yes", stays "Yes"
+  const newPhotos = (d.photos_uploaded || String(woRow[23]).toLowerCase() === 'yes')
+    ? 'Yes' : 'No';
+
+  // Use submitted marking types; fall back to existing if not provided
+  const newMarkings = (d.marking_types && d.marking_types.trim())
+    ? d.marking_types.trim()
+    : String(woRow[19] || '');
+
+  // ── Write WO Tracker cols 15–23 (0-indexed) ──────────────────
+  // getRange(row, col, numRows, numCols) is 1-indexed
+  // Col 15 (0-indexed) = col 16 (1-indexed); 9 columns → cols 16–24 (1-indexed)
+  // woRowIdx is 0-indexed in allRows; sheet row = woRowIdx + 1
+  woSheet.getRange(woRowIdx + 1, 16, 1, 9).setValues([[
+    newStatus,                                              // col 15: Status
+    newDispatch,                                            // col 16: Dispatch Date
+    newWorkStart,                                           // col 17: Work Start Date
+    newWorkEnd,                                             // col 18: Work End Date
+    newMarkings,                                            // col 19: Marking Types
+    (d.sqft_completed != null) ? d.sqft_completed : (woRow[20] || ''), // col 20: SQFT
+    (d.paint_material  || String(woRow[21] || '')).trim(),  // col 21: Paint/Material
+    newIssues,                                              // col 22: Issues Reported
+    newPhotos                                               // col 23: Photos Uploaded?
+  ]]);
+
+  Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
+
+  // ── Write Daily Sign-In Data rows (one per crew member) ──────
+  const signInSheet = ss.getSheetByName('Daily Sign-In Data');
+
+  d.crew.forEach(member => {
+    const hours    = parseFloat(member.hours)    || 0;
+    const overtime = parseFloat(member.overtime) || Math.max(0, hours - 8);
+
+    signInSheet.appendRow([
+      d.date,                              //  0  Date
+      d.wo_id,                             //  1  Work Order #
+      String(woRow[1]),                    //  2  Prime Contractor
+      String(woRow[2]),                    //  3  Contract #
+      String(woRow[3]),                    //  4  Borough
+      String(woRow[5]),                    //  5  Location
+      String(member.name   || '').trim(),  //  6  Employee Name
+      String(member.classification || ''), //  7  Classification
+      String(member.time_in  || ''),       //  8  Time In
+      String(member.time_out || ''),       //  9  Time Out
+      hours,                               // 10  Hours Worked
+      overtime,                            // 11  Overtime Hours
+      (d.sqft_completed != null) ? d.sqft_completed : '', // 12  SQFT Completed
+      (d.paint_material || '').trim(),     // 13  Paint/Material
+      d.wo_complete ? 'Yes' : 'No',        // 14  WO Complete?
+      (d.issues || '').trim(),             // 15  Issues/Notes
+      '',                                  // 16  Admin Reviewed? (blank — admin fills)
+      ''                                   // 17  Review Notes    (blank — admin fills)
+    ]);
+  });
+
+  Logger.log('✅ Sign-In Data: ' + d.crew.length + ' row(s) appended for WO ' + d.wo_id);
+
+  // ── Automation Log ────────────────────────────────────────────
+  const actionNote = d.wo_complete
+    ? 'WO marked COMPLETE — review for invoicing, field report, and production log'
+    : '';
+
+  ss.getSheetByName('Automation Log').appendRow([
+    new Date(),
+    'Field Report Web App',
+    'Field report submitted',
+    d.wo_id,
+    d.crew.length + ' crew member(s) on ' + d.date,
+    newStatus,
+    '',
+    actionNote
+  ]);
+
+  return jsonResponse_({ success: true, wo_id: d.wo_id, status: newStatus });
+}
+
+
+// ── action: get_dashboard_data ────────────────────────────────
+
+/**
+ * Returns all WO Tracker rows + summary stats for the React dashboard.
+ * Called by the Express backend (/api/dashboard) which proxies here.
+ */
+function handleGetDashboardData_() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+
+  const wos = allRows.slice(1)
+    .filter(r => r[0])   // skip blank rows
+    .map(r => ({
+      id:            String(r[0]),
+      contractor:    String(r[1]),
+      contract_num:  String(r[2]),
+      borough:       String(r[3]),
+      contract_id:   String(r[4]),
+      location:      String(r[5]),
+      from_street:   String(r[6]),
+      to_street:     String(r[7]),
+      due_date:      String(r[8]  || ''),
+      priority:      String(r[9]  || ''),
+      work_type:     String(r[10] || ''),
+      wo_received:   String(r[11] || ''),
+      water_blast:   String(r[12] || ''),
+      status:        String(r[15] || 'Received'),
+      dispatch_date: String(r[16] || ''),
+      work_start:    String(r[17] || ''),
+      work_end:      String(r[18] || ''),
+      marking_types: String(r[19] || ''),
+      sqft:          r[20] != null ? String(r[20]) : '',
+      paint:         String(r[21] || ''),
+      issues:        String(r[22] || ''),
+      photos:        String(r[23] || ''),
+      prod_log:      String(r[24] || ''),
+      field_report:  String(r[25] || ''),
+      invoice_sent:  String(r[29] || ''),
+      payment_recv:  String(r[30] || '')
+    }));
+
+  // Pipeline summary counts
+  const count = (statusStr) =>
+    wos.filter(w => w.status.toLowerCase() === statusStr.toLowerCase()).length;
+
+  const stats = {
+    total:       wos.length,
+    received:    count('Received'),
+    dispatched:  count('Dispatched'),
+    in_progress: count('In Progress'),
+    complete:    count('Complete')
+  };
+
+  // Contractor breakdown
+  const byContractor = {};
+  wos.forEach(w => {
+    const c = w.contractor || 'Unknown';
+    byContractor[c] = (byContractor[c] || 0) + 1;
+  });
+
+  // WOs needing attention (issues reported, incomplete docs)
+  const attention = wos.filter(w =>
+    w.status.toLowerCase() !== 'complete' && (
+      (w.issues && w.issues.trim()) ||
+      (w.status.toLowerCase() === 'in progress' && w.photos.toLowerCase() !== 'yes')
+    )
+  ).map(w => w.id);
+
+  return jsonResponse_({ wos, stats, byContractor, attention });
 }

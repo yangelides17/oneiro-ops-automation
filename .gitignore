@@ -33,3 +33,8 @@ Thumbs.db
 # Railway / env
 .env
 *.env
+
+# Web app
+webapp/node_modules/
+webapp/dist/
+webapp/.vite/
