@@ -191,16 +191,21 @@ def _upload_via_proxy(local_path: Path, folder_id: str, url: str, key: str) -> s
 
     pdf_bytes = local_path.read_bytes()
     encoded   = base64.b64encode(pdf_bytes).decode('utf-8')
-    params    = {
+
+    # Send everything as a JSON body — Apps Script handles this natively
+    # via e.postData.contents. Mixing URL params + octet-stream body is
+    # unreliable across Google's infrastructure and causes HTML error pages.
+    import json as _json
+    payload = _json.dumps({
         'key':       key,
         'filename':  local_path.name,
         'folder_id': folder_id,
-    }
+        'data':      encoded,
+    })
     resp = requests.post(
         url,
-        params=params,
-        data=encoded,
-        headers={'Content-Type': 'application/octet-stream'},
+        data=payload,
+        headers={'Content-Type': 'application/json'},
         timeout=60,
         allow_redirects=True,
     )
