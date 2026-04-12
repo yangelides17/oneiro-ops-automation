@@ -62,15 +62,46 @@ def log(msg: str):
 
 # ── Google Auth ───────────────────────────────────────────────────────────────
 def get_drive_service():
+    """
+    Build an authenticated Drive service.
+
+    Priority:
+      1. GOOGLE_SERVICE_ACCOUNT_JSON env var (Railway / any cloud deployment)
+         Set this in the Railway dashboard to the contents of your service account
+         key JSON file.  The Drive folders must be shared with the service account
+         email address (e.g. oneiro-worker@your-project.iam.gserviceaccount.com).
+
+      2. Local OAuth flow (development machine)
+         Requires credentials.json and opens a browser on first run.
+         Token is cached in .token.json for subsequent runs.
+    """
     try:
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from google.auth.transport.requests import Request
         from googleapiclient.discovery import build
     except ImportError:
         print("\n❌  Required packages not installed. Run:\n")
-        print("    pip3 install google-api-python-client google-auth-oauthlib --break-system-packages\n")
+        print("    pip install -r requirements.txt\n")
         sys.exit(1)
+
+    # ── Option 1: Service account (Railway / cloud) ───────────────────────────
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if sa_json:
+        try:
+            from google.oauth2 import service_account
+            import json as _json
+            sa_info = _json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(
+                sa_info, scopes=SCOPES
+            )
+            log("🔑  Authenticated via service account.")
+            return build('drive', 'v3', credentials=creds)
+        except Exception as e:
+            print(f"\n❌  Service account auth failed: {e}\n")
+            sys.exit(1)
+
+    # ── Option 2: OAuth (local development) ──────────────────────────────────
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
 
     creds = None
     if TOKEN_FILE.exists():
@@ -81,13 +112,14 @@ def get_drive_service():
             creds.refresh(Request())
         else:
             if not CREDS_FILE.exists():
-                print(f"\n❌  credentials.json not found at {CREDS_FILE}")
-                print("    See SETUP.md for instructions.\n")
+                print(f"\n❌  No auth method available.")
+                print(f"    On Railway: set the GOOGLE_SERVICE_ACCOUNT_JSON environment variable.")
+                print(f"    Locally:    place credentials.json at {CREDS_FILE}\n")
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json())
-        log("✅  Auth token saved.")
+        log("✅  OAuth token saved.")
 
     return build('drive', 'v3', credentials=creds)
 
