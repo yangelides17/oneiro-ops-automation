@@ -1316,3 +1316,92 @@ function getBoroughName_(code) {
 function getFolderId_(name) {
   return PropertiesService.getScriptProperties().getProperty(name) || CONFIG[name] || '';
 }
+
+
+// ═══════════════════════════════════════════════════════════════
+// UPLOAD PROXY — Receives filled PDFs from the Railway worker
+// ═══════════════════════════════════════════════════════════════
+//
+// WHY THIS EXISTS:
+//   Google Drive service accounts have no personal storage quota,
+//   so they cannot create files in regular (non-Shared) Drive folders.
+//   The Railway worker fills PDFs but cannot upload them directly.
+//   Instead it POSTs the bytes here, and Apps Script saves the file
+//   as the real Drive-owning Google account — no quota issues ever.
+//
+// ONE-TIME SETUP (do this after deploying the Apps Script project):
+//   Step 1 — Set the upload secret:
+//     Extensions → Apps Script → Project Settings → Script Properties
+//     Add:  UPLOAD_SECRET = <any strong random string you choose>
+//
+//   Step 2 — Deploy as a Web App:
+//     Deploy → New deployment → Type: Web App
+//     Execute as:     Me  (your Google account)
+//     Who has access: Anyone
+//     → Copy the deployment URL
+//
+//   Step 3 — Add two env vars to Railway:
+//     APPS_SCRIPT_UPLOAD_URL = <the deployment URL from Step 2>
+//     APPS_SCRIPT_UPLOAD_KEY = <the same secret from Step 1>
+//
+//   That's it. Railway will route all uploads through here.
+//   No token rotation, no credential management — it just works.
+
+/**
+ * HTTP POST handler — called by the Railway worker to save a filled PDF.
+ *
+ * Request format:
+ *   POST <web_app_url>?key=<secret>&filename=<name.pdf>&folder_id=<drive_id>
+ *   Content-Type: application/octet-stream
+ *   Body: base64-encoded PDF bytes
+ *
+ * Response JSON:
+ *   { success: true, file_id: "...", file_url: "...", filename: "..." }
+ *   { error: "...", _status: 400|401|500 }
+ */
+function doPost(e) {
+  try {
+    // ── Authenticate ────────────────────────────────────────────
+    const secret = PropertiesService.getScriptProperties()
+                     .getProperty('UPLOAD_SECRET');
+    if (!secret || e.parameter.key !== secret) {
+      return jsonResponse_({ error: 'unauthorized' }, 401);
+    }
+
+    // ── Validate params ─────────────────────────────────────────
+    const fileName = e.parameter.filename;
+    const folderId = e.parameter.folder_id;
+    if (!fileName || !folderId) {
+      return jsonResponse_(
+        { error: 'Missing required parameters: filename, folder_id' }, 400
+      );
+    }
+
+    // ── Decode + save to Drive ──────────────────────────────────
+    const pdfBytes = Utilities.base64Decode(e.postData.contents);
+    const blob     = Utilities.newBlob(pdfBytes, 'application/pdf', fileName);
+    const folder   = DriveApp.getFolderById(folderId);
+    const file     = folder.createFile(blob);
+
+    Logger.log('📄 Upload proxy saved: ' + file.getName() + ' → folder ' + folderId);
+
+    return jsonResponse_({
+      success:  true,
+      file_id:  file.getId(),
+      file_url: file.getUrl(),
+      filename: file.getName()
+    });
+
+  } catch (err) {
+    Logger.log('❌ Upload proxy error: ' + err.toString());
+    return jsonResponse_({ error: err.toString() }, 500);
+  }
+}
+
+/** Wraps an object as a JSON ContentService response. */
+function jsonResponse_(obj, statusCode) {
+  if (statusCode && statusCode !== 200) obj._status = statusCode;
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}

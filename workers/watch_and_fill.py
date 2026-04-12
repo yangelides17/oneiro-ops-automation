@@ -63,16 +63,18 @@ def log(msg: str):
 # ── Google Auth ───────────────────────────────────────────────────────────────
 def get_drive_service():
     """
-    Build an authenticated Drive service.
+    Build an authenticated Google Drive service (for reading only on Railway).
+
+    Uploads are handled by the Apps Script proxy (doPost in Code.js), so the
+    Drive service only needs read access — which service accounts handle fine.
 
     Priority:
-      1. GOOGLE_SERVICE_ACCOUNT_JSON env var (Railway / any cloud deployment)
-         Set this in the Railway dashboard to the contents of your service account
-         key JSON file.  The Drive folders must be shared with the service account
-         email address (e.g. oneiro-worker@your-project.iam.gserviceaccount.com).
+      1. GOOGLE_SERVICE_ACCOUNT_JSON env var (Railway)
+         Set this in Railway to the full contents of your service_account.json.
+         Share the Oneiro Ops Drive folder with the service account email.
 
       2. Local OAuth flow (development machine)
-         Requires credentials.json and opens a browser on first run.
+         Requires credentials.json at repo root; opens browser on first run.
          Token is cached in .token.json for subsequent runs.
     """
     try:
@@ -82,12 +84,13 @@ def get_drive_service():
         print("    pip install -r requirements.txt\n")
         sys.exit(1)
 
-    # ── Option 1: Service account (Railway / cloud) ───────────────────────────
+    import json as _json
+
+    # ── Option 1: Service account (Railway) ───────────────────────────────────
     sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
     if sa_json:
         try:
             from google.oauth2 import service_account
-            import json as _json
             sa_info = _json.loads(sa_json)
             creds = service_account.Credentials.from_service_account_info(
                 sa_info, scopes=SCOPES
@@ -113,7 +116,7 @@ def get_drive_service():
         else:
             if not CREDS_FILE.exists():
                 print(f"\n❌  No auth method available.")
-                print(f"    On Railway: set the GOOGLE_SERVICE_ACCOUNT_JSON environment variable.")
+                print(f"    On Railway: set GOOGLE_SERVICE_ACCOUNT_JSON environment variable.")
                 print(f"    Locally:    place credentials.json at {CREDS_FILE}\n")
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), SCOPES)
@@ -160,9 +163,58 @@ def download_file(service, file_id: str) -> dict:
 
 
 def upload_pdf(service, local_path: Path, parent_folder_id: str) -> str:
-    """Upload a local PDF file to Drive folder. Returns the new file's ID."""
+    """Upload a filled PDF to Google Drive.
+
+    On Railway: routes through the Apps Script Web App proxy (doPost in Code.js),
+    which saves the file as the real Drive-owning Google account.
+    Set APPS_SCRIPT_UPLOAD_URL and APPS_SCRIPT_UPLOAD_KEY in Railway env vars.
+
+    Locally: uploads directly via the Drive API using the OAuth credentials
+    obtained during --setup (no proxy needed when running as yourself).
+    """
+    upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
+    if upload_url:
+        upload_key = os.environ.get('APPS_SCRIPT_UPLOAD_KEY', '')
+        return _upload_via_proxy(local_path, parent_folder_id, upload_url, upload_key)
+    else:
+        return _upload_direct(service, local_path, parent_folder_id)
+
+
+def _upload_via_proxy(local_path: Path, folder_id: str, url: str, key: str) -> str:
+    """POST base64-encoded PDF bytes to the Apps Script upload proxy.
+
+    The proxy (doPost in Code.js) runs as your Google account and saves the
+    file to Drive — bypassing the service-account storage-quota limitation.
+    Returns the created Drive file ID.
+    """
+    import requests, base64
+
+    pdf_bytes = local_path.read_bytes()
+    encoded   = base64.b64encode(pdf_bytes).decode('utf-8')
+    params    = {
+        'key':       key,
+        'filename':  local_path.name,
+        'folder_id': folder_id,
+    }
+    resp = requests.post(
+        url,
+        params=params,
+        data=encoded,
+        headers={'Content-Type': 'application/octet-stream'},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if 'error' in result:
+        raise RuntimeError(f"Apps Script proxy error: {result['error']}")
+    log(f"  📤  Proxy upload complete → {result.get('filename')}  (Drive ID: {result.get('file_id')})")
+    return result.get('file_id', '')
+
+
+def _upload_direct(service, local_path: Path, parent_folder_id: str) -> str:
+    """Upload directly via Drive API (local dev with OAuth credentials)."""
     from googleapiclient.http import MediaFileUpload
-    meta = {'name': local_path.name, 'parents': [parent_folder_id]}
+    meta  = {'name': local_path.name, 'parents': [parent_folder_id]}
     media = MediaFileUpload(str(local_path), mimetype='application/pdf')
     created = service.files().create(body=meta, media_body=media, fields='id').execute()
     return created.get('id')
