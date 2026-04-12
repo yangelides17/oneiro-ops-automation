@@ -1343,42 +1343,40 @@ function getFolderId_(name) {
 //   Step 3 — Add two env vars to Railway:
 //     APPS_SCRIPT_UPLOAD_URL = <the deployment URL from Step 2>
 //     APPS_SCRIPT_UPLOAD_KEY = <the same secret from Step 1>
-//
-//   That's it. Railway will route all uploads through here.
-//   No token rotation, no credential management — it just works.
 
 /**
  * HTTP POST handler — called by the Railway worker to save a filled PDF.
  *
- * Request format:
- *   POST <web_app_url>?key=<secret>&filename=<name.pdf>&folder_id=<drive_id>
- *   Content-Type: application/octet-stream
- *   Body: base64-encoded PDF bytes
+ * Request body (JSON):
+ *   { key, filename, folder_id, data }   ← data is base64-encoded PDF bytes
  *
  * Response JSON:
- *   { success: true, file_id: "...", file_url: "...", filename: "..." }
+ *   { success: true, file_id, file_url, filename }
  *   { error: "...", _status: 400|401|500 }
  */
 function doPost(e) {
   try {
+    const body = JSON.parse(e.postData.contents);
+
     // ── Authenticate ────────────────────────────────────────────
     const secret = PropertiesService.getScriptProperties()
                      .getProperty('UPLOAD_SECRET');
-    if (!secret || e.parameter.key !== secret) {
+    if (!secret || body.key !== secret) {
       return jsonResponse_({ error: 'unauthorized' }, 401);
     }
 
-    // ── Validate params ─────────────────────────────────────────
-    const fileName = e.parameter.filename;
-    const folderId = e.parameter.folder_id;
-    if (!fileName || !folderId) {
+    // ── Validate ────────────────────────────────────────────────
+    const fileName = body.filename;
+    const folderId = body.folder_id;
+    const encoded  = body.data;
+    if (!fileName || !folderId || !encoded) {
       return jsonResponse_(
-        { error: 'Missing required parameters: filename, folder_id' }, 400
+        { error: 'Missing required fields: filename, folder_id, data' }, 400
       );
     }
 
     // ── Decode + save to Drive ──────────────────────────────────
-    const pdfBytes = Utilities.base64Decode(e.postData.contents);
+    const pdfBytes = Utilities.base64Decode(encoded);
     const blob     = Utilities.newBlob(pdfBytes, 'application/pdf', fileName);
     const folder   = DriveApp.getFolderById(folderId);
     const file     = folder.createFile(blob);
