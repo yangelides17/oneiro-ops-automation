@@ -1,0 +1,35 @@
+# Google OAuth credentials — never commit these
+credentials.json
+.token.json
+service_account.json
+
+# Runtime state — generated automatically
+.drive_config.json
+.processed_files.json
+
+# Local temp files
+_tmp_fills/
+_template_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test output PDFs
+*_filled.pdf
+*_TEST.pdf
+*_diagnostic.pdf
+
+# clasp / Apps Script
+.clasp.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Railway / env
+.env
+*.env
