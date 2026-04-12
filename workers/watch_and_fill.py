@@ -180,12 +180,12 @@ def get_template(service, doc_type: str) -> Path:
     if not filename:
         raise ValueError(f"No template configured for doc_type={doc_type!r}")
 
-    # Load templates folder ID from config
-    config_path = ROOT_DIR / '.drive_config.json'
-    if not config_path.exists():
-        raise RuntimeError("Drive config not found. Run --setup first.")
-    config = json.loads(config_path.read_text())
-    templates_folder_id = config.get('templates_folder_id')
+    # Load templates folder ID — env var (Railway) takes priority over local config
+    templates_folder_id = os.environ.get('DRIVE_TEMPLATES_ID')
+    if not templates_folder_id:
+        config_path = ROOT_DIR / '.drive_config.json'
+        if config_path.exists():
+            templates_folder_id = json.loads(config_path.read_text()).get('templates_folder_id')
 
     TEMPLATE_CACHE.mkdir(exist_ok=True)
     local_path = TEMPLATE_CACHE / filename
@@ -380,25 +380,46 @@ def run_setup(service, folder_id: str = None, templates_id: str = None):
 
 
 def load_folder_map(service) -> dict:
-    """Load folder IDs from config, re-discovering any missing subfolders."""
+    """Load folder IDs from environment variables (Railway) or .drive_config.json (local).
+
+    Environment variables take priority — set these in the Railway dashboard:
+      DRIVE_NEEDS_REVIEW_ID   — ID of the "Docs Needing Review" folder
+      DRIVE_TEMPLATES_ID      — ID of the Templates folder
+      DRIVE_PROD_LOGS_ID      — (optional) ID of Production Logs subfolder
+      DRIVE_CERT_PAYROLL_ID   — (optional) ID of Certified Payroll subfolder
+    """
+    needs_review_id     = os.environ.get('DRIVE_NEEDS_REVIEW_ID')
+    templates_folder_id = os.environ.get('DRIVE_TEMPLATES_ID')
+    prod_logs_id        = os.environ.get('DRIVE_PROD_LOGS_ID')
+    cert_payroll_id     = os.environ.get('DRIVE_CERT_PAYROLL_ID')
+
+    # Fall back to local .drive_config.json if env vars not set
     config_path = ROOT_DIR / '.drive_config.json'
-    if not config_path.exists():
-        log("❌  No Drive config found. Run:  python3 watch_and_fill.py --setup")
-        sys.exit(1)
+    if not needs_review_id:
+        if not config_path.exists():
+            log("❌  No Drive config found.")
+            log("    On Railway: set DRIVE_NEEDS_REVIEW_ID environment variable.")
+            log("    Locally:    run  python3 workers/watch_and_fill.py --setup")
+            sys.exit(1)
+        config = json.loads(config_path.read_text())
+        needs_review_id     = config.get('needs_review_id')
+        templates_folder_id = templates_folder_id or config.get('templates_folder_id')
+        saved_folders       = config.get('folders', {})
+        prod_logs_id        = prod_logs_id    or saved_folders.get('Production Logs')
+        cert_payroll_id     = cert_payroll_id or saved_folders.get('Certified Payroll')
+    else:
+        log("📋  Loaded folder IDs from environment variables.")
 
-    config = json.loads(config_path.read_text())
-    folder_map = config.get('folders', {})
-    needs_review_id = config.get('needs_review_id')
-
-    # Discover any subfolders not yet in config (e.g. created by Apps Script after setup)
-    for sub in WATCH_SUBFOLDERS:
-        if sub not in folder_map and needs_review_id:
+    # Build folder map — discover any subfolders not yet known
+    folder_map = {}
+    for sub, known_id in [('Production Logs', prod_logs_id), ('Certified Payroll', cert_payroll_id)]:
+        if known_id:
+            folder_map[sub] = known_id
+        elif needs_review_id:
             fid = find_folder(service, sub, parent_id=needs_review_id)
             if fid:
                 folder_map[sub] = fid
-                config['folders'] = folder_map
-                config_path.write_text(json.dumps(config, indent=2))
-                log(f"  🔎  Discovered new subfolder '{sub}': {fid}")
+                log(f"  🔎  Discovered subfolder '{sub}': {fid}")
 
     return {k: v for k, v in folder_map.items() if k in WATCH_SUBFOLDERS}
 
