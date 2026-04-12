@@ -60,10 +60,10 @@ log = logging.getLogger(__name__)
 # ── Borough code normalization ────────────────────────────────────────────────
 # WO form uses single-letter codes; the Tracker uses the 2-letter abbreviations
 BOROUGH_MAP = {
-    'K':  'BK',   # Brooklyn
+    'K':  'BK',   # Brooklyn (WO form uses K)
     'BK': 'BK',
-    'M':  'MN',   # Manhattan
-    'MN': 'MN',
+    'M':  'M',    # Manhattan (tracker uses M, not MN)
+    'MN': 'M',
     'BX': 'BX',   # Bronx
     'Q':  'QU',   # Queens
     'QU': 'QU',
@@ -71,13 +71,16 @@ BOROUGH_MAP = {
     'R':  'SI',   # alternate code for Staten Island (Richmond)
 }
 
-# Marking types that indicate MMA (methyl methacrylate) work — requires waterblast prep
-MMA_KEYWORDS = [
-    'color surface treatment',
-    'color surface',
+# Words in General Remarks that indicate MMA work (requires waterblasting)
+MMA_REMARK_KEYWORDS = [
+    'bike lane',
+    'bus lane',
+    'pedestrian space',
+    'pedestrian stop',
+    'ped space',
+    'ped stop',
     'mma',
-    'methyl methacrylate',
-    'cst',
+    'color surface',
 ]
 
 # ── Extraction prompt ─────────────────────────────────────────────────────────
@@ -99,22 +102,14 @@ If a field is not visible, illegible, or not applicable, use null. Never guess.
   "priority_level":     "Priority level label, e.g. '3 - Schedule'. Labeled 'Priority Level'.",
   "pavement_work_type": "Pavement work type, e.g. REFURBISHMENT or NEW. Labeled 'Pavement Work'.",
   "wo_received_date":   "The 'Issue To Contractor Date' at the bottom of the form, e.g. 07/17/2025.",
-  "marking_types": [
-    {
-      "type": "Marking row label, e.g. 'Double Yellow CenterLine', 'Lane Lines', 'Gores', 'Color Surface Treatment', 'Arrows', etc.",
-      "value": "Any handwritten quantity, SQFT, or note written next to that row. null if blank."
-    }
-  ],
-  "water_blast_sqft":   "If any waterblasting square footage is handwritten anywhere on the form, extract the number. Otherwise null.",
-  "general_remarks":    "Any text in the General Remarks section.",
-  "notes":              "Any other relevant handwritten or printed notes not captured above."
+  "water_blast_sqft":   "If any waterblasting square footage is handwritten anywhere on the form, extract the number as an integer. Otherwise null.",
+  "general_remarks":    "The full text of the General Remarks section (middle of the form, labeled 'General Remarks>>>>>'). Transcribe exactly as written, including handwritten text."
 }
 
 Important notes:
-- The marking_types array should include ONLY rows that have something written next to them (a number, date, or note).
-- Do not include blank marking rows.
-- water_blast_sqft may appear as a handwritten number anywhere on the form near the word 'waterblast', 'WB', or 'water blast'.
-- The Issue To Contractor Date may be labeled 'Issue To Contractor Date' near the bottom of the form.
+- water_blast_sqft may appear as a handwritten number near the words 'waterblast', 'WB', or 'water blast' anywhere on the form.
+- The General Remarks section is critical — it often contains handwritten notes about the type of work (e.g. 'RECAP PAINT FOR BIKE LANE', 'BUS LANE', 'PED SPACE'). Transcribe it fully.
+- The Issue To Contractor Date is near the bottom of the form.
 """
 
 
@@ -210,8 +205,16 @@ def normalize_wo_data(raw: dict) -> dict:
     marking_types_str = ', '.join(marking_parts)
 
     # ── Water blast logic ─────────────────────────────────────────
-    # Waterblasting is only required for MMA work; it is N/A for thermo.
-    # If waterblast SQFT is handwritten on the WO, that confirms it's needed.
+    # Valid dropdown values in the tracker:
+    #   Water Blast Required?  → "Yes - MMA" | "No - Thermo" | "N/A" | "" (blank if unsure)
+    #   Water Blast Confirmed? → "Yes" | "No" | "N/A"
+    #
+    # Detection priority:
+    #   1. Explicit WB SQFT handwritten on the form → "Yes - MMA"
+    #   2. General remarks mention Bike Lane / Bus Lane / Ped Space/Stop → "Yes - MMA"
+    #   3. Remarks present but no MMA indicators → "No - Thermo"
+    #   4. No remarks at all → "" (blank — admin decides)
+
     wb_sqft_raw = raw.get('water_blast_sqft')
     wb_sqft = ''
     if wb_sqft_raw is not None:
@@ -220,46 +223,41 @@ def normalize_wo_data(raw: dict) -> dict:
         except (ValueError, TypeError):
             wb_sqft = str(wb_sqft_raw).strip()
 
-    # Detect MMA from marking types
-    marking_text = marking_types_str.lower()
-    is_mma = any(kw in marking_text for kw in MMA_KEYWORDS)
+    remarks = (raw.get('general_remarks') or '').strip()
+    remarks_lower = remarks.lower()
+    is_mma = bool(wb_sqft) or any(kw in remarks_lower for kw in MMA_REMARK_KEYWORDS)
+    has_remarks = bool(remarks)
 
-    if wb_sqft:
-        # Explicit waterblast quantity found on form
+    if is_mma:
         water_blast_required = 'Yes - MMA'
-    elif is_mma:
-        # MMA work detected but no explicit WB notation — needs confirmation
-        water_blast_required = 'Pending'
+        # Confirmed only if we saw explicit WB info on the form
+        water_blast_confirmed = 'Yes' if wb_sqft else 'No'
+    elif has_remarks:
+        # Remarks present but no MMA indicators → thermoplastic work
+        water_blast_required  = 'No - Thermo'
+        water_blast_confirmed = 'N/A'
+        wb_sqft = ''  # not applicable
     else:
-        # Thermo or non-MMA work — waterblast not applicable
-        water_blast_required = 'NA'
+        # No remarks to go on — leave blank for admin to decide
+        water_blast_required  = ''
+        water_blast_confirmed = 'N/A'
+        wb_sqft = ''
 
-    # ── Notes ─────────────────────────────────────────────────────
-    remarks = raw.get('general_remarks') or ''
-    extra   = raw.get('notes') or ''
-    notes   = '; '.join(filter(None, [remarks, extra]))
-
-    # ── Build normalized dict (matches Tracker column order) ─────
+    # ── Build normalized dict ─────────────────────────────────────
     return {
-        # Fields populated from scan
-        'work_order_id':      (raw.get('work_order_id') or '').strip(),
-        'prime_contractor':   (raw.get('contractor') or '').strip().title(),
-        'contract_number':    (raw.get('contract_number') or '').strip(),
-        'borough':            borough,
-        'contract_id':        '',   # blank — admin fills from prime contractor
-        'location':           (raw.get('location') or '').strip().title(),
-        'from_street':        (raw.get('from_street') or '').strip().title(),
-        'to_street':          (raw.get('to_street') or '').strip().title(),
-        'due_date':           (raw.get('due_date') or '').strip(),
-        'priority_level':     (raw.get('priority_level') or '').strip(),
-        'pavement_work_type': (raw.get('pavement_work_type') or '').strip().upper(),
-        'wo_received_date':   (raw.get('wo_received_date') or '').strip(),
-        'marking_types':      marking_types_str,
+        'work_order_id':         (raw.get('work_order_id') or '').strip(),
+        'prime_contractor':      (raw.get('contractor') or '').strip().title(),
+        'contract_number':       (raw.get('contract_number') or '').strip(),
+        'borough':               borough,
+        'location':              (raw.get('location') or '').strip().title(),
+        'from_street':           (raw.get('from_street') or '').strip().title(),
+        'to_street':             (raw.get('to_street') or '').strip().title(),
+        'due_date':              (raw.get('due_date') or '').strip(),
+        'priority_level':        (raw.get('priority_level') or '').strip(),
+        'pavement_work_type':    (raw.get('pavement_work_type') or '').strip().upper(),
+        'wo_received_date':      (raw.get('wo_received_date') or '').strip(),
         'water_blast_required':  water_blast_required,
-        'water_blast_confirmed': 'No',
+        'water_blast_confirmed': water_blast_confirmed,
         'water_blast_sqft':      wb_sqft,
-        'notes':              notes,
-
-        # Status fields — all set to intake defaults
-        'status':              'Received',
+        'status':                'Received',
     }
