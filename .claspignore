@@ -1,0 +1,9 @@
+# Tell clasp to only push Apps Script source files.
+# Everything else (Python workers, webapp, templates, etc.) is ignored.
+
+# Ignore everything by default
+**
+
+# Allow only the Apps Script files
+!Code.js
+!appsscript.json

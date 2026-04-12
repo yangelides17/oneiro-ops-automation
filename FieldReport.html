@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Oneiro — Field Report</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --navy:      #1B2A4A;
+      --navy-dark: #111D33;
+      --gold:      #C9A227;
+      --gray:      #F4F5F8;
+      --border:    #DDE1EA;
+      --text:      #1A1A2E;
+      --muted:     #6B7280;
+      --green:     #15803D;
+      --green-bg:  #DCFCE7;
+      --red:       #DC2626;
+      --red-bg:    #FEF2F2;
+      --blue-bg:   #EFF6FF;
+      --blue:      #1D4ED8;
+      --amber-bg:  #FEFCE8;
+      --amber:     #A16207;
+      --orange-bg: #FFF7ED;
+      --orange:    #C2410C;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--gray);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Screens ──────────────────────────────────── */
+    .screen { display: none; }
+    .screen.active { display: block; }
+
+    /* ── Header ───────────────────────────────────── */
+    .app-header {
+      background: var(--navy);
+      color: white;
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .logo-mark {
+      width: 38px; height: 38px;
+      background: var(--gold);
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 900; font-size: 17px; color: var(--navy);
+      flex-shrink: 0; letter-spacing: -1px;
+    }
+    .header-text-title { font-size: 17px; font-weight: 700; }
+    .header-text-sub   { font-size: 11px; color: rgba(255,255,255,0.6); }
+
+    /* ── Container ────────────────────────────────── */
+    .container { max-width: 640px; margin: 0 auto; padding: 16px 14px; }
+
+    /* ── Cards ────────────────────────────────────── */
+    .card {
+      background: white;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      padding: 18px;
+      margin-bottom: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .card-label {
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--navy);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ── Form fields ──────────────────────────────── */
+    .field { margin-bottom: 12px; }
+    .field:last-child { margin-bottom: 0; }
+
+    label.field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    input[type="text"],
+    input[type="number"],
+    input[type="date"],
+    input[type="time"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 11px 13px;
+      font-size: 15px;
+      border: 1.5px solid var(--border);
+      border-radius: 9px;
+      background: white;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      -webkit-appearance: none;
+      appearance: none;
+      font-family: inherit;
+    }
+    select {
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%236B7280' d='M5 7L0.5 2.5h9z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 13px center;
+      padding-right: 36px;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--navy);
+      box-shadow: 0 0 0 3px rgba(27,42,74,0.12);
+    }
+    input[readonly], input[disabled] {
+      background: var(--gray);
+      color: var(--muted);
+      cursor: default;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 76px;
+      line-height: 1.5;
+    }
+
+    .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row-3 { display: grid; grid-template-columns: 1fr 80px 64px auto; gap: 6px; align-items: end; }
+
+    /* ── WO Info panel ────────────────────────────── */
+    .wo-panel {
+      background: var(--gray);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      font-size: 13.5px;
+      display: none;
+      border: 1px solid var(--border);
+    }
+    .wo-panel.show { display: block; }
+    .wo-row {
+      display: flex;
+      gap: 10px;
+      padding: 3px 0;
+    }
+    .wo-key {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      min-width: 80px;
+      padding-top: 2px;
+    }
+    .wo-val { font-weight: 500; }
+
+    /* ── Status badges ────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .badge-received   { background: var(--blue-bg);   color: var(--blue); }
+    .badge-dispatched { background: var(--amber-bg);  color: var(--amber); }
+    .badge-progress   { background: var(--orange-bg); color: var(--orange); }
+    .badge-complete   { background: var(--green-bg);  color: var(--green); }
+
+    /* ── Buttons ──────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 10px 16px;
+      border: none; border-radius: 9px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s;
+      font-family: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn-primary {
+      background: var(--navy); color: white;
+      width: 100%; padding: 15px;
+      font-size: 16px; border-radius: 12px;
+      letter-spacing: 0.01em;
+    }
+    .btn-primary:active { opacity: 0.82; transform: scale(0.99); }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+    .btn-outline {
+      background: white; color: var(--navy);
+      border: 1.5px solid var(--border);
+      width: 100%;
+    }
+    .btn-outline:active { background: var(--gray); }
+    .btn-icon {
+      background: none; color: var(--red); border: none;
+      padding: 6px 8px; font-size: 20px; line-height: 1;
+      border-radius: 6px;
+    }
+    .btn-icon:active { background: var(--red-bg); }
+    .btn-sm { font-size: 13px; padding: 8px 13px; }
+
+    /* ── Yes / No toggles ─────────────────────────── */
+    .yn-group {
+      display: flex;
+      border: 1.5px solid var(--border);
+      border-radius: 9px;
+      overflow: hidden;
+    }
+    .yn-opt {
+      flex: 1; text-align: center;
+      padding: 11px 8px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      background: white;
+      color: var(--muted);
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .yn-opt + .yn-opt { border-left: 1.5px solid var(--border); }
+    .yn-opt.sel-yes { background: var(--green);  color: white; }
+    .yn-opt.sel-no  { background: var(--red);    color: white; }
+
+    /* ── Crew cards ───────────────────────────────── */
+    .crew-card {
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .crew-card-hdr {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .crew-card-title { font-size: 13px; font-weight: 700; color: var(--navy); }
+
+    /* ── Marking rows ─────────────────────────────── */
+    .mark-row {
+      display: grid;
+      grid-template-columns: 1fr 72px 60px 34px;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .mark-row input[type="number"] { padding: 10px 8px; font-size: 14px; }
+    .mark-row select               { padding: 10px 8px; font-size: 14px; padding-right: 28px; }
+
+    /* ── Error banner ─────────────────────────────── */
+    .error-banner {
+      background: var(--red-bg);
+      border: 1px solid #FECACA;
+      color: var(--red);
+      border-radius: 9px;
+      padding: 12px 15px;
+      font-size: 14px;
+      margin-bottom: 14px;
+      display: none;
+    }
+    .error-banner.show { display: block; }
+
+    /* ── Loading screen ───────────────────────────── */
+    #screen-loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 80vh;
+      gap: 18px;
+    }
+    #screen-loading.active { display: flex; }
+    .spinner {
+      width: 44px; height: 44px;
+      border: 3px solid var(--border);
+      border-top-color: var(--navy);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-text { color: var(--muted); font-size: 14px; }
+
+    /* ── Error screen ─────────────────────────────── */
+    #screen-error { padding: 60px 24px; text-align: center; }
+    #screen-error.active { display: block; }
+
+    /* ── Success screen ───────────────────────────── */
+    #screen-success { padding-bottom: 40px; }
+    #screen-success.active { display: block; }
+    .success-body { padding: 48px 24px 32px; text-align: center; }
+    .success-icon { font-size: 64px; margin-bottom: 18px; }
+    .success-title { font-size: 24px; font-weight: 800; color: var(--navy); margin-bottom: 8px; }
+    .success-sub   { color: var(--muted); font-size: 15px; margin-bottom: 28px; line-height: 1.6; }
+
+    /* ── Misc ─────────────────────────────────────── */
+    .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+    .mt-10 { margin-top: 10px; }
+    .mt-14 { margin-top: 14px; }
+    .spacer { height: 40px; }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════ -->
+<!--  LOADING                                          -->
+<!-- ══════════════════════════════════════════════════ -->
+<div id="screen-loading" class="screen active">
+  <div class="spinner"></div>
+  <p class="loading-text">Loading work orders…</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════ -->
+<!--  ERROR                                            -->
+<!-- ══════════════════════════════════════════════════ -->
+<div id="screen-error" class="screen">
+  <div style="font-size:52px;margin-bottom:16px;">⚠️</div>
+  <h2 style="font-size:22px;color:var(--navy);margin-bottom:8px;">Could not load</h2>
+  <p id="error-text" style="color:var(--muted);margin-bottom:24px;font-size:14px;"></p>
+  <button class="btn btn-outline btn-sm" onclick="location.reload()" style="width:auto;padding:10px 24px;">
+    Try again
+  </button>
+</div>
+
+<!-- ══════════════════════════════════════════════════ -->
+<!--  MAIN FORM                                        -->
+<!-- ══════════════════════════════════════════════════ -->
+<div id="screen-form" class="screen">
+
+  <div class="app-header">
+    <div class="logo-mark">O</div>
+    <div>
+      <div class="header-text-title">Field Report</div>
+      <div class="header-text-sub">Oneiro Collection LLC</div>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="error-banner" id="form-error"></div>
+
+    <!-- ── 1. Work Order ──────────────────────────── -->
+    <div class="card">
+      <div class="card-label">Work Order</div>
+
+      <div class="field">
+        <label class="field-label">Select Work Order *</label>
+        <select id="wo-select" onchange="onWOSelect()">
+          <option value="">— Choose a Work Order —</option>
+        </select>
+      </div>
+
+      <div class="wo-panel" id="wo-panel">
+        <div class="wo-row"><span class="wo-key">Contractor</span><span class="wo-val" id="p-contractor"></span></div>
+        <div class="wo-row"><span class="wo-key">Borough</span>   <span class="wo-val" id="p-borough"></span></div>
+        <div class="wo-row"><span class="wo-key">Location</span>  <span class="wo-val" id="p-location"></span></div>
+        <div class="wo-row"><span class="wo-key">From → To</span> <span class="wo-val" id="p-streets"></span></div>
+        <div class="wo-row"><span class="wo-key">Due Date</span>  <span class="wo-val" id="p-due"></span></div>
+        <div class="wo-row"><span class="wo-key">Work Type</span> <span class="wo-val" id="p-type"></span></div>
+        <div class="wo-row"><span class="wo-key">Status</span>    <span class="wo-val" id="p-status"></span></div>
+      </div>
+    </div>
+
+    <!-- ── 2. Schedule ────────────────────────────── -->
+    <div class="card">
+      <div class="card-label">Schedule</div>
+
+      <div class="row-2">
+        <div class="field">
+          <label class="field-label">Date of Work *</label>
+          <input type="date" id="work-date" required>
+        </div>
+        <div class="field">
+          <label class="field-label">Dispatch Date</label>
+          <input type="date" id="dispatch-date">
+        </div>
+      </div>
+
+      <div class="row-2 mt-10">
+        <div class="field">
+          <label class="field-label">Work Start Date</label>
+          <input type="date" id="work-start-date">
+        </div>
+        <div class="field" id="end-date-field" style="display:none;">
+          <label class="field-label">Work End Date</label>
+          <input type="date" id="work-end-date">
+        </div>
+      </div>
+
+      <p class="hint" id="date-hint">
+        Dispatch / Start / End dates: only fill if not already recorded in the tracker.
+      </p>
+    </div>
+
+    <!-- ── 3. Work Details ────────────────────────── -->
+    <div class="card">
+      <div class="card-label">Work Details</div>
+
+      <div class="field">
+        <label class="field-label">Marking Types Completed</label>
+        <div id="marking-rows"></div>
+        <button type="button" class="btn btn-outline btn-sm mt-10" onclick="addMarkingRow()">
+          + Add Marking Type
+        </button>
+      </div>
+
+      <div class="row-2 mt-14">
+        <div class="field">
+          <label class="field-label">SQFT Completed</label>
+          <input type="number" id="sqft" placeholder="0" min="0" inputmode="numeric">
+        </div>
+        <div class="field">
+          <label class="field-label">Paint / Material</label>
+          <input type="text" id="paint-material" placeholder="e.g. White Thermo">
+        </div>
+      </div>
+
+      <div class="field mt-14">
+        <label class="field-label">Issues / Notes</label>
+        <textarea id="issues" placeholder="Problems, delays, or anything for admin to know…"></textarea>
+      </div>
+    </div>
+
+    <!-- ── 4. Crew ────────────────────────────────── -->
+    <div class="card">
+      <div class="card-label">Crew</div>
+      <div id="crew-rows"></div>
+      <button type="button" class="btn btn-outline btn-sm mt-10" onclick="addCrewRow()">
+        + Add Crew Member
+      </button>
+    </div>
+
+    <!-- ── 5. Completion ──────────────────────────── -->
+    <div class="card">
+      <div class="card-label">Completion</div>
+
+      <div class="field">
+        <label class="field-label">Is this Work Order complete?</label>
+        <div class="yn-group" id="tgl-complete" data-val="no">
+          <div class="yn-opt sel-no" data-val="no"  onclick="setToggle('tgl-complete','no')">No — more work needed</div>
+          <div class="yn-opt"        data-val="yes" onclick="setToggle('tgl-complete','yes')">Yes — WO Done ✓</div>
+        </div>
+      </div>
+
+      <div class="field mt-14">
+        <label class="field-label">Photos uploaded to Drive?</label>
+        <div class="yn-group" id="tgl-photos" data-val="no">
+          <div class="yn-opt sel-no" data-val="no"  onclick="setToggle('tgl-photos','no')">Not yet</div>
+          <div class="yn-opt"        data-val="yes" onclick="setToggle('tgl-photos','yes')">Yes — uploaded ✓</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Submit ─────────────────────────────────── -->
+    <button class="btn btn-primary" id="submit-btn" onclick="submitReport()">
+      Submit Field Report
+    </button>
+
+    <div class="spacer"></div>
+  </div><!-- /container -->
+</div><!-- /screen-form -->
+
+<!-- ══════════════════════════════════════════════════ -->
+<!--  SUCCESS                                          -->
+<!-- ══════════════════════════════════════════════════ -->
+<div id="screen-success" class="screen">
+  <div class="app-header">
+    <div class="logo-mark">O</div>
+    <div>
+      <div class="header-text-title">Field Report</div>
+      <div class="header-text-sub">Oneiro Collection LLC</div>
+    </div>
+  </div>
+  <div class="container">
+    <div class="success-body">
+      <div class="success-icon">✅</div>
+      <div class="success-title">Report Submitted!</div>
+      <p class="success-sub" id="success-msg">Your field report has been recorded.</p>
+      <button class="btn btn-outline" onclick="resetForm()" style="width:auto;padding:12px 28px;">
+        Submit Another Report
+      </button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+// ── Config (injected by doGet template at serve time) ─────────
+const API_URL = '<?= scriptUrl ?>';
+const API_KEY = '<?= apiKey ?>';
+
+// ── App state ─────────────────────────────────────────────────
+let allWOs      = [];   // loaded from get_active_wos
+let crewSeq     = 0;    // auto-increment crew row IDs
+let markingSeq  = 0;    // auto-increment marking row IDs
+
+// ── Classification options ────────────────────────────────────
+const CLASSIFICATIONS = [
+  'LP (Crew Chief)',
+  'Laborer',
+  'Driver',
+  'Flagger',
+  'Foreman',
+  'Equipment Operator'
+];
+
+// ── Marking type options ──────────────────────────────────────
+const MARKING_TYPES = [
+  'Crosswalk',
+  'Stop Bar',
+  'Lane Line',
+  'Center Line',
+  'Double Yellow',
+  'No Passing Zone',
+  'Arrow – Straight',
+  'Arrow – Left',
+  'Arrow – Right',
+  'Arrow – U-Turn',
+  'Combined Arrow',
+  'Bike Lane',
+  'Bus Lane',
+  'Pedestrian Space',
+  'Yield Line',
+  'Yield to Pedestrians',
+  'School (SCHOOL)',
+  'Railroad Crossing',
+  'Parking Space',
+  'Curb Marking',
+  'Other'
+];
+
+// ── Init ──────────────────────────────────────────────────────
+window.addEventListener('load', async () => {
+  // Pre-fill today's date
+  document.getElementById('work-date').value = isoToday();
+
+  // Seed form with first crew + marking row
+  addMarkingRow();
+  addCrewRow();
+
+  // Fetch active WOs
+  try {
+    const data = await apiPost({ action: 'get_active_wos', key: API_KEY });
+    allWOs = data.wos || [];
+    populateWODropdown(allWOs);
+    show('screen-form');
+  } catch (err) {
+    document.getElementById('error-text').textContent =
+      'Failed to load work orders: ' + err.message;
+    show('screen-error');
+  }
+});
+
+// ── Screen management ─────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  window.scrollTo(0, 0);
+}
+
+// ── API helper ────────────────────────────────────────────────
+async function apiPost(body) {
+  const res = await fetch(API_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body)
+  });
+  // Apps Script always returns 200; check inner error field
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// ── WO Dropdown ───────────────────────────────────────────────
+function populateWODropdown(wos) {
+  const sel = document.getElementById('wo-select');
+  sel.innerHTML = '<option value="">— Choose a Work Order —</option>';
+  wos.forEach(wo => {
+    const opt = document.createElement('option');
+    opt.value = wo.id;
+    opt.textContent = wo.id + '  —  ' + wo.location + '  (' + wo.borough + ')';
+    sel.appendChild(opt);
+  });
+}
+
+function onWOSelect() {
+  const woId = document.getElementById('wo-select').value;
+  const wo   = allWOs.find(w => w.id === woId);
+  const panel = document.getElementById('wo-panel');
+
+  if (!wo) { panel.classList.remove('show'); return; }
+
+  document.getElementById('p-contractor').textContent = wo.contractor || '—';
+  document.getElementById('p-borough').textContent    = wo.borough    || '—';
+  document.getElementById('p-location').textContent   = wo.location   || '—';
+  document.getElementById('p-streets').textContent    =
+    (wo.from_street || '?') + ' → ' + (wo.to_street || '?');
+  document.getElementById('p-due').textContent        = wo.due_date   || '—';
+  document.getElementById('p-type').textContent       = wo.work_type  || '—';
+  document.getElementById('p-status').innerHTML       = statusBadge(wo.status);
+
+  // Pre-fill date fields if already set in tracker
+  if (wo.dispatch_date && wo.dispatch_date !== 'null')
+    document.getElementById('dispatch-date').value = toDateInput(wo.dispatch_date);
+  if (wo.work_start_date && wo.work_start_date !== 'null')
+    document.getElementById('work-start-date').value = toDateInput(wo.work_start_date);
+
+  // Show hint about pre-filled dates
+  const hints = [];
+  if (wo.dispatch_date   && wo.dispatch_date   !== 'null')
+    hints.push('Dispatch date already in tracker: ' + wo.dispatch_date);
+  if (wo.work_start_date && wo.work_start_date !== 'null')
+    hints.push('Work start date already in tracker: ' + wo.work_start_date);
+  document.getElementById('date-hint').textContent = hints.length
+    ? hints.join('. ') + '.'
+    : 'Dispatch / Start / End dates: only fill if not already recorded in the tracker.';
+
+  panel.classList.add('show');
+}
+
+function statusBadge(s) {
+  const sl = (s || '').toLowerCase();
+  if (sl === 'complete')    return '<span class="badge badge-complete">Complete</span>';
+  if (sl === 'in progress') return '<span class="badge badge-progress">In Progress</span>';
+  if (sl === 'dispatched')  return '<span class="badge badge-dispatched">Dispatched</span>';
+  return '<span class="badge badge-received">Received</span>';
+}
+
+// ── Marking rows ──────────────────────────────────────────────
+function addMarkingRow() {
+  const idx = ++markingSeq;
+  const el = document.createElement('div');
+  el.className = 'mark-row';
+  el.id = 'mr-' + idx;
+  el.innerHTML =
+    '<select id="mt-' + idx + '">' +
+      MARKING_TYPES.map(t => '<option value="' + t + '">' + t + '</option>').join('') +
+    '</select>' +
+    '<input type="number" id="mq-' + idx + '" placeholder="Qty" min="0" inputmode="numeric">' +
+    '<select id="mu-' + idx + '">' +
+      '<option value="SF">SF</option>' +
+      '<option value="LF">LF</option>' +
+      '<option value="EA">EA</option>' +
+    '</select>' +
+    '<button type="button" class="btn btn-icon" onclick="removeMarkingRow(' + idx + ')">×</button>';
+  document.getElementById('marking-rows').appendChild(el);
+}
+
+function removeMarkingRow(idx) {
+  const el = document.getElementById('mr-' + idx);
+  if (el) el.remove();
+}
+
+function collectMarkingTypes() {
+  const parts = [];
+  document.querySelectorAll('[id^="mr-"]').forEach(row => {
+    const i    = row.id.slice(3);
+    const type = document.getElementById('mt-' + i)?.value;
+    const qty  = document.getElementById('mq-' + i)?.value;
+    const unit = document.getElementById('mu-' + i)?.value;
+    if (type && qty && parseFloat(qty) > 0) parts.push(type + ': ' + qty + ' ' + unit);
+  });
+  return parts.join(', ');
+}
+
+// ── Crew rows ─────────────────────────────────────────────────
+function addCrewRow() {
+  const idx = ++crewSeq;
+  const el  = document.createElement('div');
+  el.className = 'crew-card';
+  el.id = 'cr-' + idx;
+  el.innerHTML = `
+    <div class="crew-card-hdr">
+      <span class="crew-card-title">Crew Member #${idx}</span>
+      <button type="button" class="btn btn-icon" onclick="removeCrewRow(${idx})" title="Remove">×</button>
+    </div>
+    <div class="field">
+      <label class="field-label">Full Name *</label>
+      <input type="text" id="cn-${idx}" placeholder="First Last" autocomplete="name" autocapitalize="words">
+    </div>
+    <div class="field">
+      <label class="field-label">Classification *</label>
+      <select id="cc-${idx}">
+        ${CLASSIFICATIONS.map(c => '<option value="' + c + '">' + c + '</option>').join('')}
+      </select>
+    </div>
+    <div class="row-2">
+      <div class="field">
+        <label class="field-label">Time In *</label>
+        <input type="time" id="ci-${idx}" onchange="calcHours(${idx})">
+      </div>
+      <div class="field">
+        <label class="field-label">Time Out *</label>
+        <input type="time" id="co-${idx}" onchange="calcHours(${idx})">
+      </div>
+    </div>
+    <div class="row-2 mt-10">
+      <div class="field">
+        <label class="field-label">Reg. Hours</label>
+        <input type="number" id="ch-${idx}" step="0.25" readonly placeholder="—">
+      </div>
+      <div class="field">
+        <label class="field-label">OT Hours</label>
+        <input type="number" id="ct-${idx}" step="0.25" readonly placeholder="—">
+      </div>
+    </div>`;
+  document.getElementById('crew-rows').appendChild(el);
+}
+
+function removeCrewRow(idx) {
+  const el = document.getElementById('cr-' + idx);
+  if (el) el.remove();
+}
+
+function calcHours(idx) {
+  const inVal  = document.getElementById('ci-' + idx)?.value;
+  const outVal = document.getElementById('co-' + idx)?.value;
+  if (!inVal || !outVal) return;
+
+  const [iH, iM] = inVal.split(':').map(Number);
+  const [oH, oM] = outVal.split(':').map(Number);
+  const mins = (oH * 60 + oM) - (iH * 60 + iM);
+  if (mins <= 0) {
+    document.getElementById('ch-' + idx).value = '';
+    document.getElementById('ct-' + idx).value = '';
+    return;
+  }
+
+  const hrs = mins / 60;
+  const ot  = Math.max(0, hrs - 8);
+  document.getElementById('ch-' + idx).value = hrs.toFixed(2);
+  document.getElementById('ct-' + idx).value = ot > 0 ? ot.toFixed(2) : '0.00';
+}
+
+function collectCrew() {
+  const members = [];
+  document.querySelectorAll('.crew-card').forEach(card => {
+    const i    = card.id.slice(3);
+    const name = (document.getElementById('cn-' + i)?.value || '').trim();
+    if (!name) return;
+    const cls    = document.getElementById('cc-' + i)?.value || '';
+    const tIn    = document.getElementById('ci-' + i)?.value || '';
+    const tOut   = document.getElementById('co-' + i)?.value || '';
+    const hrs    = parseFloat(document.getElementById('ch-' + i)?.value) || 0;
+    const ot     = parseFloat(document.getElementById('ct-' + i)?.value) || 0;
+    members.push({
+      name:           name,
+      classification: cls,
+      time_in:        fmt24to12(tIn),
+      time_out:       fmt24to12(tOut),
+      hours:          hrs,
+      overtime:       ot
+    });
+  });
+  return members;
+}
+
+// ── Yes/No toggles ────────────────────────────────────────────
+function setToggle(groupId, val) {
+  const grp = document.getElementById(groupId);
+  grp.querySelectorAll('.yn-opt').forEach(opt => {
+    opt.classList.remove('sel-yes', 'sel-no');
+    if (opt.dataset.val === val) {
+      opt.classList.add(val === 'yes' ? 'sel-yes' : 'sel-no');
+    }
+  });
+  grp.dataset.val = val;
+
+  // Show/hide Work End Date field when WO complete toggle changes
+  if (groupId === 'tgl-complete') {
+    const endField = document.getElementById('end-date-field');
+    endField.style.display = val === 'yes' ? 'block' : 'none';
+    if (val === 'yes' && !document.getElementById('work-end-date').value) {
+      document.getElementById('work-end-date').value = isoToday();
+    }
+  }
+}
+
+function getToggle(groupId) {
+  return document.getElementById(groupId).dataset.val || 'no';
+}
+
+// ── Submit ────────────────────────────────────────────────────
+async function submitReport() {
+  clearError();
+
+  const woId     = document.getElementById('wo-select').value;
+  const workDate = document.getElementById('work-date').value;
+
+  if (!woId)     { showError('Please select a Work Order.'); return; }
+  if (!workDate) { showError('Please enter the date of work.'); return; }
+
+  const crew = collectCrew();
+  if (crew.length === 0) {
+    showError('Please add at least one crew member with a name.'); return;
+  }
+  for (const m of crew) {
+    if (!m.time_in || !m.time_out) {
+      showError('Please enter Time In and Time Out for every crew member.'); return;
+    }
+  }
+
+  const woComplete     = getToggle('tgl-complete') === 'yes';
+  const photosUploaded = getToggle('tgl-photos')   === 'yes';
+  const markingTypes   = collectMarkingTypes();
+  const sqftRaw        = document.getElementById('sqft').value;
+
+  const payload = {
+    action: 'submit_field_report',
+    key:    API_KEY,
+    data: {
+      wo_id:           woId,
+      date:            workDate,
+      dispatch_date:   document.getElementById('dispatch-date').value    || '',
+      work_start_date: document.getElementById('work-start-date').value  || '',
+      work_end_date:   document.getElementById('work-end-date').value    || '',
+      wo_complete:     woComplete,
+      marking_types:   markingTypes,
+      sqft_completed:  sqftRaw !== '' ? parseFloat(sqftRaw) : null,
+      paint_material:  document.getElementById('paint-material').value.trim(),
+      issues:          document.getElementById('issues').value.trim(),
+      photos_uploaded: photosUploaded,
+      crew:            crew
+    }
+  };
+
+  const btn = document.getElementById('submit-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Submitting…';
+
+  try {
+    const result = await apiPost(payload);
+    const wo = allWOs.find(w => w.id === woId) || {};
+    document.getElementById('success-msg').textContent =
+      result.wo_id + ' — ' + (wo.location || '') +
+      '  |  Status: ' + result.status +
+      '  |  ' + crew.length + ' crew member(s) logged.';
+    show('screen-success');
+  } catch (err) {
+    showError('Submission failed: ' + err.message);
+    btn.disabled    = false;
+    btn.textContent = 'Submit Field Report';
+  }
+}
+
+function resetForm() { location.reload(); }
+
+// ── Error helpers ─────────────────────────────────────────────
+function showError(msg) {
+  const el = document.getElementById('form-error');
+  el.textContent = msg;
+  el.classList.add('show');
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function clearError() {
+  document.getElementById('form-error').classList.remove('show');
+}
+
+// ── Time / date helpers ───────────────────────────────────────
+function isoToday() {
+  const d = new Date();
+  return d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+}
+
+// Convert "HH:MM" (24h) → "H:MM AM/PM" for the spreadsheet
+function fmt24to12(t) {
+  if (!t) return '';
+  const [h, m] = t.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 || 12;
+  return h12 + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+}
+
+// Convert "MM/DD/YYYY" or "M/D/YYYY" → "YYYY-MM-DD" for date inputs
+function toDateInput(s) {
+  if (!s || s === 'null') return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return m[3] + '-' + m[1].padStart(2,'0') + '-' + m[2].padStart(2,'0');
+  return '';
+}
+</script>
+</body>
+</html>

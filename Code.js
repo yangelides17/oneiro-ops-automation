@@ -1384,6 +1384,10 @@ function doPost(e) {
       return handleSubmitFieldReport_(body);
     } else if (action === 'get_dashboard_data') {
       return handleGetDashboardData_();
+    } else if (action === 'upload_photo') {
+      return handleUploadPhoto_(body);
+    } else if (action === 'upload_signature') {
+      return handleUploadSignature_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -1898,4 +1902,107 @@ function handleGetDashboardData_() {
   ).map(w => w.id);
 
   return jsonResponse_({ wos, stats, byContractor, attention });
+}
+
+
+// ── action: upload_photo ──────────────────────────────────────
+
+/**
+ * Uploads a work-order site photo to Drive.
+ * Saves into: Archive / Contractor / ContractNum-Borough / WO#-Location / Photos /
+ *
+ * body.data:
+ *   wo_id     — Work Order # (used to find the archive folder)
+ *   filename  — original filename (e.g. "IMG_1234.jpg")
+ *   mime_type — MIME type (e.g. "image/jpeg")
+ *   data      — base64-encoded file bytes
+ */
+function handleUploadPhoto_(body) {
+  const { wo_id, filename, mime_type, data } = body;
+  if (!wo_id || !filename || !data) {
+    return jsonResponse_({ error: 'Missing required fields: wo_id, filename, data' }, 400);
+  }
+
+  const photosFolder = getWOSubfolder_(wo_id, 'Photos');
+  if (!photosFolder) {
+    return jsonResponse_({ error: 'Could not locate or create WO archive folder' }, 500);
+  }
+
+  const bytes = Utilities.base64Decode(data);
+  const blob  = Utilities.newBlob(bytes, mime_type || 'image/jpeg', filename);
+  const file  = photosFolder.createFile(blob);
+
+  Logger.log('📸 Photo uploaded for WO ' + wo_id + ': ' + filename);
+  return jsonResponse_({ success: true, file_id: file.getId(), file_url: file.getUrl() });
+}
+
+
+// ── action: upload_signature ──────────────────────────────────
+
+/**
+ * Uploads a crew member's digital signature (PNG) to Drive.
+ * Saves into: Archive / ... / WO#-Location / Signatures /
+ *
+ * body.data:
+ *   wo_id        — Work Order #
+ *   crew_name    — employee name (for filename)
+ *   signature    — "time_in" or "time_out"
+ *   work_date    — date string (YYYY-MM-DD)
+ *   data         — base64-encoded PNG
+ */
+function handleUploadSignature_(body) {
+  const { wo_id, crew_name, signature, work_date, data } = body;
+  if (!wo_id || !crew_name || !data) {
+    return jsonResponse_({ error: 'Missing required fields: wo_id, crew_name, data' }, 400);
+  }
+
+  const sigsFolder = getWOSubfolder_(wo_id, 'Signatures');
+  if (!sigsFolder) {
+    return jsonResponse_({ error: 'Could not locate or create WO archive folder' }, 500);
+  }
+
+  // Filename: "2026-04-12_John Smith_time_in.png"
+  const safeName = String(crew_name).replace(/[^a-zA-Z0-9 _-]/g, '');
+  const filename  = (work_date || 'unknown') + '_' + safeName + '_' + (signature || 'sig') + '.png';
+
+  const bytes = Utilities.base64Decode(data);
+  const blob  = Utilities.newBlob(bytes, 'image/png', filename);
+  const file  = sigsFolder.createFile(blob);
+
+  Logger.log('✍️ Signature saved for ' + crew_name + ' (' + signature + ') on WO ' + wo_id);
+  return jsonResponse_({ success: true, file_id: file.getId(), file_url: file.getUrl() });
+}
+
+
+/**
+ * Helper: returns (creating if needed) a named subfolder inside the WO's archive folder.
+ * Path: Archive / Contractor / ContractNum-Borough / WO#-Location / [subfolderName]
+ */
+function getWOSubfolder_(wo_id, subfolderName) {
+  try {
+    const props     = PropertiesService.getScriptProperties();
+    const archiveId = props.getProperty('ARCHIVE_ID');
+    if (!archiveId) return null;
+
+    const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const woSheet = ss.getSheetByName('Work Order Tracker');
+    const allRows = woSheet.getDataRange().getValues();
+    const woRow   = allRows.find(r => r[0] && String(r[0]) === String(wo_id));
+
+    const contractor = woRow ? String(woRow[1] || 'Unknown') : 'Unknown';
+    const contractNum = woRow ? String(woRow[2] || '').split('/')[0] : 'Unknown';
+    const borough    = woRow ? String(woRow[3] || '') : '';
+    const location   = woRow ? String(woRow[5] || wo_id) : wo_id;
+
+    const archiveRoot      = DriveApp.getFolderById(archiveId);
+    const contractorFolder = getOrCreateSubfolder_(archiveRoot, contractor);
+    const contractFolder   = getOrCreateSubfolder_(contractorFolder,
+                               contractNum + (borough ? ' - ' + getBoroughName_(borough) : ''));
+    const woFolder         = getOrCreateSubfolder_(contractFolder, wo_id + ' - ' + location);
+
+    return getOrCreateSubfolder_(woFolder, subfolderName);
+  } catch (err) {
+    Logger.log('⚠️ getWOSubfolder_ error: ' + err.toString());
+    return null;
+  }
 }
