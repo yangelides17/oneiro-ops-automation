@@ -202,11 +202,39 @@ def _upload_via_proxy(local_path: Path, folder_id: str, url: str, key: str) -> s
         data=encoded,
         headers={'Content-Type': 'application/octet-stream'},
         timeout=60,
+        allow_redirects=True,
     )
+
+    # Log the raw response so we can diagnose proxy issues clearly
+    log(f"  📡  Proxy response: HTTP {resp.status_code}, {len(resp.content)} bytes")
+
+    # Empty body = proxy not reachable or Web App not deployed with doPost
+    if not resp.content.strip():
+        raise RuntimeError(
+            f"Apps Script proxy returned an empty response (HTTP {resp.status_code}). "
+            f"Common causes:\n"
+            f"    • doPost not yet deployed — go to Deploy → New deployment in Apps Script\n"
+            f"    • 'Who has access' is not set to 'Anyone' on the Web App deployment\n"
+            f"    • APPS_SCRIPT_UPLOAD_URL is a /dev URL (requires auth) — use the /exec URL\n"
+            f"    • APPS_SCRIPT_UPLOAD_KEY doesn't match UPLOAD_SECRET in Script Properties"
+        )
+
     resp.raise_for_status()
-    result = resp.json()
+
+    # Non-JSON response = Google returned an HTML error / login page
+    try:
+        result = resp.json()
+    except Exception:
+        snippet = resp.text[:300].replace('\n', ' ')
+        raise RuntimeError(
+            f"Apps Script proxy returned non-JSON (HTTP {resp.status_code}): {snippet!r}\n"
+            f"    This usually means the Web App redirected to a login page.\n"
+            f"    Ensure 'Who has access' is set to 'Anyone' (not 'Anyone with Google account')."
+        )
+
     if 'error' in result:
         raise RuntimeError(f"Apps Script proxy error: {result['error']}")
+
     log(f"  📤  Proxy upload complete → {result.get('filename')}  (Drive ID: {result.get('file_id')})")
     return result.get('file_id', '')
 
