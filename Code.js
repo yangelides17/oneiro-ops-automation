@@ -1354,47 +1354,227 @@ function getFolderId_(name) {
  *   { success: true, file_id, file_url, filename }
  *   { error: "...", _status: 400|401|500 }
  */
+/**
+ * doPost — central HTTP handler for Railway worker requests.
+ *
+ * Dispatches on body.action:
+ *   "upload_pdf"  — save a filled PDF to a Drive folder (original proxy)
+ *   "write_wo"    — write a parsed Work Order to the WO Tracker + archive PDF
+ *
+ * All requests must include body.key matching the UPLOAD_SECRET Script Property.
+ */
 function doPost(e) {
   try {
-    const body = JSON.parse(e.postData.contents);
+    const body   = JSON.parse(e.postData.contents);
+    const secret = PropertiesService.getScriptProperties().getProperty('UPLOAD_SECRET');
 
-    // ── Authenticate ────────────────────────────────────────────
-    const secret = PropertiesService.getScriptProperties()
-                     .getProperty('UPLOAD_SECRET');
     if (!secret || body.key !== secret) {
       return jsonResponse_({ error: 'unauthorized' }, 401);
     }
 
-    // ── Validate ────────────────────────────────────────────────
-    const fileName = body.filename;
-    const folderId = body.folder_id;
-    const encoded  = body.data;
-    if (!fileName || !folderId || !encoded) {
-      return jsonResponse_(
-        { error: 'Missing required fields: filename, folder_id, data' }, 400
-      );
+    const action = body.action || 'upload_pdf';
+
+    if (action === 'upload_pdf') {
+      return handleUploadPdf_(body);
+    } else if (action === 'write_wo') {
+      return handleWriteWO_(body);
+    } else {
+      return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
 
-    // ── Decode + save to Drive ──────────────────────────────────
-    const pdfBytes = Utilities.base64Decode(encoded);
-    const blob     = Utilities.newBlob(pdfBytes, 'application/pdf', fileName);
-    const folder   = DriveApp.getFolderById(folderId);
-    const file     = folder.createFile(blob);
-
-    Logger.log('📄 Upload proxy saved: ' + file.getName() + ' → folder ' + folderId);
-
-    return jsonResponse_({
-      success:  true,
-      file_id:  file.getId(),
-      file_url: file.getUrl(),
-      filename: file.getName()
-    });
-
   } catch (err) {
-    Logger.log('❌ Upload proxy error: ' + err.toString());
+    Logger.log('❌ doPost error: ' + err.toString());
     return jsonResponse_({ error: err.toString() }, 500);
   }
 }
+
+
+// ── action: upload_pdf ────────────────────────────────────────────────────────
+
+function handleUploadPdf_(body) {
+  const fileName = body.filename;
+  const folderId = body.folder_id;
+  const encoded  = body.data;
+
+  if (!fileName || !folderId || !encoded) {
+    return jsonResponse_({ error: 'Missing required fields: filename, folder_id, data' }, 400);
+  }
+
+  const pdfBytes = Utilities.base64Decode(encoded);
+  const blob     = Utilities.newBlob(pdfBytes, 'application/pdf', fileName);
+  const folder   = DriveApp.getFolderById(folderId);
+  const file     = folder.createFile(blob);
+
+  Logger.log('📄 Upload proxy saved: ' + file.getName() + ' → folder ' + folderId);
+
+  return jsonResponse_({
+    success:  true,
+    file_id:  file.getId(),
+    file_url: file.getUrl(),
+    filename: file.getName()
+  });
+}
+
+
+// ── action: write_wo ──────────────────────────────────────────────────────────
+
+/**
+ * Writes a parsed Work Order to the WO Tracker sheet and archives the source PDF.
+ *
+ * body.file_id  — Drive file ID of the original scanned WO PDF
+ * body.data     — normalized dict from parse_work_order.normalize_wo_data()
+ *
+ * WO Tracker columns (0-indexed, 35 total):
+ *  0  Work Order #          11  WO Received Date      22  Issues Reported
+ *  1  Prime Contractor      12  Water Blast Required?  23  Photos Uploaded?
+ *  2  Contract Number       13  Water Blast Confirmed? 24  Production Log Done?
+ *  3  Borough               14  Water Blast SQFT       25  Field Report Done?
+ *  4  Contract ID / Reg #   15  Status                 26  Invoice #
+ *  5  Location              16  Dispatch Date          27  Invoice Date
+ *  6  From Street           17  Work Start Date        28  Invoice Amount
+ *  7  To Street             18  Work End Date          29  Invoice Sent?
+ *  8  Due Date              19  Marking Types          30  Payment Received?
+ *  9  Priority Level        20  SQFT Completed         31  Payment Date
+ * 10  Pavement Work Type    21  Paint / Material Used  32  Certified Payroll Week
+ *                                                      33  Filed?
+ *                                                      34  Notes
+ */
+function handleWriteWO_(body) {
+  const fileId = body.file_id;
+  const d      = body.data || {};
+
+  if (!d.work_order_id) {
+    return jsonResponse_({ error: 'Missing work_order_id in data' }, 400);
+  }
+
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+
+  // ── Duplicate check ───────────────────────────────────────────
+  const isDuplicate = allRows.slice(1).some(r => String(r[0]) === String(d.work_order_id));
+  if (isDuplicate) {
+    Logger.log('⚠️ WO already in tracker: ' + d.work_order_id + ' — deleting from Scan Inbox');
+    if (fileId) {
+      try { DriveApp.getFileById(fileId).setTrashed(true); } catch(e) {}
+    }
+    return jsonResponse_({ success: true, duplicate: true, work_order_id: d.work_order_id });
+  }
+
+  // ── Contract ID lookup ────────────────────────────────────────
+  // Strip the suffix (e.g. /SFT, /PRE) from both the incoming contract number
+  // and each row in Contract Lookup before comparing, so they always match.
+  const contractNumStripped = String(d.contract_number || '').split('/')[0].trim();
+  const clSheet  = ss.getSheetByName('Contract Lookup');
+  const clData   = clSheet ? clSheet.getDataRange().getValues() : [];
+  const contractRow = clData.slice(1).find(r => {
+    const clNum     = String(r[0] || '').split('/')[0].trim();
+    const clBorough = String(r[1] || '').trim();
+    return clNum === contractNumStripped && clBorough === String(d.borough || '').trim();
+  });
+
+  // Contract Lookup col 3 holds the Contract ID / Reg #
+  // Columns: 0=Contract Number, 1=Borough Code, 2=Borough Full Name, 3=Contract ID/Reg #
+  const CONTRACT_ID_COL = 3;
+  const contractId = contractRow ? String(contractRow[CONTRACT_ID_COL] || '').trim() : '';
+  const contractIdMissing = !contractId;
+
+  // ── Build row (35 columns) ────────────────────────────────────
+  // Columns 0-15 come from the WO scan.
+  // Columns 16-34 are operational — filled later from the web app and generated docs.
+  // Yes/No tracking columns default to "No" so status is trackable from day one.
+  const row = [
+    d.work_order_id      || '',  //  0  Work Order #
+    d.prime_contractor   || '',  //  1  Prime Contractor
+    d.contract_number    || '',  //  2  Contract Number
+    d.borough            || '',  //  3  Borough
+    contractId,                  //  4  Contract ID / Reg # (from Contract Lookup; blank if not found)
+    d.location           || '',  //  5  Location
+    d.from_street        || '',  //  6  From Street
+    d.to_street          || '',  //  7  To Street
+    d.due_date           || '',  //  8  Due Date
+    d.priority_level     || '',  //  9  Priority Level
+    d.pavement_work_type || '',  // 10  Pavement Work Type
+    d.wo_received_date   || '',  // 11  WO Received Date
+    d.water_blast_required  || '',  // 12  Water Blast Required?
+    d.water_blast_confirmed || '',  // 13  Water Blast Confirmed?
+    d.water_blast_sqft   || '',     // 14  Water Blast SQFT
+    'Received',                  // 15  Status
+
+    // ── Operational columns (filled from web app / generated docs) ──
+    '', '', '',                  // 16-18  Dispatch / Work Start / Work End dates
+    '',                          // 19  Marking Types    ← from crew web app
+    '', '', '',                  // 20-22  SQFT Completed, Paint/Material, Issues
+    'No', 'No', 'No',            // 23-25  Photos, Prod Log, Field Report Done
+    '', '', '', 'No',            // 26-29  Invoice #, Date, Amount, Sent
+    'No', '',                    // 30-31  Payment Received, Date
+    '',                          // 32  Certified Payroll Week
+    'No',                        // 33  Filed
+    ''                           // 34  Notes             ← from crew web app
+  ];
+
+  woSheet.appendRow(row);
+  Logger.log('✅ WO added to tracker: ' + d.work_order_id
+             + (contractIdMissing ? ' (Contract ID not found in lookup)' : ''));
+
+  // ── Archive the source PDF ────────────────────────────────────
+  if (fileId) archiveWOFile_(fileId, d);
+
+  // ── Automation Log ────────────────────────────────────────────
+  const actionNote = contractIdMissing
+    ? 'Action Required: Contract ID / Reg # not found in Contract Lookup — request from prime contractor and add to both WO Tracker (col E) and Contract Lookup sheet'
+    : 'WO intake complete — review extracted fields for accuracy';
+
+  ss.getSheetByName('Automation Log').appendRow([
+    new Date(),
+    'Scan Inbox Parser',
+    'WO Scan Processed',
+    d.work_order_id,
+    (d.prime_contractor || '') + ' / ' + (d.contract_number || '') + ' / ' + (d.location || ''),
+    'Added to Tracker',
+    '',
+    actionNote
+  ]);
+
+  return jsonResponse_({ success: true, work_order_id: d.work_order_id });
+}
+
+
+/**
+ * Archive the original WO PDF scan into:
+ *   Archive / [Contractor] / [ContractNum - Borough] / [WO# - Location] /
+ * Then rename the original in Scan Inbox with ✅ prefix to prevent reprocessing.
+ */
+function archiveWOFile_(fileId, d) {
+  try {
+    const props      = PropertiesService.getScriptProperties();
+    const archiveId  = props.getProperty('ARCHIVE_ID');
+    if (!archiveId || !fileId) return;
+
+    const file        = DriveApp.getFileById(fileId);
+    const archiveRoot = DriveApp.getFolderById(archiveId);
+    const contractor  = d.prime_contractor || 'Unknown';
+    const contractNum = String(d.contract_number || '').split('/')[0];
+    const borough     = d.borough || '';
+    const location    = d.location || d.work_order_id;
+
+    // Archive / Contractor / ContractNum - Borough / WO# - Location /
+    const contractorFolder = getOrCreateSubfolder_(archiveRoot, contractor);
+    const contractFolder   = getOrCreateSubfolder_(contractorFolder,
+                               contractNum + (borough ? ' - ' + getBoroughName_(borough) : ''));
+    const woFolder         = getOrCreateSubfolder_(contractFolder,
+                               d.work_order_id + ' - ' + location);
+
+    file.makeCopy(file.getName(), woFolder);
+    file.setTrashed(true);  // delete from Scan Inbox — archive is the single source of truth
+
+    Logger.log('📁 WO PDF archived: ' + d.work_order_id + ' → ' + contractor + '/' + contractNum);
+  } catch (err) {
+    Logger.log('⚠️ Could not archive WO file: ' + err.toString());
+    // Non-fatal — WO row was already written to tracker
+  }
+}
+
 
 /** Wraps an object as a JSON ContentService response. */
 function jsonResponse_(obj, statusCode) {
