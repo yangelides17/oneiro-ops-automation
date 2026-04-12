@@ -40,13 +40,22 @@ POLL_SECONDS    = int(os.environ.get('POLL_SECONDS', 20))
 # Google Drive API scopes needed
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# Subfolder names inside Needs Review that we watch
+# Subfolder names inside Needs Review that we watch for JSON payloads
 WATCH_SUBFOLDERS = ['Production Logs', 'Certified Payroll']
 
 # Maps _type → template filename on Drive (inside the Templates folder)
 TEMPLATE_FILES = {
     'production_log':    'Metro Thermoplastic Daily Production Log Template_FORM.pdf',
     'certified_payroll': 'Certified Payroll Report Template_FORM.pdf',
+}
+
+# MIME types we treat as scanned Work Order documents in the Scan Inbox
+SCAN_INBOX_MIMETYPES = {
+    'application/pdf':  'application/pdf',
+    'image/jpeg':       'image/jpeg',
+    'image/jpg':        'image/jpeg',
+    'image/png':        'image/png',
+    'image/tiff':       'image/tiff',
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +169,120 @@ def download_file(service, file_id: str) -> dict:
         _, done = downloader.next_chunk()
     buf.seek(0)
     return json.loads(buf.read().decode('utf-8'))
+
+
+def download_binary(service, file_id: str) -> bytes:
+    """Download any Drive file as raw bytes (PDF, image, etc.)."""
+    from googleapiclient.http import MediaIoBaseDownload
+    request = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def list_scan_inbox_files(service, folder_id: str) -> list:
+    """Return unprocessed WO scan files (PDF/image) in the Scan Inbox folder."""
+    mime_conditions = ' or '.join(
+        f"mimeType='{m}'" for m in SCAN_INBOX_MIMETYPES
+    )
+    q = (f"'{folder_id}' in parents and ({mime_conditions}) "
+         f"and not name contains '✅' and trashed=false")
+    result = service.files().list(
+        q=q,
+        fields='files(id,name,mimeType,createdTime)',
+        orderBy='createdTime'
+    ).execute()
+    return result.get('files', [])
+
+
+def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
+    """
+    Download a WO scan from the Scan Inbox, parse it with Claude Vision,
+    and post the structured data to the Apps Script doPost handler which
+    writes a new row to the Work Order Tracker and archives the PDF.
+    """
+    import requests as _requests
+    from parse_work_order import parse as parse_wo
+
+    file_id   = file_meta['id']
+    file_name = file_meta['name']
+    mime_type = SCAN_INBOX_MIMETYPES.get(file_meta.get('mimeType', ''), 'application/pdf')
+
+    log(f"📋  WO Scan: {file_name}")
+
+    # ── Download ──────────────────────────────────────────────────
+    try:
+        file_bytes = download_binary(service, file_id)
+        log(f"  📥  Downloaded {len(file_bytes) / 1024:.0f} KB")
+    except Exception as e:
+        log(f"  ❌  Download failed: {e}")
+        return False
+
+    # ── Parse with Claude Vision ──────────────────────────────────
+    try:
+        log("  🔍  Parsing with Claude Vision...")
+        wo_data = parse_wo(file_bytes, mime_type)
+    except Exception as e:
+        log(f"  ❌  Parse failed: {e}")
+        return False
+
+    if '_parse_error' in wo_data:
+        log(f"  ❌  Claude could not parse WO: {wo_data['_parse_error']}")
+        return False
+
+    wo_id = wo_data.get('work_order_id', 'UNKNOWN')
+    log(f"  ✅  Parsed: {wo_id} — {wo_data.get('prime_contractor')} / "
+        f"{wo_data.get('contract_number')} / {wo_data.get('location')}")
+
+    # ── Post to Apps Script ───────────────────────────────────────
+    upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
+    upload_key = os.environ.get('APPS_SCRIPT_UPLOAD_KEY', '')
+
+    if not upload_url:
+        log("  ⚠️   APPS_SCRIPT_UPLOAD_URL not set — cannot write to WO Tracker.")
+        log("      Set this in Railway env vars.")
+        return False
+
+    import json as _json
+    payload = _json.dumps({
+        'action':  'write_wo',
+        'key':     upload_key,
+        'file_id': file_id,
+        'data':    wo_data,
+    })
+
+    try:
+        resp = _requests.post(
+            upload_url,
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=60,
+            allow_redirects=True,
+        )
+        log(f"  📡  Apps Script response: HTTP {resp.status_code}, {len(resp.content)} bytes")
+
+        if not resp.content.strip():
+            log("  ❌  Empty response from Apps Script — check doPost deployment.")
+            return False
+
+        result = resp.json()
+        if 'error' in result:
+            log(f"  ❌  Apps Script error: {result['error']}")
+            return False
+
+        if result.get('duplicate'):
+            log(f"  ℹ️   WO {wo_id} already in tracker — archived file only.")
+        else:
+            log(f"  ✅  WO {wo_id} added to tracker and archived.")
+
+        return True
+
+    except Exception as e:
+        log(f"  ❌  Apps Script POST failed: {e}")
+        return False
 
 
 def upload_pdf(service, local_path: Path, parent_folder_id: str) -> str:
@@ -401,7 +524,9 @@ def process_file(service, file_meta: dict, folder_id: str, tmp_dir: Path) -> boo
     return True
 
 
-def scan_once(service, folder_map: dict, processed: set, tmp_dir: Path):
+def scan_once(service, folder_map: dict, scan_inbox_id: str | None,
+             processed: set, tmp_dir: Path):
+    # ── JSON payloads → PDF fillers ───────────────────────────────
     for subfolder_name, folder_id in folder_map.items():
         files = list_json_files(service, folder_id)
         for f in files:
@@ -411,6 +536,19 @@ def scan_once(service, folder_map: dict, processed: set, tmp_dir: Path):
             if success:
                 processed.add(f['id'])
                 save_state(processed)
+
+    # ── Scan Inbox → Claude Vision WO parser ─────────────────────
+    if scan_inbox_id:
+        wo_files = list_scan_inbox_files(service, scan_inbox_id)
+        for f in wo_files:
+            if f['id'] in processed:
+                continue
+            success = process_wo_scan(service, f, tmp_dir)
+            # Mark as processed regardless — on failure we don't want infinite retries.
+            # The file remains in Scan Inbox with its original name so the admin can
+            # manually review. Apps Script will rename it with ✅ on success.
+            processed.add(f['id'])
+            save_state(processed)
 
 
 # ── Setup mode ────────────────────────────────────────────────────────────────
@@ -464,17 +602,23 @@ def run_setup(service, folder_id: str = None, templates_id: str = None):
     log("   Run  python3 watch_and_fill.py  to start watching.\n")
 
 
-def load_folder_map(service) -> dict:
+def load_folder_map(service) -> tuple:
     """Load folder IDs from environment variables (Railway) or .drive_config.json (local).
 
     Environment variables take priority — set these in the Railway dashboard:
       DRIVE_NEEDS_REVIEW_ID   — ID of the "Docs Needing Review" folder
       DRIVE_TEMPLATES_ID      — ID of the Templates folder
+      DRIVE_SCAN_INBOX_ID     — ID of the "Scan Inbox" folder (WO scans)
       DRIVE_PROD_LOGS_ID      — (optional) ID of Production Logs subfolder
       DRIVE_CERT_PAYROLL_ID   — (optional) ID of Certified Payroll subfolder
+
+    Returns:
+      (folder_map, scan_inbox_id) where folder_map is {subfolder_name: id}
+      and scan_inbox_id is the Drive ID of the Scan Inbox (or None).
     """
     needs_review_id     = os.environ.get('DRIVE_NEEDS_REVIEW_ID')
     templates_folder_id = os.environ.get('DRIVE_TEMPLATES_ID')
+    scan_inbox_id       = os.environ.get('DRIVE_SCAN_INBOX_ID')
     prod_logs_id        = os.environ.get('DRIVE_PROD_LOGS_ID')
     cert_payroll_id     = os.environ.get('DRIVE_CERT_PAYROLL_ID')
 
@@ -506,7 +650,22 @@ def load_folder_map(service) -> dict:
                 folder_map[sub] = fid
                 log(f"  🔎  Discovered subfolder '{sub}': {fid}")
 
-    return {k: v for k, v in folder_map.items() if k in WATCH_SUBFOLDERS}
+    # Discover Scan Inbox if not provided
+    if not scan_inbox_id and needs_review_id:
+        # Scan Inbox is a top-level folder, not under Needs Review — search broadly
+        for name in ['📥 Scan Inbox', 'Scan Inbox', 'scan inbox']:
+            scan_inbox_id = find_folder(service, name)
+            if scan_inbox_id:
+                log(f"  🔎  Discovered Scan Inbox: {scan_inbox_id}")
+                break
+    elif scan_inbox_id:
+        log(f"  📥  Scan Inbox: {scan_inbox_id}")
+
+    if not scan_inbox_id:
+        log("  ⚠️   Scan Inbox not found. Set DRIVE_SCAN_INBOX_ID to enable WO parsing.")
+
+    return ({k: v for k, v in folder_map.items() if k in WATCH_SUBFOLDERS},
+            scan_inbox_id)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -524,10 +683,11 @@ def main():
         run_setup(service, folder_id=args.folder_id, templates_id=args.templates_id)
         return
 
-    folder_map = load_folder_map(service)
-    if not folder_map:
-        log("⚠️   No watched folders found. Trigger generateDailyDocuments once in Apps Script,")
-        log("    then re-run  python3 watch_and_fill.py --setup  to pick up the new subfolders.")
+    folder_map, scan_inbox_id = load_folder_map(service)
+    if not folder_map and not scan_inbox_id:
+        log("⚠️   No watched folders found.")
+        log("    Trigger generateDailyDocuments once in Apps Script,")
+        log("    then re-run  python3 watch_and_fill.py --setup  to pick up subfolders.")
         return
 
     tmp_dir = ROOT_DIR / '_tmp_fills'
@@ -535,17 +695,21 @@ def main():
 
     processed = load_state()
 
+    watching = list(folder_map.keys())
+    if scan_inbox_id:
+        watching.append('Scan Inbox')
+
     if args.once:
         log("⚡  Running one-shot scan...")
-        scan_once(service, folder_map, processed, tmp_dir)
+        scan_once(service, folder_map, scan_inbox_id, processed, tmp_dir)
         log("Done.")
         return
 
-    log(f"👀  Watching Google Drive folders: {', '.join(folder_map)}")
+    log(f"👀  Watching: {', '.join(watching)}")
     log(f"   Polling every {POLL_SECONDS}s  (Ctrl+C to stop)\n")
     try:
         while True:
-            scan_once(service, folder_map, processed, tmp_dir)
+            scan_once(service, folder_map, scan_inbox_id, processed, tmp_dir)
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
         log("\n👋  Watcher stopped.")
