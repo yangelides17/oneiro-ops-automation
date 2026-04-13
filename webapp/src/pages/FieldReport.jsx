@@ -34,12 +34,6 @@ const calcHours = (tin, tout) => {
   const hrs = mins / 60
   return { hours: hrs.toFixed(2), overtime: Math.max(0, hrs-8).toFixed(2) }
 }
-const toDateInput = (s) => {
-  if (!s || s === 'null') return ''
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s
-  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
-  return m ? `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}` : ''
-}
 const newCrew    = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
 const newMarking = () => ({ type:MARKING_TYPES[0], qty:'', unit:'SF' })
 
@@ -252,9 +246,6 @@ export default function FieldReport() {
   // Form fields
   const [selectedWOId,  setSelectedWOId]  = useState('')
   const [workDate,      setWorkDate]       = useState(isoToday())
-  const [dispatchDate,  setDispatchDate]   = useState('')
-  const [workStartDate, setWorkStartDate]  = useState('')
-  const [workEndDate,   setWorkEndDate]    = useState('')
   const [markingRows,   setMarkingRows]    = useState([newMarking()])
   const [sqft,          setSqft]           = useState('')
   const [paintMaterial, setPaintMaterial]  = useState('')
@@ -278,18 +269,6 @@ export default function FieldReport() {
       .catch(e=>setApiError(e.message))
       .finally(()=>setLoading(false))
   }, [])
-
-  // Pre-fill dates when WO changes
-  useEffect(() => {
-    if (!selectedWO) return
-    setDispatchDate(toDateInput(selectedWO.dispatch_date))
-    setWorkStartDate(toDateInput(selectedWO.work_start_date))
-  }, [selectedWOId])
-
-  // Show end-date field when WO marked complete
-  useEffect(() => {
-    if (woComplete==='yes' && !workEndDate) setWorkEndDate(isoToday())
-  }, [woComplete])
 
   // Marking rows
   const updateMarking = (i,f,v) => setMarkingRows(r=>r.map((x,j)=>j===i?{...x,[f]:v}:x))
@@ -334,12 +313,9 @@ export default function FieldReport() {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          wo_id:           selectedWOId,
-          date:            workDate,
-          dispatch_date:   dispatchDate,
-          work_start_date: workStartDate,
-          work_end_date:   workEndDate,
-          wo_complete:     woComplete==='yes',
+          wo_id:       selectedWOId,
+          date:        workDate,
+          wo_complete: woComplete==='yes',
           marking_types:   markingTypesStr,
           sqft_completed:  sqft!=='' ? parseFloat(sqft) : null,
           paint_material:  paintMaterial.trim(),
@@ -389,7 +365,6 @@ export default function FieldReport() {
   // ── Reset ─────────────────────────────────────────────────
   function reset() {
     setSubmitted(null); setSelectedWOId(''); setWorkDate(isoToday())
-    setDispatchDate(''); setWorkStartDate(''); setWorkEndDate('')
     setMarkingRows([newMarking()]); setSqft(''); setPaintMaterial(''); setIssues('')
     setCrewMembers([newCrew()]); setWoComplete('no'); setPhotoFiles([]); setFormError('')
   }
@@ -476,33 +451,12 @@ export default function FieldReport() {
           {selectedWO && <WOPanel wo={selectedWO} />}
         </div>
 
-        {/* 2 · Schedule */}
-        <div className="card p-4 space-y-3">
-          <p className="section-label">Schedule</p>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Date of Work" required>
-              <input type="date" value={workDate} onChange={e=>setWorkDate(e.target.value)} className="field-input" />
-            </Field>
-            <Field label="Dispatch Date" hint={selectedWO?.dispatch_date?`Set: ${selectedWO.dispatch_date}`:undefined}>
-              <input type="date" value={dispatchDate} onChange={e=>setDispatchDate(e.target.value)} className="field-input" />
-            </Field>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Work Start Date" hint={selectedWO?.work_start_date?`Set: ${selectedWO.work_start_date}`:undefined}>
-              <input type="date" value={workStartDate} onChange={e=>setWorkStartDate(e.target.value)} className="field-input" />
-            </Field>
-            {woComplete==='yes' && (
-              <Field label="Work End Date">
-                <input type="date" value={workEndDate} onChange={e=>setWorkEndDate(e.target.value)} className="field-input" />
-              </Field>
-            )}
-          </div>
-          <p className="text-[11px] text-slate-400">Only fill dates not already recorded in the tracker.</p>
-        </div>
-
-        {/* 3 · Work Details */}
+        {/* 2 · Work Details */}
         <div className="card p-4 space-y-4">
           <p className="section-label">Work Details</p>
+          <Field label="Date of Work" required>
+            <input type="date" value={workDate} onChange={e=>setWorkDate(e.target.value)} className="field-input" />
+          </Field>
           <div className="space-y-2">
             <label className="field-label">Marking Types Completed</label>
             <div className="space-y-1.5">
@@ -532,7 +486,7 @@ export default function FieldReport() {
           </Field>
         </div>
 
-        {/* 4 · Photos */}
+        {/* 3 · Photos */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Site Photos</p>
           {selectedWOId
@@ -541,7 +495,7 @@ export default function FieldReport() {
           }
         </div>
 
-        {/* 5 · Crew & Signatures */}
+        {/* 4 · Crew & Signatures */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Crew & Signatures ({crewMembers.length})</p>
           <p className="text-[11px] text-slate-400">
@@ -555,7 +509,7 @@ export default function FieldReport() {
           <button type="button" onClick={addCrew} className="btn-ghost text-xs w-full">+ Add Crew Member</button>
         </div>
 
-        {/* 6 · Completion */}
+        {/* 5 · Completion */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Completion</p>
           <Field label="Is this Work Order complete?">

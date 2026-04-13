@@ -1673,11 +1673,9 @@ function handleGetActiveWOs_() {
  *
  * Expected body.data fields:
  *   wo_id           — Work Order # (e.g. "PT-11930")
- *   date            — Date of work (YYYY-MM-DD)
- *   dispatch_date   — Dispatch Date (YYYY-MM-DD, optional)
- *   work_start_date — Work Start Date (YYYY-MM-DD, optional)
- *   work_end_date   — Work End Date (YYYY-MM-DD, optional)
- *   wo_complete     — boolean — marks WO complete, sets Work End Date
+ *   date            — Date of work (YYYY-MM-DD). Used to auto-set Dispatch Date,
+ *                     Work Start Date (if blank), and Work End Date (if complete).
+ *   wo_complete     — boolean — marks WO complete, sets Work End Date = date
  *   marking_types   — string ("Crosswalk: 500 SF, Stop Bar: 10 LF")
  *   sqft_completed  — number
  *   paint_material  — string
@@ -1730,12 +1728,13 @@ function handleSubmitFieldReport_(body) {
   const currentWorkEnd   = woRow[18] ? String(woRow[18]) : '';
   const currentIssues    = String(woRow[22] || '').trim();
 
-  // Only set dates if not already recorded
-  const newDispatch  = currentDispatch  || d.dispatch_date   || '';
-  const newWorkStart = currentWorkStart || d.work_start_date || '';
-  const newWorkEnd   = d.wo_complete
-    ? (d.work_end_date || d.date)
-    : currentWorkEnd;
+  // Auto-derive dates from Date of Work when not already recorded.
+  // Dispatch Date and Work Start Date are treated as the same — both default
+  // to the first Field Report's Date of Work if blank in the tracker.
+  const newDispatch  = currentDispatch  || d.date;
+  const newWorkStart = currentWorkStart || d.date;
+  // Work End Date is only written when the WO is marked complete on this submission.
+  const newWorkEnd   = d.wo_complete ? d.date : currentWorkEnd;
 
   // Progress status forward (never backward)
   let newStatus = currentStatus;
