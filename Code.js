@@ -1350,7 +1350,12 @@ function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) 
         );
       }
     }
-    throw batchErr;  // probe succeeded — re-throw original so we don't swallow it
+    // Probe couldn't reproduce per-cell — still attach the sheet label so the
+    // caller never sees a bare "Invalid Entry" message with no context.
+    throw new Error(
+      `${sheetLabel} → batch write failed (per-cell probe could not isolate). ` +
+      `Original: ${batchErr.message}`
+    );
   }
 }
 
@@ -1392,7 +1397,13 @@ function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
         sheet.deleteRow(targetRow);
       }
     }
-    throw culprit || batchErr;
+    if (culprit) throw culprit;
+    // Probe couldn't reproduce per-cell — still attach the sheet label so the
+    // caller never sees a bare "Invalid Entry" message with no context.
+    throw new Error(
+      `${sheetLabel} → batch append failed (per-cell probe could not isolate). ` +
+      `Original: ${batchErr.message}`
+    );
   }
 }
 
@@ -1474,7 +1485,10 @@ function doPost(e) {
   } catch (err) {
     Logger.log('❌ doPost error: ' + err.toString());
     if (err.stack) Logger.log('Stack trace:\n' + err.stack);
-    return jsonResponse_({ error: err.toString() }, 500);
+    // Include the stack in the JSON response so the React app / network
+    // inspector can show it without needing access to Apps Script Executions
+    // (whose list entries aren't clickable in the current UI).
+    return jsonResponse_({ error: err.toString(), stack: err.stack || '' }, 500);
   }
 }
 
@@ -1788,6 +1802,15 @@ function handleSubmitFieldReport_(body) {
     return jsonResponse_({ error: 'At least one crew member is required' }, 400);
   }
 
+  // Breadcrumb: updated before each risky operation so any uncaught exception
+  // inside this handler surfaces with "[step=<phase>]" attached — otherwise
+  // doPost's catch returns only the raw exception text (e.g. "Invalid Entry")
+  // and there's no way to tell which phase blew up.
+  let step = 'init';
+
+  try {
+
+  step = 'open spreadsheet / find WO row';
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
   const allRows = woSheet.getDataRange().getValues();
@@ -1860,6 +1883,7 @@ function handleSubmitFieldReport_(body) {
     'Marking Types', 'SQFT Completed', 'Paint/Material',
     'Issues Reported', 'Photos Uploaded?'
   ];
+  step = 'WO Tracker write';
   writeRowWithProbing_(woSheet, woRowIdx + 1, 16, woValues, woLabels, 'WO Tracker');
 
   Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
@@ -1873,7 +1897,8 @@ function handleSubmitFieldReport_(body) {
     'WO Complete?', 'Issues/Notes', 'Admin Reviewed?', 'Review Notes'
   ];
 
-  d.crew.forEach(member => {
+  d.crew.forEach((member, idx) => {
+    step = `Sign-In Data row ${idx + 1}/${d.crew.length} (${member.name || '<no name>'})`;
     const hours    = parseFloat(member.hours)    || 0;
     const overtime = parseFloat(member.overtime) || Math.max(0, hours - 8);
 
@@ -1905,14 +1930,24 @@ function handleSubmitFieldReport_(body) {
   // ── Sign-In Log JSON export → Python worker fills the PDF ────
   // Runs on every submit (partial days still need a sign-in sheet).
   // Wrapped so a failure here doesn't reject the whole submit.
+  step = 'Sign-In JSON export';
   try {
     generateSignInJson_(d, woRow, ss);
   } catch (err) {
     Logger.log('⚠️ Sign-In JSON export failed: ' + err);
-    ss.getSheetByName('Automation Log').appendRow([
-      new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
-      String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
-    ]);
+    // The failure-logging write must never throw over the original sign-in
+    // error (and must never reject the whole submit). If Automation Log's
+    // Status column has dropdown validation that rejects "Error", an
+    // un-wrapped appendRow here would surface as the bare "Invalid Entry"
+    // message with no indication that it came from the error handler.
+    try {
+      ss.getSheetByName('Automation Log').appendRow([
+        new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
+        String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
+      ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Could not write Sign-In failure to Automation Log: ' + logErr);
+    }
   }
 
   // ── Automation Log ────────────────────────────────────────────
@@ -1920,6 +1955,7 @@ function handleSubmitFieldReport_(body) {
     ? 'WO marked COMPLETE — review for invoicing, field report, and production log'
     : '';
 
+  step = 'Automation Log write';
   appendRowWithProbing_(
     ss.getSheetByName('Automation Log'),
     [
@@ -1937,6 +1973,16 @@ function handleSubmitFieldReport_(body) {
   );
 
   return jsonResponse_({ success: true, wo_id: d.wo_id, status: newStatus });
+
+  } catch (err) {
+    // Attach the current phase so the React caller sees e.g.
+    //   "[step=Automation Log write] Automation Log → "Status" rejected value …"
+    // instead of a bare "Invalid Entry" with no hint.
+    const msg = (err && err.message) ? err.message : String(err);
+    const wrapped = new Error(`[step=${step}] ${msg}`);
+    wrapped.stack = err && err.stack ? err.stack : wrapped.stack;
+    throw wrapped;
+  }
 }
 
 
