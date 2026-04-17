@@ -1473,6 +1473,7 @@ function doPost(e) {
 
   } catch (err) {
     Logger.log('❌ doPost error: ' + err.toString());
+    if (err.stack) Logger.log('Stack trace:\n' + err.stack);
     return jsonResponse_({ error: err.toString() }, 500);
   }
 }
@@ -1919,16 +1920,21 @@ function handleSubmitFieldReport_(body) {
     ? 'WO marked COMPLETE — review for invoicing, field report, and production log'
     : '';
 
-  ss.getSheetByName('Automation Log').appendRow([
-    new Date(),
-    'Field Report Web App',
-    'Field report submitted',
-    d.wo_id,
-    d.crew.length + ' crew member(s) on ' + d.date,
-    newStatus,
-    '',
-    actionNote
-  ]);
+  appendRowWithProbing_(
+    ss.getSheetByName('Automation Log'),
+    [
+      new Date(),
+      'Field Report Web App',
+      'Field report submitted',
+      d.wo_id,
+      d.crew.length + ' crew member(s) on ' + d.date,
+      newStatus,
+      '',
+      actionNote
+    ],
+    ['Timestamp', 'Source', 'Action', 'Related', 'Details', 'Status', 'User', 'Next Steps'],
+    'Automation Log'
+  );
 
   return jsonResponse_({ success: true, wo_id: d.wo_id, status: newStatus });
 }
