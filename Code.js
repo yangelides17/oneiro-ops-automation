@@ -1336,11 +1336,20 @@ function getFolderId_(name) {
 function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) {
   try {
     sheet.getRange(row, startCol, 1, values.length).setValues([values]);
+    // CRITICAL: Apps Script's setValues is DEFERRED — the write gets
+    // buffered and validation fires on the next read (e.g. getLastRow()
+    // on any sheet). Without flush(), a dropdown violation in this
+    // write would escape this try/catch and surface as a bare "Invalid
+    // Entry" error at some later unrelated sheet read. flush() forces
+    // the write to commit now so any validation error lands in our
+    // catch block where the probe can identify the culprit column.
+    SpreadsheetApp.flush();
   } catch (batchErr) {
     // Probe per-column to identify which one failed
     for (let i = 0; i < values.length; i++) {
       try {
         sheet.getRange(row, startCol + i).setValue(values[i]);
+        SpreadsheetApp.flush();  // per-cell flush for same reason as above
       } catch (colErr) {
         const label = labels[i] || `col ${startCol + i}`;
         const val   = JSON.stringify(values[i]);
@@ -1368,28 +1377,57 @@ function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) 
  * partial data behind.
  */
 function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
-  // Trim trailing empty cells before append: sheet.appendRow([..., '', ''])
-  // writes explicit empty strings which can trip a dropdown validator on
-  // those trailing cells ("Invalid Entry - Please select from the dropdown
-  // list."), whereas omitting them leaves the cells truly blank — which
-  // every validator we've seen accepts.
+  // Catch-all safety wrapper — guarantees the sheet label + phase tag is
+  // attached to any error that escapes the probe logic, so a caller never
+  // sees a bare Google validation message without context.
+  const ctx = { phase: 'init' };
+  try {
+    return appendRowWithProbingImpl_(sheet, values, labels, sheetLabel, ctx);
+  } catch (err) {
+    const msg = (err && err.message) ? err.message : String(err);
+    if (msg.indexOf(sheetLabel) !== -1) throw err;  // already tagged
+    throw new Error(`${sheetLabel} (phase=${ctx.phase}) → ${msg}`);
+  }
+}
+
+function appendRowWithProbingImpl_(sheet, values, labels, sheetLabel, ctx) {
+  ctx.phase = 'trim';
+  // Trim trailing empty cells — defensive no-op with setValues, but kept
+  // so the probe's range width matches what the caller actually intended.
   let trimLen = values.length;
   while (trimLen > 0 && (values[trimLen - 1] === '' || values[trimLen - 1] == null)) {
     trimLen--;
   }
   if (trimLen < values.length) values = values.slice(0, trimLen);
 
+  ctx.phase = 'getLastRow';
+  const targetRow = sheet.getLastRow() + 1;
+
+  // Prefer setValues over appendRow. appendRow validates the FULL row
+  // range against all data-validation rules — including dropdown columns
+  // we aren't writing. setValues is scoped to the specific range we're
+  // writing, so only those columns' validators run.
+  ctx.phase = 'setValues';
   try {
-    sheet.appendRow(values);
+    sheet.getRange(targetRow, 1, 1, values.length).setValues([values]);
+    // Force deferred validation to fire now — see writeRowWithProbing_
+    // for the full explanation. Without flush(), a dropdown violation
+    // escapes this try and surfaces as a bare error at the next sheet
+    // read somewhere else in the handler.
+    SpreadsheetApp.flush();
     return;
   } catch (batchErr) {
-    // Probe per-column by writing to the row that appendRow *would have* filled
-    const targetRow = sheet.getLastRow() + 1;
+    ctx.phase = 'per-cell probe';
+    Logger.log(`❌ setValues threw on ${sheetLabel}: ${batchErr.message}`);
+    // Keep the variable name so the rest of the probe/diagnostic code
+    // below continues to make sense — it's still the "next row after
+    // last data" we just tried to fill.
     let culprit = null;
     try {
       for (let i = 0; i < values.length; i++) {
         try {
           sheet.getRange(targetRow, i + 1).setValue(values[i]);
+          SpreadsheetApp.flush();  // per-cell flush so validation fires now
         } catch (colErr) {
           const label = labels[i] || `col ${i + 1}`;
           const val   = JSON.stringify(values[i]);
@@ -1404,11 +1442,20 @@ function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
       // Remove the probe row whether we identified the culprit or not —
       // we don't want partial data left behind on validation failure, and
       // we don't want a duplicate if the probe somehow succeeded.
-      if (sheet.getLastRow() >= targetRow) {
-        sheet.deleteRow(targetRow);
+      // IMPORTANT: wrap in its own try/catch — if deleteRow throws, its
+      // exception would replace any pending `culprit` throw below and
+      // masquerade as the submit's failure (we've seen exactly that).
+      try {
+        if (sheet.getLastRow() >= targetRow) {
+          sheet.deleteRow(targetRow);
+        }
+      } catch (delErr) {
+        Logger.log(`⚠️ deleteRow(probe) for ${sheetLabel} failed: ${delErr.message}`);
       }
     }
     if (culprit) throw culprit;
+
+    ctx.phase = 'rule inspection';
 
     // Per-cell probe didn't reproduce. That happens when appendRow validates
     // the row atomically but per-cell setValue bypasses validation (e.g.
@@ -1806,7 +1853,7 @@ function handleGetActiveWOs_() {
   const ORDER = { 'in progress': 0, 'dispatched': 1, 'received': 2 };
 
   const wos = allRows.slice(1)
-    .filter(r => r[0] && String(r[15]).toLowerCase() !== 'complete')
+    .filter(r => r[0] && String(r[15]).toLowerCase() !== 'completed')
     .map(r => ({
       id:              String(r[0]),
       contractor:      String(r[1]),
@@ -1917,7 +1964,7 @@ function handleSubmitFieldReport_(body) {
   // Progress status forward (never backward)
   let newStatus = currentStatus;
   if (d.wo_complete) {
-    newStatus = 'Complete';
+    newStatus = 'Completed';
   } else if (newWorkStart && (currentStatus === 'Received' || currentStatus === 'Dispatched')) {
     newStatus = 'In Progress';
   } else if (newDispatch && currentStatus === 'Received') {
@@ -2215,7 +2262,7 @@ function handleGetDashboardData_() {
     received:    count('Received'),
     dispatched:  count('Dispatched'),
     in_progress: count('In Progress'),
-    complete:    count('Complete')
+    complete:    count('Completed')
   };
 
   // Contractor breakdown
@@ -2227,7 +2274,7 @@ function handleGetDashboardData_() {
 
   // WOs needing attention (issues reported, incomplete docs)
   const attention = wos.filter(w =>
-    w.status.toLowerCase() !== 'complete' && (
+    w.status.toLowerCase() !== 'completed' && (
       (w.issues && w.issues.trim()) ||
       (w.status.toLowerCase() === 'in progress' && w.photos.toLowerCase() !== 'yes')
     )

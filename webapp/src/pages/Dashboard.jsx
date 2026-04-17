@@ -56,7 +56,7 @@ function FilterBar({ label, options, value, onChange }) {
 // ── WO Table row ──────────────────────────────────────────────
 function WORow({ wo, flagged }) {
   const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
-    && wo.status.toLowerCase() !== 'complete'
+    && wo.status.toLowerCase() !== 'completed'
 
   return (
     <tr className={`border-b border-slate-100 text-sm transition-colors
@@ -152,7 +152,7 @@ export default function Dashboard() {
     { name: 'Received',    value: data.stats.received,    fill: '#3b82f6' },
     { name: 'Dispatched',  value: data.stats.dispatched,  fill: '#f59e0b' },
     { name: 'In Progress', value: data.stats.in_progress, fill: '#f97316' },
-    { name: 'Complete',    value: data.stats.complete,    fill: '#22c55e' },
+    { name: 'Completed',   value: data.stats.complete,    fill: '#22c55e' },
   ] : []
 
   // Loading state
@@ -234,7 +234,7 @@ export default function Dashboard() {
           color="text-blue-600"
         />
         <StatCard
-          label="Complete"
+          label="Completed"
           value={stats?.complete}
           sub="all time"
           color="text-green-600"
@@ -338,7 +338,7 @@ export default function Dashboard() {
           <div className="space-y-2">
             <FilterBar
               label="Status"
-              options={['Received', 'Dispatched', 'In Progress', 'Complete']}
+              options={['Received', 'Dispatched', 'In Progress', 'Completed']}
               value={statusFilt}
               onChange={setStatusFilt}
             />
