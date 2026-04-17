@@ -1318,6 +1318,77 @@ function getFolderId_(name) {
 }
 
 
+/**
+ * Sheet write with per-column diagnostics.
+ *
+ * Attempts a single batched setValues (fast path). If that fails —
+ * typically because a cell has data validation that rejects the value —
+ * retries column by column to identify exactly which column + value was
+ * the culprit, then re-throws with a specific message.
+ *
+ * @param sheet       the Sheet
+ * @param row         1-indexed row
+ * @param startCol    1-indexed starting column
+ * @param values      array of values to write (one per column)
+ * @param labels      human-readable column names, parallel to values
+ * @param sheetLabel  short label for the sheet (used in error messages)
+ */
+function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) {
+  try {
+    sheet.getRange(row, startCol, 1, values.length).setValues([values]);
+  } catch (batchErr) {
+    // Probe per-column to identify which one failed
+    for (let i = 0; i < values.length; i++) {
+      try {
+        sheet.getRange(row, startCol + i).setValue(values[i]);
+      } catch (colErr) {
+        const label = labels[i] || `col ${startCol + i}`;
+        const val   = JSON.stringify(values[i]);
+        throw new Error(
+          `${sheetLabel} → "${label}" rejected value ${val}. ` +
+          `Cell validation: ${colErr.message}`
+        );
+      }
+    }
+    throw batchErr;  // probe succeeded — re-throw original so we don't swallow it
+  }
+}
+
+
+/**
+ * Append a row, but if it fails, probe per-column by writing to a scratch
+ * row to identify which column was rejected. Leaves no scratch data behind
+ * on success.
+ */
+function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
+  try {
+    sheet.appendRow(values);
+  } catch (batchErr) {
+    // Append an empty row to use as a scratch space for per-column probing
+    sheet.appendRow([]);
+    const probeRow = sheet.getLastRow();
+    try {
+      for (let i = 0; i < values.length; i++) {
+        try {
+          sheet.getRange(probeRow, i + 1).setValue(values[i]);
+        } catch (colErr) {
+          const label = labels[i] || `col ${i + 1}`;
+          const val   = JSON.stringify(values[i]);
+          throw new Error(
+            `${sheetLabel} → "${label}" rejected value ${val}. ` +
+            `Cell validation: ${colErr.message}`
+          );
+        }
+      }
+    } finally {
+      // Clean up the scratch row whether we identified the bad column or not
+      sheet.deleteRow(probeRow);
+    }
+    throw batchErr;
+  }
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // UPLOAD PROXY — Receives filled PDFs from the Railway worker
 // ═══════════════════════════════════════════════════════════════
@@ -1763,31 +1834,41 @@ function handleSubmitFieldReport_(body) {
     : String(woRow[19] || '');
 
   // ── Write WO Tracker cols 15–23 (0-indexed) ──────────────────
-  // getRange(row, col, numRows, numCols) is 1-indexed
   // Col 15 (0-indexed) = col 16 (1-indexed); 9 columns → cols 16–24 (1-indexed)
-  // woRowIdx is 0-indexed in allRows; sheet row = woRowIdx + 1
-  woSheet.getRange(woRowIdx + 1, 16, 1, 9).setValues([[
-    newStatus,                                              // col 15: Status
-    newDispatch,                                            // col 16: Dispatch Date
-    newWorkStart,                                           // col 17: Work Start Date
-    newWorkEnd,                                             // col 18: Work End Date
-    newMarkings,                                            // col 19: Marking Types
-    (d.sqft_completed != null) ? d.sqft_completed : (woRow[20] || ''), // col 20: SQFT
-    (d.paint_material  || String(woRow[21] || '')).trim(),  // col 21: Paint/Material
-    newIssues,                                              // col 22: Issues Reported
-    newPhotos                                               // col 23: Photos Uploaded?
-  ]]);
+  const woValues = [
+    newStatus,                                                        // col 15: Status
+    newDispatch,                                                      // col 16: Dispatch Date
+    newWorkStart,                                                     // col 17: Work Start Date
+    newWorkEnd,                                                       // col 18: Work End Date
+    newMarkings,                                                      // col 19: Marking Types
+    (d.sqft_completed != null) ? d.sqft_completed : (woRow[20] || ''),// col 20: SQFT
+    (d.paint_material  || String(woRow[21] || '')).trim(),            // col 21: Paint/Material
+    newIssues,                                                        // col 22: Issues Reported
+    newPhotos                                                         // col 23: Photos Uploaded?
+  ];
+  const woLabels = [
+    'Status', 'Dispatch Date', 'Work Start Date', 'Work End Date',
+    'Marking Types', 'SQFT Completed', 'Paint/Material',
+    'Issues Reported', 'Photos Uploaded?'
+  ];
+  writeRowWithProbing_(woSheet, woRowIdx + 1, 16, woValues, woLabels, 'WO Tracker');
 
   Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
 
   // ── Write Daily Sign-In Data rows (one per crew member) ──────
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
+  const signInLabels = [
+    'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
+    'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
+    'Hours Worked', 'Overtime Hours', 'SQFT Completed', 'Paint/Material',
+    'WO Complete?', 'Issues/Notes', 'Admin Reviewed?', 'Review Notes'
+  ];
 
   d.crew.forEach(member => {
     const hours    = parseFloat(member.hours)    || 0;
     const overtime = parseFloat(member.overtime) || Math.max(0, hours - 8);
 
-    signInSheet.appendRow([
+    const row = [
       d.date,                              //  0  Date
       d.wo_id,                             //  1  Work Order #
       String(woRow[1]),                    //  2  Prime Contractor
@@ -1804,9 +1885,10 @@ function handleSubmitFieldReport_(body) {
       (d.paint_material || '').trim(),     // 13  Paint/Material
       d.wo_complete ? 'Yes' : 'No',        // 14  WO Complete?
       (d.issues || '').trim(),             // 15  Issues/Notes
-      '',                                  // 16  Admin Reviewed? (blank — admin fills)
-      ''                                   // 17  Review Notes    (blank — admin fills)
-    ]);
+      '',                                  // 16  Admin Reviewed?
+      ''                                   // 17  Review Notes
+    ];
+    appendRowWithProbing_(signInSheet, row, signInLabels, 'Daily Sign-In Data');
   });
 
   Logger.log('✅ Sign-In Data: ' + d.crew.length + ' row(s) appended for WO ' + d.wo_id);
