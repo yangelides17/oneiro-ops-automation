@@ -96,7 +96,7 @@ function createFolderStructure_() {
   // Top-level folders
   const scanInbox = root.createFolder('📥 Scan Inbox');
   const needsReview = root.createFolder('📋 Needs Review');
-  const approvedSent = root.createFolder('✅ Approved & Sent');
+  const approvedSent = root.createFolder('✅ Approved Docs');
   const archive = root.createFolder('🗂️ Archive');
   const reports = root.createFolder('📊 Reports');
   const templates = root.createFolder('⚙️ Templates');
@@ -600,7 +600,7 @@ Contact Oneiro Collection LLC to pay.     BALANCE DUE           ${amount.toLocal
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * Processes documents that the admin has moved to the Approved & Sent folder.
+ * Processes documents that the admin has moved to the Approved Docs folder.
  * Automatically emails them to the correct contractor contact and files them.
  */
 function processApprovedDocuments() {
@@ -675,15 +675,15 @@ function processApprovedDocuments() {
     // Log to Automation Log tab before deleting
     const logSheet = ss.getSheetByName('Automation Log');
     logSheet.appendRow([
-      new Date(), 'Approve & Send', 'File moved to Approved & Sent folder',
+      new Date(), 'Approve & Send', 'File moved to Approved Docs folder',
       fileName,
       `Emailed to: ${recipientList} | ${archiveNote}`,
       'Completed', '', 'No'
     ]);
 
-    // Delete from Approved & Sent — archive is now the single source of truth
+    // Delete from Approved Docs — archive is now the single source of truth
     file.setTrashed(true);
-    Logger.log(`🗑️ Deleted from Approved & Sent: ${fileName}`);
+    Logger.log(`🗑️ Deleted from Approved Docs: ${fileName}`);
   }
 }
 
@@ -1811,6 +1811,19 @@ function handleSubmitFieldReport_(body) {
 
   Logger.log('✅ Sign-In Data: ' + d.crew.length + ' row(s) appended for WO ' + d.wo_id);
 
+  // ── Sign-In Log JSON export → Python worker fills the PDF ────
+  // Runs on every submit (partial days still need a sign-in sheet).
+  // Wrapped so a failure here doesn't reject the whole submit.
+  try {
+    generateSignInJson_(d, woRow, ss);
+  } catch (err) {
+    Logger.log('⚠️ Sign-In JSON export failed: ' + err);
+    ss.getSheetByName('Automation Log').appendRow([
+      new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
+      String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
+    ]);
+  }
+
   // ── Automation Log ────────────────────────────────────────────
   const actionNote = d.wo_complete
     ? 'WO marked COMPLETE — review for invoicing, field report, and production log'
@@ -1828,6 +1841,101 @@ function handleSubmitFieldReport_(body) {
   ]);
 
   return jsonResponse_({ success: true, wo_id: d.wo_id, status: newStatus });
+}
+
+
+/**
+ * Build a SignIn JSON payload from the submitted field report + WO Tracker row,
+ * and write it to Drive folder "Needs Review / Sign-In Logs / ". The Railway
+ * Python worker (watch_and_fill.py) polls that folder, fills the Sign-In PDF
+ * template with embedded signatures, and uploads the result back.
+ *
+ * Signatures are expected inline as base64 data URLs on each crew member
+ * (sig_in_b64, sig_out_b64) and on the crew-leader block
+ * (contractor_signature_b64). They are forwarded verbatim — never persisted
+ * separately to Drive.
+ *
+ * Date formatting: the Sign-In PDF shows "M/D/YY". We accept "YYYY-MM-DD"
+ * from the web app and reformat.
+ */
+function generateSignInJson_(d, woRow, ss) {
+  const props          = PropertiesService.getScriptProperties();
+  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
+
+  const reviewFolder   = DriveApp.getFolderById(needsReviewId);
+  const signInFolder   = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
+
+  // WO Tracker columns: 1=Prime Contractor, 2=Contract #, 3=Borough, 5=Location
+  const primeContractor = String(woRow[1] || '').trim();
+  const contractNum     = String(woRow[2] || '').trim();
+  const boroughCode     = String(woRow[3] || '').trim();
+  const location        = String(woRow[5] || '').trim();
+  const boroughName     = boroughCode ? getBoroughName_(boroughCode) : '';
+
+  // "Contract #" field on the sign-in form shows contract + borough
+  // (user preference — we don't have a separate Registration # field).
+  const contractLabel = boroughName
+    ? `${contractNum} - ${boroughName}`
+    : contractNum;
+
+  // Project Name/Location = "<WO#> | <Location>"
+  const projectName = location
+    ? `${d.wo_id} | ${location}`
+    : d.wo_id;
+
+  // Reformat YYYY-MM-DD → M/D/YY to match the paper form's date style
+  const dateFmt = (iso) => {
+    if (!iso) return '';
+    const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return String(iso);
+    const [, yyyy, mm, dd] = m;
+    return `${parseInt(mm, 10)}/${parseInt(dd, 10)}/${yyyy.slice(-2)}`;
+  };
+  const dateHeader = dateFmt(d.date);
+
+  const payload = {
+    _type:              'signin',
+    wo_id:              d.wo_id,
+    date:               dateHeader,
+    prime_contractor:   primeContractor,
+    subcontractor:      CONFIG.EMPLOYER.name,
+    contract_number:    contractLabel,
+    address:            '',   // TODO: source from Contractor Contacts yard-address column when populated
+    agency:             'NYCDOT',
+    project_name:       projectName,
+    crew: (d.crew || []).map(m => ({
+      name:            String(m.name || '').trim(),
+      classification:  String(m.classification || '').trim(),
+      time_in:         String(m.time_in  || ''),
+      time_out:        String(m.time_out || ''),
+      sig_in_b64:      m.sig_in_b64  || '',
+      sig_out_b64:     m.sig_out_b64 || '',
+    })),
+    // Crew-leader block at the bottom of the form. The Field Report web app
+    // sends these alongside the per-member sigs.
+    contractor_name:            String(d.contractor_name || '').trim(),
+    contractor_title:           String(d.contractor_title || 'Crew Leader').trim(),
+    date_signed:                dateFmt(d.date_signed || d.date),
+    contractor_signature_b64:   d.contractor_signature_b64 || '',
+  };
+
+  // Filename: SignIn_<WO>_<YYYY-MM-DD>.json — matches the worker's expected
+  // naming so deduplication works if the admin re-submits.
+  const isoDate = (d.date || '').slice(0, 10) || 'unknown';
+  const fileName = `SignIn_${d.wo_id}_${isoDate}.json`;
+
+  // Overwrite any existing file with the same name (same-day re-submit)
+  const existing = signInFolder.getFilesByName(fileName);
+  while (existing.hasNext()) existing.next().setTrashed(true);
+
+  signInFolder.createFile(
+    fileName,
+    JSON.stringify(payload, null, 2),
+    MimeType.PLAIN_TEXT
+  );
+
+  Logger.log('✅ Sign-In JSON exported: ' + fileName);
 }
 
 

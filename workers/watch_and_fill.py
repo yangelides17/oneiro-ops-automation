@@ -41,12 +41,13 @@ POLL_SECONDS    = int(os.environ.get('POLL_SECONDS', 20))
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
 # Subfolder names inside Needs Review that we watch for JSON payloads
-WATCH_SUBFOLDERS = ['Production Logs', 'Certified Payroll']
+WATCH_SUBFOLDERS = ['Production Logs', 'Certified Payroll', 'Sign-In Logs']
 
 # Maps _type → template filename on Drive (inside the Templates folder)
 TEMPLATE_FILES = {
     'production_log':    'Metro Thermoplastic Daily Production Log Template_FORM.pdf',
     'certified_payroll': 'Certified Payroll Report Template_FORM.pdf',
+    'signin':            'Employee Daily Sign In Log Template_FORM.pdf',
 }
 
 # MIME types we treat as scanned Work Order documents in the Scan Inbox
@@ -148,8 +149,13 @@ def find_folder(service, name: str, parent_id: str = None) -> str | None:
 
 
 def list_json_files(service, folder_id: str):
-    """Return list of {id, name, createdTime} for .json files in folder_id."""
-    q = f"'{folder_id}' in parents and mimeType='text/plain' and name contains '.json' and trashed=false"
+    """Return list of {id, name, createdTime} for .json files in folder_id.
+
+    Accepts either mimeType — Apps Script writes JSON as text/plain via
+    MimeType.PLAIN_TEXT, but manual uploads (or Drive API uploads) often
+    use application/json. Match both."""
+    q = (f"'{folder_id}' in parents and name contains '.json' and trashed=false "
+         f"and (mimeType='text/plain' or mimeType='application/json')")
     result = service.files().list(
         q=q,
         fields='files(id,name,createdTime)',
@@ -482,9 +488,21 @@ def fill_certified_payroll(service, data: dict, tmp_dir: Path) -> Path:
     return out
 
 
+def fill_signin(service, data: dict, tmp_dir: Path) -> Path:
+    from fill_signin import fill
+    template = get_template(service, 'signin')
+    wo_id    = data.get('wo_id', 'unknown')
+    date_str = (data.get('date', 'unknown')
+                .replace('/', '-').replace(' ', '_'))
+    out = tmp_dir / f"SignIn_{wo_id}_{date_str}_FILLED.pdf"
+    fill(data, template_path=str(template), output_path=str(out))
+    return out
+
+
 FILLERS = {
     'production_log':    fill_production_log,
     'certified_payroll': fill_certified_payroll,
+    'signin':            fill_signin,
 }
 
 
@@ -609,18 +627,32 @@ def load_folder_map(service) -> tuple:
       DRIVE_NEEDS_REVIEW_ID   — ID of the "Docs Needing Review" folder
       DRIVE_TEMPLATES_ID      — ID of the Templates folder
       DRIVE_SCAN_INBOX_ID     — ID of the "Scan Inbox" folder (WO scans)
-      DRIVE_PROD_LOGS_ID      — (optional) ID of Production Logs subfolder
-      DRIVE_CERT_PAYROLL_ID   — (optional) ID of Certified Payroll subfolder
+
+    Per-subfolder env overrides (optional — otherwise discovered from Drive):
+      DRIVE_PROD_LOGS_ID        — Production Logs
+      DRIVE_CERT_PAYROLL_ID     — Certified Payroll
+      DRIVE_SIGN_IN_LOGS_ID     — Sign-In Logs
 
     Returns:
       (folder_map, scan_inbox_id) where folder_map is {subfolder_name: id}
       and scan_inbox_id is the Drive ID of the Scan Inbox (or None).
     """
+    # Maps WATCH_SUBFOLDER name → corresponding env var override
+    SUBFOLDER_ENV = {
+        'Production Logs':   'DRIVE_PROD_LOGS_ID',
+        'Certified Payroll': 'DRIVE_CERT_PAYROLL_ID',
+        'Sign-In Logs':      'DRIVE_SIGN_IN_LOGS_ID',
+    }
+
     needs_review_id     = os.environ.get('DRIVE_NEEDS_REVIEW_ID')
     templates_folder_id = os.environ.get('DRIVE_TEMPLATES_ID')
     scan_inbox_id       = os.environ.get('DRIVE_SCAN_INBOX_ID')
-    prod_logs_id        = os.environ.get('DRIVE_PROD_LOGS_ID')
-    cert_payroll_id     = os.environ.get('DRIVE_CERT_PAYROLL_ID')
+
+    # Start with env overrides for each watched subfolder
+    subfolder_ids: dict[str, str | None] = {
+        sub: os.environ.get(env_var)
+        for sub, env_var in SUBFOLDER_ENV.items()
+    }
 
     # Fall back to local .drive_config.json if env vars not set
     config_path = ROOT_DIR / '.drive_config.json'
@@ -634,16 +666,18 @@ def load_folder_map(service) -> tuple:
         needs_review_id     = config.get('needs_review_id')
         templates_folder_id = templates_folder_id or config.get('templates_folder_id')
         saved_folders       = config.get('folders', {})
-        prod_logs_id        = prod_logs_id    or saved_folders.get('Production Logs')
-        cert_payroll_id     = cert_payroll_id or saved_folders.get('Certified Payroll')
+        for sub in SUBFOLDER_ENV:
+            if not subfolder_ids[sub]:
+                subfolder_ids[sub] = saved_folders.get(sub)
     else:
         log("📋  Loaded folder IDs from environment variables.")
 
     # Build folder map — discover any subfolders not yet known
-    folder_map = {}
-    for sub, known_id in [('Production Logs', prod_logs_id), ('Certified Payroll', cert_payroll_id)]:
-        if known_id:
-            folder_map[sub] = known_id
+    folder_map: dict[str, str] = {}
+    for sub in WATCH_SUBFOLDERS:
+        known = subfolder_ids.get(sub)
+        if known:
+            folder_map[sub] = known
         elif needs_review_id:
             fid = find_folder(service, sub, parent_id=needs_review_id)
             if fid:
@@ -664,8 +698,7 @@ def load_folder_map(service) -> tuple:
     if not scan_inbox_id:
         log("  ⚠️   Scan Inbox not found. Set DRIVE_SCAN_INBOX_ID to enable WO parsing.")
 
-    return ({k: v for k, v in folder_map.items() if k in WATCH_SUBFOLDERS},
-            scan_inbox_id)
+    return (folder_map, scan_inbox_id)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
