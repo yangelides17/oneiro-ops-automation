@@ -1368,6 +1368,17 @@ function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) 
  * partial data behind.
  */
 function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
+  // Trim trailing empty cells before append: sheet.appendRow([..., '', ''])
+  // writes explicit empty strings which can trip a dropdown validator on
+  // those trailing cells ("Invalid Entry - Please select from the dropdown
+  // list."), whereas omitting them leaves the cells truly blank — which
+  // every validator we've seen accepts.
+  let trimLen = values.length;
+  while (trimLen > 0 && (values[trimLen - 1] === '' || values[trimLen - 1] == null)) {
+    trimLen--;
+  }
+  if (trimLen < values.length) values = values.slice(0, trimLen);
+
   try {
     sheet.appendRow(values);
     return;
@@ -1401,55 +1412,71 @@ function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
 
     // Per-cell probe didn't reproduce. That happens when appendRow validates
     // the row atomically but per-cell setValue bypasses validation (e.g.
-    // dropdown ranges applied only to specific rows, cross-cell rules).
-    // Read the validation rules on row 2 (first data row) and check each
-    // value against any list-type rule — that identifies the culprit
-    // deterministically.
-    try {
-      const probeRow   = sheet.getRange(2, 1, 1, values.length);
-      const rules      = probeRow.getDataValidations()[0];
-      for (let i = 0; i < values.length; i++) {
-        const rule = rules[i];
-        if (!rule) continue;
-        const criteriaType = rule.getCriteriaType();
-        const criteriaName = criteriaType ? String(criteriaType) : '';
-        // Covers VALUE_IN_LIST and VALUE_IN_RANGE
-        if (criteriaName.indexOf('VALUE_IN') === -1) continue;
-        const crArgs = rule.getCriteriaValues() || [];
-        let allowed = [];
-        if (criteriaName.indexOf('LIST') !== -1) {
-          allowed = Array.isArray(crArgs[0]) ? crArgs[0].map(String) : crArgs.map(String);
-        } else if (criteriaName.indexOf('RANGE') !== -1 && crArgs[0]) {
-          try {
-            allowed = crArgs[0].getValues().flat().filter(v => v !== '').map(String);
-          } catch (rangeErr) {
-            allowed = [];
-          }
+    // dropdown ranges applied to specific rows, cross-cell rules). Scan
+    // validation rules on both row 2 and the intended append row, merge
+    // them, and check every list/range rule against its incoming value.
+    const DV = SpreadsheetApp.DataValidationCriteria;
+    const mergedRules = new Array(values.length).fill(null);
+    const inspectRows = [2, targetRow, Math.max(targetRow - 1, 3)];
+    inspectRows.forEach(rowNum => {
+      if (rowNum < 2) return;
+      try {
+        const rules = sheet.getRange(rowNum, 1, 1, values.length).getDataValidations()[0];
+        for (let i = 0; i < rules.length; i++) {
+          if (!mergedRules[i] && rules[i]) mergedRules[i] = rules[i];
         }
-        const raw    = values[i];
-        const asStr  = (raw == null) ? '' : String(raw);
-        if (asStr === '') continue;  // empty usually permitted
-        if (allowed.length && allowed.indexOf(asStr) === -1) {
-          throw new Error(
-            `${sheetLabel} → "${labels[i] || 'col ' + (i + 1)}" value ` +
-            `${JSON.stringify(raw)} not in allowed list [${allowed.join(', ')}]. ` +
-            `Criteria: ${criteriaName}`
-          );
-        }
+      } catch (err) { /* ignore row read errors */ }
+    });
+
+    // Check each value against list/range rules — this is the deterministic
+    // identifier when per-cell probe can't reproduce.
+    for (let i = 0; i < mergedRules.length; i++) {
+      const rule = mergedRules[i];
+      if (!rule) continue;
+      const t       = rule.getCriteriaType();
+      const crArgs  = rule.getCriteriaValues() || [];
+      let allowed   = null;
+      if (t === DV.VALUE_IN_LIST) {
+        allowed = (Array.isArray(crArgs[0]) ? crArgs[0] : [crArgs[0]]).map(String);
+      } else if (t === DV.VALUE_IN_RANGE && crArgs[0]) {
+        try { allowed = crArgs[0].getValues().flat().filter(v => v !== '').map(String); }
+        catch (err) { allowed = null; }
       }
-    } catch (inspectErr) {
-      // Re-throw specific diagnosis; otherwise fall through to value dump.
-      if (String(inspectErr.message).indexOf(sheetLabel) === 0) throw inspectErr;
+      if (!allowed) continue;
+      const raw   = values[i];
+      const asStr = (raw == null) ? '' : String(raw);
+      if (asStr === '') continue;
+      if (allowed.indexOf(asStr) === -1) {
+        throw new Error(
+          `${sheetLabel} → "${labels[i] || 'col ' + (i + 1)}" value ` +
+          `${JSON.stringify(raw)} not in allowed list [${allowed.join(', ')}].`
+        );
+      }
     }
 
-    // Fall-through: dump all values with their labels so the caller can
-    // eyeball which one violates validation even when automated detection
-    // missed it. This is always better than a bare "Invalid Entry" message.
+    // Still couldn't isolate. Summarize what we DID find on the sheet so
+    // the next paste-back tells us which columns actually have validation
+    // (and of what type) — that narrows it down even when the rule type
+    // isn't a plain list/range dropdown.
+    const ruleSummary = mergedRules.map((r, i) => {
+      if (!r) return null;
+      const t    = r.getCriteriaType();
+      const args = r.getCriteriaValues() || [];
+      let desc   = String(t || 'UNKNOWN');
+      if (t === DV.VALUE_IN_LIST) {
+        const items = Array.isArray(args[0]) ? args[0] : [args[0]];
+        desc += ` [${items.map(String).join(',')}]`;
+      } else if (t === DV.VALUE_IN_RANGE && args[0]) {
+        try { desc += ` [range ${args[0].getA1Notation()}]`; } catch (_) {}
+      }
+      return `${labels[i]}: ${desc}`;
+    }).filter(Boolean);
+
     const summary = values
       .map((v, i) => `${labels[i] || 'col' + (i + 1)}=${JSON.stringify(v)}`)
       .join(' | ');
     throw new Error(
-      `${sheetLabel} → batch append failed (per-cell probe could not isolate). ` +
+      `${sheetLabel} → batch append failed. Rules found: {${ruleSummary.join(' ; ')}}. ` +
       `Row values: [${summary}]. Original: ${batchErr.message}`
     );
   }
@@ -1937,12 +1964,19 @@ function handleSubmitFieldReport_(body) {
   Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
 
   // ── Write Daily Sign-In Data rows (one per crew member) ──────
+  //
+  // NOTE on trailing empty columns: Admin Reviewed? (col 16) has a
+  // dropdown validator that rejects the explicit empty string appendRow
+  // writes ("Invalid Entry — Please select from the dropdown list."),
+  // but accepts a truly blank cell. We fix this by only appending the
+  // 16 data columns — Admin Reviewed? and Review Notes are left blank
+  // for the admin to fill in later.
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const signInLabels = [
     'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
     'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
     'Hours Worked', 'Overtime Hours', 'SQFT Completed', 'Paint/Material',
-    'WO Complete?', 'Issues/Notes', 'Admin Reviewed?', 'Review Notes'
+    'WO Complete?', 'Issues/Notes'
   ];
 
   d.crew.forEach((member, idx) => {
@@ -1966,9 +2000,10 @@ function handleSubmitFieldReport_(body) {
       (d.sqft_completed != null) ? d.sqft_completed : '', // 12  SQFT Completed
       (d.paint_material || '').trim(),     // 13  Paint/Material
       d.wo_complete ? 'Yes' : 'No',        // 14  WO Complete?
-      (d.issues || '').trim(),             // 15  Issues/Notes
-      '',                                  // 16  Admin Reviewed?
-      ''                                   // 17  Review Notes
+      (d.issues || '').trim()              // 15  Issues/Notes
+      // cols 16/17 (Admin Reviewed?, Review Notes) left truly blank —
+      // appendRow with '' writes a non-blank cell that trips dropdown
+      // validation; omitting them leaves the cells truly empty.
     ];
     appendRowWithProbing_(signInSheet, row, signInLabels, 'Daily Sign-In Data');
   });
