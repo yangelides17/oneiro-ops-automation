@@ -1356,35 +1356,43 @@ function writeRowWithProbing_(sheet, row, startCol, values, labels, sheetLabel) 
 
 
 /**
- * Append a row, but if it fails, probe per-column by writing to a scratch
- * row to identify which column was rejected. Leaves no scratch data behind
- * on success.
+ * Append a row, but if the batched append fails (e.g. a cell has dropdown
+ * validation that rejected the value), probe per-column by writing cells
+ * one at a time to identify which column was rejected, then re-throw with
+ * a specific message. The probe row is deleted afterwards so we leave no
+ * partial data behind.
  */
 function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
   try {
     sheet.appendRow(values);
+    return;
   } catch (batchErr) {
-    // Append an empty row to use as a scratch space for per-column probing
-    sheet.appendRow([]);
-    const probeRow = sheet.getLastRow();
+    // Probe per-column by writing to the row that appendRow *would have* filled
+    const targetRow = sheet.getLastRow() + 1;
+    let culprit = null;
     try {
       for (let i = 0; i < values.length; i++) {
         try {
-          sheet.getRange(probeRow, i + 1).setValue(values[i]);
+          sheet.getRange(targetRow, i + 1).setValue(values[i]);
         } catch (colErr) {
           const label = labels[i] || `col ${i + 1}`;
           const val   = JSON.stringify(values[i]);
-          throw new Error(
+          culprit = new Error(
             `${sheetLabel} → "${label}" rejected value ${val}. ` +
             `Cell validation: ${colErr.message}`
           );
+          break;
         }
       }
     } finally {
-      // Clean up the scratch row whether we identified the bad column or not
-      sheet.deleteRow(probeRow);
+      // Remove the probe row whether we identified the culprit or not —
+      // we don't want partial data left behind on validation failure, and
+      // we don't want a duplicate if the probe somehow succeeded.
+      if (sheet.getLastRow() >= targetRow) {
+        sheet.deleteRow(targetRow);
+      }
     }
-    throw batchErr;
+    throw culprit || batchErr;
   }
 }
 
