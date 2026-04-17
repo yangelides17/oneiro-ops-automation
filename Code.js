@@ -1398,11 +1398,59 @@ function appendRowWithProbing_(sheet, values, labels, sheetLabel) {
       }
     }
     if (culprit) throw culprit;
-    // Probe couldn't reproduce per-cell — still attach the sheet label so the
-    // caller never sees a bare "Invalid Entry" message with no context.
+
+    // Per-cell probe didn't reproduce. That happens when appendRow validates
+    // the row atomically but per-cell setValue bypasses validation (e.g.
+    // dropdown ranges applied only to specific rows, cross-cell rules).
+    // Read the validation rules on row 2 (first data row) and check each
+    // value against any list-type rule — that identifies the culprit
+    // deterministically.
+    try {
+      const probeRow   = sheet.getRange(2, 1, 1, values.length);
+      const rules      = probeRow.getDataValidations()[0];
+      for (let i = 0; i < values.length; i++) {
+        const rule = rules[i];
+        if (!rule) continue;
+        const criteriaType = rule.getCriteriaType();
+        const criteriaName = criteriaType ? String(criteriaType) : '';
+        // Covers VALUE_IN_LIST and VALUE_IN_RANGE
+        if (criteriaName.indexOf('VALUE_IN') === -1) continue;
+        const crArgs = rule.getCriteriaValues() || [];
+        let allowed = [];
+        if (criteriaName.indexOf('LIST') !== -1) {
+          allowed = Array.isArray(crArgs[0]) ? crArgs[0].map(String) : crArgs.map(String);
+        } else if (criteriaName.indexOf('RANGE') !== -1 && crArgs[0]) {
+          try {
+            allowed = crArgs[0].getValues().flat().filter(v => v !== '').map(String);
+          } catch (rangeErr) {
+            allowed = [];
+          }
+        }
+        const raw    = values[i];
+        const asStr  = (raw == null) ? '' : String(raw);
+        if (asStr === '') continue;  // empty usually permitted
+        if (allowed.length && allowed.indexOf(asStr) === -1) {
+          throw new Error(
+            `${sheetLabel} → "${labels[i] || 'col ' + (i + 1)}" value ` +
+            `${JSON.stringify(raw)} not in allowed list [${allowed.join(', ')}]. ` +
+            `Criteria: ${criteriaName}`
+          );
+        }
+      }
+    } catch (inspectErr) {
+      // Re-throw specific diagnosis; otherwise fall through to value dump.
+      if (String(inspectErr.message).indexOf(sheetLabel) === 0) throw inspectErr;
+    }
+
+    // Fall-through: dump all values with their labels so the caller can
+    // eyeball which one violates validation even when automated detection
+    // missed it. This is always better than a bare "Invalid Entry" message.
+    const summary = values
+      .map((v, i) => `${labels[i] || 'col' + (i + 1)}=${JSON.stringify(v)}`)
+      .join(' | ');
     throw new Error(
       `${sheetLabel} → batch append failed (per-cell probe could not isolate). ` +
-      `Original: ${batchErr.message}`
+      `Row values: [${summary}]. Original: ${batchErr.message}`
     );
   }
 }
