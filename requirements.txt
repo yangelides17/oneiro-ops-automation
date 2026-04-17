@@ -4,7 +4,11 @@ google-auth-httplib2>=0.1.1
 google-auth-oauthlib>=1.1.0
 
 # PDF filling
-pypdf>=3.17.0
+# NOTE: pinned to 4.3.1 — pypdf 6.10.x has a regression in
+# update_page_form_field_values that crashes with
+# "'int' object has no attribute 'encode'" when rendering
+# filled text-field appearance streams.
+pypdf==4.3.1
 # Signature overlay on Sign-In Log PDFs
 Pillow>=10.0.0
 reportlab>=4.0.0
