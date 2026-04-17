@@ -4,9 +4,11 @@ import SignaturePad from '../components/SignaturePad'
 import ConfirmModal from '../components/ConfirmModal'
 
 // ── Constants ─────────────────────────────────────────────────
-const CLASSIFICATIONS = [
-  'LP (Crew Chief)', 'Laborer', 'Driver', 'Flagger', 'Foreman', 'Equipment Operator'
-]
+// Must match the dropdown validation on the Daily Sign-In Data sheet's
+// Classification column — LP (Line Person / Crew Chief) and SAT (Stripe
+// Assistant Tech). Adding values here without updating the sheet validation
+// will cause sign-in submissions to fail with "Invalid Entry".
+const CLASSIFICATIONS = ['LP', 'SAT']
 const MARKING_TYPES = [
   'Crosswalk', 'Stop Bar', 'Lane Line', 'Center Line', 'Double Yellow',
   'No Passing Zone', 'Arrow – Straight', 'Arrow – Left', 'Arrow – Right',

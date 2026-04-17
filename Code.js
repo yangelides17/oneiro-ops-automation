@@ -2025,7 +2025,9 @@ function handleGetDashboardData_() {
  *   data      — base64-encoded file bytes
  */
 function handleUploadPhoto_(body) {
-  const { wo_id, filename, mime_type, data } = body;
+  // Express proxy wraps the payload under body.data
+  const d = body.data || {};
+  const { wo_id, filename, mime_type, data } = d;
   if (!wo_id || !filename || !data) {
     return jsonResponse_({ error: 'Missing required fields: wo_id, filename, data' }, 400);
   }
@@ -2058,7 +2060,9 @@ function handleUploadPhoto_(body) {
  *   data         — base64-encoded PNG
  */
 function handleUploadSignature_(body) {
-  const { wo_id, crew_name, signature, work_date, data } = body;
+  // Express proxy wraps the payload under body.data
+  const d = body.data || {};
+  const { wo_id, crew_name, signature, work_date, data } = d;
   if (!wo_id || !crew_name || !data) {
     return jsonResponse_({ error: 'Missing required fields: wo_id, crew_name, data' }, 400);
   }
