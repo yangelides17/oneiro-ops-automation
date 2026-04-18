@@ -1728,6 +1728,8 @@ function doPost(e) {
       return handleUploadPhoto_(body);
     } else if (action === 'upload_signature') {
       return handleUploadSignature_(body);
+    } else if (action === 'get_marking_items') {
+      return handleGetMarkingItems_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -1871,6 +1873,14 @@ function handleWriteWO_(body) {
   Logger.log('✅ WO added to tracker: ' + d.work_order_id
              + (contractIdMissing ? ' (Contract ID not found in lookup)' : ''));
 
+  // ── Seed Marking Items ────────────────────────────────────────
+  // The parser hands us d.top_markings and d.intersection_grid — expand
+  // them into per-crosswalk / per-direction rows so the Field Report UI
+  // can load them later and the crew enters SF per item. No-op if the
+  // Marking Items sheet doesn't exist (i.e. setupMarkingItems not run).
+  const seededCount = seedMarkingItems_(ss, d);
+  Logger.log(`   📋 Seeded ${seededCount} Marking Items for ${d.work_order_id}`);
+
   // ── Archive the source PDF ────────────────────────────────────
   if (fileId) archiveWOFile_(fileId, d);
 
@@ -1936,6 +1946,375 @@ function jsonResponse_(obj, statusCode) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// MARKING ITEMS — seed on scan, read for field report
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Expand a Stop Msg / Stop Line cell value into a list of single-letter
+ * directions. Handles:
+ *   - Full English words: "North"/"East"/"South"/"West" → ["N"|"E"|"S"|"W"]
+ *   - Letter strings:     "EW" → ["E","W"]; "NSEW" → ["N","S","E","W"]
+ *   - Mixed/malformed:    filters to just N/S/E/W chars and de-dupes.
+ * Returns [] for empty input.
+ */
+function expandDirLetters_(val) {
+  const s = String(val || '').trim();
+  if (!s) return [];
+  const FULL_WORD = { 'NORTH': 'N', 'EAST': 'E', 'SOUTH': 'S', 'WEST': 'W' };
+  const upper = s.toUpperCase();
+  if (FULL_WORD[upper]) return [FULL_WORD[upper]];
+  // Treat as concatenated letters. Dedupe while preserving order.
+  const seen = {};
+  const out  = [];
+  upper.split('').forEach(c => {
+    if ('NSEW'.indexOf(c) === -1) return;
+    if (seen[c]) return;
+    seen[c] = true;
+    out.push(c);
+  });
+  return out;
+}
+
+
+/**
+ * Expand parsed WO top_markings + intersection_grid arrays into rows on
+ * the Marking Items sheet. Called from handleWriteWO_ after the Tracker
+ * row is appended.
+ *
+ * Row schema (17 cols) — set up by setupMarkingItems():
+ *   A Item ID  B Work Order #  C Work Type  D Section  E Sort Order
+ *   F Category  G Intersection  H Direction  I Description
+ *   J Planned  K Unit  L Quantity Completed  M Color/Material
+ *   N Date Completed  O Status  P Added By  Q Notes
+ *
+ * Expansion rules (per user requirement: one row per discrete marking):
+ *   - Top Table: one row per non-empty {category, description}
+ *   - Intersection Grid HVX columns (N/E/S/W): each non-empty cell = 1 row
+ *   - Stop Msg / Stop Lines: split into multiple rows via expandDirLetters_
+ *     ("EW" → 2 rows, "NSEW" → 4 rows, "West" → 1 row)
+ *
+ * @returns number of rows inserted (0 if nothing to seed or sheet missing).
+ */
+function seedMarkingItems_(ss, d) {
+  const topMarkings = d.top_markings       || [];
+  const grid        = d.intersection_grid  || [];
+  if (topMarkings.length === 0 && grid.length === 0) return 0;
+
+  const markingSheet = ss.getSheetByName('Marking Items');
+  if (!markingSheet) {
+    Logger.log('⚠️ Marking Items sheet not found — skip seeding. ' +
+               'Run setupMarkingItems() from the menu first.');
+    return 0;
+  }
+
+  const woId     = d.work_order_id;
+  const workType = d.work_type || '';
+  const pad3     = (x) => String(x).padStart(3, '0');
+  const rows     = [];
+  let n = 1;
+
+  // ── Top Table items ───────────────────────────────────────────
+  topMarkings.forEach((m, i) => {
+    if (!m || !m.category || !m.description) return;
+    rows.push([
+      `${woId}-${pad3(n++)}`,        // A  Item ID
+      woId,                           // B  Work Order #
+      workType,                       // C  Work Type
+      'Top Table',                    // D  Section
+      100 + i * 10,                   // E  Sort Order
+      String(m.category).trim(),      // F  Category
+      '',                             // G  Intersection
+      '',                             // H  Direction
+      String(m.description).trim(),   // I  Description
+      '',                             // J  Planned
+      'SF',                           // K  Unit
+      '',                             // L  Quantity Completed
+      '',                             // M  Color/Material
+      '',                             // N  Date Completed
+      'Pending',                      // O  Status
+      'Scanner',                      // P  Added By
+      ''                              // Q  Notes
+    ]);
+  });
+
+  // ── Intersection Grid items ───────────────────────────────────
+  const DIR_ORDER = ['n', 'e', 's', 'w', 'stop_msg', 'stop_lines'];
+  grid.forEach((ig, interIdx) => {
+    if (!ig || !ig.intersection) return;
+    DIR_ORDER.forEach((key, dirIdx) => {
+      const raw = String(ig[key] || '').trim();
+      if (!raw) return;
+
+      let category, directions;
+      if (key === 'stop_msg') {
+        category   = 'Stop Msg';
+        directions = expandDirLetters_(raw);
+      } else if (key === 'stop_lines') {
+        category   = 'Stop Line';
+        directions = expandDirLetters_(raw);
+      } else {
+        category   = 'HVX Crosswalk';
+        directions = [key.toUpperCase()];   // n→N, e→E, etc.
+      }
+
+      directions.forEach((dir, subIdx) => {
+        rows.push([
+          `${woId}-${pad3(n++)}`,
+          woId,
+          workType,
+          'Intersection Grid',
+          1000 + interIdx * 100 + dirIdx * 10 + subIdx,
+          category,
+          String(ig.intersection).trim(),
+          dir,
+          '',          // Description (blank for grid items)
+          raw,         // Planned = raw WO value ("HVX", "EW", "West")
+          'SF',
+          '',
+          '',
+          '',
+          'Pending',
+          'Scanner',
+          ''
+        ]);
+      });
+    });
+  });
+
+  if (rows.length === 0) return 0;
+
+  // Write all rows at once via setValues (never appendRow — see memory
+  // feedback_apps_script_appendrow_empty.md). Flush forces any deferred
+  // validation error to fire here instead of at the next sheet read.
+  const startRow = markingSheet.getLastRow() + 1;
+  markingSheet
+    .getRange(startRow, 1, rows.length, rows[0].length)
+    .setValues(rows);
+  SpreadsheetApp.flush();
+
+  return rows.length;
+}
+
+
+/**
+ * Apply completion updates to existing Marking Items rows. Writes cols
+ * L (Quantity), M (Color/Material), N (Date Completed), O (Status),
+ * Q (Notes) per item. Zero/blank quantity → Status = Pending (so a
+ * user can un-mark a row by clearing the number).
+ *
+ * @returns {number} rows actually touched (missing item_ids are skipped).
+ */
+function applyMarkingUpdates_(ss, updates, dateOfWork) {
+  if (!updates || updates.length === 0) return 0;
+
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) throw new Error('Marking Items sheet missing — run setupMarkingItems() first');
+
+  const data = sheet.getDataRange().getValues();
+  const idxById = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][0] || '').trim();
+    if (id) idxById[id] = i + 1;  // 1-indexed sheet row
+  }
+
+  let updated = 0;
+  updates.forEach(u => {
+    const rowNum = idxById[u.item_id];
+    if (!rowNum) {
+      Logger.log(`⚠️ Marking Item ${u.item_id} not found — skipping update`);
+      return;
+    }
+    const qty    = parseFloat(u.quantity);
+    const hasQty = !isNaN(qty) && qty > 0;
+
+    sheet.getRange(rowNum, 12).setValue(hasQty ? qty : '');
+    sheet.getRange(rowNum, 13).setValue(String(u.color_material || '').trim());
+    sheet.getRange(rowNum, 14).setValue(hasQty ? dateOfWork : '');
+    sheet.getRange(rowNum, 15).setValue(hasQty ? 'Completed' : 'Pending');
+    if (u.notes !== undefined) {
+      sheet.getRange(rowNum, 17).setValue(String(u.notes || '').trim());
+    }
+    updated++;
+  });
+
+  SpreadsheetApp.flush();  // surface deferred validation errors in-place
+  return updated;
+}
+
+
+/**
+ * Append manually-added Marking Items rows (items the WO scan didn't
+ * cover, or corrections the crew added in the field).
+ *
+ * @returns {number} rows appended.
+ */
+function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
+  if (!newItems || newItems.length === 0) return 0;
+
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) throw new Error('Marking Items sheet missing — run setupMarkingItems() first');
+
+  // Find the highest item number already used for this WO so the new
+  // IDs continue the sequence.
+  const data = sheet.getDataRange().getValues();
+  let maxN = 0;
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][0] || '');
+    if (id.indexOf(woId + '-') === 0) {
+      const n = parseInt(id.split('-').pop(), 10);
+      if (!isNaN(n) && n > maxN) maxN = n;
+    }
+  }
+
+  const pad3 = (x) => String(x).padStart(3, '0');
+  const rows = newItems.map((item, idx) => {
+    const qty    = parseFloat(item.quantity);
+    const hasQty = !isNaN(qty) && qty > 0;
+    return [
+      `${woId}-${pad3(maxN + idx + 1)}`,           // A Item ID
+      woId,                                         // B Work Order #
+      workType,                                     // C Work Type
+      'Manual',                                     // D Section
+      9000 + idx,                                   // E Sort Order
+      String(item.category || '').trim(),           // F Category
+      String(item.intersection || '').trim(),       // G Intersection
+      String(item.direction || '').trim(),          // H Direction
+      String(item.description || '').trim(),        // I Description
+      '',                                           // J Planned
+      String(item.unit || 'SF').trim(),             // K Unit
+      hasQty ? qty : '',                            // L Quantity
+      String(item.color_material || '').trim(),     // M Color/Material
+      hasQty ? dateOfWork : '',                     // N Date Completed
+      hasQty ? 'Completed' : 'Pending',             // O Status
+      'Manual',                                     // P Added By
+      ''                                            // Q Notes
+    ];
+  });
+
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+  SpreadsheetApp.flush();
+  return rows.length;
+}
+
+
+/**
+ * Recompute WO Tracker cols 19-21 rollups from the Marking Items sheet.
+ *
+ * MMA:    marking_types = distinct Category joined by ", "
+ *         paint_material = distinct Color/Material joined by ", "
+ *         sqft_completed = SUM(Quantity WHERE Unit = 'SF')
+ *
+ * Thermo: marking_types = "N/A"     (too many categories to rollup)
+ *         paint_material = "N/A"    (Thermo doesn't record material)
+ *         sqft_completed = SUM(Quantity WHERE Unit = 'SF')
+ *
+ * Only COMPLETED items contribute to marking_types / paint_material.
+ * SQFT includes all items with a quantity (regardless of status) so the
+ * tracker reflects what's been measured even if status is still Pending.
+ */
+function computeMarkingRollups_(ss, woId) {
+  const blank = { marking_types: '', sqft_completed: '', paint_material: '' };
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return blank;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return blank;
+
+  const woItems = data.slice(1).filter(r => String(r[1] || '').trim() === woId);
+  if (woItems.length === 0) return blank;
+
+  const anyThermo = woItems.some(r => String(r[2] || '').toLowerCase() === 'thermo');
+
+  let sqftSum = 0;
+  let hasQty  = false;
+  woItems.forEach(r => {
+    const unit = String(r[10] || '').toUpperCase();
+    if (unit !== 'SF') return;
+    const qty = parseFloat(r[11]);
+    if (isNaN(qty) || qty <= 0) return;
+    sqftSum += qty;
+    hasQty = true;
+  });
+
+  if (anyThermo) {
+    return {
+      marking_types:  'N/A',
+      sqft_completed: hasQty ? sqftSum : '',
+      paint_material: 'N/A',
+    };
+  }
+
+  const cats = {}, mats = {};
+  woItems.forEach(r => {
+    const status = String(r[14] || '').toLowerCase();
+    if (status !== 'completed') return;
+    const cat = String(r[5]  || '').trim();
+    const mat = String(r[12] || '').trim();
+    if (cat) cats[cat] = true;
+    if (mat && mat.toLowerCase() !== 'n/a') mats[mat] = true;
+  });
+
+  return {
+    marking_types:  Object.keys(cats).sort().join(', '),
+    sqft_completed: hasQty ? sqftSum : '',
+    paint_material: Object.keys(mats).sort().join(', '),
+  };
+}
+
+
+/**
+ * HTTP handler: return all Marking Items rows for a given WO, ordered
+ * by Sort Order. The Field Report UI calls this on WO selection to
+ * pre-populate its per-item SF input list.
+ *
+ * body: { action: 'get_marking_items', key, wo_id }
+ * response: { items: [...] }
+ */
+function handleGetMarkingItems_(body) {
+  // Express proxy wraps args under `data`; fall back to top-level for
+  // direct callers.
+  const payload = body.data || body;
+  const woId = String(payload.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return jsonResponse_({ items: [] });
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return jsonResponse_({ items: [] });
+
+  const items = data.slice(1)
+    .filter(r => String(r[1] || '').trim() === woId)   // col B = Work Order #
+    .map(r => ({
+      item_id:        String(r[0]  || ''),
+      work_order_id:  String(r[1]  || ''),
+      work_type:      String(r[2]  || ''),
+      section:        String(r[3]  || ''),
+      sort_order:     Number(r[4]) || 0,
+      category:       String(r[5]  || ''),
+      intersection:   String(r[6]  || ''),
+      direction:      String(r[7]  || ''),
+      description:    String(r[8]  || ''),
+      planned:        String(r[9]  || ''),
+      unit:           String(r[10] || ''),
+      quantity:       r[11] === '' || r[11] == null ? null : Number(r[11]),
+      color_material: String(r[12] || ''),
+      date_completed: r[13] instanceof Date
+                         ? Utilities.formatDate(r[13], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+                         : String(r[13] || ''),
+      status:         String(r[14] || ''),
+      added_by:       String(r[15] || ''),
+      notes:          String(r[16] || '')
+    }))
+    .sort((a, b) => a.sort_order - b.sort_order);
+
+  return jsonResponse_({ items });
 }
 
 
@@ -2110,23 +2489,37 @@ function handleSubmitFieldReport_(body) {
   const newPhotos = (d.photos_uploaded || String(woRow[23]).toLowerCase() === 'yes')
     ? 'Yes' : 'No';
 
-  // Use submitted marking types; fall back to existing if not provided
-  const newMarkings = (d.marking_types && d.marking_types.trim())
-    ? d.marking_types.trim()
-    : String(woRow[19] || '');
+  // ── Process Marking Items first ───────────────────────────────
+  // (1) Update existing items with quantity/material/status/date.
+  // (2) Append manually-added items.
+  // (3) Recompute WO Tracker cols 19-21 from the resulting sheet state
+  //     so the tracker's rollup reflects what was just written.
+  step = 'marking updates';
+  const nUpdated = applyMarkingUpdates_(ss, d.marking_updates || [], d.date);
+
+  step = 'marking new';
+  const workTypeHint = String(d.work_type || '').trim();  // UI may pass this; else blank
+  const nNew = applyMarkingNew_(ss, d.wo_id, workTypeHint, d.marking_new || [], d.date);
+
+  step = 'marking rollup';
+  const rollups = computeMarkingRollups_(ss, d.wo_id);
+  Logger.log(`✅ Marking Items: ${nUpdated} updated, ${nNew} added; ` +
+             `rollup → types=${JSON.stringify(rollups.marking_types)}, ` +
+             `sqft=${rollups.sqft_completed}, ` +
+             `material=${JSON.stringify(rollups.paint_material)}`);
 
   // ── Write WO Tracker cols 15–23 (0-indexed) ──────────────────
   // Col 15 (0-indexed) = col 16 (1-indexed); 9 columns → cols 16–24 (1-indexed)
   const woValues = [
-    newStatus,                                                        // col 15: Status
-    newDispatch,                                                      // col 16: Dispatch Date
-    newWorkStart,                                                     // col 17: Work Start Date
-    newWorkEnd,                                                       // col 18: Work End Date
-    newMarkings,                                                      // col 19: Marking Types
-    (d.sqft_completed != null) ? d.sqft_completed : (woRow[20] || ''),// col 20: SQFT
-    (d.paint_material  || String(woRow[21] || '')).trim(),            // col 21: Paint/Material
-    newIssues,                                                        // col 22: Issues Reported
-    newPhotos                                                         // col 23: Photos Uploaded?
+    newStatus,                          // col 15: Status
+    newDispatch,                        // col 16: Dispatch Date
+    newWorkStart,                       // col 17: Work Start Date
+    newWorkEnd,                         // col 18: Work End Date
+    rollups.marking_types,              // col 19: Marking Types (rollup)
+    rollups.sqft_completed,             // col 20: SQFT Completed (rollup)
+    rollups.paint_material,             // col 21: Paint/Material Used (rollup)
+    newIssues,                          // col 22: Issues Reported
+    newPhotos                           // col 23: Photos Uploaded?
   ];
   const woLabels = [
     'Status', 'Dispatch Date', 'Work Start Date', 'Work End Date',
@@ -2139,19 +2532,15 @@ function handleSubmitFieldReport_(body) {
   Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
 
   // ── Write Daily Sign-In Data rows (one per crew member) ──────
-  //
-  // NOTE on trailing empty columns: Admin Reviewed? (col 16) has a
-  // dropdown validator that rejects the explicit empty string appendRow
-  // writes ("Invalid Entry — Please select from the dropdown list."),
-  // but accepts a truly blank cell. We fix this by only appending the
-  // 16 data columns — Admin Reviewed? and Review Notes are left blank
-  // for the admin to fill in later.
+  // New 14-col schema (cols 12-13 = Admin Reviewed? / Review Notes, filled
+  // later by admin — we leave them truly blank). WO-level fields that used
+  // to live here (SQFT, Paint/Material, WO Complete?, Issues/Notes) moved
+  // to Marking Items rollups + WO Tracker cols 19-22.
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const signInLabels = [
     'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
     'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
-    'Hours Worked', 'Overtime Hours', 'SQFT Completed', 'Paint/Material',
-    'WO Complete?', 'Issues/Notes'
+    'Hours Worked', 'Overtime Hours'
   ];
 
   d.crew.forEach((member, idx) => {
@@ -2171,14 +2560,10 @@ function handleSubmitFieldReport_(body) {
       String(member.time_in  || ''),       //  8  Time In
       String(member.time_out || ''),       //  9  Time Out
       hours,                               // 10  Hours Worked
-      overtime,                            // 11  Overtime Hours
-      (d.sqft_completed != null) ? d.sqft_completed : '', // 12  SQFT Completed
-      (d.paint_material || '').trim(),     // 13  Paint/Material
-      d.wo_complete ? 'Yes' : 'No',        // 14  WO Complete?
-      (d.issues || '').trim()              // 15  Issues/Notes
-      // cols 16/17 (Admin Reviewed?, Review Notes) left truly blank —
-      // appendRow with '' writes a non-blank cell that trips dropdown
-      // validation; omitting them leaves the cells truly empty.
+      overtime                             // 11  Overtime Hours
+      // cols 12 (Admin Reviewed?) and 13 (Review Notes) omitted so the
+      // cells stay truly blank — the dropdown validator rejects an
+      // explicit '' but accepts a truly empty cell.
     ];
     appendRowWithProbing_(signInSheet, row, signInLabels, 'Daily Sign-In Data');
   });

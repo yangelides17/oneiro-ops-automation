@@ -99,6 +99,23 @@ app.get('/api/dashboard', async (_req, res) => {
 })
 
 /**
+ * GET /api/wo-markings/:woId
+ * Returns the Marking Items rows pre-populated for this WO (from the
+ * scan) plus any completions that have already been written. The Field
+ * Report UI uses this to render the list of items the crew needs to
+ * measure on-site.
+ */
+app.get('/api/wo-markings/:woId', async (req, res) => {
+  try {
+    const data = await callAppsScript('get_marking_items', { wo_id: req.params.woId })
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/wo-markings error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/field-report
  * Submits a crew field report (writes to Daily Sign-In Data + WO Tracker).
  * Body: the field report data object (see Apps Script handleSubmitFieldReport_)

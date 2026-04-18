@@ -9,13 +9,36 @@ import ConfirmModal from '../components/ConfirmModal'
 // Assistant Tech). Adding values here without updating the sheet validation
 // will cause sign-in submissions to fail with "Invalid Entry".
 const CLASSIFICATIONS = ['LP', 'SAT']
-const MARKING_TYPES = [
-  'Crosswalk', 'Stop Bar', 'Lane Line', 'Center Line', 'Double Yellow',
-  'No Passing Zone', 'Arrow – Straight', 'Arrow – Left', 'Arrow – Right',
-  'Arrow – U-Turn', 'Combined Arrow', 'Bike Lane', 'Bus Lane',
-  'Pedestrian Space', 'Yield Line', 'Yield to Pedestrians', 'School (SCHOOL)',
-  'Railroad Crossing', 'Parking Space', 'Curb Marking', 'Other'
+
+// Canonical marking categories for the "Add marking manually" dropdown.
+// Mirrors the list in Apps Script setupMarkingItems() / Marking Items col F.
+const MARKING_CATEGORIES = [
+  // WO Top Table
+  'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
+  'Solid Lines', 'Rail Road X/Diamond', 'Others',
+  // Intersection Grid
+  'HVX Crosswalk', 'Stop Msg', 'Stop Line',
+  // Page 2 detailed lines
+  '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
+  // Page 2 messages
+  'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
+  // Page 2 railroad
+  'Railroad (RR)', 'Railroad (X)',
+  // Page 2 arrows
+  'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
+  // Page 2 misc
+  'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
+  // Page 2 bike lane
+  'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
+  // MMA
+  'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
 ]
+
+const SECTION_HEADERS = {
+  'Top Table':          'WO Top Table',
+  'Intersection Grid':  'Intersection Grid',
+  'Manual':             'Manually Added',
+}
 
 // ── Helpers ───────────────────────────────────────────────────
 const isoToday = () => {
@@ -36,8 +59,23 @@ const calcHours = (tin, tout) => {
   const hrs = mins / 60
   return { hours: hrs.toFixed(2), overtime: Math.max(0, hrs-8).toFixed(2) }
 }
-const newCrew    = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
-const newMarking = () => ({ type:MARKING_TYPES[0], qty:'', unit:'SF' })
+const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
+const newManualMarking = () => ({
+  category: MARKING_CATEGORIES[0], description: '', intersection: '', direction: '',
+  unit: 'SF', quantity: '', color_material: ''
+})
+
+// Human label for a marking item — e.g. "Double Yellow Line  •  RECAP FROM HAMILTON PL TO 2ND AV"
+// or "2 AV — East HVX" for grid entries.
+function itemLabel(item) {
+  if (item.section === 'Intersection Grid' && item.intersection) {
+    const dirFull = { N: 'North', E: 'East', S: 'South', W: 'West' }[item.direction] || item.direction
+    return `${item.intersection} — ${dirFull} ${item.category}`
+  }
+  return item.description
+    ? `${item.category} · ${item.description}`
+    : item.category
+}
 
 // ── Field wrapper ─────────────────────────────────────────────
 function Field({ label, required, hint, children }) {
@@ -65,20 +103,86 @@ function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
   )
 }
 
-// ── Marking row ───────────────────────────────────────────────
-function MarkingRow({ idx, data, onChange, onRemove }) {
+// ── Planned marking row (pre-populated from WO scan) ──────────
+// Read-only label + editable qty/material. Thermo items hide material.
+function MarkingItemRow({ item, onChange }) {
+  const isThermo = String(item.work_type || '').toLowerCase() === 'thermo'
   return (
-    <div className="grid grid-cols-[1fr_72px_60px_32px] gap-1.5 items-center">
-      <select value={data.type} onChange={e=>onChange(idx,'type',e.target.value)} className="field-input text-sm py-2">
-        {MARKING_TYPES.map(t=><option key={t}>{t}</option>)}
-      </select>
-      <input type="number" min="0" placeholder="Qty" value={data.qty}
-        onChange={e=>onChange(idx,'qty',e.target.value)} className="field-input text-sm py-2 text-center" />
-      <select value={data.unit} onChange={e=>onChange(idx,'unit',e.target.value)} className="field-input text-sm py-2">
-        {['SF','LF','EA'].map(u=><option key={u}>{u}</option>)}
-      </select>
-      <button type="button" onClick={()=>onRemove(idx)}
-        className="text-red-400 hover:text-red-600 text-xl font-light h-9 flex items-center justify-center">×</button>
+    <div className="border border-slate-200 rounded-lg p-2.5 bg-white space-y-2">
+      <div className="flex items-baseline gap-2">
+        <span className="flex-1 text-sm font-semibold text-navy leading-tight break-words">
+          {itemLabel(item)}
+        </span>
+        {item.planned && (
+          <span className="text-[10px] font-mono uppercase tracking-wide text-slate-400 shrink-0">
+            planned: {item.planned}
+          </span>
+        )}
+      </div>
+      <div className={`grid gap-2 items-center ${isThermo ? 'grid-cols-[60px_1fr]' : 'grid-cols-[60px_60px_1fr]'}`}>
+        <input
+          type="number" min="0" inputMode="numeric" placeholder={item.unit || 'SF'}
+          value={item.quantity ?? ''}
+          onChange={e => onChange(item.item_id, { quantity: e.target.value, _dirty: true })}
+          className="field-input text-sm py-2 text-center" />
+        <select
+          value={item.unit || 'SF'}
+          onChange={e => onChange(item.item_id, { unit: e.target.value, _dirty: true })}
+          className="field-input text-sm py-2">
+          {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
+        </select>
+        {!isThermo && (
+          <input
+            type="text" placeholder="Color / Material (e.g. White Thermo)"
+            value={item.color_material ?? ''}
+            onChange={e => onChange(item.item_id, { color_material: e.target.value, _dirty: true })}
+            className="field-input text-sm py-2" />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Manual marking row (not from WO scan) ──────────────────────
+function ManualMarkingRow({ idx, data, onChange, onRemove }) {
+  return (
+    <div className="border border-amber-200 rounded-lg p-2.5 bg-amber-50/50 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700">Manual entry</span>
+        <button type="button" onClick={() => onRemove(idx)}
+          className="text-red-400 hover:text-red-600 text-xl leading-none h-6 w-6 flex items-center justify-center">×</button>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <select value={data.category} onChange={e => onChange(idx, { category: e.target.value })}
+          className="field-input text-sm py-2">
+          {MARKING_CATEGORIES.map(c => <option key={c}>{c}</option>)}
+        </select>
+        <input type="text" placeholder="Description (optional)"
+          value={data.description} onChange={e => onChange(idx, { description: e.target.value })}
+          className="field-input text-sm py-2" />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <input type="text" placeholder="Intersection (optional)"
+          value={data.intersection} onChange={e => onChange(idx, { intersection: e.target.value })}
+          className="field-input text-sm py-2" />
+        <select value={data.direction} onChange={e => onChange(idx, { direction: e.target.value })}
+          className="field-input text-sm py-2">
+          <option value="">No direction</option>
+          {['N','E','S','W'].map(d => <option key={d}>{d}</option>)}
+        </select>
+      </div>
+      <div className="grid grid-cols-[60px_60px_1fr] gap-2">
+        <input type="number" min="0" inputMode="numeric" placeholder="Qty"
+          value={data.quantity} onChange={e => onChange(idx, { quantity: e.target.value })}
+          className="field-input text-sm py-2 text-center" />
+        <select value={data.unit} onChange={e => onChange(idx, { unit: e.target.value })}
+          className="field-input text-sm py-2">
+          {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
+        </select>
+        <input type="text" placeholder="Color / Material (leave blank for Thermo)"
+          value={data.color_material} onChange={e => onChange(idx, { color_material: e.target.value })}
+          className="field-input text-sm py-2" />
+      </div>
     </div>
   )
 }
@@ -248,9 +352,9 @@ export default function FieldReport() {
   // Form fields
   const [selectedWOId,  setSelectedWOId]  = useState('')
   const [workDate,      setWorkDate]       = useState(isoToday())
-  const [markingRows,   setMarkingRows]    = useState([newMarking()])
-  const [sqft,          setSqft]           = useState('')
-  const [paintMaterial, setPaintMaterial]  = useState('')
+  const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wo-markings/:woId
+  const [newMarkings,   setNewMarkings]    = useState([])   // manually added this session
+  const [markingsLoading, setMarkingsLoading] = useState(false)
   const [issues,        setIssues]         = useState('')
   const [crewMembers,   setCrewMembers]    = useState([newCrew()])
   const [woComplete,    setWoComplete]     = useState('no')
@@ -274,19 +378,61 @@ export default function FieldReport() {
       .finally(()=>setLoading(false))
   }, [])
 
-  // Marking rows
-  const updateMarking = (i,f,v) => setMarkingRows(r=>r.map((x,j)=>j===i?{...x,[f]:v}:x))
-  const addMarking    = () => setMarkingRows(r=>[...r,newMarking()])
-  const removeMarking = (i) => setMarkingRows(r=>r.filter((_,j)=>j!==i))
+  // Load pre-populated marking items from the WO scan whenever the
+  // selected WO changes. Reset any in-progress manual additions too.
+  useEffect(() => {
+    if (!selectedWOId) {
+      setMarkingItems([])
+      setNewMarkings([])
+      return
+    }
+    setMarkingsLoading(true)
+    fetch(`/api/wo-markings/${encodeURIComponent(selectedWOId)}`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) throw new Error(d.error)
+        // Sort by sort_order so the list reads top-to-bottom against the paper WO.
+        const items = (d.items || []).slice().sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
+        setMarkingItems(items)
+        setNewMarkings([])
+      })
+      .catch(e => {
+        console.error('Failed to load marking items:', e)
+        setMarkingItems([])
+      })
+      .finally(() => setMarkingsLoading(false))
+  }, [selectedWOId])
+
+  // Planned marking updates — in-place edits, with a _dirty flag so we
+  // only send touched rows back.
+  const updateMarkingItem = (itemId, patch) =>
+    setMarkingItems(list => list.map(it => it.item_id === itemId ? { ...it, ...patch } : it))
+
+  // Manual markings
+  const addManualMarking = () => setNewMarkings(list => [...list, newManualMarking()])
+  const updateManualMarking = (idx, patch) =>
+    setNewMarkings(list => list.map((x, j) => j === idx ? { ...x, ...patch } : x))
+  const removeManualMarking = (idx) =>
+    setNewMarkings(list => list.filter((_, j) => j !== idx))
 
   // Crew rows
   const updateCrew = (i, updated) => setCrewMembers(l=>l.map((m,j)=>j===i?updated:m))
   const addCrew    = () => setCrewMembers(l=>[...l,newCrew()])
   const removeCrew = (i) => setCrewMembers(l=>l.filter((_,j)=>j!==i))
 
-  const markingTypesStr = markingRows
-    .filter(r=>r.qty && parseFloat(r.qty)>0)
-    .map(r=>`${r.type}: ${r.qty} ${r.unit}`).join(', ')
+  // Group planned items by section for rendering (Top Table → Grid → other)
+  const itemsBySection = markingItems.reduce((acc, it) => {
+    const sec = it.section || 'Other'
+    ;(acc[sec] = acc[sec] || []).push(it)
+    return acc
+  }, {})
+  const SECTION_ORDER = ['Top Table', 'Intersection Grid', 'Manual', 'Other']
+
+  // Infer WO work type from any loaded planned item (Thermo beats MMA if
+  // mixed). Falls back to blank if no items are loaded yet.
+  const inferredWorkType = markingItems.some(i => String(i.work_type).toLowerCase() === 'thermo')
+    ? 'Thermo'
+    : markingItems.some(i => String(i.work_type).toLowerCase() === 'mma') ? 'MMA' : ''
 
   // ── Core submit (called after all guards pass) ────────────
   async function doSubmit() {
@@ -313,6 +459,29 @@ export default function FieldReport() {
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
     try {
+      // Only send touched planned items. "Dirty" = user edited qty/unit/material.
+      const markingUpdates = markingItems
+        .filter(i => i._dirty)
+        .map(i => ({
+          item_id:        i.item_id,
+          quantity:       i.quantity === '' || i.quantity == null ? null : parseFloat(i.quantity),
+          color_material: (i.color_material || '').trim(),
+          unit:           i.unit || 'SF',
+        }))
+
+      // All manual adds that have at least a category are included.
+      const markingNew = newMarkings
+        .filter(n => (n.category || '').trim())
+        .map(n => ({
+          category:       (n.category || '').trim(),
+          description:    (n.description || '').trim(),
+          intersection:   (n.intersection || '').trim(),
+          direction:      (n.direction || '').trim(),
+          unit:           n.unit || 'SF',
+          quantity:       n.quantity === '' || n.quantity == null ? null : parseFloat(n.quantity),
+          color_material: (n.color_material || '').trim(),
+        }))
+
       const res = await fetch('/api/field-report', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -320,9 +489,9 @@ export default function FieldReport() {
           wo_id:       selectedWOId,
           date:        workDate,
           wo_complete: woComplete==='yes',
-          marking_types:   markingTypesStr,
-          sqft_completed:  sqft!=='' ? parseFloat(sqft) : null,
-          paint_material:  paintMaterial.trim(),
+          work_type:   inferredWorkType,
+          marking_updates: markingUpdates,
+          marking_new:     markingNew,
           issues:          issues.trim(),
           photos_uploaded: photosUploaded,
           crew: validCrew.map(m=>({
@@ -376,7 +545,7 @@ export default function FieldReport() {
   // ── Reset ─────────────────────────────────────────────────
   function reset() {
     setSubmitted(null); setSelectedWOId(''); setWorkDate(isoToday())
-    setMarkingRows([newMarking()]); setSqft(''); setPaintMaterial(''); setIssues('')
+    setMarkingItems([]); setNewMarkings([]); setIssues('')
     setCrewMembers([newCrew()]); setWoComplete('no'); setPhotoFiles([]); setFormError('')
     setCrewLeaderName(''); setCrewLeaderSignature(null)
   }
@@ -469,28 +638,70 @@ export default function FieldReport() {
           <Field label="Date of Work" required>
             <input type="date" value={workDate} onChange={e=>setWorkDate(e.target.value)} className="field-input" />
           </Field>
+
+          {/* ── Marking Items ─────────────────────────────────── */}
           <div className="space-y-2">
-            <label className="field-label">Marking Types Completed</label>
-            <div className="space-y-1.5">
-              {markingRows.map((row,i)=>(
-                <MarkingRow key={i} idx={i} data={row} onChange={updateMarking} onRemove={removeMarking} />
-              ))}
+            <div className="flex items-baseline justify-between">
+              <label className="field-label">Marking Items</label>
+              {inferredWorkType && (
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {inferredWorkType}
+                </span>
+              )}
             </div>
-            <button type="button" onClick={addMarking} className="btn-ghost text-xs">+ Add Marking Type</button>
-            {markingTypesStr && (
-              <p className="text-[11px] text-slate-400 bg-slate-50 rounded-lg px-2 py-1.5 font-mono">{markingTypesStr}</p>
+
+            {!selectedWOId && (
+              <p className="text-xs text-slate-400 italic">
+                Select a Work Order above to see its marking items.
+              </p>
+            )}
+
+            {selectedWOId && markingsLoading && (
+              <p className="text-xs text-slate-400 italic">Loading marking items…</p>
+            )}
+
+            {selectedWOId && !markingsLoading && markingItems.length === 0 && newMarkings.length === 0 && (
+              <p className="text-xs text-slate-400 italic bg-slate-50 rounded-lg px-3 py-2">
+                No items pre-populated from the scan. Use "Add marking manually" below to log what was done.
+              </p>
+            )}
+
+            {/* Planned items, grouped by section */}
+            {SECTION_ORDER.map(sec => {
+              const rows = itemsBySection[sec] || []
+              if (!rows.length) return null
+              return (
+                <div key={sec} className="space-y-1.5">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-2">
+                    {SECTION_HEADERS[sec] || sec}
+                  </p>
+                  {rows.map(item => (
+                    <MarkingItemRow key={item.item_id} item={item} onChange={updateMarkingItem} />
+                  ))}
+                </div>
+              )
+            })}
+
+            {/* Manual additions */}
+            {newMarkings.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-amber-700 mt-2">
+                  Manually Added
+                </p>
+                {newMarkings.map((nm, i) => (
+                  <ManualMarkingRow key={i} idx={i} data={nm}
+                    onChange={updateManualMarking} onRemove={removeManualMarking} />
+                ))}
+              </div>
+            )}
+
+            {selectedWOId && (
+              <button type="button" onClick={addManualMarking} className="btn-ghost text-xs mt-1">
+                + Add marking manually
+              </button>
             )}
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="SQFT Completed">
-              <input type="number" value={sqft} onChange={e=>setSqft(e.target.value)}
-                placeholder="0" min="0" inputMode="numeric" className="field-input" />
-            </Field>
-            <Field label="Paint / Material">
-              <input type="text" value={paintMaterial} onChange={e=>setPaintMaterial(e.target.value)}
-                placeholder="e.g. White Thermo" className="field-input" />
-            </Field>
-          </div>
+
           <Field label="Issues / Notes">
             <textarea value={issues} onChange={e=>setIssues(e.target.value)}
               placeholder="Problems, delays, or anything admin should know…"
