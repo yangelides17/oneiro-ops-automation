@@ -166,6 +166,133 @@ function setupTriggers_() {
 
 
 // ═══════════════════════════════════════════════════════════════
+// MARKING ITEMS — per-item marking completion schema (MMA + Thermo)
+// ═══════════════════════════════════════════════════════════════
+//
+// `Marking Items` captures one row per discrete piece of marking work
+// on a WO — top-table items, per-intersection per-crosswalk entries, or
+// manually added items. The parser seeds rows at scan time; the Field
+// Report UI loads them for the crew to enter SF + material; rollups
+// flow back to WO Tracker cols 19-21.
+//
+// Run once from the custom menu after each schema change. Idempotent.
+
+function setupMarkingItems() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const MAX_ROWS = 2000;
+
+  // ── 1. Marking Items tab ──────────────────────────────────────
+  let markingSheet = ss.getSheetByName('Marking Items');
+  const createdNew = !markingSheet;
+  if (createdNew) {
+    markingSheet = ss.insertSheet('Marking Items');
+  }
+
+  const mHeaders = [
+    'Item ID', 'Work Order #', 'Work Type', 'Section', 'Sort Order',
+    'Category', 'Intersection', 'Direction', 'Description',
+    'Planned', 'Unit', 'Quantity Completed', 'Color/Material',
+    'Date Completed', 'Status', 'Added By', 'Notes'
+  ];
+  markingSheet.getRange(1, 1, 1, mHeaders.length).setValues([mHeaders]);
+  markingSheet.getRange(1, 1, 1, mHeaders.length).setFontWeight('bold');
+  markingSheet.setFrozenRows(1);
+
+  // Canonical marking categories — covers Page 1 (scan time) + Page 2
+  // (Contractor Field Report) + MMA types. `strict: false` turns the
+  // dropdown into a picker/suggestion list so manually added items can
+  // introduce new categories without being rejected.
+  const MARKING_CATEGORIES = [
+    // WO Page 1 — Top Table
+    'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
+    'Solid Lines', 'Rail Road X/Diamond', 'Others',
+    // WO Page 1 — Intersection Grid
+    'HVX Crosswalk', 'Stop Msg', 'Stop Line',
+    // Page 2 — detailed lines
+    '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
+    // Page 2 — messages
+    'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
+    // Page 2 — railroad
+    'Railroad (RR)', 'Railroad (X)',
+    // Page 2 — arrows
+    'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
+    // Page 2 — miscellaneous
+    'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
+    // Page 2 — bike lane
+    'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
+    // MMA
+    'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
+  ];
+
+  const mDropdowns = [
+    { col:  3, values: ['MMA', 'Thermo'],                              strict: true  },
+    { col:  4, values: ['Top Table', 'Intersection Grid', 'Manual'],   strict: true  },
+    { col:  6, values: MARKING_CATEGORIES,                             strict: false }, // Category
+    { col:  8, values: ['N', 'E', 'S', 'W'],                           strict: true  }, // Direction
+    { col: 11, values: ['SF', 'LF', 'EA'],                             strict: true  },
+    { col: 15, values: ['Pending', 'Completed', 'Skipped'],            strict: true  },
+    { col: 16, values: ['Scanner', 'Manual'],                          strict: true  },
+  ];
+  mDropdowns.forEach(({ col, values, strict }) => {
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(values, true)
+      .setAllowInvalid(!strict)
+      .build();
+    markingSheet.getRange(2, col, MAX_ROWS - 1, 1).setDataValidation(rule);
+  });
+
+  Logger.log(createdNew
+    ? '✅ Marking Items sheet created with 17-col header + validations'
+    : '↻ Marking Items header/validations reconciled');
+
+  // ── 2. Daily Sign-In Data → 14-col schema ─────────────────────
+  // Old schema (18 cols) had SQFT Completed / Paint/Material /
+  // WO Complete? / Issues-Notes at cols 13-16. Those four columns
+  // migrate to Marking Items (per-item) and WO Tracker rollups.
+  const signInSheet = ss.getSheetByName('Daily Sign-In Data');
+  if (!signInSheet) {
+    Logger.log('⚠️  Daily Sign-In Data sheet not found — skipping schema update');
+  } else {
+    // Detect old schema by the col-13 header; drop those 4 cols if present.
+    const col13Header = String(signInSheet.getRange(1, 13).getValue() || '').toLowerCase();
+    if (col13Header.indexOf('sqft') !== -1) {
+      signInSheet.deleteColumns(13, 4);
+      Logger.log('↻ Dropped legacy cols 13-16 (SQFT/Paint/WO Complete/Issues) from Daily Sign-In Data');
+    }
+
+    const sHeaders = [
+      'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
+      'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
+      'Hours Worked', 'Overtime Hours', 'Admin Reviewed?', 'Review Notes'
+    ];
+    signInSheet.getRange(1, 1, 1, sHeaders.length).setValues([sHeaders]);
+    signInSheet.getRange(1, 1, 1, sHeaders.length).setFontWeight('bold');
+    signInSheet.setFrozenRows(1);
+
+    // Re-apply Admin Reviewed? dropdown on new col 13 (was col 17 before drop).
+    const adminRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(['Yes', 'No'], true)
+      .setAllowInvalid(false)
+      .build();
+    signInSheet.getRange(2, 13, MAX_ROWS - 1, 1).setDataValidation(adminRule);
+
+    Logger.log('✅ Daily Sign-In Data reshaped to 14-col schema + Admin Reviewed? dropdown reapplied');
+  }
+
+  Logger.log('🚀 setupMarkingItems() complete');
+  try {
+    SpreadsheetApp.getUi().alert(
+      createdNew
+        ? 'Marking Items sheet created + Daily Sign-In Data reshaped. See Logs for details.'
+        : 'Schema reconciled. See Logs for details.'
+    );
+  } catch (_) {
+    // No UI context (e.g. running from script editor without active sheet) — skip alert.
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
 // 2. SCAN INBOX WATCHER — Detects new WO PDFs dropped in folder
 // ═══════════════════════════════════════════════════════════════
 
@@ -1258,6 +1385,7 @@ function onOpen() {
     .addItem('🔍 Check Scan Inbox Now', 'checkScanInbox')
     .addSeparator()
     .addItem('⚙️ Run Initial Setup', 'setupAutomation')
+    .addItem('⚙️ Set up Marking Items schema', 'setupMarkingItems')
     .addToUi();
 }
 
@@ -2151,6 +2279,21 @@ function generateSignInJson_(d, woRow, ss) {
     ? `${contractNum} - ${boroughName}`
     : contractNum;
 
+  // Look up the prime contractor's address from Contractor Contacts.
+  // Sheet layout: col 0 = Contractor, col 5 = Address (billing/yard).
+  // Best-effort — blank if sheet missing or contractor not listed.
+  let primeAddress = '';
+  try {
+    const ccSheet = ss.getSheetByName('Contractor Contacts');
+    if (ccSheet) {
+      const ccData = ccSheet.getDataRange().getValues();
+      const ccRow = ccData.find(r => String(r[0] || '').trim() === primeContractor);
+      if (ccRow) primeAddress = String(ccRow[5] || '').trim();
+    }
+  } catch (err) {
+    Logger.log(`⚠️ Contractor Contacts lookup failed for ${primeContractor}: ${err}`);
+  }
+
   // Project Name/Location = "<WO#> | <Location>"
   const projectName = location
     ? `${d.wo_id} | ${location}`
@@ -2173,7 +2316,7 @@ function generateSignInJson_(d, woRow, ss) {
     prime_contractor:   primeContractor,
     subcontractor:      CONFIG.EMPLOYER.name,
     contract_number:    contractLabel,
-    address:            '',   // TODO: source from Contractor Contacts yard-address column when populated
+    address:            primeAddress,
     agency:             'NYCDOT',
     project_name:       projectName,
     crew: (d.crew || []).map(m => ({

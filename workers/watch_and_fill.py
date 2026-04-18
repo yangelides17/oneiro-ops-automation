@@ -242,6 +242,10 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
     wo_id = wo_data.get('work_order_id', 'UNKNOWN')
     log(f"  ✅  Parsed: {wo_id} — {wo_data.get('prime_contractor')} / "
         f"{wo_data.get('contract_number')} / {wo_data.get('location')}")
+    top_ct = len(wo_data.get('top_markings') or [])
+    grid_ct = len(wo_data.get('intersection_grid') or [])
+    wtype  = wo_data.get('work_type') or '?'
+    log(f"      work_type={wtype}, top_markings={top_ct}, intersection_grid rows={grid_ct}")
 
     # ── Post to Apps Script ───────────────────────────────────────
     upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')

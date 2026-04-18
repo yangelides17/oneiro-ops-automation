@@ -103,13 +103,48 @@ If a field is not visible, illegible, or not applicable, use null. Never guess.
   "pavement_work_type": "Pavement work type, e.g. REFURBISHMENT or NEW. Labeled 'Pavement Work'.",
   "wo_received_date":   "The 'Issue To Contractor Date' at the bottom of the form, e.g. 07/17/2025.",
   "water_blast_sqft":   "If any waterblasting square footage is handwritten anywhere on the form, extract the number as an integer. Otherwise null.",
-  "general_remarks":    "The full text of the General Remarks section (middle of the form, labeled 'General Remarks>>>>>'). Transcribe exactly as written, including handwritten text."
+  "general_remarks":    "The full text of the General Remarks section (middle of the form, labeled 'General Remarks>>>>>'). Transcribe exactly as written, including handwritten text.",
+
+  "top_markings": [
+    {
+      "category":    "One of: Double Yellow Line, Lane Lines, Gores, Messages, Arrows, Solid Lines, Rail Road X/Diamond, Others. Use the label as printed in the middle of the top table (a row per line/marking type).",
+      "description": "The free-text description to the right of the category label, e.g. 'RECAP FROM HAMILTON PL TO 2ND AV'. Transcribe exactly, including 'RECAP' if present. Leave out any rows where the description column is blank."
+    }
+  ],
+
+  "intersection_grid": [
+    {
+      "intersection": "The intersection name as printed in the leftmost INTERSECTIONS column, e.g. '5 AV', 'HAMILTON PL'. Transcribe exactly.",
+      "n":          "The value of the 'North' column for this row, usually 'HVX' or blank.",
+      "e":          "The value of the 'East' column for this row.",
+      "s":          "The value of the 'South' column for this row.",
+      "w":          "The value of the 'West' column for this row.",
+      "stop_msg":   "The value of the 'Stop Msg' column for this row. Usually blank, or a directional string like 'West', 'East', 'EW', 'NSEW'.",
+      "stop_lines": "The value of the 'Stop lines' (far-right) column for this row. Same format as stop_msg."
+    }
+  ]
 }
 
 Important notes:
 - water_blast_sqft may appear as a handwritten number near the words 'waterblast', 'WB', or 'water blast' anywhere on the form.
 - The General Remarks section is critical — it often contains handwritten notes about the type of work (e.g. 'RECAP PAINT FOR BIKE LANE', 'BUS LANE', 'PED SPACE'). Transcribe it fully.
 - The Issue To Contractor Date is near the bottom of the form.
+
+top_markings rules:
+- This is the upper table that lists marking CATEGORIES down the middle column (Double Yellow CenterLine / Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road X / Diamond / Others).
+- Only include a row if its description column contains any text (e.g. 'RECAP', 'RECAP FROM HAMILTON PL TO 2ND AV'). Skip blank rows entirely.
+- Normalize the category label: output 'Double Yellow Line' (not 'Double Yellow CenterLine'), 'Rail Road X/Diamond' (not 'Rail Road X / Diamond').
+- Preserve the description text verbatim including all caps.
+- Order top_markings by their printed row order.
+
+intersection_grid rules:
+- This is the bottom table with column headers: INTERSECTIONS | Order | North | East | South | West | Stop Msg | Sch M 8' | Sch M 10' | Stop lines
+- IGNORE the Order, Sch M 8', and Sch M 10' columns — they are unused in our system.
+- Only include a row if the INTERSECTIONS cell has text AND at least one of N/E/S/W/stop_msg/stop_lines has a non-empty value. Skip blank rows at the bottom of the table.
+- For N/E/S/W cells: copy the value verbatim. Typical value is 'HVX' when a crosswalk is required at that direction; blank otherwise.
+- For stop_msg and stop_lines cells: copy the directional string verbatim. Values are usually 'North', 'East', 'South', 'West', or concatenations like 'EW' (East AND West), 'NS', 'NSEW'. Preserve the exact letters.
+- Return an empty array if the form has no intersection grid entries.
+- Order intersection_grid top-to-bottom as printed.
 """
 
 
@@ -151,7 +186,9 @@ def parse(file_bytes: bytes, mime_type: str = 'application/pdf') -> dict:
     try:
         response = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=1024,
+            # Bumped from 1024 to 4096 — Thermo WOs can have 10+ intersection
+            # grid rows, each with 7 fields, plus the top-markings array.
+            max_tokens=4096,
             messages=[{
                 "role": "user",
                 "content": [
@@ -243,6 +280,49 @@ def normalize_wo_data(raw: dict) -> dict:
         water_blast_confirmed = 'N/A'
         wb_sqft = ''
 
+    # ── Normalize top_markings + intersection_grid ────────────────
+    # Both are passed through to the Apps Script handler, which expands them
+    # into individual Marking Items rows (one row per discrete piece of work).
+    top_markings = []
+    for m in (raw.get('top_markings') or []):
+        if not isinstance(m, dict):
+            continue
+        category = (m.get('category') or '').strip()
+        description = (m.get('description') or '').strip()
+        if category and description:
+            top_markings.append({'category': category, 'description': description})
+
+    intersection_grid = []
+    for ig in (raw.get('intersection_grid') or []):
+        if not isinstance(ig, dict):
+            continue
+        intersection = (ig.get('intersection') or '').strip()
+        if not intersection:
+            continue
+        cells = {
+            'n':          (ig.get('n') or '').strip(),
+            'e':          (ig.get('e') or '').strip(),
+            's':          (ig.get('s') or '').strip(),
+            'w':          (ig.get('w') or '').strip(),
+            'stop_msg':   (ig.get('stop_msg') or '').strip(),
+            'stop_lines': (ig.get('stop_lines') or '').strip(),
+        }
+        # Only include if at least one direction/stop cell is populated.
+        if any(v for v in cells.values()):
+            intersection_grid.append({'intersection': intersection, **cells})
+
+    # ── Derive work_type (MMA vs Thermo) ──────────────────────────
+    # MMA detection above already sets water_blast_required = 'Yes - MMA'
+    # when remarks/handwritten WB SQFT indicate MMA work. Intersection
+    # grids and top-marking "RECAP" entries are Thermo-specific, so if
+    # either is populated we default to Thermo. Admin can override later.
+    if water_blast_required == 'Yes - MMA':
+        work_type = 'MMA'
+    elif intersection_grid or top_markings:
+        work_type = 'Thermo'
+    else:
+        work_type = ''   # admin decides
+
     # ── Build normalized dict ─────────────────────────────────────
     return {
         'work_order_id':         (raw.get('work_order_id') or '').strip(),
@@ -260,4 +340,7 @@ def normalize_wo_data(raw: dict) -> dict:
         'water_blast_confirmed': water_blast_confirmed,
         'water_blast_sqft':      wb_sqft,
         'status':                'Received',
+        'work_type':             work_type,
+        'top_markings':          top_markings,
+        'intersection_grid':     intersection_grid,
     }
