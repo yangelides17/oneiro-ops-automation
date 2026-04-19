@@ -65,17 +65,6 @@ const newManualMarking = () => ({
   unit: 'SF', quantity: '', color_material: ''
 })
 
-// Human label for a marking item — e.g. "Double Yellow Line  •  RECAP FROM HAMILTON PL TO 2ND AV"
-// or "2 AV — East HVX" for grid entries.
-function itemLabel(item) {
-  if (item.section === 'Intersection Grid' && item.intersection) {
-    const dirFull = { N: 'North', E: 'East', S: 'South', W: 'West' }[item.direction] || item.direction
-    return `${item.intersection} — ${dirFull} ${item.category}`
-  }
-  return item.description
-    ? `${item.category} · ${item.description}`
-    : item.category
-}
 
 // ── Field wrapper ─────────────────────────────────────────────
 function Field({ label, required, hint, children }) {
@@ -104,41 +93,87 @@ function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
 }
 
 // ── Planned marking row (pre-populated from WO scan) ──────────
-// Read-only label + editable qty/material. Thermo items hide material.
+// Single-line layout per section so rows align vertically like a grid.
+// Pre-populated fields (Marking Type, Intersection, Direction) are
+// readOnly input boxes — they display the scanned value but look the
+// same as editable fields. Editable: Quantity, Unit, Color/Material.
 function MarkingItemRow({ item, onChange }) {
-  const isThermo = String(item.work_type || '').toLowerCase() === 'thermo'
-  return (
-    <div className="border border-slate-200 rounded-lg p-2.5 bg-white space-y-2">
-      <div className="flex items-baseline gap-2">
-        <span className="flex-1 text-sm font-semibold text-navy leading-tight break-words">
-          {itemLabel(item)}
-        </span>
-        {item.planned && (
-          <span className="text-[10px] font-mono uppercase tracking-wide text-slate-400 shrink-0">
-            planned: {item.planned}
-          </span>
-        )}
+  const workType  = String(item.work_type || '').toLowerCase()
+  const section   = item.section || ''
+  const isMMA     = workType === 'mma'
+  const isGrid    = section === 'Intersection Grid'
+
+  const onField = (field) => (e) =>
+    onChange(item.item_id, { [field]: e.target.value, _dirty: true })
+
+  const INPUT   = 'field-input text-sm py-2'
+  const RO      = INPUT + ' bg-slate-50 text-slate-600 cursor-default focus:ring-0'
+  const QTY     = INPUT + ' text-center'
+
+  const CategoryBox = (
+    <input type="text" readOnly placeholder="Marking Type"
+      value={item.category ?? ''} className={RO} />
+  )
+  const QtyBox = (
+    <input type="number" min="0" inputMode="numeric" placeholder="Quantity"
+      value={item.quantity ?? ''} onChange={onField('quantity')} className={QTY} />
+  )
+  const UnitBox = (
+    <select value={item.unit || 'SF'} onChange={onField('unit')} className={INPUT}>
+      {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
+    </select>
+  )
+
+  // Grid layouts — all columns rendered into the same CSS grid so
+  // Marking Type / Intersection / Direction / Qty / Unit columns align
+  // across every row in a section.
+  if (isGrid) {
+    return (
+      <div className="grid items-center gap-2"
+           style={{ gridTemplateColumns: '1fr 110px 64px 72px 56px' }}>
+        {CategoryBox}
+        <input type="text" readOnly placeholder="Intersection"
+          value={item.intersection ?? ''} className={RO} />
+        <input type="text" readOnly placeholder="Direction"
+          value={item.direction ?? ''} className={RO + ' text-center'} />
+        {QtyBox}
+        {UnitBox}
       </div>
-      <div className={`grid gap-2 items-center ${isThermo ? 'grid-cols-[60px_1fr]' : 'grid-cols-[60px_60px_1fr]'}`}>
-        <input
-          type="number" min="0" inputMode="numeric" placeholder={item.unit || 'SF'}
-          value={item.quantity ?? ''}
-          onChange={e => onChange(item.item_id, { quantity: e.target.value, _dirty: true })}
-          className="field-input text-sm py-2 text-center" />
-        <select
-          value={item.unit || 'SF'}
-          onChange={e => onChange(item.item_id, { unit: e.target.value, _dirty: true })}
-          className="field-input text-sm py-2">
-          {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
-        </select>
-        {!isThermo && (
-          <input
-            type="text" placeholder="Color / Material (e.g. White Thermo)"
+    )
+  }
+
+  if (isMMA) {
+    return (
+      <div className="space-y-0.5">
+        <div className="grid items-center gap-2"
+             style={{ gridTemplateColumns: '1fr 1fr 72px 56px' }}>
+          {CategoryBox}
+          <input type="text" placeholder="Color / Material"
             value={item.color_material ?? ''}
-            onChange={e => onChange(item.item_id, { color_material: e.target.value, _dirty: true })}
-            className="field-input text-sm py-2" />
+            onChange={onField('color_material')} className={INPUT} />
+          {QtyBox}
+          {UnitBox}
+        </div>
+        {item.description && (
+          <p className="text-[11px] text-slate-400 pl-1">Note: {item.description}</p>
         )}
       </div>
+    )
+  }
+
+  // Top Table (Thermo default) — description rendered as a separate
+  // "Note:" line so the row grid stays 3 columns wide.
+  return (
+    <div className="space-y-0.5">
+      <div className="grid items-center gap-2"
+           style={{ gridTemplateColumns: '1fr 72px 56px' }}>
+        {CategoryBox}
+        {QtyBox}
+        {UnitBox}
+      </div>
+      {item.description && (
+        <p className="text-[11px] text-slate-400 pl-1">Note: {item.description}</p>
+      )}
     </div>
   )
 }
