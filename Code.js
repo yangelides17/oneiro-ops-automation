@@ -182,16 +182,34 @@ function setupMarkingItems() {
   const MAX_ROWS = 2000;
 
   // ── 1. Marking Items tab ──────────────────────────────────────
+  //
+  // Ordering: rows are written to the sheet contiguously per WO (all
+  // seed rows from a scan are in one setValues call; manual rows get
+  // appended at submit time). Filtering by WO# preserves insertion
+  // order. No "Sort Order" column needed — eliminates an arithmetic
+  // collision risk at ~80+ intersections or 1000+ manual adds.
   let markingSheet = ss.getSheetByName('Marking Items');
   const createdNew = !markingSheet;
   if (createdNew) {
     markingSheet = ss.insertSheet('Marking Items');
+  } else {
+    // Migration from earlier schemas — detect and drop legacy cols.
+    const colEHeader = String(markingSheet.getRange(1, 5).getValue() || '').toLowerCase();
+    if (colEHeader.indexOf('sort order') !== -1) {
+      markingSheet.deleteColumns(5, 1);
+      Logger.log('↻ Dropped legacy "Sort Order" column — ordering now implicit');
+    }
+    const colIHeader = String(markingSheet.getRange(1, 9).getValue() || '').toLowerCase();
+    if (colIHeader.indexOf('planned') !== -1) {
+      markingSheet.deleteColumns(9, 1);
+      Logger.log('↻ Dropped legacy "Planned" column — redundant with Category + Direction');
+    }
   }
 
   const mHeaders = [
-    'Item ID', 'Work Order #', 'Work Type', 'Section', 'Sort Order',
+    'Item ID', 'Work Order #', 'Work Type', 'Section',
     'Category', 'Intersection', 'Direction', 'Description',
-    'Planned', 'Unit', 'Quantity Completed', 'Color/Material',
+    'Unit', 'Quantity Completed', 'Color/Material',
     'Date Completed', 'Status', 'Added By', 'Notes'
   ];
   markingSheet.getRange(1, 1, 1, mHeaders.length).setValues([mHeaders]);
@@ -224,14 +242,22 @@ function setupMarkingItems() {
     'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
   ];
 
+  // Column indices (1-based) for the 15-col schema:
+  //   A  1 Item ID         E  5 Category       I   9 Unit
+  //   B  2 Work Order #    F  6 Intersection   J  10 Quantity Completed
+  //   C  3 Work Type       G  7 Direction      K  11 Color/Material
+  //   D  4 Section         H  8 Description    L  12 Date Completed
+  //                                             M  13 Status
+  //                                             N  14 Added By
+  //                                             O  15 Notes
   const mDropdowns = [
     { col:  3, values: ['MMA', 'Thermo'],                              strict: true  },
     { col:  4, values: ['Top Table', 'Intersection Grid', 'Manual'],   strict: true  },
-    { col:  6, values: MARKING_CATEGORIES,                             strict: false }, // Category
-    { col:  8, values: ['N', 'E', 'S', 'W'],                           strict: true  }, // Direction
-    { col: 11, values: ['SF', 'LF', 'EA'],                             strict: true  },
-    { col: 15, values: ['Pending', 'Completed', 'Skipped'],            strict: true  },
-    { col: 16, values: ['Scanner', 'Manual'],                          strict: true  },
+    { col:  5, values: MARKING_CATEGORIES,                             strict: false }, // Category
+    { col:  7, values: ['N', 'E', 'S', 'W'],                           strict: true  }, // Direction
+    { col:  9, values: ['SF', 'LF', 'EA'],                             strict: true  }, // Unit
+    { col: 13, values: ['Pending', 'Completed', 'Skipped'],            strict: true  }, // Status
+    { col: 14, values: ['Scanner', 'Manual'],                          strict: true  }, // Added By
   ];
   mDropdowns.forEach(({ col, values, strict }) => {
     const rule = SpreadsheetApp.newDataValidation()
@@ -242,7 +268,7 @@ function setupMarkingItems() {
   });
 
   Logger.log(createdNew
-    ? '✅ Marking Items sheet created with 17-col header + validations'
+    ? '✅ Marking Items sheet created with 15-col header + validations'
     : '↻ Marking Items header/validations reconciled');
 
   // ── 2. Daily Sign-In Data → 14-col schema ─────────────────────
@@ -2018,34 +2044,35 @@ function seedMarkingItems_(ss, d) {
   let n = 1;
 
   // ── Top Table items ───────────────────────────────────────────
-  topMarkings.forEach((m, i) => {
+  // Ordering is implicit from the order rows are pushed to the `rows`
+  // array below → single setValues write → sheet row order. No sort
+  // column needed.
+  topMarkings.forEach((m) => {
     if (!m || !m.category || !m.description) return;
     rows.push([
       `${woId}-${pad3(n++)}`,        // A  Item ID
       woId,                           // B  Work Order #
       workType,                       // C  Work Type
       'Top Table',                    // D  Section
-      100 + i * 10,                   // E  Sort Order
-      String(m.category).trim(),      // F  Category
-      '',                             // G  Intersection
-      '',                             // H  Direction
-      String(m.description).trim(),   // I  Description
-      '',                             // J  Planned
-      'SF',                           // K  Unit
-      '',                             // L  Quantity Completed
-      '',                             // M  Color/Material
-      '',                             // N  Date Completed
-      'Pending',                      // O  Status
-      'Scanner',                      // P  Added By
-      ''                              // Q  Notes
+      String(m.category).trim(),      // E  Category
+      '',                             // F  Intersection
+      '',                             // G  Direction
+      String(m.description).trim(),   // H  Description
+      'SF',                           // I  Unit
+      '',                             // J  Quantity Completed
+      '',                             // K  Color/Material
+      '',                             // L  Date Completed
+      'Pending',                      // M  Status
+      'Scanner',                      // N  Added By
+      ''                              // O  Notes
     ]);
   });
 
   // ── Intersection Grid items ───────────────────────────────────
   const DIR_ORDER = ['n', 'e', 's', 'w', 'stop_msg', 'stop_lines'];
-  grid.forEach((ig, interIdx) => {
+  grid.forEach((ig) => {
     if (!ig || !ig.intersection) return;
-    DIR_ORDER.forEach((key, dirIdx) => {
+    DIR_ORDER.forEach((key) => {
       const raw = String(ig[key] || '').trim();
       if (!raw) return;
 
@@ -2061,25 +2088,23 @@ function seedMarkingItems_(ss, d) {
         directions = [key.toUpperCase()];   // n→N, e→E, etc.
       }
 
-      directions.forEach((dir, subIdx) => {
+      directions.forEach((dir) => {
         rows.push([
-          `${woId}-${pad3(n++)}`,
-          woId,
-          workType,
-          'Intersection Grid',
-          1000 + interIdx * 100 + dirIdx * 10 + subIdx,
-          category,
-          String(ig.intersection).trim(),
-          dir,
-          '',          // Description (blank for grid items)
-          raw,         // Planned = raw WO value ("HVX", "EW", "West")
-          'SF',
-          '',
-          '',
-          '',
-          'Pending',
-          'Scanner',
-          ''
+          `${woId}-${pad3(n++)}`,       // A  Item ID
+          woId,                          // B  Work Order #
+          workType,                      // C  Work Type
+          'Intersection Grid',           // D  Section
+          category,                      // E  Category
+          String(ig.intersection).trim(),// F  Intersection
+          dir,                           // G  Direction
+          '',                            // H  Description (blank for grid items)
+          'SF',                          // I  Unit
+          '',                            // J  Quantity Completed
+          '',                            // K  Color/Material
+          '',                            // L  Date Completed
+          'Pending',                     // M  Status
+          'Scanner',                     // N  Added By
+          ''                             // O  Notes
         ]);
       });
     });
@@ -2102,9 +2127,9 @@ function seedMarkingItems_(ss, d) {
 
 /**
  * Apply completion updates to existing Marking Items rows. Writes cols
- * L (Quantity), M (Color/Material), N (Date Completed), O (Status),
- * Q (Notes) per item. Zero/blank quantity → Status = Pending (so a
- * user can un-mark a row by clearing the number).
+ * I (Unit), J (Quantity), K (Color/Material), L (Date Completed),
+ * M (Status), O (Notes) per item. Zero/blank quantity → Status =
+ * Pending (so a user can un-mark a row by clearing the number).
  *
  * @returns {number} rows actually touched (missing item_ids are skipped).
  */
@@ -2131,12 +2156,13 @@ function applyMarkingUpdates_(ss, updates, dateOfWork) {
     const qty    = parseFloat(u.quantity);
     const hasQty = !isNaN(qty) && qty > 0;
 
-    sheet.getRange(rowNum, 12).setValue(hasQty ? qty : '');
-    sheet.getRange(rowNum, 13).setValue(String(u.color_material || '').trim());
-    sheet.getRange(rowNum, 14).setValue(hasQty ? dateOfWork : '');
-    sheet.getRange(rowNum, 15).setValue(hasQty ? 'Completed' : 'Pending');
+    if (u.unit) sheet.getRange(rowNum, 9).setValue(String(u.unit).trim());
+    sheet.getRange(rowNum, 10).setValue(hasQty ? qty : '');
+    sheet.getRange(rowNum, 11).setValue(String(u.color_material || '').trim());
+    sheet.getRange(rowNum, 12).setValue(hasQty ? dateOfWork : '');
+    sheet.getRange(rowNum, 13).setValue(hasQty ? 'Completed' : 'Pending');
     if (u.notes !== undefined) {
-      sheet.getRange(rowNum, 17).setValue(String(u.notes || '').trim());
+      sheet.getRange(rowNum, 15).setValue(String(u.notes || '').trim());
     }
     updated++;
   });
@@ -2179,19 +2205,17 @@ function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
       woId,                                         // B Work Order #
       workType,                                     // C Work Type
       'Manual',                                     // D Section
-      9000 + idx,                                   // E Sort Order
-      String(item.category || '').trim(),           // F Category
-      String(item.intersection || '').trim(),       // G Intersection
-      String(item.direction || '').trim(),          // H Direction
-      String(item.description || '').trim(),        // I Description
-      '',                                           // J Planned
-      String(item.unit || 'SF').trim(),             // K Unit
-      hasQty ? qty : '',                            // L Quantity
-      String(item.color_material || '').trim(),     // M Color/Material
-      hasQty ? dateOfWork : '',                     // N Date Completed
-      hasQty ? 'Completed' : 'Pending',             // O Status
-      'Manual',                                     // P Added By
-      ''                                            // Q Notes
+      String(item.category || '').trim(),           // E Category
+      String(item.intersection || '').trim(),       // F Intersection
+      String(item.direction || '').trim(),          // G Direction
+      String(item.description || '').trim(),        // H Description
+      String(item.unit || 'SF').trim(),             // I Unit
+      hasQty ? qty : '',                            // J Quantity
+      String(item.color_material || '').trim(),     // K Color/Material
+      hasQty ? dateOfWork : '',                     // L Date Completed
+      hasQty ? 'Completed' : 'Pending',             // M Status
+      'Manual',                                     // N Added By
+      ''                                            // O Notes
     ];
   });
 
@@ -2230,12 +2254,17 @@ function computeMarkingRollups_(ss, woId) {
 
   const anyThermo = woItems.some(r => String(r[2] || '').toLowerCase() === 'thermo');
 
+  // Column indices (0-based) under the 15-col schema:
+  //   0 Item ID    4 Category       8 Unit         12 Status
+  //   1 WO#        5 Intersection   9 Qty          13 Added By
+  //   2 Work Type  6 Direction      10 Material    14 Notes
+  //   3 Section    7 Description    11 Date Completed
   let sqftSum = 0;
   let hasQty  = false;
   woItems.forEach(r => {
-    const unit = String(r[10] || '').toUpperCase();
+    const unit = String(r[8] || '').toUpperCase();
     if (unit !== 'SF') return;
-    const qty = parseFloat(r[11]);
+    const qty = parseFloat(r[9]);
     if (isNaN(qty) || qty <= 0) return;
     sqftSum += qty;
     hasQty = true;
@@ -2251,10 +2280,10 @@ function computeMarkingRollups_(ss, woId) {
 
   const cats = {}, mats = {};
   woItems.forEach(r => {
-    const status = String(r[14] || '').toLowerCase();
+    const status = String(r[12] || '').toLowerCase();
     if (status !== 'completed') return;
-    const cat = String(r[5]  || '').trim();
-    const mat = String(r[12] || '').trim();
+    const cat = String(r[4]  || '').trim();
+    const mat = String(r[10] || '').trim();
     if (cat) cats[cat] = true;
     if (mat && mat.toLowerCase() !== 'n/a') mats[mat] = true;
   });
@@ -2268,9 +2297,10 @@ function computeMarkingRollups_(ss, woId) {
 
 
 /**
- * HTTP handler: return all Marking Items rows for a given WO, ordered
- * by Sort Order. The Field Report UI calls this on WO selection to
- * pre-populate its per-item SF input list.
+ * HTTP handler: return all Marking Items rows for a given WO, in sheet
+ * row order (which is the insertion order — scan-seeded items first,
+ * then manual items as they were added). The Field Report UI calls this
+ * on WO selection to pre-populate its per-item SF input list.
  *
  * body: { action: 'get_marking_items', key, wo_id }
  * response: { items: [...] }
@@ -2289,30 +2319,33 @@ function handleGetMarkingItems_(body) {
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return jsonResponse_({ items: [] });
 
+  // Column indices (0-based) under the 15-col schema:
+  //   0 Item ID    4 Category       8 Unit         12 Status
+  //   1 WO#        5 Intersection   9 Qty          13 Added By
+  //   2 Work Type  6 Direction      10 Material    14 Notes
+  //   3 Section    7 Description    11 Date Completed
+  // .filter() preserves array order → sheet row order → insertion order.
   const items = data.slice(1)
-    .filter(r => String(r[1] || '').trim() === woId)   // col B = Work Order #
+    .filter(r => String(r[1] || '').trim() === woId)
     .map(r => ({
       item_id:        String(r[0]  || ''),
       work_order_id:  String(r[1]  || ''),
       work_type:      String(r[2]  || ''),
       section:        String(r[3]  || ''),
-      sort_order:     Number(r[4]) || 0,
-      category:       String(r[5]  || ''),
-      intersection:   String(r[6]  || ''),
-      direction:      String(r[7]  || ''),
-      description:    String(r[8]  || ''),
-      planned:        String(r[9]  || ''),
-      unit:           String(r[10] || ''),
-      quantity:       r[11] === '' || r[11] == null ? null : Number(r[11]),
-      color_material: String(r[12] || ''),
-      date_completed: r[13] instanceof Date
-                         ? Utilities.formatDate(r[13], CONFIG.TIMEZONE, 'yyyy-MM-dd')
-                         : String(r[13] || ''),
-      status:         String(r[14] || ''),
-      added_by:       String(r[15] || ''),
-      notes:          String(r[16] || '')
-    }))
-    .sort((a, b) => a.sort_order - b.sort_order);
+      category:       String(r[4]  || ''),
+      intersection:   String(r[5]  || ''),
+      direction:      String(r[6]  || ''),
+      description:    String(r[7]  || ''),
+      unit:           String(r[8]  || ''),
+      quantity:       r[9]  === '' || r[9]  == null ? null : Number(r[9]),
+      color_material: String(r[10] || ''),
+      date_completed: r[11] instanceof Date
+                         ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+                         : String(r[11] || ''),
+      status:         String(r[12] || ''),
+      added_by:       String(r[13] || ''),
+      notes:          String(r[14] || '')
+    }));
 
   return jsonResponse_({ items });
 }

@@ -426,9 +426,9 @@ export default function FieldReport() {
       .then(r => r.json())
       .then(d => {
         if (d.error) throw new Error(d.error)
-        // Sort by sort_order so the list reads top-to-bottom against the paper WO.
-        const items = (d.items || []).slice().sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
-        setMarkingItems(items)
+        // Preserve sheet row order (= insertion order from the scan + any
+        // earlier manual adds) — no client-side sorting needed.
+        setMarkingItems(d.items || [])
         setNewMarkings([])
       })
       .catch(e => {
