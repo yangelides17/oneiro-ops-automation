@@ -424,6 +424,10 @@ export default function FieldReport() {
 
   // UI state
   const [formError,      setFormError]      = useState('')
+  // Bumps every time we set an error — even if the message is the same
+  // string the user already saw — so the scroll-to-error effect fires on
+  // repeat submits too.
+  const [errorNonce,     setErrorNonce]     = useState(0)
   const [submitStep,     setSubmitStep]     = useState('')  // current step label
   const [submitting,     setSubmitting]     = useState(false)
   const [submitted,      setSubmitted]      = useState(null)
@@ -463,14 +467,22 @@ export default function FieldReport() {
       .finally(() => setMarkingsLoading(false))
   }, [selectedWOId])
 
-  // Scroll the form-level error banner into view whenever it becomes
-  // populated. Submit lives at the bottom of a long form; without this
-  // a new error at the top is easy to miss.
+  // Scroll the form-level error banner into view every time it's
+  // raised — including a repeat submit that produces the same error
+  // string (keyed on errorNonce, not formError, so React fires the
+  // effect even if the message is identical to the last one).
   useEffect(() => {
     if (formError && errorRef.current) {
       errorRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
-  }, [formError])
+  }, [errorNonce])
+
+  // Set a new form-level error AND bump the nonce so the scroll effect
+  // always fires, even if `msg` matches the previously-shown error.
+  const raiseError = (msg) => {
+    setFormError(msg)
+    setErrorNonce(n => n + 1)
+  }
 
   // ── Per-row save helpers ──────────────────────────────────────
   const markSaving = (itemId, on) => {
@@ -686,7 +698,7 @@ export default function FieldReport() {
       if (data.error) throw new Error(data.error)
       setSubmitted({ wo_id:data.wo_id, status:data.status, crew_count:validCrew.length, photos:photoFiles.length })
     } catch (err) {
-      setFormError('Submission failed: ' + err.message)
+      raiseError('Submission failed: ' + err.message)
     } finally {
       setSubmitting(false)
       setSubmitStep('')
@@ -697,13 +709,13 @@ export default function FieldReport() {
   function handleSubmit(e) {
     e.preventDefault()
     setFormError('')
-    if (!selectedWOId)  { setFormError('Please select a Work Order.'); return }
-    if (!workDate)      { setFormError('Please enter the date of work.'); return }
+    if (!selectedWOId)  { raiseError('Please select a Work Order.'); return }
+    if (!workDate)      { raiseError('Please enter the date of work.'); return }
     const valid = crewMembers.filter(m=>m.name.trim())
-    if (!valid.length)  { setFormError('Please add at least one crew member.'); return }
+    if (!valid.length)  { raiseError('Please add at least one crew member.'); return }
     for (const m of valid) {
       if (!m.timeIn||!m.timeOut) {
-        setFormError(`Enter Time In and Time Out for ${m.name||'all crew members'}.`); return
+        raiseError(`Enter Time In and Time Out for ${m.name||'all crew members'}.`); return
       }
     }
     // If the crew is declaring the WO complete, every Marking Item must
@@ -719,7 +731,7 @@ export default function FieldReport() {
           return `• ${base}`
         }).join('\n')
         const more = bad.length > 6 ? `\n…and ${bad.length - 6} more` : ''
-        setFormError(
+        raiseError(
           `Can't mark WO complete — ${bad.length} marking item${bad.length===1?'':'s'} ${bad.length===1?'is':'are'} missing required fields ` +
           `(Quantity + Unit${/* MMA color hint */''}, plus Color/Material for MMA items).\n\n${labels}${more}\n\n` +
           `Fill in the missing values or delete the row, then re-submit.`
