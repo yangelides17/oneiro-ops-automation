@@ -417,6 +417,10 @@ export default function FieldReport() {
   const [rowError,      setRowError]      = useState('')
   // In-flight saves mirror of rowSaving for awaitable access from doSubmit.
   const inFlightRef = useRef(new Set())
+  // Ref on the error banner so we can scroll it into view when it appears —
+  // the Submit button is at the bottom of the form, so a new error would
+  // otherwise be off-screen at the top.
+  const errorRef = useRef(null)
 
   // UI state
   const [formError,      setFormError]      = useState('')
@@ -458,6 +462,15 @@ export default function FieldReport() {
       })
       .finally(() => setMarkingsLoading(false))
   }, [selectedWOId])
+
+  // Scroll the form-level error banner into view whenever it becomes
+  // populated. Submit lives at the bottom of a long form; without this
+  // a new error at the top is easy to miss.
+  useEffect(() => {
+    if (formError && errorRef.current) {
+      errorRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [formError])
 
   // ── Per-row save helpers ──────────────────────────────────────
   const markSaving = (itemId, on) => {
@@ -830,7 +843,7 @@ export default function FieldReport() {
       </div>
 
       {formError && (
-        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm whitespace-pre-line">{formError}</div>
+        <div ref={errorRef} className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm whitespace-pre-line scroll-mt-4">{formError}</div>
       )}
 
       <form onSubmit={handleSubmit} className="space-y-4">
