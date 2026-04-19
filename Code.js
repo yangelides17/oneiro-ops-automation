@@ -250,6 +250,13 @@ function setupMarkingItems() {
   //                                              M  13 Status
   //                                              N  14 Added By
   //                                              O  15 Notes
+
+  // Clear ALL existing data validations on rows 2+ first — otherwise
+  // stale validators left over from prior schemas (e.g. an old SF/LF/EA
+  // dropdown hanging on what is now the Quantity column) will reject
+  // legitimate input after a column swap or header change.
+  markingSheet.getRange(2, 1, MAX_ROWS - 1, mHeaders.length).clearDataValidations();
+
   const mDropdowns = [
     { col:  3, values: ['MMA', 'Thermo'],                              strict: true  },
     { col:  4, values: ['Top Table', 'Intersection Grid', 'Manual'],   strict: true  }, // WO Section
