@@ -2496,12 +2496,17 @@ function handleUpdateMarkingItem_(body) {
 
   const data = sheet.getDataRange().getValues();
   let rowNum = 0;
+  let currentRow = null;
   for (let i = 1; i < data.length; i++) {
-    if (String(data[i][0] || '').trim() === itemId) { rowNum = i + 1; break; }
+    if (String(data[i][0] || '').trim() === itemId) {
+      rowNum = i + 1;
+      currentRow = data[i];
+      break;
+    }
   }
   if (!rowNum) return jsonResponse_({ error: 'item_id not found: ' + itemId }, 404);
 
-  // Column indices (1-based). Matches the 15-col schema.
+  // Column indices. 1-based for setValue; 0-based (IDX) for currentRow reads.
   const COL = {
     work_type:     3,
     section:       4,
@@ -2516,27 +2521,55 @@ function handleUpdateMarkingItem_(body) {
     status:        13,
     notes:         15,
   };
+  const IDX = {
+    work_type: 2, section: 3, category: 4, intersection: 5, direction: 6,
+    description: 7, quantity: 8, unit: 9, color_material: 10, status: 12,
+    notes: 14,
+  };
 
-  // Write each patchable field present in the request.
+  const wasCompleted   = String(currentRow[IDX.status] || '') === 'Completed';
+  let   anyFieldChanged = false;
+
+  // Write each patchable string field present in the request. Track
+  // whether any value actually changed — used below to decide if a
+  // previously-Completed row should reopen to Pending.
   ['work_type','section','category','intersection','direction','description',
    'unit','color_material','notes'].forEach(key => {
-    if (d[key] !== undefined) {
-      sheet.getRange(rowNum, COL[key]).setValue(String(d[key] || '').trim());
-    }
+    if (d[key] === undefined) return;
+    const newVal = String(d[key] || '').trim();
+    const curVal = String(currentRow[IDX[key]] || '').trim();
+    if (newVal !== curVal) anyFieldChanged = true;
+    sheet.getRange(rowNum, COL[key]).setValue(newVal);
   });
 
   if (d.quantity !== undefined) {
-    const q = parseFloat(d.quantity);
+    const q      = parseFloat(d.quantity);
     const hasQty = !isNaN(q) && q > 0;
+    const cur    = currentRow[IDX.quantity];
+    const curStr = (cur === '' || cur == null) ? '' : String(cur);
+    const newStr = hasQty ? String(q) : '';
+    if (curStr !== newStr) anyFieldChanged = true;
     sheet.getRange(rowNum, COL.quantity).setValue(hasQty ? q : '');
 
-    // Status / Date Completed side-effect: clearing a qty (empty / 0) flips
-    // a previously-Completed row back to Pending immediately. Setting a
-    // positive qty leaves Status alone — submit promotes it.
+    // Clearing a qty flips a previously-Completed row back to Pending
+    // immediately and clears Date Completed. Setting a positive qty
+    // alone would otherwise leave Status as-is — but see the
+    // "anyFieldChanged on Completed" rule below, which also covers
+    // the set-qty-to-a-different-number case.
     if (!hasQty) {
       sheet.getRange(rowNum, COL.status).setValue('Pending');
       sheet.getRange(rowNum, COL.date_completed).setValue('');
     }
+  }
+
+  // Reopen a Completed row whenever the user actually changes something
+  // — crews need to re-confirm at next submit. No-op if the row was
+  // already Pending, or if the patch didn't actually change any values
+  // (e.g. user opened Edit modal and hit Confirm without touching
+  // anything).
+  if (wasCompleted && anyFieldChanged) {
+    sheet.getRange(rowNum, COL.status).setValue('Pending');
+    sheet.getRange(rowNum, COL.date_completed).setValue('');
   }
 
   SpreadsheetApp.flush();
