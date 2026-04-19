@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import StatusBadge  from '../components/StatusBadge'
-import SignaturePad from '../components/SignaturePad'
-import ConfirmModal from '../components/ConfirmModal'
+import StatusBadge      from '../components/StatusBadge'
+import SignaturePad     from '../components/SignaturePad'
+import ConfirmModal     from '../components/ConfirmModal'
+import MarkingFormModal from '../components/MarkingFormModal'
+import RowKebab         from '../components/RowKebab'
 
 // ── Constants ─────────────────────────────────────────────────
 // Must match the dropdown validation on the Daily Sign-In Data sheet's
@@ -9,30 +11,6 @@ import ConfirmModal from '../components/ConfirmModal'
 // Assistant Tech). Adding values here without updating the sheet validation
 // will cause sign-in submissions to fail with "Invalid Entry".
 const CLASSIFICATIONS = ['LP', 'SAT']
-
-// Canonical marking categories for the "Add marking manually" dropdown.
-// Mirrors the list in Apps Script setupMarkingItems() / Marking Items col F.
-const MARKING_CATEGORIES = [
-  // WO Top Table
-  'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
-  'Solid Lines', 'Rail Road X/Diamond', 'Others',
-  // Intersection Grid
-  'HVX Crosswalk', 'Stop Msg', 'Stop Line',
-  // Page 2 detailed lines
-  '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
-  // Page 2 messages
-  'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
-  // Page 2 railroad
-  'Railroad (RR)', 'Railroad (X)',
-  // Page 2 arrows
-  'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
-  // Page 2 misc
-  'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
-  // Page 2 bike lane
-  'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
-  // MMA
-  'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
-]
 
 const SECTION_HEADERS = {
   'Top Table':          'WO Top Table',
@@ -60,10 +38,6 @@ const calcHours = (tin, tout) => {
   return { hours: hrs.toFixed(2), overtime: Math.max(0, hrs-8).toFixed(2) }
 }
 const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
-const newManualMarking = () => ({
-  category: MARKING_CATEGORIES[0], description: '', intersection: '', direction: '',
-  unit: 'SF', quantity: '', color_material: ''
-})
 
 
 // ── Field wrapper ─────────────────────────────────────────────
@@ -92,31 +66,39 @@ function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
   )
 }
 
-// ── Planned marking row (pre-populated from WO scan) ──────────
+// ── Planned marking row ───────────────────────────────────────
 // Single-line layout per section so rows align vertically like a grid.
-// Pre-populated fields (Marking Type, Intersection, Direction) are
-// readOnly input boxes — they display the scanned value but look the
-// same as editable fields. Editable: Quantity, Unit, Color/Material.
-function MarkingItemRow({ item, onChange }) {
-  const workType  = String(item.work_type || '').toLowerCase()
-  const section   = item.section || ''
-  const isMMA     = workType === 'mma'
-  const isGrid    = section === 'Intersection Grid'
+// Quantity / Unit / Color-Material are directly editable (autosave via
+// onFieldChange debounced in the parent). Marking Type / Intersection /
+// Direction are readOnly here — use the kebab menu's Edit action to
+// change them (which opens MarkingFormModal with a warning).
+//
+// Leftmost cell: checkbox. Rightmost cell: kebab (replaced by a spinner
+// while the row has a pending save).
+function MarkingItemRow({
+  item, selected, saving, onToggleSelect, onFieldChange, onEdit, onDelete
+}) {
+  const workType = String(item.work_type || '').toLowerCase()
+  const section  = item.section || ''
+  const isMMA    = workType === 'mma'
+  const isGrid   = section === 'Intersection Grid'
 
-  const onField = (field) => (e) =>
-    onChange(item.item_id, { [field]: e.target.value, _dirty: true })
+  const INPUT = 'field-input text-sm py-2'
+  const RO    = INPUT + ' bg-slate-50 text-slate-500 cursor-default focus:ring-0'
+  const QTY   = INPUT + ' text-center'
 
-  const INPUT   = 'field-input text-sm py-2'
-  const RO      = INPUT + ' bg-slate-50 text-slate-600 cursor-default focus:ring-0'
-  const QTY     = INPUT + ' text-center'
+  const onField = (field) => (e) => onFieldChange(item.item_id, field, e.target.value)
 
   const CategoryBox = (
-    <input type="text" readOnly placeholder="Marking Type"
-      value={item.category ?? ''} className={RO} />
+    <input type="text" readOnly value={item.category ?? ''}
+      placeholder="Marking Type" className={RO} />
   )
   const QtyBox = (
-    <input type="number" min="0" inputMode="numeric" placeholder="Quantity"
-      value={item.quantity ?? ''} onChange={onField('quantity')} className={QTY} />
+    <input
+      type="number" min="0" inputMode="numeric" placeholder="Quantity"
+      value={item.quantity == null ? '' : item.quantity}
+      onChange={onField('quantity')} className={QTY}
+    />
   )
   const UnitBox = (
     <select value={item.unit || 'SF'} onChange={onField('unit')} className={INPUT}>
@@ -124,20 +106,34 @@ function MarkingItemRow({ item, onChange }) {
     </select>
   )
 
-  // Grid layouts — all columns rendered into the same CSS grid so
-  // Marking Type / Intersection / Direction / Qty / Unit columns align
-  // across every row in a section.
+  const Checkbox = (
+    <input type="checkbox" checked={selected}
+      onChange={e => onToggleSelect(item.item_id, e.target.checked)}
+      className="w-4 h-4 accent-navy cursor-pointer" />
+  )
+  const ActionCell = saving
+    ? <Spinner />
+    : <RowKebab items={[
+        { label: 'Edit',   onClick: () => onEdit(item) },
+        { label: 'Delete', onClick: () => onDelete(item), danger: true },
+      ]} />
+
+  // Grid layouts — checkbox on left, kebab/spinner on right, same gaps
+  // across section variants so Marking Type / Intersection / Direction
+  // columns line up vertically within a section.
   if (isGrid) {
     return (
       <div className="grid items-center gap-2"
-           style={{ gridTemplateColumns: '1fr 110px 64px 72px 56px' }}>
+           style={{ gridTemplateColumns: '24px 1fr 110px 64px 72px 56px 28px' }}>
+        {Checkbox}
         {CategoryBox}
-        <input type="text" readOnly placeholder="Intersection"
-          value={item.intersection ?? ''} className={RO} />
-        <input type="text" readOnly placeholder="Direction"
-          value={item.direction ?? ''} className={RO + ' text-center'} />
+        <input type="text" readOnly value={item.intersection ?? ''}
+          placeholder="Intersection" className={RO} />
+        <input type="text" readOnly value={item.direction ?? ''}
+          placeholder="Direction" className={RO + ' text-center'} />
         {QtyBox}
         {UnitBox}
+        {ActionCell}
       </div>
     )
   }
@@ -146,78 +142,46 @@ function MarkingItemRow({ item, onChange }) {
     return (
       <div className="space-y-0.5">
         <div className="grid items-center gap-2"
-             style={{ gridTemplateColumns: '1fr 1fr 72px 56px' }}>
+             style={{ gridTemplateColumns: '24px 1fr 1fr 72px 56px 28px' }}>
+          {Checkbox}
           {CategoryBox}
           <input type="text" placeholder="Color / Material"
             value={item.color_material ?? ''}
             onChange={onField('color_material')} className={INPUT} />
           {QtyBox}
           {UnitBox}
+          {ActionCell}
         </div>
         {item.description && (
-          <p className="text-[11px] text-slate-400 pl-1">Note: {item.description}</p>
+          <p className="text-[11px] text-slate-400 pl-9">Note: {item.description}</p>
         )}
       </div>
     )
   }
 
-  // Top Table (Thermo default) — description rendered as a separate
-  // "Note:" line so the row grid stays 3 columns wide.
+  // Top Table / Manual / other
   return (
     <div className="space-y-0.5">
       <div className="grid items-center gap-2"
-           style={{ gridTemplateColumns: '1fr 72px 56px' }}>
+           style={{ gridTemplateColumns: '24px 1fr 72px 56px 28px' }}>
+        {Checkbox}
         {CategoryBox}
         {QtyBox}
         {UnitBox}
+        {ActionCell}
       </div>
       {item.description && (
-        <p className="text-[11px] text-slate-400 pl-1">Note: {item.description}</p>
+        <p className="text-[11px] text-slate-400 pl-9">Note: {item.description}</p>
       )}
     </div>
   )
 }
 
-// ── Manual marking row (not from WO scan) ──────────────────────
-function ManualMarkingRow({ idx, data, onChange, onRemove }) {
+// ── Tiny inline spinner ───────────────────────────────────────
+function Spinner() {
   return (
-    <div className="border border-amber-200 rounded-lg p-2.5 bg-amber-50/50 space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700">Manual entry</span>
-        <button type="button" onClick={() => onRemove(idx)}
-          className="text-red-400 hover:text-red-600 text-xl leading-none h-6 w-6 flex items-center justify-center">×</button>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <select value={data.category} onChange={e => onChange(idx, { category: e.target.value })}
-          className="field-input text-sm py-2">
-          {MARKING_CATEGORIES.map(c => <option key={c}>{c}</option>)}
-        </select>
-        <input type="text" placeholder="Description (optional)"
-          value={data.description} onChange={e => onChange(idx, { description: e.target.value })}
-          className="field-input text-sm py-2" />
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <input type="text" placeholder="Intersection (optional)"
-          value={data.intersection} onChange={e => onChange(idx, { intersection: e.target.value })}
-          className="field-input text-sm py-2" />
-        <select value={data.direction} onChange={e => onChange(idx, { direction: e.target.value })}
-          className="field-input text-sm py-2">
-          <option value="">No direction</option>
-          {['N','E','S','W'].map(d => <option key={d}>{d}</option>)}
-        </select>
-      </div>
-      <div className="grid grid-cols-[60px_60px_1fr] gap-2">
-        <input type="number" min="0" inputMode="numeric" placeholder="Qty"
-          value={data.quantity} onChange={e => onChange(idx, { quantity: e.target.value })}
-          className="field-input text-sm py-2 text-center" />
-        <select value={data.unit} onChange={e => onChange(idx, { unit: e.target.value })}
-          className="field-input text-sm py-2">
-          {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
-        </select>
-        <input type="text" placeholder="Color / Material (leave blank for Thermo)"
-          value={data.color_material} onChange={e => onChange(idx, { color_material: e.target.value })}
-          className="field-input text-sm py-2" />
-      </div>
+    <div className="w-7 h-7 flex items-center justify-center">
+      <div className="w-4 h-4 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
     </div>
   )
 }
@@ -388,7 +352,6 @@ export default function FieldReport() {
   const [selectedWOId,  setSelectedWOId]  = useState('')
   const [workDate,      setWorkDate]       = useState(isoToday())
   const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wo-markings/:woId
-  const [newMarkings,   setNewMarkings]    = useState([])   // manually added this session
   const [markingsLoading, setMarkingsLoading] = useState(false)
   const [issues,        setIssues]         = useState('')
   const [crewMembers,   setCrewMembers]    = useState([newCrew()])
@@ -396,6 +359,13 @@ export default function FieldReport() {
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
   const [crewLeaderName,      setCrewLeaderName]      = useState('')
   const [crewLeaderSignature, setCrewLeaderSignature] = useState(null)
+
+  // Per-row UI state for the Marking Items list
+  const [selectedIds,   setSelectedIds]   = useState(new Set())
+  const [rowSaving,     setRowSaving]     = useState(new Set())
+  const [formModal,     setFormModal]     = useState(null)  // {mode, item} or null
+  const [deleteConfirm, setDeleteConfirm] = useState(null)  // {ids:[...], label?} or null
+  const [rowError,      setRowError]      = useState('')
 
   // UI state
   const [formError,      setFormError]      = useState('')
@@ -414,11 +384,11 @@ export default function FieldReport() {
   }, [])
 
   // Load pre-populated marking items from the WO scan whenever the
-  // selected WO changes. Reset any in-progress manual additions too.
+  // selected WO changes.
   useEffect(() => {
     if (!selectedWOId) {
       setMarkingItems([])
-      setNewMarkings([])
+      setSelectedIds(new Set())
       return
     }
     setMarkingsLoading(true)
@@ -429,7 +399,7 @@ export default function FieldReport() {
         // Preserve sheet row order (= insertion order from the scan + any
         // earlier manual adds) — no client-side sorting needed.
         setMarkingItems(d.items || [])
-        setNewMarkings([])
+        setSelectedIds(new Set())
       })
       .catch(e => {
         console.error('Failed to load marking items:', e)
@@ -438,30 +408,121 @@ export default function FieldReport() {
       .finally(() => setMarkingsLoading(false))
   }, [selectedWOId])
 
-  // Planned marking updates — in-place edits, with a _dirty flag so we
-  // only send touched rows back.
-  const updateMarkingItem = (itemId, patch) =>
-    setMarkingItems(list => list.map(it => it.item_id === itemId ? { ...it, ...patch } : it))
+  // ── Per-row save helpers ──────────────────────────────────────
+  // Mark a row as saving and clear any prior error on it.
+  const markSaving = (itemId, on) => {
+    setRowSaving(prev => {
+      const next = new Set(prev)
+      if (on) next.add(itemId); else next.delete(itemId)
+      return next
+    })
+  }
 
-  // Manual markings
-  const addManualMarking = () => setNewMarkings(list => [...list, newManualMarking()])
-  const updateManualMarking = (idx, patch) =>
-    setNewMarkings(list => list.map((x, j) => j === idx ? { ...x, ...patch } : x))
-  const removeManualMarking = (idx) =>
-    setNewMarkings(list => list.filter((_, j) => j !== idx))
+  // Issue a PATCH for one field, update state with the server response.
+  // Used by both the debounced text inputs and the unit dropdown.
+  const saveField = async (itemId, patch) => {
+    markSaving(itemId, true)
+    setRowError('')
+    try {
+      const res = await fetch(`/api/marking-items/${encodeURIComponent(itemId)}`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(patch),
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      if (data.item) {
+        setMarkingItems(list => list.map(i => i.item_id === itemId ? data.item : i))
+      }
+    } catch (err) {
+      console.error('save field failed', err)
+      setRowError(`Couldn't save: ${err.message}`)
+      // Force a refetch to make sure state reflects truth.
+      refetchMarkings()
+    } finally {
+      markSaving(itemId, false)
+    }
+  }
+
+  // Inline debounce for text fields (Quantity, Color/Material). Each
+  // item_id has its own timer so parallel rows don't interfere.
+  const saveTimers = useRef({})
+  const scheduleSave = (itemId, patch, delay = 400) => {
+    clearTimeout(saveTimers.current[itemId])
+    saveTimers.current[itemId] = setTimeout(() => {
+      delete saveTimers.current[itemId]
+      saveField(itemId, patch)
+    }, delay)
+  }
+
+  // Field-change dispatcher. Quantity/Color coerce through the debouncer;
+  // Unit fires on-change since it's a dropdown.
+  const onRowFieldChange = (itemId, field, value) => {
+    // Optimistic local update
+    setMarkingItems(list => list.map(i =>
+      i.item_id === itemId ? { ...i, [field]: value } : i
+    ))
+    if (field === 'unit') {
+      saveField(itemId, { unit: value })
+    } else if (field === 'quantity' || field === 'color_material') {
+      scheduleSave(itemId, { [field]: value })
+    } else {
+      // Fallback — immediate save for any future editable field.
+      saveField(itemId, { [field]: value })
+    }
+  }
+
+  const refetchMarkings = async () => {
+    if (!selectedWOId) return
+    try {
+      const r = await fetch(`/api/wo-markings/${encodeURIComponent(selectedWOId)}`)
+      const d = await r.json()
+      if (!d.error) setMarkingItems(d.items || [])
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Selection / bulk helpers ──────────────────────────────────
+  const toggleSelect = (id, on) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (on) next.add(id); else next.delete(id)
+      return next
+    })
+  }
+  const selectAll = () => setSelectedIds(new Set(markingItems.map(i => i.item_id)))
+  const clearSelection = () => setSelectedIds(new Set())
+
+  // ── Delete (single or bulk) ───────────────────────────────────
+  const doDelete = async (ids) => {
+    if (!ids.length) return
+    try {
+      const res = await fetch('/api/marking-items', {
+        method:  'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ item_ids: ids }),
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      const deleted = new Set(data.deleted || ids)
+      setMarkingItems(list => list.filter(i => !deleted.has(i.item_id)))
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        deleted.forEach(id => next.delete(id))
+        return next
+      })
+      setRowError('')
+    } catch (err) {
+      console.error('delete failed', err)
+      setRowError(`Delete failed: ${err.message}`)
+    } finally {
+      setDeleteConfirm(null)
+    }
+  }
 
   // Crew rows
   const updateCrew = (i, updated) => setCrewMembers(l=>l.map((m,j)=>j===i?updated:m))
   const addCrew    = () => setCrewMembers(l=>[...l,newCrew()])
   const removeCrew = (i) => setCrewMembers(l=>l.filter((_,j)=>j!==i))
-
-  // Group planned items by section for rendering (Top Table → Grid → other)
-  const itemsBySection = markingItems.reduce((acc, it) => {
-    const sec = it.section || 'Other'
-    ;(acc[sec] = acc[sec] || []).push(it)
-    return acc
-  }, {})
-  const SECTION_ORDER = ['Top Table', 'Intersection Grid', 'Manual', 'Other']
 
   // Infer WO work type from any loaded planned item (Thermo beats MMA if
   // mixed). Falls back to blank if no items are loaded yet.
@@ -494,29 +555,8 @@ export default function FieldReport() {
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
     try {
-      // Only send touched planned items. "Dirty" = user edited qty/unit/material.
-      const markingUpdates = markingItems
-        .filter(i => i._dirty)
-        .map(i => ({
-          item_id:        i.item_id,
-          quantity:       i.quantity === '' || i.quantity == null ? null : parseFloat(i.quantity),
-          color_material: (i.color_material || '').trim(),
-          unit:           i.unit || 'SF',
-        }))
-
-      // All manual adds that have at least a category are included.
-      const markingNew = newMarkings
-        .filter(n => (n.category || '').trim())
-        .map(n => ({
-          category:       (n.category || '').trim(),
-          description:    (n.description || '').trim(),
-          intersection:   (n.intersection || '').trim(),
-          direction:      (n.direction || '').trim(),
-          unit:           n.unit || 'SF',
-          quantity:       n.quantity === '' || n.quantity == null ? null : parseFloat(n.quantity),
-          color_material: (n.color_material || '').trim(),
-        }))
-
+      // Marking Items are already live-persisted via per-row CRUD
+      // endpoints. Submit only sends WO-level data + crew + signatures.
       const res = await fetch('/api/field-report', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -525,8 +565,6 @@ export default function FieldReport() {
           date:        workDate,
           wo_complete: woComplete==='yes',
           work_type:   inferredWorkType,
-          marking_updates: markingUpdates,
-          marking_new:     markingNew,
           issues:          issues.trim(),
           photos_uploaded: photosUploaded,
           crew: validCrew.map(m=>({
@@ -580,7 +618,8 @@ export default function FieldReport() {
   // ── Reset ─────────────────────────────────────────────────
   function reset() {
     setSubmitted(null); setSelectedWOId(''); setWorkDate(isoToday())
-    setMarkingItems([]); setNewMarkings([]); setIssues('')
+    setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
+    setIssues('')
     setCrewMembers([newCrew()]); setWoComplete('no'); setPhotoFiles([]); setFormError('')
     setCrewLeaderName(''); setCrewLeaderSignature(null)
   }
@@ -642,6 +681,44 @@ export default function FieldReport() {
         />
       )}
 
+      {/* Marking Items — Add / Edit form modal */}
+      {formModal && (
+        <MarkingFormModal
+          mode={formModal.mode}
+          item={formModal.item}
+          woId={selectedWOId}
+          workType={inferredWorkType}
+          onClose={() => setFormModal(null)}
+          onSaved={(savedItem) => {
+            if (formModal.mode === 'add') {
+              setMarkingItems(list => [...list, savedItem])
+            } else {
+              setMarkingItems(list =>
+                list.map(i => i.item_id === savedItem.item_id ? savedItem : i))
+            }
+            setFormModal(null)
+            setRowError('')
+          }}
+        />
+      )}
+
+      {/* Delete confirmation — single or bulk */}
+      {deleteConfirm && (
+        <ConfirmModal
+          title={deleteConfirm.ids.length === 1
+            ? 'Delete this marking item?'
+            : `Delete ${deleteConfirm.ids.length} marking items?`}
+          message={deleteConfirm.ids.length === 1
+            ? `${deleteConfirm.label || 'Item'} will be permanently removed from the sheet.`
+            : 'These rows will be permanently removed from the sheet. This cannot be undone.'}
+          confirmLabel="Delete"
+          cancelLabel="Cancel"
+          danger
+          onConfirm={() => doDelete(deleteConfirm.ids)}
+          onCancel={() => setDeleteConfirm(null)}
+        />
+      )}
+
       <div>
         <h1 className="text-2xl font-black text-navy">Field Report</h1>
         <p className="text-slate-500 text-sm mt-0.5">Log crew sign-in, work progress, and photos for a Work Order.</p>
@@ -685,6 +762,12 @@ export default function FieldReport() {
               )}
             </div>
 
+            {rowError && (
+              <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-700">
+                {rowError}
+              </div>
+            )}
+
             {!selectedWOId && (
               <p className="text-xs text-slate-400 italic">
                 Select a Work Order above to see its marking items.
@@ -695,43 +778,77 @@ export default function FieldReport() {
               <p className="text-xs text-slate-400 italic">Loading marking items…</p>
             )}
 
-            {selectedWOId && !markingsLoading && markingItems.length === 0 && newMarkings.length === 0 && (
+            {selectedWOId && !markingsLoading && markingItems.length === 0 && (
               <p className="text-xs text-slate-400 italic bg-slate-50 rounded-lg px-3 py-2">
                 No items pre-populated from the scan. Use "Add marking manually" below to log what was done.
               </p>
             )}
 
-            {/* Planned items, grouped by section */}
-            {SECTION_ORDER.map(sec => {
-              const rows = itemsBySection[sec] || []
-              if (!rows.length) return null
+            {/* Bulk-select header — visible only when selection is active */}
+            {selectedIds.size > 0 && (
+              <div className="flex items-center justify-between bg-slate-50
+                              border border-slate-200 rounded-lg px-3 py-2 sticky top-0 z-10">
+                <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.size === markingItems.length && markingItems.length > 0}
+                    onChange={e => e.target.checked ? selectAll() : clearSelection()}
+                    className="w-4 h-4 accent-navy"
+                  />
+                  <span className="font-semibold">
+                    {selectedIds.size} selected
+                  </span>
+                </label>
+                <div className="flex gap-2">
+                  <button type="button" onClick={clearSelection}
+                    className="text-xs font-semibold text-slate-500 hover:text-slate-700 px-2">
+                    Clear
+                  </button>
+                  <button type="button"
+                    onClick={() => setDeleteConfirm({ ids: Array.from(selectedIds) })}
+                    className="text-xs font-bold bg-red-500 text-white hover:bg-red-600
+                               rounded-lg px-3 py-1.5 transition-colors">
+                    Delete selected
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Planned + manual items in sheet order, with a divider each
+                time the Section value changes so the crew can read
+                top-to-bottom against the paper WO. */}
+            {markingItems.map((item, idx) => {
+              const prevSection = idx > 0 ? markingItems[idx - 1].section : null
+              const showHeader  = item.section !== prevSection
               return (
-                <div key={sec} className="space-y-1.5">
-                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-2">
-                    {SECTION_HEADERS[sec] || sec}
-                  </p>
-                  {rows.map(item => (
-                    <MarkingItemRow key={item.item_id} item={item} onChange={updateMarkingItem} />
-                  ))}
+                <div key={item.item_id}>
+                  {showHeader && (
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-3 mb-1">
+                      {SECTION_HEADERS[item.section] || item.section || 'Other'}
+                    </p>
+                  )}
+                  <MarkingItemRow
+                    item={item}
+                    selected={selectedIds.has(item.item_id)}
+                    saving={rowSaving.has(item.item_id)}
+                    onToggleSelect={toggleSelect}
+                    onFieldChange={onRowFieldChange}
+                    onEdit={(it) => setFormModal({ mode: 'edit', item: it })}
+                    onDelete={(it) => setDeleteConfirm({
+                      ids:   [it.item_id],
+                      label: `${it.category}${it.intersection ? ` — ${it.intersection} ${it.direction}` : ''}`
+                    })}
+                  />
                 </div>
               )
             })}
 
-            {/* Manual additions */}
-            {newMarkings.length > 0 && (
-              <div className="space-y-1.5">
-                <p className="text-[10px] font-bold uppercase tracking-wider text-amber-700 mt-2">
-                  Manually Added
-                </p>
-                {newMarkings.map((nm, i) => (
-                  <ManualMarkingRow key={i} idx={i} data={nm}
-                    onChange={updateManualMarking} onRemove={removeManualMarking} />
-                ))}
-              </div>
-            )}
-
             {selectedWOId && (
-              <button type="button" onClick={addManualMarking} className="btn-ghost text-xs mt-1">
+              <button
+                type="button"
+                onClick={() => setFormModal({ mode: 'add', item: null })}
+                className="btn-ghost text-xs mt-1"
+              >
                 + Add marking manually
               </button>
             )}

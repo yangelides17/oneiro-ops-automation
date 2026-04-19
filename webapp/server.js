@@ -116,6 +116,55 @@ app.get('/api/wo-markings/:woId', async (req, res) => {
 })
 
 /**
+ * POST /api/marking-items
+ * Create ONE manually-added marking item. Body: full item fields (wo_id,
+ * category, etc.). Response: { item: <full row object> }.
+ */
+app.post('/api/marking-items', async (req, res) => {
+  try {
+    const data = await callAppsScript('create_marking_item', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/marking-items error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * PATCH /api/marking-items/:itemId
+ * Update any subset of editable fields on one marking item. Body: a
+ * partial patch (quantity, unit, category, etc.). Response:
+ * { item: <full updated row object> }.
+ */
+app.patch('/api/marking-items/:itemId', async (req, res) => {
+  try {
+    const data = await callAppsScript('update_marking_item', {
+      ...req.body,
+      item_id: req.params.itemId,
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('PATCH /api/marking-items error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * DELETE /api/marking-items
+ * Delete one or more marking items by Item ID. Body: { item_ids: [...] }.
+ * Response: { deleted: [<ids removed>] }.
+ */
+app.delete('/api/marking-items', async (req, res) => {
+  try {
+    const data = await callAppsScript('delete_marking_items', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('DELETE /api/marking-items error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/field-report
  * Submits a crew field report (writes to Daily Sign-In Data + WO Tracker).
  * Body: the field report data object (see Apps Script handleSubmitFieldReport_)

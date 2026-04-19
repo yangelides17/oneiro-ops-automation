@@ -1763,6 +1763,12 @@ function doPost(e) {
       return handleUploadSignature_(body);
     } else if (action === 'get_marking_items') {
       return handleGetMarkingItems_(body);
+    } else if (action === 'create_marking_item') {
+      return handleCreateMarkingItem_(body);
+    } else if (action === 'update_marking_item') {
+      return handleUpdateMarkingItem_(body);
+    } else if (action === 'delete_marking_items') {
+      return handleDeleteMarkingItems_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2359,6 +2365,273 @@ function handleGetMarkingItems_(body) {
 
 
 // ═══════════════════════════════════════════════════════════════
+// MARKING ITEMS — per-row CRUD (live Drive sync from the UI)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Read a single row by Item ID and return the same shape as
+ * handleGetMarkingItems_ entries (so the UI can spot-update state
+ * without a refetch). Returns null if the ID is not found.
+ */
+function readMarkingItemById_(sheet, itemId) {
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() !== itemId) continue;
+    const r = data[i];
+    return {
+      item_id:        String(r[0]  || ''),
+      work_order_id:  String(r[1]  || ''),
+      work_type:      String(r[2]  || ''),
+      section:        String(r[3]  || ''),
+      category:       String(r[4]  || ''),
+      intersection:   String(r[5]  || ''),
+      direction:      String(r[6]  || ''),
+      description:    String(r[7]  || ''),
+      quantity:       r[8]  === '' || r[8]  == null ? null : Number(r[8]),
+      unit:           String(r[9]  || ''),
+      color_material: String(r[10] || ''),
+      date_completed: r[11] instanceof Date
+                         ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+                         : String(r[11] || ''),
+      status:         String(r[12] || ''),
+      added_by:       String(r[13] || ''),
+      notes:          String(r[14] || '')
+    };
+  }
+  return null;
+}
+
+
+/**
+ * Append ONE manually-added row. Status is always 'Pending' regardless
+ * of whether the client supplied a quantity — crews only confirm
+ * completion via the Field Report submit, not at item creation.
+ *
+ * body.data: { wo_id, category, description?, intersection?, direction?,
+ *   unit?, quantity?, color_material?, notes?, work_type? }
+ * response:  { item: <full row object> }
+ */
+function handleCreateMarkingItem_(body) {
+  const d    = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  const cat  = String(d.category || '').trim();
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (!cat)  return jsonResponse_({ error: 'Missing category' }, 400);
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return jsonResponse_({
+    error: 'Marking Items sheet missing — run setupMarkingItems() first'
+  }, 500);
+
+  // Derive work_type: prefer any existing row for this WO, then client hint.
+  const allRows = sheet.getDataRange().getValues();
+  let workType = '';
+  let maxN     = 0;
+  for (let i = 1; i < allRows.length; i++) {
+    const id = String(allRows[i][0] || '');
+    if (id.indexOf(woId + '-') !== 0) continue;
+    if (!workType) workType = String(allRows[i][2] || '');
+    const n = parseInt(id.split('-').pop(), 10);
+    if (!isNaN(n) && n > maxN) maxN = n;
+  }
+  if (!workType) workType = String(d.work_type || '').trim();
+
+  const qty = parseFloat(d.quantity);
+  const hasQty = !isNaN(qty) && qty > 0;
+  const pad3 = (x) => String(x).padStart(3, '0');
+  const newId = `${woId}-${pad3(maxN + 1)}`;
+
+  const row = [
+    newId,                                      // A Item ID
+    woId,                                       // B Work Order #
+    workType,                                   // C Work Type
+    'Manual',                                   // D WO Section
+    cat,                                        // E Marking Type
+    String(d.intersection || '').trim(),        // F Intersection
+    String(d.direction    || '').trim(),        // G Direction
+    String(d.description  || '').trim(),        // H Description
+    hasQty ? qty : '',                          // I Quantity
+    String(d.unit || 'SF').trim(),              // J Unit
+    String(d.color_material || '').trim(),      // K Color/Material
+    '',                                         // L Date Completed — always blank until submit
+    'Pending',                                  // M Status — always Pending until submit
+    'Manual',                                   // N Added By
+    String(d.notes || '').trim()                // O Notes
+  ];
+
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, 1, row.length).setValues([row]);
+  SpreadsheetApp.flush();
+
+  const item = readMarkingItemById_(sheet, newId);
+  return jsonResponse_({ item });
+}
+
+
+/**
+ * Patch one or more editable fields on an existing row.
+ *
+ * Status / Date Completed rule: when `quantity` is in the patch and the
+ * new value is 0/null/empty, force Status back to 'Pending' and clear
+ * Date Completed (so a previously-Completed row can't look done with no
+ * measurement). When `quantity` is set to > 0, leave Status and Date
+ * Completed untouched — promotion to Completed is a submit-time job.
+ *
+ * body.data: { item_id, <any patchable field> }
+ *   patchable: work_type, section, category, intersection, direction,
+ *              description, quantity, unit, color_material, notes.
+ * response:  { item: <full updated row> }
+ */
+function handleUpdateMarkingItem_(body) {
+  const d      = body.data || {};
+  const itemId = String(d.item_id || '').trim();
+  if (!itemId) return jsonResponse_({ error: 'Missing item_id' }, 400);
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return jsonResponse_({
+    error: 'Marking Items sheet missing — run setupMarkingItems() first'
+  }, 500);
+
+  const data = sheet.getDataRange().getValues();
+  let rowNum = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === itemId) { rowNum = i + 1; break; }
+  }
+  if (!rowNum) return jsonResponse_({ error: 'item_id not found: ' + itemId }, 404);
+
+  // Column indices (1-based). Matches the 15-col schema.
+  const COL = {
+    work_type:     3,
+    section:       4,
+    category:      5,
+    intersection:  6,
+    direction:     7,
+    description:   8,
+    quantity:      9,
+    unit:          10,
+    color_material:11,
+    date_completed:12,
+    status:        13,
+    notes:         15,
+  };
+
+  // Write each patchable field present in the request.
+  ['work_type','section','category','intersection','direction','description',
+   'unit','color_material','notes'].forEach(key => {
+    if (d[key] !== undefined) {
+      sheet.getRange(rowNum, COL[key]).setValue(String(d[key] || '').trim());
+    }
+  });
+
+  if (d.quantity !== undefined) {
+    const q = parseFloat(d.quantity);
+    const hasQty = !isNaN(q) && q > 0;
+    sheet.getRange(rowNum, COL.quantity).setValue(hasQty ? q : '');
+
+    // Status / Date Completed side-effect: clearing a qty (empty / 0) flips
+    // a previously-Completed row back to Pending immediately. Setting a
+    // positive qty leaves Status alone — submit promotes it.
+    if (!hasQty) {
+      sheet.getRange(rowNum, COL.status).setValue('Pending');
+      sheet.getRange(rowNum, COL.date_completed).setValue('');
+    }
+  }
+
+  SpreadsheetApp.flush();
+  const item = readMarkingItemById_(sheet, itemId);
+  return jsonResponse_({ item });
+}
+
+
+/**
+ * Delete one or more Marking Items rows by Item ID.
+ *
+ * body.data: { item_ids: ['<id1>', '<id2>', ...] }
+ * response:  { deleted: [<ids that were found and removed>] }
+ */
+function handleDeleteMarkingItems_(body) {
+  const d   = body.data || {};
+  const ids = Array.isArray(d.item_ids) ? d.item_ids.map(String) : [];
+  if (ids.length === 0) return jsonResponse_({ error: 'item_ids is empty' }, 400);
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return jsonResponse_({
+    error: 'Marking Items sheet missing — run setupMarkingItems() first'
+  }, 500);
+
+  const data = sheet.getDataRange().getValues();
+  const idSet = {};
+  ids.forEach(id => { idSet[String(id).trim()] = true; });
+
+  // Collect 1-based row numbers to delete. Sort descending so deleting
+  // doesn't shift earlier row indices out from under us.
+  const rowNums = [];
+  const deleted = [];
+  for (let i = 1; i < data.length; i++) {
+    const rowId = String(data[i][0] || '').trim();
+    if (idSet[rowId]) {
+      rowNums.push(i + 1);
+      deleted.push(rowId);
+    }
+  }
+  rowNums.sort((a, b) => b - a);
+  rowNums.forEach(r => sheet.deleteRow(r));
+  SpreadsheetApp.flush();
+
+  return jsonResponse_({ deleted });
+}
+
+
+/**
+ * Submit-time status promotion. Walks every Marking Items row for `woId`
+ * and sets:
+ *   qty > 0  → Status='Completed', Date Completed=dateOfWork
+ *   else     → Status='Pending',   Date Completed=''
+ *
+ * Batched with two single-column setValues calls for efficiency.
+ */
+function finalizeMarkingStatus_(ss, woId, dateOfWork) {
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return 0;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return 0;
+
+  // Track contiguous run of WO rows. The rows ARE contiguous per WO
+  // (see plan) but we don't need to rely on that — we build arrays of
+  // (rowNum, status, dateCompleted) and then write per-cell.
+  let touched = 0;
+  data.forEach((r, idx) => {
+    if (idx === 0) return;  // header
+    if (String(r[1] || '').trim() !== woId) return;
+    const q = parseFloat(r[8]);
+    const hasQty = !isNaN(q) && q > 0;
+    const status = hasQty ? 'Completed' : 'Pending';
+    const date   = hasQty ? dateOfWork : '';
+    const rowNum = idx + 1;
+    // Only write if the value actually changed — avoids needless churn
+    // on the sheet (each setValue is a round-trip).
+    if (String(r[12] || '') !== status) {
+      sheet.getRange(rowNum, 13).setValue(status);
+      touched++;
+    }
+    const currentDate = r[11] instanceof Date
+      ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+      : String(r[11] || '');
+    if (currentDate !== date) {
+      sheet.getRange(rowNum, 12).setValue(date);
+      touched++;
+    }
+  });
+  if (touched) SpreadsheetApp.flush();
+  return touched;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
 // 9. WEB APP — Crew Field Report
 // ═══════════════════════════════════════════════════════════════
 
@@ -2529,21 +2802,20 @@ function handleSubmitFieldReport_(body) {
   const newPhotos = (d.photos_uploaded || String(woRow[23]).toLowerCase() === 'yes')
     ? 'Yes' : 'No';
 
-  // ── Process Marking Items first ───────────────────────────────
-  // (1) Update existing items with quantity/material/status/date.
-  // (2) Append manually-added items.
-  // (3) Recompute WO Tracker cols 19-21 from the resulting sheet state
-  //     so the tracker's rollup reflects what was just written.
-  step = 'marking updates';
-  const nUpdated = applyMarkingUpdates_(ss, d.marking_updates || [], d.date);
-
-  step = 'marking new';
-  const workTypeHint = String(d.work_type || '').trim();  // UI may pass this; else blank
-  const nNew = applyMarkingNew_(ss, d.wo_id, workTypeHint, d.marking_new || [], d.date);
+  // ── Finalize Marking Items + compute rollups ─────────────────
+  // Marking Items rows are already live-persisted via the per-row CRUD
+  // endpoints (create/update/delete) — no need to re-apply anything here.
+  // Submit time does two things:
+  //  (1) Promote Status: any row with qty > 0 → Completed, else Pending.
+  //      (Status was held at Pending during data entry; this is when the
+  //      crew formally confirms the day's work.)
+  //  (2) Recompute WO Tracker cols 19-21 rollups from final sheet state.
+  step = 'marking finalize status';
+  const nFinalized = finalizeMarkingStatus_(ss, d.wo_id, d.date);
 
   step = 'marking rollup';
   const rollups = computeMarkingRollups_(ss, d.wo_id);
-  Logger.log(`✅ Marking Items: ${nUpdated} updated, ${nNew} added; ` +
+  Logger.log(`✅ Marking Items: ${nFinalized} status cells updated; ` +
              `rollup → types=${JSON.stringify(rollups.marking_types)}, ` +
              `sqft=${rollups.sqft_completed}, ` +
              `material=${JSON.stringify(rollups.paint_material)}`);
