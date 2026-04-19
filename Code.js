@@ -207,9 +207,9 @@ function setupMarkingItems() {
   }
 
   const mHeaders = [
-    'Item ID', 'Work Order #', 'Work Type', 'Section',
-    'Category', 'Intersection', 'Direction', 'Description',
-    'Unit', 'Quantity Completed', 'Color/Material',
+    'Item ID', 'Work Order #', 'Work Type', 'WO Section',
+    'Marking Type', 'Intersection', 'Direction', 'Description',
+    'Quantity Completed', 'Unit', 'Color/Material',
     'Date Completed', 'Status', 'Added By', 'Notes'
   ];
   markingSheet.getRange(1, 1, 1, mHeaders.length).setValues([mHeaders]);
@@ -243,19 +243,19 @@ function setupMarkingItems() {
   ];
 
   // Column indices (1-based) for the 15-col schema:
-  //   A  1 Item ID         E  5 Category       I   9 Unit
-  //   B  2 Work Order #    F  6 Intersection   J  10 Quantity Completed
-  //   C  3 Work Type       G  7 Direction      K  11 Color/Material
-  //   D  4 Section         H  8 Description    L  12 Date Completed
-  //                                             M  13 Status
-  //                                             N  14 Added By
-  //                                             O  15 Notes
+  //   A  1 Item ID         E  5 Marking Type    I   9 Quantity Completed
+  //   B  2 Work Order #    F  6 Intersection    J  10 Unit
+  //   C  3 Work Type       G  7 Direction       K  11 Color/Material
+  //   D  4 WO Section      H  8 Description     L  12 Date Completed
+  //                                              M  13 Status
+  //                                              N  14 Added By
+  //                                              O  15 Notes
   const mDropdowns = [
     { col:  3, values: ['MMA', 'Thermo'],                              strict: true  },
-    { col:  4, values: ['Top Table', 'Intersection Grid', 'Manual'],   strict: true  },
-    { col:  5, values: MARKING_CATEGORIES,                             strict: false }, // Category
+    { col:  4, values: ['Top Table', 'Intersection Grid', 'Manual'],   strict: true  }, // WO Section
+    { col:  5, values: MARKING_CATEGORIES,                             strict: false }, // Marking Type
     { col:  7, values: ['N', 'E', 'S', 'W'],                           strict: true  }, // Direction
-    { col:  9, values: ['SF', 'LF', 'EA'],                             strict: true  }, // Unit
+    { col: 10, values: ['SF', 'LF', 'EA'],                             strict: true  }, // Unit
     { col: 13, values: ['Pending', 'Completed', 'Skipped'],            strict: true  }, // Status
     { col: 14, values: ['Scanner', 'Manual'],                          strict: true  }, // Added By
   ];
@@ -2053,13 +2053,13 @@ function seedMarkingItems_(ss, d) {
       `${woId}-${pad3(n++)}`,        // A  Item ID
       woId,                           // B  Work Order #
       workType,                       // C  Work Type
-      'Top Table',                    // D  Section
-      String(m.category).trim(),      // E  Category
+      'Top Table',                    // D  WO Section
+      String(m.category).trim(),      // E  Marking Type
       '',                             // F  Intersection
       '',                             // G  Direction
       String(m.description).trim(),   // H  Description
-      'SF',                           // I  Unit
-      '',                             // J  Quantity Completed
+      '',                             // I  Quantity Completed
+      'SF',                           // J  Unit
       '',                             // K  Color/Material
       '',                             // L  Date Completed
       'Pending',                      // M  Status
@@ -2093,13 +2093,13 @@ function seedMarkingItems_(ss, d) {
           `${woId}-${pad3(n++)}`,       // A  Item ID
           woId,                          // B  Work Order #
           workType,                      // C  Work Type
-          'Intersection Grid',           // D  Section
-          category,                      // E  Category
+          'Intersection Grid',           // D  WO Section
+          category,                      // E  Marking Type
           String(ig.intersection).trim(),// F  Intersection
           dir,                           // G  Direction
           '',                            // H  Description (blank for grid items)
-          'SF',                          // I  Unit
-          '',                            // J  Quantity Completed
+          '',                            // I  Quantity Completed
+          'SF',                          // J  Unit
           '',                            // K  Color/Material
           '',                            // L  Date Completed
           'Pending',                     // M  Status
@@ -2127,7 +2127,7 @@ function seedMarkingItems_(ss, d) {
 
 /**
  * Apply completion updates to existing Marking Items rows. Writes cols
- * I (Unit), J (Quantity), K (Color/Material), L (Date Completed),
+ * I (Quantity), J (Unit), K (Color/Material), L (Date Completed),
  * M (Status), O (Notes) per item. Zero/blank quantity → Status =
  * Pending (so a user can un-mark a row by clearing the number).
  *
@@ -2156,13 +2156,13 @@ function applyMarkingUpdates_(ss, updates, dateOfWork) {
     const qty    = parseFloat(u.quantity);
     const hasQty = !isNaN(qty) && qty > 0;
 
-    if (u.unit) sheet.getRange(rowNum, 9).setValue(String(u.unit).trim());
-    sheet.getRange(rowNum, 10).setValue(hasQty ? qty : '');
-    sheet.getRange(rowNum, 11).setValue(String(u.color_material || '').trim());
-    sheet.getRange(rowNum, 12).setValue(hasQty ? dateOfWork : '');
-    sheet.getRange(rowNum, 13).setValue(hasQty ? 'Completed' : 'Pending');
+    sheet.getRange(rowNum, 9).setValue(hasQty ? qty : '');                       // I Quantity
+    if (u.unit) sheet.getRange(rowNum, 10).setValue(String(u.unit).trim());      // J Unit
+    sheet.getRange(rowNum, 11).setValue(String(u.color_material || '').trim()); // K Color/Material
+    sheet.getRange(rowNum, 12).setValue(hasQty ? dateOfWork : '');               // L Date Completed
+    sheet.getRange(rowNum, 13).setValue(hasQty ? 'Completed' : 'Pending');       // M Status
     if (u.notes !== undefined) {
-      sheet.getRange(rowNum, 15).setValue(String(u.notes || '').trim());
+      sheet.getRange(rowNum, 15).setValue(String(u.notes || '').trim());         // O Notes
     }
     updated++;
   });
@@ -2204,13 +2204,13 @@ function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
       `${woId}-${pad3(maxN + idx + 1)}`,           // A Item ID
       woId,                                         // B Work Order #
       workType,                                     // C Work Type
-      'Manual',                                     // D Section
-      String(item.category || '').trim(),           // E Category
+      'Manual',                                     // D WO Section
+      String(item.category || '').trim(),           // E Marking Type
       String(item.intersection || '').trim(),       // F Intersection
       String(item.direction || '').trim(),          // G Direction
       String(item.description || '').trim(),        // H Description
-      String(item.unit || 'SF').trim(),             // I Unit
-      hasQty ? qty : '',                            // J Quantity
+      hasQty ? qty : '',                            // I Quantity
+      String(item.unit || 'SF').trim(),             // J Unit
       String(item.color_material || '').trim(),     // K Color/Material
       hasQty ? dateOfWork : '',                     // L Date Completed
       hasQty ? 'Completed' : 'Pending',             // M Status
@@ -2255,16 +2255,16 @@ function computeMarkingRollups_(ss, woId) {
   const anyThermo = woItems.some(r => String(r[2] || '').toLowerCase() === 'thermo');
 
   // Column indices (0-based) under the 15-col schema:
-  //   0 Item ID    4 Category       8 Unit         12 Status
-  //   1 WO#        5 Intersection   9 Qty          13 Added By
-  //   2 Work Type  6 Direction      10 Material    14 Notes
-  //   3 Section    7 Description    11 Date Completed
+  //   0 Item ID     4 Marking Type   8 Quantity      12 Status
+  //   1 WO#         5 Intersection   9 Unit          13 Added By
+  //   2 Work Type   6 Direction      10 Material     14 Notes
+  //   3 WO Section  7 Description    11 Date Completed
   let sqftSum = 0;
   let hasQty  = false;
   woItems.forEach(r => {
-    const unit = String(r[8] || '').toUpperCase();
+    const unit = String(r[9] || '').toUpperCase();
     if (unit !== 'SF') return;
-    const qty = parseFloat(r[9]);
+    const qty = parseFloat(r[8]);
     if (isNaN(qty) || qty <= 0) return;
     sqftSum += qty;
     hasQty = true;
@@ -2320,10 +2320,10 @@ function handleGetMarkingItems_(body) {
   if (data.length < 2) return jsonResponse_({ items: [] });
 
   // Column indices (0-based) under the 15-col schema:
-  //   0 Item ID    4 Category       8 Unit         12 Status
-  //   1 WO#        5 Intersection   9 Qty          13 Added By
-  //   2 Work Type  6 Direction      10 Material    14 Notes
-  //   3 Section    7 Description    11 Date Completed
+  //   0 Item ID     4 Marking Type   8 Quantity      12 Status
+  //   1 WO#         5 Intersection   9 Unit          13 Added By
+  //   2 Work Type   6 Direction      10 Material     14 Notes
+  //   3 WO Section  7 Description    11 Date Completed
   // .filter() preserves array order → sheet row order → insertion order.
   const items = data.slice(1)
     .filter(r => String(r[1] || '').trim() === woId)
@@ -2336,8 +2336,8 @@ function handleGetMarkingItems_(body) {
       intersection:   String(r[5]  || ''),
       direction:      String(r[6]  || ''),
       description:    String(r[7]  || ''),
-      unit:           String(r[8]  || ''),
-      quantity:       r[9]  === '' || r[9]  == null ? null : Number(r[9]),
+      quantity:       r[8]  === '' || r[8]  == null ? null : Number(r[8]),
+      unit:           String(r[9]  || ''),
       color_material: String(r[10] || ''),
       date_completed: r[11] instanceof Date
                          ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
