@@ -2619,12 +2619,16 @@ function handleDeleteMarkingItems_(body) {
 
 
 /**
- * Submit-time status promotion. Walks every Marking Items row for `woId`
- * and sets:
- *   qty > 0  → Status='Completed', Date Completed=dateOfWork
- *   else     → Status='Pending',   Date Completed=''
+ * Submit-time status promotion. Walks every Marking Items row for `woId`:
  *
- * Batched with two single-column setValues calls for efficiency.
+ *   qty > 0 AND Status != Completed  → promote to Completed + set Date = dateOfWork
+ *   qty > 0 AND already Completed    → leave untouched (preserves original Date Completed)
+ *   qty empty/0                      → force Pending, clear Date
+ *
+ * Preserving Date Completed across re-submissions is important: when a
+ * WO spans multiple days and the crew submits a second Field Report on
+ * Day 2, any rows already marked Completed on Day 1 must keep their
+ * Day 1 Date Completed — otherwise the audit trail gets rewritten.
  */
 function finalizeMarkingStatus_(ss, woId, dateOfWork) {
   const sheet = ss.getSheetByName('Marking Items');
@@ -2633,30 +2637,40 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork) {
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return 0;
 
-  // Track contiguous run of WO rows. The rows ARE contiguous per WO
-  // (see plan) but we don't need to rely on that — we build arrays of
-  // (rowNum, status, dateCompleted) and then write per-cell.
   let touched = 0;
   data.forEach((r, idx) => {
     if (idx === 0) return;  // header
     if (String(r[1] || '').trim() !== woId) return;
-    const q = parseFloat(r[8]);
-    const hasQty = !isNaN(q) && q > 0;
-    const status = hasQty ? 'Completed' : 'Pending';
-    const date   = hasQty ? dateOfWork : '';
-    const rowNum = idx + 1;
-    // Only write if the value actually changed — avoids needless churn
-    // on the sheet (each setValue is a round-trip).
-    if (String(r[12] || '') !== status) {
-      sheet.getRange(rowNum, 13).setValue(status);
-      touched++;
-    }
-    const currentDate = r[11] instanceof Date
-      ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
-      : String(r[11] || '');
-    if (currentDate !== date) {
-      sheet.getRange(rowNum, 12).setValue(date);
-      touched++;
+
+    const q              = parseFloat(r[8]);
+    const hasQty         = !isNaN(q) && q > 0;
+    const currentStatus  = String(r[12] || '');
+    const rowNum         = idx + 1;
+
+    if (hasQty) {
+      // Promote only if not already Completed. If already Completed,
+      // both Status and Date Completed are preserved — this is the
+      // bug fix that keeps Day 1's date intact across Day 2 submits.
+      if (currentStatus !== 'Completed') {
+        sheet.getRange(rowNum, 13).setValue('Completed');
+        sheet.getRange(rowNum, 12).setValue(dateOfWork);
+        touched += 2;
+      }
+    } else {
+      // qty empty/0 — row cannot be Completed. Revert to Pending and
+      // clear Date if needed (defensive: covers admins zeroing a qty
+      // directly on the sheet after a prior Completed submit).
+      if (currentStatus !== 'Pending') {
+        sheet.getRange(rowNum, 13).setValue('Pending');
+        touched++;
+      }
+      const currentDate = r[11] instanceof Date
+        ? Utilities.formatDate(r[11], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+        : String(r[11] || '');
+      if (currentDate !== '') {
+        sheet.getRange(rowNum, 12).setValue('');
+        touched++;
+      }
     }
   });
   if (touched) SpreadsheetApp.flush();
