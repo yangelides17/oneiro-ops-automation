@@ -18,6 +18,41 @@ const SECTION_HEADERS = {
   'Manual':             'Manually Added',
 }
 
+// Category sets that drive row layout. Keep in sync with
+// setupMarkingItems() MARKING_CATEGORIES. An item's category overrides
+// its Section when picking a layout — a manually-added "HVX Crosswalk"
+// still renders as an intersection row.
+const GRID_CATEGORIES = new Set(['HVX Crosswalk', 'Stop Msg', 'Stop Line'])
+const MMA_CATEGORIES  = new Set(['Bike Lane', 'Bus Lane', 'Pedestrian Space', 'Ped Stop'])
+
+function pickLayout(item) {
+  const cat = item.category || ''
+  if (GRID_CATEGORIES.has(cat))                                 return 'grid'
+  if (item.section === 'Intersection Grid')                     return 'grid'
+  if (MMA_CATEGORIES.has(cat))                                  return 'mma'
+  if (String(item.work_type || '').toLowerCase() === 'mma')     return 'mma'
+  return 'default'
+}
+
+function rowRequiresColor(item) {
+  if (MMA_CATEGORIES.has(item.category || '')) return true
+  return String(item.work_type || '').toLowerCase() === 'mma'
+}
+
+/**
+ * Is this row "ready to be confirmed complete" at submit time?
+ * - Already Completed → yes.
+ * - Pending → needs qty > 0, unit set, and color/material if MMA.
+ */
+function rowIsCompletable(item) {
+  if (item.status === 'Completed') return true
+  const qty = parseFloat(item.quantity)
+  if (isNaN(qty) || qty <= 0) return false
+  if (!String(item.unit || '').trim()) return false
+  if (rowRequiresColor(item) && !String(item.color_material || '').trim()) return false
+  return true
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 const isoToday = () => {
   const d = new Date()
@@ -67,27 +102,42 @@ function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
 }
 
 // ── Planned marking row ───────────────────────────────────────
-// Single-line layout per section so rows align vertically like a grid.
-// Quantity / Unit / Color-Material are directly editable (autosave via
-// onFieldChange debounced in the parent). Marking Type / Intersection /
-// Direction are readOnly here — use the kebab menu's Edit action to
-// change them (which opens MarkingFormModal with a warning).
+// Single-line layout per section/category so rows align vertically like a
+// grid. Layout is driven by `pickLayout(item)`:
+//   grid    → [Type][Intersection][Direction][Qty][Unit]
+//   mma     → [Type][Color/Material][Qty][Unit]
+//   default → [Type][Qty][Unit]
 //
-// Leftmost cell: checkbox. Rightmost cell: kebab (replaced by a spinner
-// while the row has a pending save).
+// Inline fields save on commit (blur / Enter / dropdown change) — not on
+// every keystroke — to avoid persisting intermediate values while the
+// user is still typing. Once Status='Completed', all inline fields are
+// read-only; use the kebab → Edit to reopen editing via the modal.
+//
+// Leftmost cell: checkbox (only rendered in bulk-select mode).
+// Rightmost cell: kebab or per-row spinner.
 function MarkingItemRow({
-  item, selected, saving, onToggleSelect, onFieldChange, onEdit, onDelete
+  item, selected, saving, bulkMode,
+  onToggleSelect, onLocalChange, onCommit,
+  onEdit, onDelete, onStartBulk,
 }) {
-  const workType = String(item.work_type || '').toLowerCase()
-  const section  = item.section || ''
-  const isMMA    = workType === 'mma'
-  const isGrid   = section === 'Intersection Grid'
+  const layout = pickLayout(item)
+  const locked = item.status === 'Completed'
 
   const INPUT = 'field-input text-sm py-2'
   const RO    = INPUT + ' bg-slate-50 text-slate-500 cursor-default focus:ring-0'
-  const QTY   = INPUT + ' text-center'
+  const LOCK  = INPUT + ' bg-slate-50 text-slate-500 cursor-not-allowed focus:ring-0'
+  const QTY_LIVE   = INPUT + ' text-center'
+  const QTY_LOCKED = LOCK  + ' text-center'
 
-  const onField = (field) => (e) => onFieldChange(item.item_id, field, e.target.value)
+  // onChange handlers. Text inputs update local state only; commits
+  // happen in onBlur/onKeyDown. Unit (dropdown) commits immediately.
+  const onLocalText  = (field) => (e) => onLocalChange(item.item_id, field, e.target.value)
+  const onCommitText = (field) => (e) => onCommit(item.item_id, field, e.target.value)
+  const onDropdown   = (field) => (e) => {
+    onLocalChange(item.item_id, field, e.target.value)
+    onCommit(item.item_id, field, e.target.value)
+  }
+  const onEnterBlur = (e) => { if (e.key === 'Enter') e.target.blur() }
 
   const CategoryBox = (
     <input type="text" readOnly value={item.category ?? ''}
@@ -95,84 +145,82 @@ function MarkingItemRow({
   )
   const QtyBox = (
     <input
-      type="number" min="0" inputMode="numeric" placeholder="Quantity"
+      type="number" min="0" inputMode="numeric" placeholder="Qty"
       value={item.quantity == null ? '' : item.quantity}
-      onChange={onField('quantity')} className={QTY}
+      onChange={onLocalText('quantity')}
+      onBlur={onCommitText('quantity')}
+      onKeyDown={onEnterBlur}
+      readOnly={locked}
+      className={locked ? QTY_LOCKED : QTY_LIVE}
     />
   )
   const UnitBox = (
-    <select value={item.unit || 'SF'} onChange={onField('unit')} className={INPUT}>
+    <select value={item.unit || 'SF'}
+      onChange={onDropdown('unit')}
+      disabled={locked}
+      className={locked ? LOCK : INPUT}>
       {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
     </select>
   )
-
-  const Checkbox = (
+  const ColorBox = (
+    <input type="text" placeholder="Color / Material"
+      value={item.color_material ?? ''}
+      onChange={onLocalText('color_material')}
+      onBlur={onCommitText('color_material')}
+      onKeyDown={onEnterBlur}
+      readOnly={locked}
+      className={locked ? LOCK : INPUT}
+    />
+  )
+  const CheckboxCell = bulkMode ? (
     <input type="checkbox" checked={selected}
       onChange={e => onToggleSelect(item.item_id, e.target.checked)}
       className="w-4 h-4 accent-navy cursor-pointer" />
-  )
+  ) : null
   const ActionCell = saving
     ? <Spinner />
     : <RowKebab items={[
-        { label: 'Edit',   onClick: () => onEdit(item) },
-        { label: 'Delete', onClick: () => onDelete(item), danger: true },
+        { label: 'Edit',        onClick: () => onEdit(item) },
+        { label: 'Delete',      onClick: () => onDelete(item), danger: true },
+        { label: 'Bulk delete', onClick: () => onStartBulk() },
       ]} />
 
-  // Grid layouts — checkbox on left, kebab/spinner on right, same gaps
-  // across section variants so Marking Type / Intersection / Direction
-  // columns line up vertically within a section.
-  if (isGrid) {
-    return (
-      <div className="grid items-center gap-2"
-           style={{ gridTemplateColumns: '24px 1fr 110px 64px 72px 56px 28px' }}>
-        {Checkbox}
-        {CategoryBox}
-        <input type="text" readOnly value={item.intersection ?? ''}
-          placeholder="Intersection" className={RO} />
-        <input type="text" readOnly value={item.direction ?? ''}
-          placeholder="Direction" className={RO + ' text-center'} />
-        {QtyBox}
-        {UnitBox}
-        {ActionCell}
-      </div>
-    )
-  }
+  // Grid templates — [checkbox?] + fields + [action]. Checkbox col is
+  // 0px when bulk mode is off (hidden entirely).
+  const CB  = bulkMode ? '24px ' : ''
+  const END = ' 28px'
+  const tpl = layout === 'grid'
+    ? `${CB}1fr 110px 64px 90px 56px${END}`
+    : layout === 'mma'
+      ? `${CB}1fr 1fr 90px 56px${END}`
+      : `${CB}1fr 90px 56px${END}`
 
-  if (isMMA) {
-    return (
-      <div className="space-y-0.5">
-        <div className="grid items-center gap-2"
-             style={{ gridTemplateColumns: '24px 1fr 1fr 72px 56px 28px' }}>
-          {Checkbox}
-          {CategoryBox}
-          <input type="text" placeholder="Color / Material"
-            value={item.color_material ?? ''}
-            onChange={onField('color_material')} className={INPUT} />
-          {QtyBox}
-          {UnitBox}
-          {ActionCell}
-        </div>
-        {item.description && (
-          <p className="text-[11px] text-slate-400 pl-9">Note: {item.description}</p>
-        )}
-      </div>
-    )
-  }
+  const DescNote = item.description
+    ? <p className={`text-[11px] text-slate-400 ${bulkMode ? 'pl-9' : 'pl-1'}`}>Note: {item.description}</p>
+    : null
 
-  // Top Table / Manual / other
   return (
     <div className="space-y-0.5">
-      <div className="grid items-center gap-2"
-           style={{ gridTemplateColumns: '24px 1fr 72px 56px 28px' }}>
-        {Checkbox}
+      <div className="grid items-center gap-2" style={{ gridTemplateColumns: tpl }}>
+        {CheckboxCell}
         {CategoryBox}
+
+        {layout === 'grid' && (
+          <>
+            <input type="text" readOnly value={item.intersection ?? ''}
+              placeholder="Intersection" className={RO} />
+            <input type="text" readOnly value={item.direction ?? ''}
+              placeholder="Direction" className={RO + ' text-center'} />
+          </>
+        )}
+        {layout === 'mma' && ColorBox}
+
         {QtyBox}
         {UnitBox}
         {ActionCell}
       </div>
-      {item.description && (
-        <p className="text-[11px] text-slate-400 pl-9">Note: {item.description}</p>
-      )}
+      {/* Top-table / MMA items may carry a description; grid items don't. */}
+      {layout !== 'grid' && DescNote}
     </div>
   )
 }
@@ -361,11 +409,14 @@ export default function FieldReport() {
   const [crewLeaderSignature, setCrewLeaderSignature] = useState(null)
 
   // Per-row UI state for the Marking Items list
+  const [bulkMode,      setBulkMode]      = useState(false)
   const [selectedIds,   setSelectedIds]   = useState(new Set())
   const [rowSaving,     setRowSaving]     = useState(new Set())
   const [formModal,     setFormModal]     = useState(null)  // {mode, item} or null
   const [deleteConfirm, setDeleteConfirm] = useState(null)  // {ids:[...], label?} or null
   const [rowError,      setRowError]      = useState('')
+  // In-flight saves mirror of rowSaving for awaitable access from doSubmit.
+  const inFlightRef = useRef(new Set())
 
   // UI state
   const [formError,      setFormError]      = useState('')
@@ -409,8 +460,9 @@ export default function FieldReport() {
   }, [selectedWOId])
 
   // ── Per-row save helpers ──────────────────────────────────────
-  // Mark a row as saving and clear any prior error on it.
   const markSaving = (itemId, on) => {
+    if (on) inFlightRef.current.add(itemId)
+    else    inFlightRef.current.delete(itemId)
     setRowSaving(prev => {
       const next = new Set(prev)
       if (on) next.add(itemId); else next.delete(itemId)
@@ -418,8 +470,18 @@ export default function FieldReport() {
     })
   }
 
-  // Issue a PATCH for one field, update state with the server response.
-  // Used by both the debounced text inputs and the unit dropdown.
+  const refetchMarkings = async () => {
+    if (!selectedWOId) return
+    try {
+      const r = await fetch(`/api/wo-markings/${encodeURIComponent(selectedWOId)}`)
+      const d = await r.json()
+      if (!d.error) setMarkingItems(d.items || [])
+    } catch { /* non-fatal */ }
+  }
+
+  // Issue a PATCH for one field. On success, only merge back the fields
+  // we explicitly patched plus status/date_completed (server-derived) —
+  // so fields the user might still be typing into don't get clobbered.
   const saveField = async (itemId, patch) => {
     markSaving(itemId, true)
     setRowError('')
@@ -432,53 +494,52 @@ export default function FieldReport() {
       const data = await res.json()
       if (data.error) throw new Error(data.error)
       if (data.item) {
-        setMarkingItems(list => list.map(i => i.item_id === itemId ? data.item : i))
+        setMarkingItems(list => list.map(i => {
+          if (i.item_id !== itemId) return i
+          const merged = {
+            ...i,
+            status:         data.item.status,
+            date_completed: data.item.date_completed,
+          }
+          Object.keys(patch).forEach(k => { merged[k] = data.item[k] })
+          return merged
+        }))
       }
     } catch (err) {
       console.error('save field failed', err)
       setRowError(`Couldn't save: ${err.message}`)
-      // Force a refetch to make sure state reflects truth.
       refetchMarkings()
     } finally {
       markSaving(itemId, false)
     }
   }
 
-  // Inline debounce for text fields (Quantity, Color/Material). Each
-  // item_id has its own timer so parallel rows don't interfere.
-  const saveTimers = useRef({})
-  const scheduleSave = (itemId, patch, delay = 400) => {
-    clearTimeout(saveTimers.current[itemId])
-    saveTimers.current[itemId] = setTimeout(() => {
-      delete saveTimers.current[itemId]
-      saveField(itemId, patch)
-    }, delay)
-  }
-
-  // Field-change dispatcher. Quantity/Color coerce through the debouncer;
-  // Unit fires on-change since it's a dropdown.
-  const onRowFieldChange = (itemId, field, value) => {
-    // Optimistic local update
+  // Optimistic local update — does NOT save. Called as the user types.
+  const onRowLocalChange = (itemId, field, value) => {
     setMarkingItems(list => list.map(i =>
       i.item_id === itemId ? { ...i, [field]: value } : i
     ))
-    if (field === 'unit') {
-      saveField(itemId, { unit: value })
-    } else if (field === 'quantity' || field === 'color_material') {
-      scheduleSave(itemId, { [field]: value })
-    } else {
-      // Fallback — immediate save for any future editable field.
-      saveField(itemId, { [field]: value })
-    }
   }
 
-  const refetchMarkings = async () => {
-    if (!selectedWOId) return
-    try {
-      const r = await fetch(`/api/wo-markings/${encodeURIComponent(selectedWOId)}`)
-      const d = await r.json()
-      if (!d.error) setMarkingItems(d.items || [])
-    } catch { /* non-fatal */ }
+  // Commit a value to the server. Called on blur/Enter for text inputs
+  // and on-change for dropdowns. Skips the PATCH if the value already
+  // matches what's in state (i.e. no real change).
+  const onRowCommit = (itemId, field, value) => {
+    // Coerce quantity to a number for comparison / send
+    const normalized = field === 'quantity'
+      ? (value === '' || value == null ? null : parseFloat(value))
+      : value
+    saveField(itemId, { [field]: normalized })
+  }
+
+  // Wait for every in-flight save to finish — called before the
+  // Field Report submit so finalize/rollup operate on fresh Drive data.
+  const waitForSaves = async () => {
+    // Give any onBlur handler currently mid-execution a tick to register.
+    await new Promise(r => setTimeout(r, 25))
+    while (inFlightRef.current.size > 0) {
+      await new Promise(r => setTimeout(r, 50))
+    }
   }
 
   // ── Selection / bulk helpers ──────────────────────────────────
@@ -489,8 +550,16 @@ export default function FieldReport() {
       return next
     })
   }
-  const selectAll = () => setSelectedIds(new Set(markingItems.map(i => i.item_id)))
+  const selectAll   = () => setSelectedIds(new Set(markingItems.map(i => i.item_id)))
   const clearSelection = () => setSelectedIds(new Set())
+  const enterBulkMode  = () => {
+    setBulkMode(true)
+    setSelectedIds(new Set())  // no pre-selection per user preference
+  }
+  const exitBulkMode   = () => {
+    setBulkMode(false)
+    setSelectedIds(new Set())
+  }
 
   // ── Delete (single or bulk) ───────────────────────────────────
   const doDelete = async (ids) => {
@@ -508,6 +577,11 @@ export default function FieldReport() {
       setSelectedIds(prev => {
         const next = new Set(prev)
         deleted.forEach(id => next.delete(id))
+        // If bulk mode was on and all selected items are now gone,
+        // collapse back out of bulk mode so the header disappears.
+        if (bulkMode && next.size === 0) {
+          setBulkMode(false)
+        }
         return next
       })
       setRowError('')
@@ -535,6 +609,15 @@ export default function FieldReport() {
     setFormError('')
     setSubmitting(true)
     const validCrew = crewMembers.filter(m=>m.name.trim())
+
+    // Step 0 — make sure any focused input flushes its save, then wait
+    // for all in-flight PATCHes to land so finalize/rollup on the server
+    // read the freshest Marking Items state.
+    setSubmitStep('Saving pending edits…')
+    if (typeof document !== 'undefined' && document.activeElement?.blur) {
+      document.activeElement.blur()
+    }
+    await waitForSaves()
 
     // Step 1 — upload photos to Drive
     let photosUploaded = false
@@ -610,6 +693,27 @@ export default function FieldReport() {
         setFormError(`Enter Time In and Time Out for ${m.name||'all crew members'}.`); return
       }
     }
+    // If the crew is declaring the WO complete, every Marking Item must
+    // be completable (already Completed, or Pending with the required
+    // fields filled in). Anything else is either missing a measurement
+    // or needs to be deleted — block submit with a specific list.
+    if (woComplete === 'yes' && markingItems.length > 0) {
+      const bad = markingItems.filter(i => !rowIsCompletable(i))
+      if (bad.length > 0) {
+        const labels = bad.slice(0, 6).map(i => {
+          const base = i.intersection ? `${i.intersection} ${i.direction || ''} ${i.category}`.trim()
+                                      : i.category
+          return `• ${base}`
+        }).join('\n')
+        const more = bad.length > 6 ? `\n…and ${bad.length - 6} more` : ''
+        setFormError(
+          `Can't mark WO complete — ${bad.length} marking item${bad.length===1?'':'s'} ${bad.length===1?'is':'are'} missing required fields ` +
+          `(Quantity + Unit${/* MMA color hint */''}, plus Color/Material for MMA items).\n\n${labels}${more}\n\n` +
+          `Fill in the missing values or delete the row, then re-submit.`
+        )
+        return
+      }
+    }
     // Guard: no photos selected
     if (photoFiles.length===0) { setShowPhotoModal(true); return }
     doSubmit()
@@ -619,7 +723,8 @@ export default function FieldReport() {
   function reset() {
     setSubmitted(null); setSelectedWOId(''); setWorkDate(isoToday())
     setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
-    setIssues('')
+    setBulkMode(false); inFlightRef.current.clear()
+    setIssues(''); setRowError('')
     setCrewMembers([newCrew()]); setWoComplete('no'); setPhotoFiles([]); setFormError('')
     setCrewLeaderName(''); setCrewLeaderSignature(null)
   }
@@ -725,7 +830,7 @@ export default function FieldReport() {
       </div>
 
       {formError && (
-        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm">{formError}</div>
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm whitespace-pre-line">{formError}</div>
       )}
 
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -784,8 +889,8 @@ export default function FieldReport() {
               </p>
             )}
 
-            {/* Bulk-select header — visible only when selection is active */}
-            {selectedIds.size > 0 && (
+            {/* Bulk-select header — visible only while bulk mode is on. */}
+            {bulkMode && (
               <div className="flex items-center justify-between bg-slate-50
                               border border-slate-200 rounded-lg px-3 py-2 sticky top-0 z-10">
                 <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
@@ -799,14 +904,16 @@ export default function FieldReport() {
                     {selectedIds.size} selected
                   </span>
                 </label>
-                <div className="flex gap-2">
-                  <button type="button" onClick={clearSelection}
+                <div className="flex gap-2 items-center">
+                  <button type="button" onClick={exitBulkMode}
                     className="text-xs font-semibold text-slate-500 hover:text-slate-700 px-2">
                     Clear
                   </button>
                   <button type="button"
+                    disabled={selectedIds.size === 0}
                     onClick={() => setDeleteConfirm({ ids: Array.from(selectedIds) })}
                     className="text-xs font-bold bg-red-500 text-white hover:bg-red-600
+                               disabled:opacity-40 disabled:cursor-not-allowed
                                rounded-lg px-3 py-1.5 transition-colors">
                     Delete selected
                   </button>
@@ -831,13 +938,16 @@ export default function FieldReport() {
                     item={item}
                     selected={selectedIds.has(item.item_id)}
                     saving={rowSaving.has(item.item_id)}
+                    bulkMode={bulkMode}
                     onToggleSelect={toggleSelect}
-                    onFieldChange={onRowFieldChange}
+                    onLocalChange={onRowLocalChange}
+                    onCommit={onRowCommit}
                     onEdit={(it) => setFormModal({ mode: 'edit', item: it })}
                     onDelete={(it) => setDeleteConfirm({
                       ids:   [it.item_id],
                       label: `${it.category}${it.intersection ? ` — ${it.intersection} ${it.direction}` : ''}`
                     })}
+                    onStartBulk={enterBulkMode}
                   />
                 </div>
               )
