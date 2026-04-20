@@ -1850,6 +1850,11 @@ function handleWriteWO_(body) {
   ensureWoTrackerCFRCols_(woSheet);
   const allRows = woSheet.getDataRange().getValues();
 
+  // Breadcrumb — verify the 3 CFR fields arrived from the Vision parser
+  Logger.log('CFR scan fields → date_entered=' + JSON.stringify(d.date_entered)
+             + ', school=' + JSON.stringify(d.school)
+             + ', prep_by=' + JSON.stringify(d.prep_by));
+
   // ── Duplicate check ───────────────────────────────────────────
   const isDuplicate = allRows.slice(1).some(r => String(r[0]) === String(d.work_order_id));
   if (isDuplicate) {
@@ -2003,6 +2008,59 @@ function ensureWoTrackerCFRCols_(woSheet) {
   }
   woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setValues([CFR_HEADERS]);
   woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setFontWeight('bold');
+}
+
+
+/**
+ * DEBUG / one-off: run this manually from the Apps Script editor to add
+ * the 3 CFR columns to the WO Tracker immediately, without waiting for
+ * a fresh WO scan.
+ */
+function addCFRColumnsNow() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerCFRCols_(sheet);
+  Logger.log('✅ CFR columns added/verified on Work Order Tracker.');
+}
+
+
+/**
+ * DEBUG / one-off: run this manually to force the CFR export for a given
+ * WO, bypassing handleSubmitFieldReport_ entirely. Edit WO_ID below, then
+ * click Run. Will exercise aggregateMarkingItemsForCFR_ + generate the
+ * JSON and tell you if anything throws.
+ */
+function debugGenerateCFRForWO() {
+  const WO_ID = 'RM-43281';   // ← edit me
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const all = woSheet.getDataRange().getValues();
+  const row = all.slice(1).find(r => String(r[0]) === String(WO_ID));
+  if (!row) {
+    Logger.log('❌ WO not found: ' + WO_ID);
+    return;
+  }
+
+  const fakeD = {
+    wo_id: WO_ID,
+    date: new Date().toISOString().slice(0, 10),
+    wo_complete: true,
+  };
+
+  // Aggregate first so we can see the shape
+  const agg = aggregateMarkingItemsForCFR_(ss, WO_ID);
+  Logger.log('Aggregated: ' + JSON.stringify(agg, null, 2));
+
+  // Issues: pull from the tracker directly for this debug path
+  const issues = String(row[22] || '').trim();
+
+  try {
+    generateContractorFieldReportJson_(fakeD, row, ss, issues);
+    Logger.log('✅ CFR JSON exported for ' + WO_ID);
+  } catch (err) {
+    Logger.log('❌ CFR export failed: ' + err);
+  }
 }
 
 
@@ -3058,8 +3116,11 @@ function handleSubmitFieldReport_(body) {
   // Only when the WO is being marked complete on THIS submit. The
   // Python worker (watch_and_fill.py) polls "Needs Review / Field
   // Reports" for this _type and fills the CFR PDF.
+  Logger.log('CFR gate: wo_complete=' + JSON.stringify(d.wo_complete)
+             + ' (typeof=' + typeof d.wo_complete + ')');
   if (d.wo_complete) {
     step = 'CFR JSON export';
+    Logger.log('→ entering CFR export block for ' + d.wo_id);
     try {
       generateContractorFieldReportJson_(d, woRow, ss, newIssues);
     } catch (err) {
@@ -3073,6 +3134,8 @@ function handleSubmitFieldReport_(body) {
         Logger.log('⚠️ Could not write CFR failure to Automation Log: ' + logErr);
       }
     }
+  } else {
+    Logger.log('→ CFR export skipped: wo_complete is falsy');
   }
 
   // ── Automation Log ────────────────────────────────────────────
@@ -3406,6 +3469,16 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
 
   const aggregated = aggregateMarkingItemsForCFR_(ss, d.wo_id);
 
+  // Flatten multi-line issues to a single line for the PDF (the General
+  // Remarks field is single-line — a raw \n gets truncated at the first
+  // line). Each issue line already carries its own date prefix, so " | "
+  // is enough visual separation.
+  const flatRemarks = String(aggregatedIssues || '')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .join(' | ');
+
   const payload = {
     _type:             'contractor_field_report',
     wo_id:             d.wo_id,
@@ -3421,7 +3494,7 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
     to:                toStreet,
     install_from:      dateFmt(workStart) || workStart,
     install_to:        dateFmt(d.date),
-    general_remarks:   String(aggregatedIssues || '').trim(),
+    general_remarks:   flatRemarks,
     markings:          aggregated.top_table,
     grid:              aggregated.grid,
     prep_by:           prepBy,
