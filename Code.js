@@ -3371,12 +3371,37 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
 
   // install_from = existing Work Start (first-submit date, already in tracker)
   // install_to   = today's submit date (WO is being completed now)
-  const dateFmt = (iso) => {
-    if (!iso) return '';
-    const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (!m) return String(iso);
-    const [, yyyy, mm, dd] = m;
-    return `${parseInt(mm, 10)}/${parseInt(dd, 10)}/${yyyy}`;
+  //
+  // Accepts multiple input shapes and returns M/D/YYYY:
+  //   "2026-01-28"                    → "1/28/2026"
+  //   "1/28/2026" / "01/28/2026"      → "1/28/2026"
+  //   "Wednesday, January 28, 2026"   → "1/28/2026"   (WO scan format)
+  //   "January 28, 2026"              → "1/28/2026"
+  //   Date object                     → "1/28/2026"
+  //   anything else                   → pass through unchanged
+  const dateFmt = (val) => {
+    if (!val) return '';
+    if (val instanceof Date && !isNaN(val.getTime())) {
+      return `${val.getMonth() + 1}/${val.getDate()}/${val.getFullYear()}`;
+    }
+    const s = String(val).trim();
+    if (!s) return '';
+    // ISO yyyy-mm-dd
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${parseInt(m[2], 10)}/${parseInt(m[3], 10)}/${m[1]}`;
+    // Already M/D/YYYY — normalize leading zeros
+    m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (m) {
+      const yyyy = m[3].length === 2 ? '20' + m[3] : m[3];
+      return `${parseInt(m[1], 10)}/${parseInt(m[2], 10)}/${yyyy}`;
+    }
+    // Long English — let Date parse it (handles "Wednesday, January 28, 2026",
+    // "January 28, 2026", etc.)
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+    }
+    return s;
   };
 
   const aggregated = aggregateMarkingItemsForCFR_(ss, d.wo_id);
