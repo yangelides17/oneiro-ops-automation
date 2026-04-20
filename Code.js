@@ -446,6 +446,20 @@ function generateDailyDocuments(dateStr) {
   });
 }
 
+/** Lazy-cached spreadsheet timezone, so repeated formatTime_ calls
+ *  don't hit SpreadsheetApp on every row. */
+let _ssTzCache_ = null;
+function _getSsTz_() {
+  if (_ssTzCache_) return _ssTzCache_;
+  try {
+    _ssTzCache_ = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSpreadsheetTimeZone();
+  } catch (e) {
+    _ssTzCache_ = CONFIG.TIMEZONE;   // fallback
+  }
+  return _ssTzCache_;
+}
+
+
 /**
  * Normalize any time-ish cell value to "h:mm AM/PM".
  *
@@ -461,7 +475,12 @@ function generateDailyDocuments(dateStr) {
 function formatTime_(val) {
   if (val == null || val === '') return '';
   if (val instanceof Date && !isNaN(val.getTime())) {
-    return Utilities.formatDate(val, Session.getScriptTimeZone(), 'h:mm a');
+    // Format in the SPREADSHEET's TZ, not the script's. Sheets parses
+    // time strings against its own TZ when storing them, so reading
+    // back and rendering in that same TZ gives us the string the user
+    // actually typed. Cached per-execution for cheap reuse.
+    const tz = _getSsTz_();
+    return Utilities.formatDate(val, tz, 'h:mm a');
   }
   const s = String(val).trim();
   if (!s) return '';
@@ -490,7 +509,13 @@ function formatTime_(val) {
 function parseTimeToMinutes_(timeStr) {
   if (timeStr == null || timeStr === '') return 0;
   if (timeStr instanceof Date && !isNaN(timeStr.getTime())) {
-    return timeStr.getHours() * 60 + timeStr.getMinutes();
+    // Same TZ rationale as formatTime_ — compute hours/minutes in the
+    // spreadsheet's TZ so 'earliest in' / 'latest out' reflects what
+    // the user actually sees in the cell.
+    const tz = _getSsTz_();
+    const hhmm = Utilities.formatDate(timeStr, tz, 'H:mm');
+    const [h, m] = hhmm.split(':').map(n => parseInt(n, 10));
+    return (isNaN(h) ? 0 : h) * 60 + (isNaN(m) ? 0 : m);
   }
   const s = String(timeStr).trim().toUpperCase();
   const match = s.match(/(\d+):(\d+)\s*(AM|PM)/);
