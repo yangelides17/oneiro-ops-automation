@@ -1769,6 +1769,8 @@ function doPost(e) {
       return handleUpdateMarkingItem_(body);
     } else if (action === 'delete_marking_items') {
       return handleDeleteMarkingItems_(body);
+    } else if (action === 'trash_file') {
+      return handleTrashFile_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2060,6 +2062,26 @@ function debugGenerateCFRForWO() {
     Logger.log('✅ CFR JSON exported for ' + WO_ID);
   } catch (err) {
     Logger.log('❌ CFR export failed: ' + err);
+  }
+}
+
+
+/**
+ * Trash a Drive file by ID. Used by the Python worker after it fills a PDF
+ * from a JSON payload — trashing the source JSON prevents the poll loop
+ * from re-processing it if the worker's local `.processed_files.json`
+ * state gets lost (e.g. Railway container restart with ephemeral disk).
+ *
+ * body: { key, file_id }
+ */
+function handleTrashFile_(body) {
+  const fileId = body.file_id;
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+  try {
+    DriveApp.getFileById(fileId).setTrashed(true);
+    return jsonResponse_({ success: true, file_id: fileId });
+  } catch (err) {
+    return jsonResponse_({ error: String(err) }, 500);
   }
 }
 

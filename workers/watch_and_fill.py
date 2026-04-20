@@ -378,6 +378,54 @@ def _upload_via_proxy(local_path: Path, folder_id: str, url: str, key: str) -> s
     return result.get('file_id', '')
 
 
+def trash_drive_file(service, file_id: str) -> bool:
+    """Trash a Drive file after we're done with it.
+
+    On Railway the worker's `.processed_files.json` state is ephemeral —
+    if the container restarts, every JSON in the watch folders gets
+    processed again, producing duplicate filled PDFs. Trashing the source
+    JSON right after a successful upload prevents that entirely: the next
+    scan just doesn't see the file.
+
+    Uses the Apps Script proxy on Railway (runs as the real file owner)
+    and the direct Drive API locally (where OAuth creds have full access).
+    """
+    upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
+    if upload_url:
+        return _trash_via_proxy(file_id, upload_url,
+                                os.environ.get('APPS_SCRIPT_UPLOAD_KEY', ''))
+    try:
+        service.files().update(fileId=file_id, body={'trashed': True}).execute()
+        return True
+    except Exception as e:
+        log(f"  ⚠️   Direct Drive trash failed for {file_id}: {e}")
+        return False
+
+
+def _trash_via_proxy(file_id: str, url: str, key: str) -> bool:
+    """Ask the Apps Script proxy to trash a Drive file."""
+    import requests, json as _json
+    try:
+        resp = requests.post(
+            url,
+            data=_json.dumps({'action': 'trash_file', 'key': key, 'file_id': file_id}),
+            headers={'Content-Type': 'application/json'},
+            timeout=30,
+            allow_redirects=True,
+        )
+        if not resp.content.strip():
+            log(f"  ⚠️   Trash proxy returned empty body (HTTP {resp.status_code})")
+            return False
+        result = resp.json()
+        if 'error' in result:
+            log(f"  ⚠️   Trash proxy error: {result['error']}")
+            return False
+        return True
+    except Exception as e:
+        log(f"  ⚠️   Trash proxy request failed: {e}")
+        return False
+
+
 def _upload_direct(service, local_path: Path, parent_folder_id: str) -> str:
     """Upload directly via Drive API (local dev with OAuth credentials)."""
     from googleapiclient.http import MediaFileUpload
@@ -555,6 +603,13 @@ def process_file(service, file_meta: dict, folder_id: str, tmp_dir: Path) -> boo
     except Exception as e:
         log(f"  ❌  Upload failed: {e}")
         return False
+
+    # Trash the source JSON so we never re-process it on the next poll,
+    # even if the processed-files state gets lost (Railway restart).
+    if trash_drive_file(service, file_id):
+        log(f"  🗑️   Trashed source JSON: {name}")
+    else:
+        log(f"  ⚠️   Could not trash source JSON {name} — may re-process on restart")
 
     return True
 
