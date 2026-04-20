@@ -4,6 +4,10 @@ import SignaturePad     from '../components/SignaturePad'
 import ConfirmModal     from '../components/ConfirmModal'
 import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
+import {
+  UNIT_OPTIONS, unitForCategory, unitIsLocked,
+  pickLayout, rowIsCompletable,
+} from '../lib/markingCategories'
 
 // ── Constants ─────────────────────────────────────────────────
 // Must match the dropdown validation on the Daily Sign-In Data sheet's
@@ -18,40 +22,9 @@ const SECTION_HEADERS = {
   'Manual':             'Manually Added',
 }
 
-// Category sets that drive row layout. Keep in sync with
-// setupMarkingItems() MARKING_CATEGORIES. An item's category overrides
-// its Section when picking a layout — a manually-added "HVX Crosswalk"
-// still renders as an intersection row.
-const GRID_CATEGORIES = new Set(['HVX Crosswalk', 'Stop Msg', 'Stop Line'])
-const MMA_CATEGORIES  = new Set(['Bike Lane', 'Bus Lane', 'Pedestrian Space', 'Ped Stop'])
-
-function pickLayout(item) {
-  const cat = item.category || ''
-  if (GRID_CATEGORIES.has(cat))                                 return 'grid'
-  if (item.section === 'Intersection Grid')                     return 'grid'
-  if (MMA_CATEGORIES.has(cat))                                  return 'mma'
-  if (String(item.work_type || '').toLowerCase() === 'mma')     return 'mma'
-  return 'default'
-}
-
-function rowRequiresColor(item) {
-  if (MMA_CATEGORIES.has(item.category || '')) return true
-  return String(item.work_type || '').toLowerCase() === 'mma'
-}
-
-/**
- * Is this row "ready to be confirmed complete" at submit time?
- * - Already Completed → yes.
- * - Pending → needs qty > 0, unit set, and color/material if MMA.
- */
-function rowIsCompletable(item) {
-  if (item.status === 'Completed') return true
-  const qty = parseFloat(item.quantity)
-  if (isNaN(qty) || qty <= 0) return false
-  if (!String(item.unit || '').trim()) return false
-  if (rowRequiresColor(item) && !String(item.color_material || '').trim()) return false
-  return true
-}
+// pickLayout / rowIsCompletable / unit helpers live in
+// ../lib/markingCategories — single source of truth shared with the
+// Add/Edit modal.
 
 // ── Helpers ───────────────────────────────────────────────────
 const isoToday = () => {
@@ -154,14 +127,21 @@ function MarkingItemRow({
       className={locked ? QTY_LOCKED : QTY_LIVE}
     />
   )
-  const UnitBox = (
-    <select value={item.unit || 'SF'}
-      onChange={onDropdown('unit')}
-      disabled={locked}
-      className={locked ? LOCK : INPUT}>
-      {['SF','LF','EA'].map(u => <option key={u}>{u}</option>)}
-    </select>
-  )
+  // Unit is derived from Marking Type for every category except "Others",
+  // which stays user-pickable. For locked categories, show the unit as
+  // read-only text (no dropdown chrome).
+  const unitLocked = unitIsLocked(item.category)
+  const derivedUnit = unitForCategory(item.category) || item.unit || ''
+  const UnitBox = unitLocked
+    ? <div className="text-sm py-2 text-center font-semibold text-slate-500">
+        {derivedUnit}
+      </div>
+    : <select value={item.unit || 'EA'}
+        onChange={onDropdown('unit')}
+        disabled={locked}
+        className={locked ? LOCK : INPUT}>
+        {UNIT_OPTIONS.map(u => <option key={u}>{u}</option>)}
+      </select>
   const ColorBox = (
     <input type="text" placeholder="Color / Material"
       value={item.color_material ?? ''}

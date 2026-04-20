@@ -2000,6 +2000,60 @@ function jsonResponse_(obj, statusCode) {
  *   - Mixed/malformed:    filters to just N/S/E/W chars and de-dupes.
  * Returns [] for empty input.
  */
+// ── Category → Unit map ──────────────────────────────────────
+// Each Marking Type has a fixed unit of measure. Keep this in sync
+// with webapp/src/lib/markingCategories.js CATEGORY_UNITS.
+// Categories intentionally omitted (e.g. "Others") accept any unit.
+const CATEGORY_UNITS_ = {
+  // SF (square feet) — MMA area work
+  'Bike Lane':           'SF',
+  'Bus Lane':            'SF',
+  'Pedestrian Space':    'SF',
+
+  // LF (linear feet) — lines, crosswalks, stop lines
+  'Double Yellow Line':  'LF',
+  'Lane Lines':          'LF',
+  'Solid Lines':         'LF',
+  '4" Line':             'LF',
+  '6" Line':             'LF',
+  '8" Line':             'LF',
+  '12" Line':            'LF',
+  '16" Line':            'LF',
+  '24" Line':            'LF',
+  'Gores':               'LF',
+  'HVX Crosswalk':       'LF',
+  'Stop Line':           'LF',
+
+  // EA (each / count) — messages, arrows, misc
+  'Messages':            'EA',
+  'Stop Msg':            'EA',
+  'Only Msg':            'EA',
+  'Bus Msg':             'EA',
+  'Bump Msg':            'EA',
+  'Custom Msg':          'EA',
+  '20 MPH Msg':          'EA',
+  'Railroad (RR)':       'EA',
+  'Railroad (X)':        'EA',
+  'Rail Road X/Diamond': 'EA',
+  'Arrows':              'EA',
+  'L/R Arrow':           'EA',
+  'Straight Arrow':      'EA',
+  'Combination Arrow':   'EA',
+  'Speed Hump Markings': 'EA',
+  'Shark Teeth 12x18':   'EA',
+  'Shark Teeth 24x36':   'EA',
+  'Bike Lane Arrow':     'EA',
+  'Bike Lane Symbol':    'EA',
+  'Bike Lane Green Bar': 'EA',
+  'Ped Stop':            'EA',
+  // "Others" is intentionally variable (user picks).
+};
+
+function unitForCategory_(category) {
+  return CATEGORY_UNITS_[String(category || '').trim()] || '';
+}
+
+
 function expandDirLetters_(val) {
   const s = String(val || '').trim();
   if (!s) return [];
@@ -2062,17 +2116,18 @@ function seedMarkingItems_(ss, d) {
   // column needed.
   topMarkings.forEach((m) => {
     if (!m || !m.category || !m.description) return;
+    const cat = String(m.category).trim();
     rows.push([
       `${woId}-${pad3(n++)}`,        // A  Item ID
       woId,                           // B  Work Order #
       workType,                       // C  Work Type
       'Top Table',                    // D  WO Section
-      String(m.category).trim(),      // E  Marking Type
+      cat,                            // E  Marking Type
       '',                             // F  Intersection
       '',                             // G  Direction
       String(m.description).trim(),   // H  Description
       '',                             // I  Quantity Completed
-      'SF',                           // J  Unit
+      unitForCategory_(cat) || 'EA',  // J  Unit (derived from category)
       '',                             // K  Color/Material
       '',                             // L  Date Completed
       'Pending',                      // M  Status
@@ -2112,7 +2167,7 @@ function seedMarkingItems_(ss, d) {
           dir,                           // G  Direction
           '',                            // H  Description (blank for grid items)
           '',                            // I  Quantity Completed
-          'SF',                          // J  Unit
+          unitForCategory_(category) || 'EA',  // J  Unit (derived from category)
           '',                            // K  Color/Material
           '',                            // L  Date Completed
           'Pending',                     // M  Status
@@ -2442,6 +2497,11 @@ function handleCreateMarkingItem_(body) {
   const pad3 = (x) => String(x).padStart(3, '0');
   const newId = `${woId}-${pad3(maxN + 1)}`;
 
+  // Unit: when the category has a fixed unit, use the map; otherwise
+  // (e.g. "Others") accept whatever the client sent, defaulting to 'EA'.
+  const lockedUnit = unitForCategory_(cat);
+  const finalUnit  = lockedUnit || String(d.unit || 'EA').trim();
+
   const row = [
     newId,                                      // A Item ID
     woId,                                       // B Work Order #
@@ -2452,7 +2512,7 @@ function handleCreateMarkingItem_(body) {
     String(d.direction    || '').trim(),        // G Direction
     String(d.description  || '').trim(),        // H Description
     hasQty ? qty : '',                          // I Quantity
-    String(d.unit || 'SF').trim(),              // J Unit
+    finalUnit,                                  // J Unit (derived from category)
     String(d.color_material || '').trim(),      // K Color/Material
     '',                                         // L Date Completed — always blank until submit
     'Pending',                                  // M Status — always Pending until submit
@@ -2529,6 +2589,21 @@ function handleUpdateMarkingItem_(body) {
 
   const wasCompleted   = String(currentRow[IDX.status] || '') === 'Completed';
   let   anyFieldChanged = false;
+
+  // If the patch changes the category, auto-derive the new unit from
+  // the CATEGORY_UNITS_ map. If the new category is variable (e.g.
+  // "Others"), honor the client-supplied unit or leave existing.
+  // This runs BEFORE the string-field writes so the unit cell ends up
+  // consistent with the (new) category even when the client didn't
+  // explicitly patch unit.
+  if (d.category !== undefined) {
+    const newCat     = String(d.category || '').trim();
+    const lockedUnit = unitForCategory_(newCat);
+    if (lockedUnit) {
+      // Force unit into the patch — overrides anything the client sent.
+      d.unit = lockedUnit;
+    }
+  }
 
   // Write each patchable string field present in the request. Track
   // whether any value actually changed — used below to decide if a

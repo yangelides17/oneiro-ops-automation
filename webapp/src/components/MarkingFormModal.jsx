@@ -1,30 +1,9 @@
 import { useEffect, useState } from 'react'
+import {
+  MARKING_CATEGORIES, UNIT_OPTIONS,
+  unitForCategory, unitIsLocked,
+} from '../lib/markingCategories'
 
-// Canonical marking categories — kept in sync with setupMarkingItems()
-// in Code.js. Non-strict dropdown so users can type anything.
-const MARKING_CATEGORIES = [
-  // WO Top Table
-  'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
-  'Solid Lines', 'Rail Road X/Diamond', 'Others',
-  // Intersection Grid
-  'HVX Crosswalk', 'Stop Msg', 'Stop Line',
-  // Page 2 detailed lines
-  '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
-  // Page 2 messages
-  'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
-  // Page 2 railroad
-  'Railroad (RR)', 'Railroad (X)',
-  // Page 2 arrows
-  'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
-  // Page 2 misc
-  'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
-  // Page 2 bike lane
-  'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
-  // MMA
-  'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
-]
-
-const UNITS      = ['SF', 'LF', 'EA']
 const DIRECTIONS = ['', 'N', 'E', 'S', 'W']
 
 /**
@@ -63,12 +42,28 @@ export default function MarkingFormModal({ mode, item, woId, workType, onClose, 
     return () => window.removeEventListener('keydown', handler)
   }, [saving, onClose])
 
-  const setField = (k, v) => setForm(f => ({ ...f, [k]: v }))
+  // When the category changes, auto-update the unit from the category map
+  // (except for categories intentionally left variable, like "Others" —
+  // those keep the user's last-picked unit).
+  const setField = (k, v) => setForm(f => {
+    const next = { ...f, [k]: v }
+    if (k === 'category') {
+      const derived = unitForCategory(v)
+      if (derived) next.unit = derived
+      else if (!next.unit) next.unit = 'EA'  // sensible default for "Others"
+    }
+    return next
+  })
 
   async function handleConfirm() {
     setError('')
     const category = form.category.trim()
     if (!category) { setError('Marking Type is required.'); return }
+
+    // Always trust the category → unit map when it specifies a unit. The
+    // form.unit field is only user-authoritative for categories that are
+    // variable (e.g. "Others").
+    const finalUnit = unitForCategory(category) || form.unit || 'EA'
 
     const payload = {
       category,
@@ -76,7 +71,7 @@ export default function MarkingFormModal({ mode, item, woId, workType, onClose, 
       direction:      form.direction,
       description:    form.description.trim(),
       quantity:       form.quantity === '' ? null : parseFloat(form.quantity),
-      unit:           form.unit || 'SF',
+      unit:           finalUnit,
       color_material: form.color_material.trim(),
       notes:          form.notes.trim(),
     }
@@ -197,13 +192,21 @@ export default function MarkingFormModal({ mode, item, woId, workType, onClose, 
               />
             </Field>
             <Field label="Unit">
-              <select
-                value={form.unit}
-                onChange={e => setField('unit', e.target.value)}
-                className="field-input"
-              >
-                {UNITS.map(u => <option key={u}>{u}</option>)}
-              </select>
+              {unitIsLocked(form.category) ? (
+                <div className="field-input bg-slate-50 text-slate-500
+                                flex items-center justify-center font-semibold
+                                cursor-not-allowed">
+                  {unitForCategory(form.category)}
+                </div>
+              ) : (
+                <select
+                  value={form.unit}
+                  onChange={e => setField('unit', e.target.value)}
+                  className="field-input"
+                >
+                  {UNIT_OPTIONS.map(u => <option key={u}>{u}</option>)}
+                </select>
+              )}
             </Field>
           </div>
 
