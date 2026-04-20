@@ -3428,9 +3428,22 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
   const fromStreet      = String(woRow[6]  || '').trim();
   const toStreet        = String(woRow[7]  || '').trim();
   const workStart       = String(woRow[17] || '').trim();
-  const dateEntered     = String(woRow[35] || '').trim();
   const school          = String(woRow[36] || 'NA').trim() || 'NA';
   const prepBy          = String(woRow[37] || '').trim();
+
+  // Date Entered — Sheets auto-parses "Wednesday, January 28, 2026" into
+  // a Date object, so stringifying it yields
+  //   "Wed Jan 28 2026 03:00:00 GMT-0500 (Eastern Standard Time)"
+  // which overflows the CFR field. Reformat Date objects back to long
+  // English; otherwise use the raw string the user typed.
+  const rawDateEntered = woRow[35];
+  let dateEntered = '';
+  if (rawDateEntered instanceof Date && !isNaN(rawDateEntered.getTime())) {
+    dateEntered = Utilities.formatDate(rawDateEntered, Session.getScriptTimeZone(),
+                                       'EEEE, MMMM d, yyyy');
+  } else {
+    dateEntered = String(rawDateEntered || '').trim();
+  }
 
   // install_from = existing Work Start (first-submit date, already in tracker)
   // install_to   = today's submit date (WO is being completed now)
