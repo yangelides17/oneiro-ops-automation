@@ -464,15 +464,178 @@ function parseTimeToMinutes_(timeStr) {
 }
 
 /**
+ * Marking Items category → PL template printed label. Used by
+ * aggregateMarkingItemsForPL_ to map crew-entered Marking Items rows
+ * into the strings the Production Log PDF filler expects in its
+ * per-WO `markings` dict.
+ *
+ * Categories not present in this map are intentionally NOT rendered in
+ * the PL grid:
+ *  - Parent-only categories (Gores, Messages, Arrows, Solid Lines,
+ *    Rail Road X/Diamond) never carry quantities.
+ *  - Ops-review items (Ped Stop, Shark Teeth 12x18, Bike Lane Green Bar,
+ *    Custom Msg) will get a home if/when the ops manager assigns them.
+ *  - MMA SF categories (Bike Lane / Bus Lane / Pedestrian Space) are
+ *    aggregated separately into the PL's Color Surface Treatment
+ *    rows via the `sqft` + `paint` fields — NOT into this marking grid.
+ *
+ * Two special cases are handled outside this map:
+ *  - 'HVX Crosswalk' + 'Stop Line' LF → sum into 'CrossWalks/Stop Lines'.
+ *  - MMA SF → sqft + paint.
+ */
+const PL_CATEGORY_MAP_ = {
+  // LF
+  'Double Yellow Line':  'Double Yellow Line (Center Line)',
+  'Lane Lines':          'Lane Lines 4" (Skips)',
+  '4" Line':             '4" Lines',
+  '6" Line':             '6" Lines',
+  '8" Line':             '8" Lines',
+  '12" Line':            '12" Lines (Gore)',
+  '16" Line':            '16" Lines',
+  '24" Line':            '24" Lines',
+  // EA
+  'Stop Msg':            'Stop Message',
+  'Only Msg':            'Message Only',
+  'Bus Msg':             'Bus Message',
+  'Bump Msg':            'Bump',
+  '20 MPH Msg':          '20 MPH Message',
+  'Railroad (RR)':       'Railroad - RR',
+  'Railroad (X)':        'Railroad - X',
+  'L/R Arrow':           'Left & or Right Arrows',
+  'Straight Arrow':      'Straight Arrow',
+  'Combination Arrow':   'Combination Arrow',
+  'Speed Hump Markings': 'Speed Hump Marking',
+  'Shark Teeth 24x36':   'Sharks Teeth 24" 36"',
+  'Bike Lane Arrow':     'Bicycle Lane Arrow',
+  'Bike Lane Symbol':    'Bicycle Lane Symbol',
+};
+
+
+/**
+ * Aggregate all Completed Marking Items for a single WO into the shape
+ * the Production Log filler expects on a per-WO-column basis:
+ *
+ *   {
+ *     markings: { '<PL row label>': <qty>, ... },   // grid cells
+ *     sqft:     <total MMA SF across this WO, or ''>, // Color Surface Treatment 1
+ *     paint:    '<color or comma-joined colors>',    // Color Surface Treatment 2
+ *   }
+ *
+ * Only rows with Status='Completed' and quantity > 0 are counted.
+ * Categories not in PL_CATEGORY_MAP_ are ignored (except HVX Crosswalk,
+ * Stop Line, and the MMA SF trio, which have their own paths).
+ */
+function aggregateMarkingItemsForPL_(ss, woId) {
+  const out = { markings: {}, sqft: '', paint: '' };
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return out;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return out;
+
+  // Col indices (15-col Marking Items schema):
+  //   1 WO#, 4 Marking Type, 5 Intersection, 6 Direction,
+  //   8 Quantity, 9 Unit, 10 Color/Material, 12 Status
+  const woItems = data.slice(1).filter(r =>
+    String(r[1] || '').trim() === woId &&
+    String(r[12] || '').toLowerCase() === 'completed'
+  );
+  if (woItems.length === 0) return out;
+
+  let sfSum = 0;
+  const colorsSet = {};
+  let crosswalkSum = 0;
+
+  woItems.forEach(r => {
+    const category = String(r[4] || '').trim();
+    const qty      = parseFloat(r[8]);
+    if (isNaN(qty) || qty <= 0) return;
+    const unit     = String(r[9] || '').toUpperCase();
+
+    // MMA SF → Color Surface Treatment 1/2, not the grid
+    if (unit === 'SF' &&
+        (category === 'Bike Lane' || category === 'Bus Lane' || category === 'Pedestrian Space')) {
+      sfSum += qty;
+      const color = String(r[10] || '').trim();
+      if (color && color.toLowerCase() !== 'n/a') colorsSet[color] = true;
+      return;
+    }
+
+    // HVX Crosswalk + Stop Line → combined LF cell
+    if (category === 'HVX Crosswalk' || category === 'Stop Line') {
+      crosswalkSum += qty;
+      return;
+    }
+
+    // Standard rename; unmapped categories drop silently
+    const plLabel = PL_CATEGORY_MAP_[category];
+    if (!plLabel) return;
+    out.markings[plLabel] = (out.markings[plLabel] || 0) + qty;
+  });
+
+  if (crosswalkSum > 0) {
+    out.markings['CrossWalks/Stop Lines'] = crosswalkSum;
+  }
+  if (sfSum > 0) {
+    out.sqft  = sfSum;
+    out.paint = Object.keys(colorsSet).sort().join(', ');
+  }
+  return out;
+}
+
+
+/**
  * Generate Metro Thermoplastic Production Daily Log
+ *
+ * Filter rule: only include WOs where the WO Tracker has
+ * `Status = 'Completed'` AND `Work End Date = targetDate`. A multi-day
+ * WO therefore appears only on the PL for the day the work was
+ * finished, and the quantities shown are the WO's full cumulative
+ * Marking Items totals (acknowledged skew for now; ops manager to
+ * weigh in).
  */
 function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss) {
   const props = PropertiesService.getScriptProperties();
   const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
+  const targetDayStr = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
 
-  // Get unique employees — track earliest time-in and latest time-out across all WOs for the day
+  // ── Filter WOs to those COMPLETED on targetDate ───────────────
+  // WO Tracker col 15 = Status, col 18 = Work End Date.
+  const completedByWO = {};
+  Object.entries(byWorkOrder).forEach(([woId, entries]) => {
+    const woRow = woData.find(r => String(r[0]) === String(woId));
+    if (!woRow) return;
+    const status = String(woRow[15] || '').trim().toLowerCase();
+    if (status !== 'completed') return;
+
+    // Work End Date can come back as a Date object or a string
+    const workEndRaw = woRow[18];
+    let workEndStr = '';
+    if (workEndRaw instanceof Date && !isNaN(workEndRaw.getTime())) {
+      workEndStr = Utilities.formatDate(workEndRaw, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    } else if (workEndRaw) {
+      const d = new Date(workEndRaw);
+      if (!isNaN(d.getTime())) {
+        workEndStr = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+      }
+    }
+    if (workEndStr !== targetDayStr) return;
+
+    completedByWO[woId] = entries;
+  });
+
+  if (Object.keys(completedByWO).length === 0) {
+    Logger.log('No WOs completed on ' + targetDayStr + ' — skipping Production Log.');
+    return null;
+  }
+
+  // Only the crew that worked on completed WOs shows up on this PL
+  const relevantEntries = [];
+  Object.values(completedByWO).forEach(rows => relevantEntries.push(...rows));
+
+  // Get unique employees — track earliest time-in and latest time-out across all completed WOs for the day
   const employees = {};
-  allEntries.forEach(row => {
+  relevantEntries.forEach(row => {
     const name = row[6];
     const timeInMins  = parseTimeToMinutes_(row[8]);
     const timeOutMins = parseTimeToMinutes_(row[9]);
@@ -488,62 +651,56 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
       if (timeOutMins > employees[name].timeOutMins) { employees[name].timeOut = row[9]; employees[name].timeOutMins = timeOutMins; }
     }
   });
-  
-  // Build the log content
+
   const dateFormatted = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'MM/dd/yyyy');
+
+  // ── Build a plain-text summary for admin review ──────────────
   let logContent = `METRO THERMOPLASTIC PRODUCTION DAILY LOG\n`;
   logContent += `Date: ${dateFormatted}\n\n`;
-  
-  // Crew members
   Object.entries(employees).forEach(([name, info]) => {
     const role = info.classification === 'LP' ? 'Crew Chief' : 'Individual';
     logContent += `${role}: ${name} | In: ${info.timeIn} | Out: ${info.timeOut}\n`;
   });
-  
   logContent += `\n${'─'.repeat(80)}\n\n`;
-  logContent += `WORK ORDERS:\n\n`;
-  logContent += `${'Borough'.padEnd(8)} ${'WO #'.padEnd(12)} ${'Location'.padEnd(25)} ${'SQFT'.padEnd(10)} ${'Paint'.padEnd(15)} ${'Complete?'}\n`;
+  logContent += `WORK ORDERS COMPLETED ${dateFormatted}:\n\n`;
+  logContent += `${'Borough'.padEnd(8)} ${'WO #'.padEnd(12)} ${'Location'.padEnd(25)} ${'SQFT'.padEnd(10)} ${'Paint/Material'}\n`;
   logContent += `${'─'.repeat(80)}\n`;
-  
-  Object.entries(byWorkOrder).forEach(([woId, entries]) => {
-    // Look up borough from WO tracker
-    const woRow = woData.find(r => r[0] === woId);
-    const borough = woRow ? woRow[3] : '??';
-    const location = woRow ? woRow[5] : entries[0][5];
-    const sqft = entries[0][12];
-    const paint = entries[0][13];
-    const complete = entries[0][14];
-    
-    logContent += `${String(borough).padEnd(8)} ${String(woId).padEnd(12)} ${String(location).padEnd(25)} ${String(sqft).padEnd(10)} ${String(paint).padEnd(15)} ${complete}\n`;
-  });
-  
-  // Save to Needs Review folder
-  const reviewFolder = DriveApp.getFolderById(needsReviewId);
-  const subFolder = getOrCreateSubfolder_(reviewFolder, 'Production Logs');
-  const fileName = `Production_Log_${Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.txt`;
-  const file = subFolder.createFile(fileName, logContent, MimeType.PLAIN_TEXT);
 
-  // ── JSON export for local PDF filler ─────────────────────────────────────
-  const sortedNames = Object.keys(employees);
-  const crewChiefName = sortedNames.find(n => employees[n].classification === 'LP') || sortedNames[0];
-  const crewMemberNames = sortedNames.filter(n => n !== crewChiefName);
-
-  const workOrdersJson = Object.entries(byWorkOrder).map(([woId, entries]) => {
-    const woRow = woData.find(r => r[0] === woId);
+  // ── Build the per-WO payload for the filler ──────────────────
+  const workOrdersJson = Object.entries(completedByWO).map(([woId, entries]) => {
+    const woRow   = woData.find(r => String(r[0]) === String(woId));
     const borough = woRow ? String(woRow[3]).toUpperCase() : '';
-    const location = woRow ? String(woRow[5]).toUpperCase() : String(entries[0][5]).toUpperCase();
+    const location = woRow ? String(woRow[5]).toUpperCase() : String(entries[0][5] || '').toUpperCase();
+    const agg     = aggregateMarkingItemsForPL_(ss, woId);
+
+    const sqftStr  = agg.sqft  !== '' ? String(agg.sqft)  : '';
+    const paintStr = agg.paint !== '' ? String(agg.paint) : '';
+
+    logContent += `${String(borough).padEnd(8)} ${String(woId).padEnd(12)} ${String(location).padEnd(25)} ${sqftStr.padEnd(10)} ${paintStr}\n`;
+
     return {
       wo_number:    String(woId),
       borough:      borough,
       location:     location,
-      sqft:         String(entries[0][12] || ''),
-      paint:        String(entries[0][13] || ''),
-      complete:     entries[0][14] ? 'Y' : 'N',
+      sqft:         sqftStr,
+      paint:        paintStr,
+      complete:     'Y',        // filter guarantees this
       layout_yn:    '',
       layout_hours: '',
-      markings:     {}
+      markings:     agg.markings,
     };
   });
+
+  // Save plain-text summary to Needs Review folder
+  const reviewFolder = DriveApp.getFolderById(needsReviewId);
+  const subFolder    = getOrCreateSubfolder_(reviewFolder, 'Production Logs');
+  const fileName     = `Production_Log_${targetDayStr}.txt`;
+  const file         = subFolder.createFile(fileName, logContent, MimeType.PLAIN_TEXT);
+
+  // ── JSON export for the Python filler ──────────────────────
+  const sortedNames = Object.keys(employees);
+  const crewChiefName = sortedNames.find(n => employees[n].classification === 'LP') || sortedNames[0];
+  const crewMemberNames = sortedNames.filter(n => n !== crewChiefName);
 
   const logJson = {
     _type:             'production_log',
@@ -571,15 +728,14 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
     work_orders: workOrdersJson
   };
 
-  const jsonFileName = `Production_Log_${Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
+  const jsonFileName = `Production_Log_${targetDayStr}.json`;
   subFolder.createFile(jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
-  // ─────────────────────────────────────────────────────────────────────────
 
   // Log it
   const logSheet = ss.getSheetByName('Automation Log');
   logSheet.appendRow([
-    new Date(), 'Production Log Generator', 'Manual trigger',
-    `${Object.keys(byWorkOrder).length} WOs on ${dateFormatted}`,
+    new Date(), 'Production Log Generator', 'Daily trigger',
+    `${Object.keys(completedByWO).length} completed WO(s) on ${dateFormatted}`,
     fileName, 'Generated',
     '', 'Yes — Review and send to Claudia'
   ]);
@@ -587,6 +743,39 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
   Logger.log('✅ Production log generated: ' + fileName);
   Logger.log('✅ Production log JSON exported: ' + jsonFileName);
   return file;
+}
+
+
+/**
+ * DEBUG / one-off: run from the Apps Script editor to generate a
+ * Production Log for any target date (default = today). Useful for
+ * verifying the Marking Items aggregation + the completion filter
+ * without waiting for the daily trigger. Logs the grouped WO list
+ * and the count of items in each WO column.
+ */
+function debugGenerateProductionLogForToday() {
+  const DATE_OVERRIDE = '';   // ← optional 'YYYY-MM-DD'; blank = today
+
+  const targetDate = DATE_OVERRIDE ? new Date(DATE_OVERRIDE + 'T12:00:00') : new Date();
+  const ss         = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const signIn     = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+  const woData     = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
+
+  const todaysEntries = signIn.slice(1).filter(row => {
+    if (!row[0]) return false;
+    return new Date(row[0]).toDateString() === targetDate.toDateString();
+  });
+  Logger.log(`Target date: ${targetDate.toDateString()} — ${todaysEntries.length} sign-in row(s).`);
+
+  const byWorkOrder = {};
+  todaysEntries.forEach(row => {
+    const woId = row[1];
+    if (!byWorkOrder[woId]) byWorkOrder[woId] = [];
+    byWorkOrder[woId].push(row);
+  });
+  Logger.log(`WOs with sign-in activity: ${Object.keys(byWorkOrder).join(', ') || '(none)'}`);
+
+  generateProductionLog_(targetDate, todaysEntries, byWorkOrder, woData, ss);
 }
 
 /**
