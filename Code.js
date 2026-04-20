@@ -3409,7 +3409,8 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
   const payload = {
     _type:             'contractor_field_report',
     wo_id:             d.wo_id,
-    date_entered:      dateFmt(dateEntered) || dateEntered,
+    // Preserve exactly as scanned from the WO (e.g. "Wednesday, January 28, 2026")
+    date_entered:      dateEntered,
     work_order:        workOrder,
     contractor:        primeContractor,
     contract_number:   contractNum,
