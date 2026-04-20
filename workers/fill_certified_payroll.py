@@ -245,6 +245,7 @@ def build_field_map(data: dict) -> dict:
 
         # Pay
         f[f'GROSS PAY THIS PROJECTRow{n}']        = str(worker.get('gross_pay', ''))
+        f[f'Total Gross Pay.0.0.{wi}']             = str(worker.get('total_gross_pay', ''))
         f[f'Net Pay.{wi}']                         = str(worker.get('net_pay', ''))
         f[f'Withholding and Deductions.{wi}']      = str(worker.get('deductions', ''))
         f[f'ANNUALIZED HOURLY RATERow{n}']         = str(worker.get('annualized_rate', ''))

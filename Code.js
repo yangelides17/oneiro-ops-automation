@@ -1366,6 +1366,56 @@ function validateSignInData(dateStr) {
  * 
  * @param {string} weekStartStr - Monday date in MM/DD/YYYY format
  */
+/**
+ * YTD gross pay for an employee across ALL projects, up to and
+ * including the payroll week end date. Applies the same day-of-week OT
+ * rule the weekly payroll uses (Sat/Sun all OT; weekday >8 OT) so the
+ * Total Gross Pay column matches the weekly column's math.
+ *
+ * signInData: full Daily Sign-In Data getValues() result (incl. header row).
+ * empName:    employee name exactly as written in Sign-In Data col 6.
+ * stRate, otRate: from Employee Registry for this employee.
+ * weekEnd:    Date object marking end of the payroll week (YTD cutoff).
+ */
+function computeYtdGrossForEmployee_(signInData, empName, stRate, otRate, weekEnd) {
+  const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const target   = normName(empName);
+  if (!target) return 0;
+
+  const yearStart = new Date(weekEnd.getFullYear(), 0, 1, 0, 0, 0);
+
+  // Aggregate total hours by date for this employee (handles the case
+  // where two sign-ins on the same day get combined before the OT rule).
+  const byDay = {};   // 'yyyy-MM-dd' → { hours, dow }
+  signInData.slice(1).forEach(row => {
+    if (!row[0]) return;
+    const rowDate = new Date(row[0]);
+    if (isNaN(rowDate.getTime())) return;
+    if (rowDate < yearStart || rowDate > weekEnd) return;
+    if (normName(row[6]) !== target) return;
+    const h = Number(row[10]) || 0;
+    if (h <= 0) return;
+    const key = Utilities.formatDate(rowDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    if (!byDay[key]) byDay[key] = { hours: 0, dow: rowDate.getDay() };
+    byDay[key].hours += h;
+  });
+
+  let totalST = 0;
+  let totalOT = 0;
+  Object.values(byDay).forEach(({ hours, dow }) => {
+    if (dow === 0 || dow === 6) {
+      totalOT += hours;
+    } else if (hours <= 8) {
+      totalST += hours;
+    } else {
+      totalST += 8;
+      totalOT += hours - 8;
+    }
+  });
+  return totalST * stRate + totalOT * otRate;
+}
+
+
 function generateCertifiedPayroll(weekStartStr) {
   // Parse MM/DD/YYYY explicitly to avoid UTC-shift issues
   const parts = weekStartStr.trim().split('/');
@@ -1459,16 +1509,35 @@ function generateCertifiedPayroll(weekStartStr) {
 
     const workersJson = [];
 
+    // Pre-build a normalized full-name lookup for this contract group so
+    // each employee match is O(1) and — crucially — doesn't collide when
+    // two employees share a first name (previous version substring-matched
+    // on the first name only).
+    const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const empByName = {};
+    empData.slice(1).forEach(r => {
+      const n = normName(r[1]);
+      if (n) empByName[n] = r;
+    });
+
     // Write to Certified Payroll Tracker
     Object.entries(byEmployee).forEach(([empName, info]) => {
-      // Look up pay rates + address/SSN4 from Employee Registry
-      const empRow = empData.find(r => String(r[1]).includes(empName.split(' ')[0]));
+      // Look up pay rates + address/SSN4 from Employee Registry by full name.
+      const empRow = empByName[normName(empName)] || null;
+      if (!empRow) {
+        Logger.log(`⚠️ Certified Payroll: no Employee Registry row matches ${JSON.stringify(empName)} — rates/address/SSN will be blank.`);
+      }
       const stRate    = empRow ? Number(empRow[6]) : 0;
       const otRate    = empRow ? Number(empRow[7]) : 0;
       const empFringe = empRow ? Number(empRow[9]) : 0;
       const erFringe  = empRow ? Number(empRow[8]) : 0;
       const empAddr   = empRow ? String(empRow[2] || '') : '';
       const empSsn4   = empRow ? String(empRow[3] || '') : '';
+
+      // YTD gross across all projects this year. Used to fill the
+      // "Total Gross Pay (All Work)" column on the certified payroll form.
+      // Applies the same day-of-week OT rule (Sat/Sun all OT; weekday >8 OT).
+      const ytdGross = computeYtdGrossForEmployee_(data, empName, stRate, otRate, weekEnd);
 
       // OT rules: ALL hours on Saturday (6) and Sunday (0) are OT.
       // On Mon–Fri, hours over 8 in a single day are OT.
@@ -1531,6 +1600,7 @@ function generateCertifiedPayroll(weekStartStr) {
         rate_st:         stRate.toFixed(2),
         rate_ot:         otRate.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
+        total_gross_pay: ytdGross.toFixed(2),   // YTD across all projects
         net_pay:         '',
         deductions:      '',
         annualized_rate: ''
@@ -3345,10 +3415,24 @@ function handleSubmitFieldReport_(body) {
     'Hours Worked', 'Overtime Hours'
   ];
 
+  // Day of work drives the OT rule below. d.date is ISO "YYYY-MM-DD"
+  // (from <input type="date">), so construct in local parts to avoid
+  // UTC-shift (new Date("2026-04-20") is interpreted as UTC midnight).
+  const dowOfWork = (() => {
+    const m = String(d.date || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return -1;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
+  })();
+  const isWeekend = (dowOfWork === 0 || dowOfWork === 6);
+
   d.crew.forEach((member, idx) => {
     step = `Sign-In Data row ${idx + 1}/${d.crew.length} (${member.name || '<no name>'})`;
-    const hours    = parseFloat(member.hours)    || 0;
-    const overtime = parseFloat(member.overtime) || Math.max(0, hours - 8);
+    const hours    = parseFloat(member.hours) || 0;
+    // Apply the OT rule server-side (authoritative). Client-supplied
+    // overtime is ignored — the rule is:
+    //   Saturday/Sunday → every hour is OT.
+    //   Monday–Friday   → hours over 8 in the day are OT; first 8 are ST.
+    const overtime = isWeekend ? hours : Math.max(0, hours - 8);
 
     const row = [
       d.date,                              //  0  Date

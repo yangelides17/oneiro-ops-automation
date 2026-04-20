@@ -36,14 +36,27 @@ const fmt24to12 = (t) => {
   const [h, m] = t.split(':').map(Number)
   return (h%12||12) + ':' + String(m).padStart(2,'0') + (h>=12?' PM':' AM')
 }
-const calcHours = (tin, tout) => {
+// Day-of-week-aware OT calc. Rule:
+//   Sat/Sun → every hour is overtime.
+//   Mon–Fri → hours over 8 are overtime.
+// workDateIso is the Date of Work as "YYYY-MM-DD" (from <input type="date">).
+// We construct a local-parts Date so there's no UTC-shift in the DOW.
+const calcHours = (tin, tout, workDateIso) => {
   if (!tin || !tout) return { hours: '', overtime: '' }
   const [ih,im] = tin.split(':').map(Number)
   const [oh,om] = tout.split(':').map(Number)
   const mins = (oh*60+om) - (ih*60+im)
   if (mins <= 0) return { hours: '', overtime: '' }
   const hrs = mins / 60
-  return { hours: hrs.toFixed(2), overtime: Math.max(0, hrs-8).toFixed(2) }
+
+  let isWeekend = false
+  const dm = String(workDateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (dm) {
+    const dow = new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3])).getDay()
+    isWeekend = (dow === 0 || dow === 6)
+  }
+  const ot = isWeekend ? hrs : Math.max(0, hrs - 8)
+  return { hours: hrs.toFixed(2), overtime: ot.toFixed(2) }
 }
 const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
 
@@ -215,11 +228,11 @@ function Spinner() {
 }
 
 // ── Crew card (with signature pads) ──────────────────────────
-function CrewCard({ idx, data, onChange, onRemove }) {
+function CrewCard({ idx, data, onChange, onRemove, workDate }) {
   const handleTime = (field, val) => {
     const tin  = field==='timeIn'  ? val : data.timeIn
     const tout = field==='timeOut' ? val : data.timeOut
-    onChange(idx, { ...data, [field]: val, ...calcHours(tin, tout) })
+    onChange(idx, { ...data, [field]: val, ...calcHours(tin, tout, workDate) })
   }
   return (
     <div className="border border-slate-200 rounded-xl p-4 space-y-4 bg-slate-50/40">
@@ -602,6 +615,19 @@ export default function FieldReport() {
   const updateCrew = (i, updated) => setCrewMembers(l=>l.map((m,j)=>j===i?updated:m))
   const addCrew    = () => setCrewMembers(l=>[...l,newCrew()])
   const removeCrew = (i) => setCrewMembers(l=>l.filter((_,j)=>j!==i))
+
+  // When the Date of Work changes, re-run the day-of-week OT rule
+  // for every crew member whose times are already filled in. Without
+  // this, flipping the date from Fri → Sat (or vice-versa) would leave
+  // stale OT splits from before the date change.
+  useEffect(() => {
+    setCrewMembers(list => list.map(m => {
+      if (!m.timeIn || !m.timeOut) return m
+      const { hours, overtime } = calcHours(m.timeIn, m.timeOut, workDate)
+      if (m.hours === hours && m.overtime === overtime) return m
+      return { ...m, hours, overtime }
+    }))
+  }, [workDate])
 
   // Infer WO work type from any loaded planned item (Thermo beats MMA if
   // mixed). Falls back to blank if no items are loaded yet.
@@ -993,7 +1019,7 @@ export default function FieldReport() {
           </p>
           <div className="space-y-4">
             {crewMembers.map((m,i)=>(
-              <CrewCard key={i} idx={i} data={m} onChange={updateCrew} onRemove={removeCrew} />
+              <CrewCard key={i} idx={i} data={m} onChange={updateCrew} onRemove={removeCrew} workDate={workDate} />
             ))}
           </div>
           <button type="button" onClick={addCrew} className="btn-ghost text-xs w-full">+ Add Crew Member</button>
