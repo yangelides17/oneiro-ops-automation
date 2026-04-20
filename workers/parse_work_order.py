@@ -48,6 +48,9 @@ Work Order Tracker column mapping (0-indexed):
   32  Certified Payroll Week   ← blank
   33  Filed?                   ← "No"
   34  Notes                    ← general remarks from WO
+  35  Date Entered             ← printed date-entered-into-DB on the WO (for CFR header)
+  36  School                   ← printed school field on the WO; default "NA"
+  37  Prep By                  ← printed Prepared-By name on the WO (for CFR footer)
 """
 
 import base64
@@ -102,6 +105,9 @@ If a field is not visible, illegible, or not applicable, use null. Never guess.
   "priority_level":     "Priority level label, e.g. '3 - Schedule'. Labeled 'Priority Level'.",
   "pavement_work_type": "Pavement work type, e.g. REFURBISHMENT or NEW. Labeled 'Pavement Work'.",
   "wo_received_date":   "The 'Issue To Contractor Date' at the bottom of the form, e.g. 07/17/2025.",
+  "date_entered":       "The 'Date Entered Into Database' (or 'Date Entered') date printed on the form header. If you cannot find an explicit Date-Entered field, use null.",
+  "school":             "The 'School' field in the header row. Usually 'NA' if no school is involved; otherwise the school name. Transcribe exactly as printed (often handwritten).",
+  "prep_by":            "The 'Prep By' or 'Prepared By' name printed in the bottom block of the form (not a signature — the printed name). Transcribe exactly.",
   "water_blast_sqft":   "If any waterblasting square footage is handwritten anywhere on the form, extract the number as an integer. Otherwise null.",
   "general_remarks":    "The full text of the General Remarks section (middle of the form, labeled 'General Remarks>>>>>'). Transcribe exactly as written, including handwritten text.",
 
@@ -343,4 +349,7 @@ def normalize_wo_data(raw: dict) -> dict:
         'work_type':             work_type,
         'top_markings':          top_markings,
         'intersection_grid':     intersection_grid,
+        'date_entered':          (raw.get('date_entered') or '').strip(),
+        'school':                (raw.get('school') or 'NA').strip() or 'NA',
+        'prep_by':               (raw.get('prep_by') or '').strip(),
     }

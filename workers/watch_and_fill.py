@@ -41,13 +41,14 @@ POLL_SECONDS    = int(os.environ.get('POLL_SECONDS', 20))
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
 # Subfolder names inside Needs Review that we watch for JSON payloads
-WATCH_SUBFOLDERS = ['Production Logs', 'Certified Payroll', 'Sign-In Logs']
+WATCH_SUBFOLDERS = ['Production Logs', 'Certified Payroll', 'Sign-In Logs', 'Field Reports']
 
 # Maps _type → template filename on Drive (inside the Templates folder)
 TEMPLATE_FILES = {
-    'production_log':    'Metro Thermoplastic Daily Production Log Template_FORM.pdf',
-    'certified_payroll': 'Certified Payroll Report Template_FORM.pdf',
-    'signin':            'Employee Daily Sign In Log Template_FORM.pdf',
+    'production_log':           'Metro Thermoplastic Daily Production Log Template_FORM.pdf',
+    'certified_payroll':        'Certified Payroll Report Template_FORM.pdf',
+    'signin':                   'Employee Daily Sign In Log Template_FORM.pdf',
+    'contractor_field_report':  'Thermo Contractor Field Report Template_FORM.pdf',
 }
 
 # MIME types we treat as scanned Work Order documents in the Scan Inbox
@@ -503,10 +504,22 @@ def fill_signin(service, data: dict, tmp_dir: Path) -> Path:
     return out
 
 
+def fill_contractor_field_report(service, data: dict, tmp_dir: Path) -> Path:
+    from fill_contractor_field_report import fill
+    template = get_template(service, 'contractor_field_report')
+    wo_id    = data.get('wo_id') or data.get('work_order', 'unknown')
+    date_str = str(data.get('install_to') or data.get('date_entered') or 'unknown') \
+                  .replace('/', '-').replace(' ', '_')
+    out = tmp_dir / f"Contractor_Field_Report_{wo_id}_{date_str}_FILLED.pdf"
+    fill(data, template_path=str(template), output_path=str(out))
+    return out
+
+
 FILLERS = {
-    'production_log':    fill_production_log,
-    'certified_payroll': fill_certified_payroll,
-    'signin':            fill_signin,
+    'production_log':           fill_production_log,
+    'certified_payroll':        fill_certified_payroll,
+    'signin':                   fill_signin,
+    'contractor_field_report':  fill_contractor_field_report,
 }
 
 
@@ -636,6 +649,7 @@ def load_folder_map(service) -> tuple:
       DRIVE_PROD_LOGS_ID        — Production Logs
       DRIVE_CERT_PAYROLL_ID     — Certified Payroll
       DRIVE_SIGN_IN_LOGS_ID     — Sign-In Logs
+      DRIVE_FIELD_REPORTS_ID    — Field Reports
 
     Returns:
       (folder_map, scan_inbox_id) where folder_map is {subfolder_name: id}
@@ -646,6 +660,7 @@ def load_folder_map(service) -> tuple:
         'Production Logs':   'DRIVE_PROD_LOGS_ID',
         'Certified Payroll': 'DRIVE_CERT_PAYROLL_ID',
         'Sign-In Logs':      'DRIVE_SIGN_IN_LOGS_ID',
+        'Field Reports':     'DRIVE_FIELD_REPORTS_ID',
     }
 
     needs_review_id     = os.environ.get('DRIVE_NEEDS_REVIEW_ID')

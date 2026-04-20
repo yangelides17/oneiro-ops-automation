@@ -1819,8 +1819,8 @@ function handleUploadPdf_(body) {
  * body.file_id  — Drive file ID of the original scanned WO PDF
  * body.data     — normalized dict from parse_work_order.normalize_wo_data()
  *
- * WO Tracker columns (0-indexed, 35 total):
- *  0  Work Order #          11  WO Received Date      22  Issues Reported
+ * WO Tracker columns (0-indexed, 38 total):
+ *  0  Work Order #          11  WO Received Date       22  Issues Reported
  *  1  Prime Contractor      12  Water Blast Required?  23  Photos Uploaded?
  *  2  Contract Number       13  Water Blast Confirmed? 24  Production Log Done?
  *  3  Borough               14  Water Blast SQFT       25  Field Report Done?
@@ -1833,6 +1833,9 @@ function handleUploadPdf_(body) {
  * 10  Pavement Work Type    21  Paint / Material Used  32  Certified Payroll Week
  *                                                      33  Filed?
  *                                                      34  Notes
+ *                                                      35  Date Entered  (from WO scan, for CFR)
+ *                                                      36  School        (from WO scan, default "NA")
+ *                                                      37  Prep By       (from WO scan, for CFR)
  */
 function handleWriteWO_(body) {
   const fileId = body.file_id;
@@ -1844,6 +1847,7 @@ function handleWriteWO_(body) {
 
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerCFRCols_(woSheet);
   const allRows = woSheet.getDataRange().getValues();
 
   // ── Duplicate check ───────────────────────────────────────────
@@ -1905,7 +1909,10 @@ function handleWriteWO_(body) {
     'No', '',                    // 30-31  Payment Received, Date
     '',                          // 32  Certified Payroll Week
     'No',                        // 33  Filed
-    ''                           // 34  Notes             ← from crew web app
+    '',                          // 34  Notes             ← from crew web app
+    d.date_entered || '',        // 35  Date Entered      ← from WO scan (for CFR)
+    d.school       || 'NA',      // 36  School            ← from WO scan (default NA)
+    d.prep_by      || ''         // 37  Prep By           ← from WO scan (for CFR)
   ];
 
   woSheet.appendRow(row);
@@ -1976,6 +1983,26 @@ function archiveWOFile_(fileId, d) {
     Logger.log('⚠️ Could not archive WO file: ' + err.toString());
     // Non-fatal — WO row was already written to tracker
   }
+}
+
+
+/**
+ * Idempotently ensures the WO Tracker has the 3 CFR columns at the end
+ * (Date Entered, School, Prep By). Safe to call on every scan intake —
+ * it only writes if the header cell is actually blank.
+ */
+function ensureWoTrackerCFRCols_(woSheet) {
+  const CFR_HEADERS = ['Date Entered', 'School', 'Prep By'];
+  const START_COL   = 36;   // 1-indexed → A=1; we want column 36 = AJ (0-indexed 35)
+  const lastCol     = woSheet.getLastColumn();
+  if (lastCol >= START_COL + CFR_HEADERS.length - 1) {
+    // Already wide enough — check headers
+    const hdrs = woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).getValues()[0];
+    const allSet = CFR_HEADERS.every((h, i) => String(hdrs[i]).trim() === h);
+    if (allSet) return;
+  }
+  woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setValues([CFR_HEADERS]);
+  woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setFontWeight('bold');
 }
 
 
@@ -3027,6 +3054,27 @@ function handleSubmitFieldReport_(body) {
     }
   }
 
+  // ── Contractor Field Report JSON export ──────────────────────
+  // Only when the WO is being marked complete on THIS submit. The
+  // Python worker (watch_and_fill.py) polls "Needs Review / Field
+  // Reports" for this _type and fills the CFR PDF.
+  if (d.wo_complete) {
+    step = 'CFR JSON export';
+    try {
+      generateContractorFieldReportJson_(d, woRow, ss, newIssues);
+    } catch (err) {
+      Logger.log('⚠️ CFR JSON export failed: ' + err);
+      try {
+        ss.getSheetByName('Automation Log').appendRow([
+          new Date(), 'CFR JSON Export', 'Failed', d.wo_id,
+          String(err), 'Error', '', 'Check logs — Contractor Field Report PDF will not be generated'
+        ]);
+      } catch (logErr) {
+        Logger.log('⚠️ Could not write CFR failure to Automation Log: ' + logErr);
+      }
+    }
+  }
+
   // ── Automation Log ────────────────────────────────────────────
   const actionNote = d.wo_complete
     ? 'WO marked COMPLETE — review for invoicing, field report, and production log'
@@ -3170,6 +3218,204 @@ function generateSignInJson_(d, woRow, ss) {
   );
 
   Logger.log('✅ Sign-In JSON exported: ' + fileName);
+}
+
+
+// ── Contractor Field Report export ────────────────────────────
+
+/**
+ * Map a Marking Items category name to the CFR template's top-table label.
+ * Most categories are 1:1; the few renames below handle plural/singular and
+ * "Arrow" → "Arrows" drift between the two surfaces.
+ * Returns null for categories that don't appear in the CFR top table
+ * (e.g. HVX Crosswalk / Stop Line / Stop Msg — those land in the grid).
+ */
+function mapCategoryToCFR_(category) {
+  const CFR_RENAMES = {
+    'Lane Lines':         'Lane Line',
+    'L/R Arrow':          'L/R Arrows',
+    'Straight Arrow':     'Straight Arrows',
+    'Combination Arrow':  'Combination Arrows',
+    'Bike Lane Arrow':    'Bike Lane Arrows',
+    'Bike Lane Symbol':   'Bike Lane Symbols',
+  };
+  // Grid-only categories — never in top table
+  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1, 'Stop Msg': 1 };
+
+  const c = String(category || '').trim();
+  if (!c) return null;
+  if (GRID_ONLY[c]) return null;
+  return CFR_RENAMES[c] || c;
+}
+
+
+/**
+ * Aggregate all Marking Items for a WO into the CFR's top-table and grid
+ * payloads. Only rows with Status='Completed' are counted.
+ *
+ * Returns:
+ *   {
+ *     top_table: { 'Double Yellow Line': 260, 'Lane Line': 180, ... },
+ *     grid: [
+ *       { intersection: '5 AV', n: '', e: '', s: '', w: 60,
+ *         stop_msg: '', sch8: '', sch10: '', st_line: '' },
+ *       ...
+ *     ]
+ *   }
+ *
+ * Intersection rows appear in the order they first show up in the Marking
+ * Items sheet (which is insertion order — scan-seeded first, then manual).
+ * School Msg 8'/10' columns are always blank (no source category today).
+ */
+function aggregateMarkingItemsForCFR_(ss, woId) {
+  const out = { top_table: {}, grid: [] };
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return out;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return out;
+
+  // Col indices (same as computeMarkingRollups_): 1 WO#, 4 Marking Type,
+  // 5 Intersection, 6 Direction, 8 Quantity, 9 Unit, 12 Status.
+  const woItems = data.slice(1).filter(r =>
+    String(r[1] || '').trim() === woId &&
+    String(r[12] || '').toLowerCase() === 'completed'
+  );
+  if (woItems.length === 0) return out;
+
+  // ── Top table: sum Quantity by mapped CFR category ──
+  woItems.forEach(r => {
+    const category = String(r[4] || '').trim();
+    const cfrLabel = mapCategoryToCFR_(category);
+    if (!cfrLabel) return;
+    const qty = parseFloat(r[8]);
+    if (isNaN(qty) || qty <= 0) return;
+    out.top_table[cfrLabel] = (out.top_table[cfrLabel] || 0) + qty;
+  });
+
+  // ── Intersection grid: build per-intersection rows ──
+  // Preserve first-seen order via an index map.
+  const rowByIntersection = {};
+  const order = [];
+
+  woItems.forEach(r => {
+    const intersection = String(r[5] || '').trim();
+    if (!intersection) return;
+    const category = String(r[4] || '').trim();
+    const direction = String(r[6] || '').trim().toUpperCase();
+    const qty = parseFloat(r[8]);
+    if (isNaN(qty) || qty <= 0) return;
+
+    if (!rowByIntersection[intersection]) {
+      rowByIntersection[intersection] = {
+        intersection: intersection,
+        order: '',   // not tracked in Marking Items
+        n: '', e: '', s: '', w: '',
+        stop_msg: '', sch8: '', sch10: '', st_line: ''
+      };
+      order.push(intersection);
+    }
+    const gridRow = rowByIntersection[intersection];
+
+    if (category === 'HVX Crosswalk' && ['N','E','S','W'].indexOf(direction) !== -1) {
+      const key = direction.toLowerCase();
+      gridRow[key] = (parseFloat(gridRow[key]) || 0) + qty;
+    } else if (category === 'Stop Msg') {
+      gridRow.stop_msg = (parseFloat(gridRow.stop_msg) || 0) + qty;
+    } else if (category === 'Stop Line') {
+      gridRow.st_line = (parseFloat(gridRow.st_line) || 0) + qty;
+    }
+    // School Msg 8'/10': no source category → stays blank.
+  });
+
+  out.grid = order.slice(0, 10).map(i => rowByIntersection[i]);
+  return out;
+}
+
+
+/**
+ * Build a Contractor Field Report JSON payload from the submitted field
+ * report + the WO Tracker row + aggregated Marking Items + the freshly
+ * computed (not yet written) issues string. Writes the JSON into the
+ * Needs Review / Field Reports Drive folder. The Railway worker
+ * (watch_and_fill.py) polls that folder and fills the PDF.
+ *
+ * Called from handleSubmitFieldReport_ ONLY when d.wo_complete === true.
+ *
+ * aggregatedIssues: the full Issues Reported string across every submit
+ * for this WO (includes the current submit's issues). Built by
+ * handleSubmitFieldReport_ as newIssues.
+ */
+function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
+  const props          = PropertiesService.getScriptProperties();
+  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
+
+  const reviewFolder   = DriveApp.getFolderById(needsReviewId);
+  const fieldRptFolder = getOrCreateSubfolder_(reviewFolder, 'Field Reports');
+
+  // WO Tracker cols: 0 WO#, 1 Prime Contractor, 2 Contract #, 3 Boro,
+  // 5 Location, 6 From, 7 To, 17 Work Start, 18 Work End,
+  // 35 Date Entered, 36 School, 37 Prep By.
+  const workOrder       = String(woRow[0]  || '').trim();
+  const primeContractor = String(woRow[1]  || '').trim();
+  const contractNum     = String(woRow[2]  || '').trim();
+  const boro            = String(woRow[3]  || '').trim();
+  const location        = String(woRow[5]  || '').trim();
+  const fromStreet      = String(woRow[6]  || '').trim();
+  const toStreet        = String(woRow[7]  || '').trim();
+  const workStart       = String(woRow[17] || '').trim();
+  const dateEntered     = String(woRow[35] || '').trim();
+  const school          = String(woRow[36] || 'NA').trim() || 'NA';
+  const prepBy          = String(woRow[37] || '').trim();
+
+  // install_from = existing Work Start (first-submit date, already in tracker)
+  // install_to   = today's submit date (WO is being completed now)
+  const dateFmt = (iso) => {
+    if (!iso) return '';
+    const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return String(iso);
+    const [, yyyy, mm, dd] = m;
+    return `${parseInt(mm, 10)}/${parseInt(dd, 10)}/${yyyy}`;
+  };
+
+  const aggregated = aggregateMarkingItemsForCFR_(ss, d.wo_id);
+
+  const payload = {
+    _type:             'contractor_field_report',
+    wo_id:             d.wo_id,
+    date_entered:      dateFmt(dateEntered) || dateEntered,
+    work_order:        workOrder,
+    contractor:        primeContractor,
+    contract_number:   contractNum,
+    boro:              boro,
+    location:          location,
+    school:            school,
+    from:              fromStreet,
+    to:                toStreet,
+    install_from:      dateFmt(workStart) || workStart,
+    install_to:        dateFmt(d.date),
+    general_remarks:   String(aggregatedIssues || '').trim(),
+    markings:          aggregated.top_table,
+    grid:              aggregated.grid,
+    prep_by:           prepBy,
+  };
+
+  const isoDate  = (d.date || '').slice(0, 10) || 'unknown';
+  const fileName = `CFR_${d.wo_id}_${isoDate}.json`;
+
+  // Overwrite any existing file with the same name (re-submit of the
+  // completion day is idempotent — same payload, same filename).
+  const existing = fieldRptFolder.getFilesByName(fileName);
+  while (existing.hasNext()) existing.next().setTrashed(true);
+
+  fieldRptFolder.createFile(
+    fileName,
+    JSON.stringify(payload, null, 2),
+    MimeType.PLAIN_TEXT
+  );
+
+  Logger.log('✅ CFR JSON exported: ' + fileName);
 }
 
 
