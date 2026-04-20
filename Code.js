@@ -447,14 +447,59 @@ function generateDailyDocuments(dateStr) {
 }
 
 /**
- * Parse a time string like "9:15 AM" or "1:15 PM" into minutes since midnight.
- * Used for correct earliest-in / latest-out comparisons (string compare fails on AM/PM).
+ * Normalize any time-ish cell value to "h:mm AM/PM".
+ *
+ * Sheets stores a time-only value as a Date pinned to 1899-12-30. When
+ * we read via getValues() that comes back as a Date object, and raw
+ * JSON-stringifying it produces "1899-12-30T07:00:00.000Z" — ugly on
+ * the downstream PDF. This helper handles all four shapes we see:
+ *   Date object (1899-12-30 epoch) → formatted in script TZ
+ *   "7:00 AM" / "12:30 PM"         → normalized (leading zeros stripped)
+ *   "07:00" / "13:30" (24h)        → converted
+ *   anything else                  → pass through
+ */
+function formatTime_(val) {
+  if (val == null || val === '') return '';
+  if (val instanceof Date && !isNaN(val.getTime())) {
+    return Utilities.formatDate(val, Session.getScriptTimeZone(), 'h:mm a');
+  }
+  const s = String(val).trim();
+  if (!s) return '';
+  // Already "h:mm AM/PM" — strip leading zero on the hour
+  let m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)$/i);
+  if (m) return `${parseInt(m[1], 10)}:${m[2]} ${m[3].toUpperCase()}`;
+  // 24-hour "HH:MM" or "HH:MM:SS"
+  m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const mm = m[2];
+    const ampm = h < 12 ? 'AM' : 'PM';
+    if (h === 0) h = 12;
+    else if (h > 12) h -= 12;
+    return `${h}:${mm} ${ampm}`;
+  }
+  return s;
+}
+
+
+/**
+ * Parse a time string like "9:15 AM" or "1:15 PM" (or the Sheets
+ * epoch-Date form) into minutes since midnight. Used for correct
+ * earliest-in / latest-out comparisons.
  */
 function parseTimeToMinutes_(timeStr) {
-  if (!timeStr) return 0;
+  if (timeStr == null || timeStr === '') return 0;
+  if (timeStr instanceof Date && !isNaN(timeStr.getTime())) {
+    return timeStr.getHours() * 60 + timeStr.getMinutes();
+  }
   const s = String(timeStr).trim().toUpperCase();
   const match = s.match(/(\d+):(\d+)\s*(AM|PM)/);
-  if (!match) return 0;
+  if (!match) {
+    // 24-hour fallback
+    const m24 = s.match(/^(\d{1,2}):(\d{2})/);
+    if (m24) return parseInt(m24[1], 10) * 60 + parseInt(m24[2], 10);
+    return 0;
+  }
   let h = parseInt(match[1]);
   const m = parseInt(match[2]);
   const ampm = match[3];
@@ -641,14 +686,14 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
     const timeOutMins = parseTimeToMinutes_(row[9]);
     if (!employees[name]) {
       employees[name] = {
-        timeIn: row[8], timeOut: row[9],
+        timeIn: formatTime_(row[8]), timeOut: formatTime_(row[9]),
         timeInMins, timeOutMins,
         classification: row[7]
       };
     } else {
       // Correct numeric comparison — not string comparison
-      if (timeInMins  < employees[name].timeInMins)  { employees[name].timeIn  = row[8]; employees[name].timeInMins  = timeInMins;  }
-      if (timeOutMins > employees[name].timeOutMins) { employees[name].timeOut = row[9]; employees[name].timeOutMins = timeOutMins; }
+      if (timeInMins  < employees[name].timeInMins)  { employees[name].timeIn  = formatTime_(row[8]); employees[name].timeInMins  = timeInMins;  }
+      if (timeOutMins > employees[name].timeOutMins) { employees[name].timeOut = formatTime_(row[9]); employees[name].timeOutMins = timeOutMins; }
     }
   });
 
@@ -691,11 +736,14 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
     };
   });
 
-  // Save plain-text summary to Needs Review folder
+  // Production Logs folder — JSON gets written below; the Python worker
+  // produces the filled PDF.
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
   const subFolder    = getOrCreateSubfolder_(reviewFolder, 'Production Logs');
-  const fileName     = `Production_Log_${targetDayStr}.txt`;
-  const file         = subFolder.createFile(fileName, logContent, MimeType.PLAIN_TEXT);
+
+  // ── Plain-text skeleton (disabled; kept in case admin wants it back) ──
+  // const fileName = `Production_Log_${targetDayStr}.txt`;
+  // const file     = subFolder.createFile(fileName, logContent, MimeType.PLAIN_TEXT);
 
   // ── JSON export for the Python filler ──────────────────────
   const sortedNames = Object.keys(employees);
@@ -729,20 +777,19 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss)
   };
 
   const jsonFileName = `Production_Log_${targetDayStr}.json`;
-  subFolder.createFile(jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
+  const jsonFile = subFolder.createFile(jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
 
   // Log it
   const logSheet = ss.getSheetByName('Automation Log');
   logSheet.appendRow([
     new Date(), 'Production Log Generator', 'Daily trigger',
     `${Object.keys(completedByWO).length} completed WO(s) on ${dateFormatted}`,
-    fileName, 'Generated',
+    jsonFileName, 'Generated',
     '', 'Yes — Review and send to Claudia'
   ]);
 
-  Logger.log('✅ Production log generated: ' + fileName);
   Logger.log('✅ Production log JSON exported: ' + jsonFileName);
-  return file;
+  return jsonFile;
 }
 
 
