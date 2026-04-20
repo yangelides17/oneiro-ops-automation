@@ -2031,7 +2031,7 @@ function addCFRColumnsNow() {
  * JSON and tell you if anything throws.
  */
 function debugGenerateCFRForWO() {
-  const WO_ID = 'RM-43281';   // ← edit me
+  const WO_ID = 'RM-43304';   // ← edit me
 
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
@@ -3441,8 +3441,17 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
   if (rawDateEntered instanceof Date && !isNaN(rawDateEntered.getTime())) {
     dateEntered = Utilities.formatDate(rawDateEntered, Session.getScriptTimeZone(),
                                        'EEEE, MMMM d, yyyy');
+  } else if (rawDateEntered && typeof rawDateEntered.getTime === 'function'
+             && !isNaN(rawDateEntered.getTime())) {
+    // Fallback: duck-type for cross-realm Date objects where `instanceof Date` fails
+    dateEntered = Utilities.formatDate(new Date(rawDateEntered.getTime()),
+                                       Session.getScriptTimeZone(),
+                                       'EEEE, MMMM d, yyyy');
   } else {
-    dateEntered = String(rawDateEntered || '').trim();
+    // String path — strip an appended " HH:MM:SS GMT..." tail if one exists
+    let s = String(rawDateEntered || '').trim();
+    s = s.replace(/\s+\d{1,2}:\d{2}:\d{2}\s+GMT.*$/, '').trim();
+    dateEntered = s;
   }
 
   // install_from = existing Work Start (first-submit date, already in tracker)
