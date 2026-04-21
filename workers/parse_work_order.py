@@ -167,6 +167,26 @@ methodical:
    do NOT pick the direction that appears "closest". If the scan is
    slightly skewed, a mark can visually drift toward a neighboring
    column; the header row is ground truth.
+3. Soft corroboration with Stop Lines. When a row has BOTH an HVX mark
+   in one of N/E/S/W AND a directional value in the Stop Lines column
+   (e.g. "North", "East", "South", "West"), those two signals usually
+   name the same direction — Stop Lines is printed text and often
+   easier to read cleanly than the narrow direction columns, so it
+   serves as a helpful sanity check on your HVX column reading. If
+   the two appear to disagree, re-examine the HVX's horizontal
+   position against the header row and trust whichever signal is
+   clearest.
+
+   This is a SOFT guide only:
+   - It occasionally doesn't hold (legit WOs can have an HVX in one
+     direction and a stop line in another). If, after careful
+     re-examination, you're still confident the HVX is in the column
+     you see, go with what you see.
+   - Do NOT invent HVX marks just because Stop Lines has a direction.
+     If a row has no visible HVX anywhere, the N/E/S/W columns stay
+     blank — no matter what Stop Lines says. Stop Lines can exist
+     independently of crosswalks. Only record HVX marks you can
+     actually see on the page.
 
 Accuracy matters more than speed on this section.
 """
