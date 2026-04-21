@@ -2183,6 +2183,8 @@ function doPost(e) {
       return handleUploadWOScan_(body);
     } else if (action === 'get_scan_status') {
       return handleGetScanStatus_(body);
+    } else if (action === 'get_scan_uploads_today') {
+      return handleGetScanUploadsToday_(body);
     } else if (action === 'log_wo_scan_failure') {
       return handleLogWOScanFailure_(body);
     } else {
@@ -2379,6 +2381,91 @@ function handleGetScanStatus_(body) {
 }
 
 
+// ── action: get_scan_uploads_today ────────────────────────────
+
+/**
+ * Returns today's scan-originated WO Tracker rows, grouped by the
+ * upload that produced them. The Scan WO page uses this as its
+ * source of truth so the queue reflects the tracker (cross-device,
+ * survives browser clears, respects admin deletions).
+ *
+ * Grouping key = col 39 (Combined Scan File ID) if set, else col 38
+ * (Scan File ID). All splits from one multi-WO upload share the
+ * same Combined ID, so they roll up to one queue item.
+ *
+ * Response shape:
+ *   { uploads: [{
+ *       file_id:     <grouping key — what the webapp originally uploaded>,
+ *       filename:    <Original Filename from col 41, or the WO# as fallback>,
+ *       uploaded_at: <ISO timestamp from col 40>,
+ *       is_combined: <true if this upload produced multiple tracker rows>,
+ *       wo_ids:      [<WO#>, ...]   // sorted by WO#
+ *     }, ...]
+ *   }
+ *
+ * "Today" is defined in the spreadsheet's timezone (not UTC) so the
+ * boundary matches what the admin sees in the sheet.
+ */
+function handleGetScanUploadsToday_(body) {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData  = woSheet.getDataRange().getValues();
+
+  const tz    = ss.getSpreadsheetTimeZone() || CONFIG.TIMEZONE;
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+
+  const asDate = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) return v;
+    if (v) {
+      const d = new Date(v);
+      if (!isNaN(d.getTime())) return d;
+    }
+    return null;
+  };
+
+  const groups = {};  // groupKey → aggregated shape
+  woData.slice(1).forEach(r => {
+    const woId       = String(r[0]  || '').trim();
+    const scanId     = String(r[38] || '').trim();
+    const combinedId = String(r[39] || '').trim();
+    if (!woId) return;
+    if (!scanId && !combinedId) return;   // not a scan-originated row
+
+    const tsRaw   = r[40];
+    const tsDate  = asDate(tsRaw);
+    if (!tsDate) return;
+    if (Utilities.formatDate(tsDate, tz, 'yyyy-MM-dd') !== today) return;
+
+    const groupKey = combinedId || scanId;
+    const filename = String(r[41] || '').trim();
+    if (!groups[groupKey]) {
+      groups[groupKey] = {
+        file_id:     groupKey,
+        filename:    filename || woId,
+        uploaded_at: tsDate.toISOString(),
+        is_combined: !!combinedId,
+        wo_ids:      [],
+      };
+    } else {
+      // Keep earliest upload timestamp in the group (closest to when
+      // the user actually hit "Upload")
+      if (tsDate.toISOString() < groups[groupKey].uploaded_at) {
+        groups[groupKey].uploaded_at = tsDate.toISOString();
+      }
+    }
+    groups[groupKey].wo_ids.push(woId);
+  });
+
+  // Sort wo_ids within each group, and sort uploads by most-recent first
+  const uploads = Object.values(groups).map(g => ({
+    ...g,
+    wo_ids: g.wo_ids.slice().sort(),
+  })).sort((a, b) => a.uploaded_at < b.uploaded_at ? 1 : -1);
+
+  return jsonResponse_({ uploads });
+}
+
+
 // ── action: log_wo_scan_failure ───────────────────────────────
 
 /**
@@ -2429,7 +2516,7 @@ function handleLogWOScanFailure_(body) {
  * body.file_id  — Drive file ID of the original scanned WO PDF
  * body.data     — normalized dict from parse_work_order.normalize_wo_data()
  *
- * WO Tracker columns (0-indexed, 40 total):
+ * WO Tracker columns (0-indexed, 42 total):
  *  0  Work Order #          11  WO Received Date       22  Issues Reported
  *  1  Prime Contractor      12  Water Blast Required?  23  Photos Uploaded?
  *  2  Contract Number       13  Water Blast Confirmed? 24  Production Log Done?
@@ -2443,11 +2530,13 @@ function handleLogWOScanFailure_(body) {
  * 10  Pavement Work Type    21  Paint / Material Used  32  Certified Payroll Week
  *                                                      33  Filed?
  *                                                      34  Notes
- *                                                      35  Date Entered          (from WO scan, for CFR)
- *                                                      36  School                (from WO scan, default "NA")
- *                                                      37  Prep By               (from WO scan, for CFR)
- *                                                      38  Scan File ID          (source PDF / split in Scan Inbox; webapp uses this to poll parse status)
- *                                                      39  Combined Scan File ID (only set for multi-WO-stack splits — shared by all splits from the same combined PDF)
+ *                                                      35  Date Entered           (from WO scan, for CFR)
+ *                                                      36  School                 (from WO scan, default "NA")
+ *                                                      37  Prep By                (from WO scan, for CFR)
+ *                                                      38  Scan File ID           (source PDF / split in Scan Inbox)
+ *                                                      39  Combined Scan File ID  (only set for multi-WO splits — shared by all splits from same combined PDF)
+ *                                                      40  Scan Upload Timestamp  (Date — lets the Scan WO page query "today's uploads")
+ *                                                      41  Original Filename      (filename the user picked in the webapp; all splits share it)
  */
 function handleWriteWO_(body) {
   const fileId = body.file_id;
@@ -2531,7 +2620,9 @@ function handleWriteWO_(body) {
     d.school       || 'NA',      // 36  School            ← from WO scan (default NA)
     d.prep_by      || '',        // 37  Prep By           ← from WO scan (for CFR)
     fileId         || '',        // 38  Scan File ID      ← source PDF (or split) in Scan Inbox
-    body.combined_file_id || '' // 39  Combined Scan File ID ← only for multi-WO stack splits; blank otherwise
+    body.combined_file_id || '', // 39  Combined Scan File ID ← only for multi-WO stack splits; blank otherwise
+    new Date(),                  // 40  Scan Upload Timestamp  ← lets the Scan WO page query "today's uploads"
+    body.original_filename || '' // 41  Original Filename       ← what the user picked in the webapp (all splits from one combined PDF share this)
   ];
 
   woSheet.appendRow(row);
@@ -2622,6 +2713,8 @@ function ensureWoTrackerExtraCols_(woSheet) {
     'Prep By',                 // col 38 / 0-idx 37
     'Scan File ID',            // col 39 / 0-idx 38
     'Combined Scan File ID',   // col 40 / 0-idx 39
+    'Scan Upload Timestamp',   // col 41 / 0-idx 40 — for "today's uploads" query
+    'Original Filename',       // col 42 / 0-idx 41 — filename the user picked in the webapp
   ];
   const START_COL = 36;
   const N = EXTRA_HEADERS.length;

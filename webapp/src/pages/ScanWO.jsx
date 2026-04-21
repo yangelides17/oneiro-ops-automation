@@ -59,38 +59,64 @@ function purgeOldHistory() {
   } catch { /* non-critical */ }
 }
 
-// Load today's history; repair any zombie in-progress items that
-// survived a page reload (they can't actually finish because their
-// File object is gone).
-function loadTodayHistory() {
+// Load today's IN-FLIGHT items from localStorage (items uploading,
+// parsing, or errored that haven't landed in the tracker yet). Items
+// that were in 'done' state under the old architecture are dropped
+// here — the tracker fetch supplies the canonical 'done' view now.
+// Zombie uploading/parsing items (killed by page reload) get
+// repaired to upload_error so the user can dismiss + re-pick.
+function loadInFlight() {
   try {
     const raw = localStorage.getItem(historyKey())
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    return parsed.map(item => {
-      if (item.parseStatus === 'done') return item
-      if (item.uploadStatus === 'uploading' || item.parseStatus === 'parsing') {
-        return {
-          ...item,
-          uploadStatus: 'upload_error',
-          parseStatus:  undefined,
-          error:        'Page reload interrupted this upload — delete and re-pick the file.',
+    return parsed
+      .filter(i => i.parseStatus !== 'done' && !i.isCommitted)
+      .map(item => {
+        if (item.uploadStatus === 'uploading' || item.parseStatus === 'parsing') {
+          return {
+            ...item,
+            uploadStatus: 'upload_error',
+            parseStatus:  undefined,
+            error:        'Page reload interrupted this upload — dismiss and re-pick the file.',
+          }
         }
-      }
-      return item
-    })
+        return item
+      })
   } catch {
     return []
   }
 }
 
-function persistHistory(items) {
-  // Only keep serializable fields; File objects never survive JSON anyway
-  const clean = items.map(({ file, ...rest }) => rest)   // eslint-disable-line no-unused-vars
+// Only persist IN-FLIGHT items (committed rows come from the tracker
+// on every mount, so there's no need to mirror them locally —
+// mirroring them would let deleted rows linger in the queue until
+// the next refresh).
+function persistInflight(items) {
+  const clean = items
+    .filter(i => !i.isCommitted)
+    .map(({ file, ...rest }) => rest)   // eslint-disable-line no-unused-vars
   try {
     localStorage.setItem(historyKey(), JSON.stringify(clean))
   } catch { /* quota / private mode */ }
+}
+
+// Convert a tracker-upload entry (from /api/scan-uploads-today) to
+// the shape the rest of the UI renders.
+function toCommittedItem(t) {
+  return {
+    id:            `committed-${t.file_id}`,
+    name:          t.filename || '(untitled scan)',
+    uploadedAt:    t.uploaded_at,
+    fileId:        t.file_id,
+    uploadStatus: 'uploaded',
+    parseStatus:  'done',
+    woIds:         Array.isArray(t.wo_ids) ? t.wo_ids : [],
+    isCombined:    !!t.is_combined,
+    isCommitted:   true,    // the source-of-truth flag
+    error:         null,
+  }
 }
 
 // Ready-queue item shape:
@@ -108,78 +134,81 @@ function newReadyItem(file) {
   }
 }
 
-// History-queue item shape:
-//   { id, name, size, type, uploadedAt, fileId,
-//     uploadStatus: 'uploading' | 'uploaded' | 'upload_error',
-//     parseStatus:  'parsing' | 'done' | 'error' | undefined,
-//     woIds: string[], error, expanded, file (runtime only) }
+// History-queue item shape (two flavors):
+//   Committed (from tracker):
+//     { id, name, uploadedAt, fileId, uploadStatus:'uploaded',
+//       parseStatus:'done', woIds, isCombined, isCommitted:true }
+//   In-flight (from localStorage):
+//     { id, name, size, type, uploadedAt, fileId,
+//       uploadStatus: 'uploading'|'uploaded'|'upload_error',
+//       parseStatus:  'parsing'|'error'|undefined,
+//       woIds: [], error, file (runtime), isCommitted:false }
+//
+// The tracker query returns today's uploads grouped by the physical
+// upload action. For every group (1 single-WO upload OR N splits of
+// one multi-WO upload), we render one committed row. In-flight items
+// for the SAME fileId are replaced the moment the tracker has them.
+
+const COMMITTED_REFRESH_MS = 30_000
 
 export default function ScanWO() {
   const fileRef    = useRef(null)
   const [readyItems,   setReadyItems]   = useState([])
-  const [historyItems, setHistoryItems] = useState(loadTodayHistory)
+  const [historyItems, setHistoryItems] = useState([])
+  const [expandedIds,  setExpandedIds]  = useState(() => new Set())
   const [submitting,   setSubmitting]   = useState(false)
   const [error,        setError]        = useState('')
   const [dragging,     setDragging]     = useState(false)
 
-  // Clean up stale day keys on mount
-  useEffect(() => { purgeOldHistory() }, [])
+  // Merge helper: replace committed slice of historyItems with a fresh
+  // tracker list, drop in-flight whose fileId is now committed, keep
+  // the rest (in-flight items still uploading/parsing/errored).
+  const applyCommittedFromTracker = (committedItems) => {
+    setHistoryItems(prev => {
+      const inflight = prev.filter(i => !i.isCommitted)
+      const committedIds = new Set(committedItems.map(c => c.fileId))
+      const stillInflight = inflight.filter(i =>
+        !i.fileId || !committedIds.has(i.fileId))
+      return [...committedItems, ...stillInflight]
+    })
+  }
 
-  // One-shot catch-up poll on mount. Re-fetches the server state of
-  // EVERY item with a fileId — not just non-done ones. Fixes the
-  // stale-done race where a multi-WO upload's first poll happened to
-  // land between splits and stored an incomplete wo_ids list; each
-  // page reload now reconciles against the tracker's current truth.
+  // Fetch today's committed uploads from the tracker. Called on mount
+  // + every COMMITTED_REFRESH_MS, + whenever an in-flight item's poll
+  // flips to 'done' (so we don't wait up to 30s for its row to appear).
+  const refreshCommitted = async () => {
+    try {
+      const res  = await fetch('/api/scan-uploads-today')
+      const data = await res.json().catch(() => ({}))
+      if (!Array.isArray(data.uploads)) return
+      applyCommittedFromTracker(data.uploads.map(toCommittedItem))
+    } catch (err) {
+      console.warn('scan-uploads-today fetch failed:', err)
+    }
+  }
+
+  // Mount: purge old day-keys, seed inflight from localStorage, then
+  // pull today's committed uploads from the tracker.
   useEffect(() => {
-    const candidates = loadTodayHistory().filter(h => h.fileId)
-    if (candidates.length === 0) return
-    let cancelled = false
-    ;(async () => {
-      try {
-        const res = await fetch('/api/scan-status', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ file_ids: candidates.map(c => c.fileId) }),
-        })
-        const data = await res.json().catch(() => ({}))
-        if (cancelled || !Array.isArray(data.statuses)) return
-        setHistoryItems(prev => prev.flatMap(p => {
-          const s = data.statuses.find(x => x.file_id === p.fileId)
-          if (!s) return [p]
-          // If an item that was previously 'done' now returns 'unknown'
-          // (file not in Scan Inbox, no tracker row, no error log), its
-          // tracker rows were deleted. Drop it from the queue so the
-          // count stays in sync with the data hub.
-          if (s.status === 'unknown' && p.parseStatus === 'done') return []
-          if (s.status === 'done') {
-            const prevLen = (p.woIds || []).length
-            const nextLen = (s.wo_ids || []).length
-            return [{
-              ...p,
-              parseStatus: 'done',
-              uploadStatus: 'uploaded',
-              error: null,
-              woIds: s.wo_ids || [],
-              // Bump doneAt whenever the count changed (so the ongoing
-              // poll continues to watch for more splits), else keep the
-              // original one.
-              doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
-            }]
-          }
-          if (s.status === 'error') {
-            return [{ ...p, parseStatus: 'error', error: s.message || 'Parse failed' }]
-          }
-          return [p]
-        }))
-      } catch (err) {
-        console.warn('scan-status catch-up poll failed:', err)
-      }
-    })()
-    return () => { cancelled = true }
-  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
+    purgeOldHistory()
+    const inflight = loadInFlight()
+    if (inflight.length > 0) setHistoryItems(inflight)
+    refreshCommitted()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  // Persist history whenever it changes
-  useEffect(() => { persistHistory(historyItems) }, [historyItems])
+  // Periodically pull fresh committed-upload state from tracker. Picks
+  // up cross-device uploads + admin deletions.
+  useEffect(() => {
+    const iv = setInterval(refreshCommitted, COMMITTED_REFRESH_MS)
+    return () => clearInterval(iv)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Persist only in-flight items whenever historyItems changes.
+  // Committed rows come from the tracker on every refresh — mirroring
+  // them would let deleted rows linger locally.
+  useEffect(() => { persistInflight(historyItems) }, [historyItems])
 
   // Clean up object URLs on unmount
   useEffect(() => () => {
@@ -231,16 +260,25 @@ export default function ScanWO() {
     return prev.filter(p => p.id !== id)
   })
 
-  const removeHistory = (id) => setHistoryItems(prev => prev.filter(p => p.id !== id))
+  // Dismissing only removes an in-flight error from local state —
+  // committed items are the tracker's truth and can only be removed
+  // by deleting the underlying WO Tracker row.
+  const removeHistory = (id) => setHistoryItems(prev =>
+    prev.filter(p => p.id !== id || p.isCommitted))
 
-  const toggleExpand = (id) => setHistoryItems(prev => prev.map(p =>
-    p.id === id ? { ...p, expanded: !p.expanded } : p))
+  const toggleExpand = (id) => setExpandedIds(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
 
   // ── Single upload: Ready item → history item ──────────────────
   const UPLOAD_CONCURRENCY = 5
 
   const uploadOne = async (readyItem) => {
-    // Create the history item immediately so the user sees it move
+    // Create the in-flight item immediately so the user sees it move.
+    // isCommitted:false marks it as localStorage-only (not tracker).
     const historyId = `${readyItem.id}-h`
     const baseHistory = {
       id:           historyId,
@@ -254,8 +292,8 @@ export default function ScanWO() {
       parseStatus:  undefined,
       woIds:        [],
       error:        null,
-      expanded:     false,
-      file:         readyItem.file,   // kept in memory only for retry
+      isCommitted:  false,
+      file:         readyItem.file,   // kept in memory for retry / re-upload
     }
     setHistoryItems(prev => [baseHistory, ...prev])
 
@@ -313,25 +351,18 @@ export default function ScanWO() {
     setSubmitting(false)
   }
 
-  // ── Status polling ────────────────────────────────────────────
-  // Continues while anything is 'parsing' OR while any 'done' item
-  // was last updated within STABLE_WINDOW_MS. That extra window
-  // catches late-arriving splits in a multi-WO upload: get_scan_status
-  // may return {done, wo_ids: [A]} before wo_ids [B, C] have been
-  // written. Polling keeps running until wo_ids count stops changing
-  // for the full window.
-  const STABLE_WINDOW_MS = 30_000
+  // ── Status polling for IN-FLIGHT items ───────────────────────
+  // Polls `get_scan_status` every POLL_INTERVAL_MS for any in-flight
+  // item currently in 'parsing' state. On 'done' → trigger a
+  // `refreshCommitted` fetch so the tracker's canonical view takes
+  // over (the applyCommittedFromTracker filter drops the in-flight
+  // item in the same cycle). On 'error' → mark the in-flight item
+  // errored so the user can dismiss. Committed items are ignored
+  // here — their state is refreshed by the periodic tracker poll.
   useEffect(() => {
-    const eligible = historyItems.filter(h => {
-      if (!h.fileId) return false
-      if (h.parseStatus === 'parsing') return true
-      if (h.parseStatus === 'done') {
-        const age = h.doneAt ? (Date.now() - h.doneAt) : Infinity
-        return age < STABLE_WINDOW_MS
-      }
-      return false
-    })
-    if (eligible.length === 0) return undefined
+    const parsing = historyItems.filter(h =>
+      !h.isCommitted && h.fileId && h.parseStatus === 'parsing')
+    if (parsing.length === 0) return undefined
 
     let cancelled = false
     const tick = async () => {
@@ -339,51 +370,42 @@ export default function ScanWO() {
         const res  = await fetch('/api/scan-status', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ file_ids: eligible.map(p => p.fileId) }),
+          body:    JSON.stringify({ file_ids: parsing.map(p => p.fileId) }),
         })
         const data = await res.json().catch(() => ({}))
         if (cancelled || !Array.isArray(data.statuses)) return
-        setHistoryItems(prev => prev.flatMap(p => {
+
+        let anyDone = false
+        setHistoryItems(prev => prev.map(p => {
+          if (p.isCommitted) return p
           const s = data.statuses.find(x => x.file_id === p.fileId)
-          if (!s) return [p]
-          // Drop items whose tracker rows were deleted (user cleaned up
-          // the data hub while the page was open). Keeps the queue +
-          // "X WOs today" counter honest.
-          if (s.status === 'unknown' && p.parseStatus === 'done') return []
+          if (!s) return p
           if (s.status === 'done') {
-            const prevLen = (p.woIds || []).length
-            const nextLen = (s.wo_ids || []).length
-            // Only bump doneAt if the count actually increased — that's
-            // our signal to keep the stability window open. Unchanged
-            // counts let doneAt age so polling eventually stops.
-            return [{
-              ...p,
-              parseStatus: 'done',
-              uploadStatus: 'uploaded',
-              error: null,
-              woIds: s.wo_ids || [],
-              doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
-            }]
+            anyDone = true
+            return p   // leave alone; refreshCommitted replaces it below
           }
           if (s.status === 'error') {
-            return [{ ...p, parseStatus: 'error', error: s.message || 'Parse failed' }]
+            return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
           }
-          return [p]   // pending — keep polling
+          return p   // pending / unknown — keep polling
         }))
+        if (anyDone) refreshCommitted()
       } catch (err) {
         console.warn('scan-status poll failed:', err)
       }
     }
 
-    // Tick immediately so the first poll cycle isn't a full interval behind
     tick()
     const interval = setInterval(tick, POLL_INTERVAL_MS)
     return () => { cancelled = true; clearInterval(interval) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyItems])
 
   // ── Summary counter ───────────────────────────────────────────
+  // Count only committed (tracker-backed) WOs. In-flight items shouldn't
+  // contribute until they're actually in the data hub.
   const woCountToday = historyItems.reduce((acc, h) =>
-    h.parseStatus === 'done' ? acc + (h.woIds?.length || 0) : acc, 0)
+    h.isCommitted ? acc + (h.woIds?.length || 0) : acc, 0)
 
   const readyProcessing = readyItems.filter(i => i.status === 'processing').length
 
@@ -456,6 +478,7 @@ export default function ScanWO() {
           </div>
           {historyItems.map(item => (
             <HistoryRow key={item.id} item={item}
+                        expanded={expandedIds.has(item.id)}
                         onRemove={removeHistory}
                         onToggle={toggleExpand} />
           ))}
@@ -509,7 +532,7 @@ function ReadyRow({ item, onRemove, disableRemove }) {
 }
 
 // ── History row (uploaded / parsing / done / error) ───────────
-function HistoryRow({ item, onRemove, onToggle }) {
+function HistoryRow({ item, expanded, onRemove, onToggle }) {
   const isError   = item.uploadStatus === 'upload_error' || item.parseStatus === 'error'
   const isPending = item.uploadStatus === 'uploading' || item.parseStatus === 'parsing'
   const isDone    = item.parseStatus === 'done'
@@ -547,7 +570,7 @@ function HistoryRow({ item, onRemove, onToggle }) {
             {isDone && multiWo && (
               <button type="button" onClick={() => onToggle(item.id)}
                 className="text-green-700 font-semibold flex items-center gap-1 hover:underline">
-                {item.woIds.length} WOs <span>{item.expanded ? '⌃' : '⌄'}</span>
+                {item.woIds.length} WOs <span>{expanded ? '⌃' : '⌄'}</span>
               </button>
             )}
           </div>
@@ -567,7 +590,7 @@ function HistoryRow({ item, onRemove, onToggle }) {
       </div>
 
       {/* Multi-WO expansion — show each WO# one per line */}
-      {isDone && multiWo && item.expanded && (
+      {isDone && multiWo && expanded && (
         <ul className="px-3 pb-3 pt-0 space-y-0.5">
           {item.woIds.map(wo => (
             <li key={wo} className="text-xs text-slate-700 font-mono pl-12">

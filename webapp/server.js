@@ -239,6 +239,23 @@ app.post('/api/scan-status', async (req, res) => {
 })
 
 /**
+ * GET /api/scan-uploads-today
+ * Returns today's scan-originated WO Tracker rows grouped by upload.
+ * The Scan WO page uses this as its source of truth so the queue
+ * reflects the tracker (cross-device, survives browser clears,
+ * respects admin deletions).
+ */
+app.get('/api/scan-uploads-today', async (_req, res) => {
+  try {
+    const data = await callAppsScript('get_scan_uploads_today')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/scan-uploads-today error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/upload-photo
  * Uploads one site photo to Drive inside the WO's Photos folder.
  * Multipart form fields:

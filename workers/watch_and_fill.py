@@ -292,11 +292,18 @@ def split_pdf_by_pages(file_bytes: bytes, page_lists):
     return outputs
 
 
-def _write_wo_from_parsed(wo_data: dict, file_id: str, combined_file_id: str = '') -> bool:
+def _write_wo_from_parsed(wo_data: dict, file_id: str, combined_file_id: str = '',
+                          original_filename: str = '') -> bool:
     """
     POST a parsed WO to Apps Script `write_wo`. Returns True on success
-    or duplicate, False on any error. combined_file_id populates col 39
-    of the tracker (only for splits from a multi-WO combined PDF).
+    or duplicate, False on any error.
+
+    combined_file_id   populates tracker col 39 — only set for splits
+                       from a multi-WO combined PDF.
+    original_filename  populates tracker col 41 — the filename the user
+                       picked in the webapp (for multi-WO splits this
+                       is the combined PDF's name, so all splits from
+                       one upload share it for queue grouping).
     """
     if '_parse_error' in wo_data:
         log(f"  ❌  Parse error: {wo_data['_parse_error']}")
@@ -312,9 +319,10 @@ def _write_wo_from_parsed(wo_data: dict, file_id: str, combined_file_id: str = '
 
     try:
         result = _apps_script_post('write_wo', {
-            'file_id':          file_id,
-            'combined_file_id': combined_file_id,
-            'data':             wo_data,
+            'file_id':           file_id,
+            'combined_file_id':  combined_file_id,
+            'original_filename': original_filename,
+            'data':              wo_data,
         })
     except Exception as e:
         log(f"  ❌  Apps Script POST failed: {e}")
@@ -403,7 +411,7 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             _log_scan_failure(file_id, file_name, wo_data['_parse_error'])
             _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
-        return _write_wo_from_parsed(wo_data, file_id)
+        return _write_wo_from_parsed(wo_data, file_id, original_filename=file_name)
 
     # ── Multi-WO: Pass 1 (detect) + split + Pass 2 (parse each) ──
     log(f"  🔍  Multi-WO path — Pass 1 detecting WO boundaries in {page_count} pages…")
@@ -423,7 +431,7 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
                               f'pass 1 failed ({detect_result["_parse_error"]}); fallback also failed ({wo_data["_parse_error"]})')
             _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
-        return _write_wo_from_parsed(wo_data, file_id)
+        return _write_wo_from_parsed(wo_data, file_id, original_filename=file_name)
 
     wo_docs = detect_result.get('wo_documents') or []
     if not wo_docs:
@@ -439,7 +447,7 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
                               f'no WOs detected; fallback parse error: {wo_data["_parse_error"]}')
             _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
-        return _write_wo_from_parsed(wo_data, file_id)
+        return _write_wo_from_parsed(wo_data, file_id, original_filename=file_name)
 
     log(f"  ✅  Pass 1: {len(wo_docs)} WO document(s) detected")
     for doc in wo_docs:
@@ -493,8 +501,11 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             _trash_via_apps_script(split_file_id, label=f'failed split {hint}')
             continue
 
-        # Write — archive for split, combined_file_id points to original
-        if _write_wo_from_parsed(wo_data, split_file_id, combined_file_id=file_id):
+        # Write — archive for split; combined_file_id + original_filename
+        # so the webapp queue can group all splits under one upload row.
+        if _write_wo_from_parsed(wo_data, split_file_id,
+                                 combined_file_id=file_id,
+                                 original_filename=file_name):
             any_success = True
 
     # Original is redundant regardless — trash it. On total failure the
