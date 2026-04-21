@@ -204,13 +204,26 @@ Your job: identify each Work Order document and return the page numbers that
 make up its scan. Rules:
 
 1. A Work Order document always contains exactly ONE WO page.
-2. If the page IMMEDIATELY after a WO is a matching CFR (a Contractor Field
-   Report whose WO # printed on it is the SAME as the preceding WO's WO #),
-   include that CFR page as part of the same document.
-3. If the next page is a CFR but the WO # doesn't match, or the CFR's WO #
-   isn't clearly legible, do NOT include it. The WO stands alone.
-4. Never include architectural drawings, blank pages, or CFRs that don't
-   match any preceding WO. Those pages get dropped.
+2. If the page IMMEDIATELY after a WO page is a CFR page, perform this
+   strict check before bundling it:
+     a. Read the WO # printed on the CFR page.
+     b. Read the WO # printed on the preceding WO page.
+     c. Compare them CHARACTER-FOR-CHARACTER. Example: "RM-43283" bundles
+        with "RM-43283" but NOT with "RM-43285", "RM43283", or "RM-43283A".
+     d. Include the CFR in the wo_document ONLY when the two WO #s are
+        identical strings.
+3. If the next page is a CFR but ANY of the following is true, DO NOT
+   include it — the WO stands alone:
+     • the CFR's WO # differs from the preceding WO's WO # (even by one
+       character or punctuation mark),
+     • the CFR's WO # is illegible, smudged, or cut off,
+     • the CFR has no WO # printed on it.
+   A CFR whose WO # doesn't match any preceding WO is an ORPHAN — it goes
+   into no wo_document. The fact that it physically follows a WO is
+   coincidental (staples come loose, scans get reordered) and does NOT
+   justify bundling.
+4. Never include architectural drawings or blank pages in any
+   wo_document. Those pages get dropped.
 5. Page numbers are 1-indexed.
 
 Return ONLY this JSON shape (no explanation, no markdown fences):
