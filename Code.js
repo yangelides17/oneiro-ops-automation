@@ -1796,8 +1796,34 @@ function promptCertifiedPayroll() {
 // ═══════════════════════════════════════════════════════════════
 
 function getOrCreateSubfolder_(parent, name) {
-  const folders = parent.getFoldersByName(name);
-  return folders.hasNext() ? folders.next() : parent.createFolder(name);
+  // Fast path: if the folder already exists, return it without taking
+  // the lock. This is the common case and needs no synchronization.
+  let folders = parent.getFoldersByName(name);
+  if (folders.hasNext()) return folders.next();
+
+  // Slow path: we think we need to create it. Take a script-wide lock
+  // so concurrent doPost calls don't race to create duplicate folders
+  // (happens when N photo uploads fire in parallel and the Photos
+  // subfolder doesn't exist yet — all N check simultaneously, all N
+  // see "no folder", all N create one).
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);  // up to 10s; folder creation is <100ms
+  } catch (e) {
+    // Couldn't acquire — fall through and risk the duplicate rather
+    // than erroring out the caller. Better a double-create than a
+    // broken upload.
+    Logger.log('⚠️ getOrCreateSubfolder_: could not acquire lock for ' + name);
+  }
+  try {
+    // Re-check inside the lock — another request may have created it
+    // while we waited.
+    folders = parent.getFoldersByName(name);
+    if (folders.hasNext()) return folders.next();
+    return parent.createFolder(name);
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* never held */ }
+  }
 }
 
 function getBoroughName_(code) {
