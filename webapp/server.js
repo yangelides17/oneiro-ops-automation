@@ -297,6 +297,105 @@ app.post('/api/approvals/:fileId/approve', async (req, res) => {
 })
 
 /**
+ * POST /api/approvals/:fileId/approve-signin
+ * Sign-In-specific approval: takes the principal's signature + printed
+ * name + title from the webapp modal, patches the PDF via pdf-lib
+ * (text fields + signature image overlay), and hands the patched
+ * bytes to Apps Script for upload to Approved Docs + trash the unsigned
+ * original. The cron handles email + archive downstream.
+ *
+ * Body: { signature_b64: string, name: string, title: string }
+ */
+app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' }), async (req, res) => {
+  const fileId = req.params.fileId
+  try {
+    const { signature_b64, name, title } = req.body || {}
+    if (!signature_b64) return res.status(400).json({ error: 'Missing signature_b64' })
+    if (!name || !String(name).trim())   return res.status(400).json({ error: 'Missing name' })
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'Missing title' })
+
+    // 1. Fetch original PDF bytes + filename from Drive
+    const fetched = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
+    if (!fetched || !fetched.data) {
+      return res.status(500).json({ error: 'Couldn\u2019t fetch PDF bytes from Drive' })
+    }
+    const pdfBytes  = Buffer.from(fetched.data, 'base64')
+    const filename  = fetched.filename
+
+    // 2. Patch with pdf-lib
+    const { PDFDocument } = await import('pdf-lib')
+    const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
+    const form   = pdfDoc.getForm()
+
+    // Date: today, M/D/YY (matches what fill_signin.py historically produced)
+    const now = new Date()
+    const dateStr = `${now.getMonth() + 1}/${now.getDate()}/${String(now.getFullYear()).slice(-2)}`
+
+    // Fill text fields
+    const trySetText = (fieldName, value) => {
+      try { form.getTextField(fieldName).setText(String(value || '')) }
+      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
+    }
+    trySetText('Contractor_Name',      name)
+    trySetText('Contractor_Title',     title)
+    trySetText('Date_Signature_Block', dateStr)
+
+    // Overlay the signature PNG onto the Contractor_Signature field's rect.
+    // pdf-lib's field.acroField.getWidgets()[0].getRectangle() returns
+    // { x, y, width, height } in PDF user-space (origin bottom-left), which
+    // matches page.drawImage's coordinate system.
+    const pngB64 = String(signature_b64).replace(/^data:image\/png;base64,/, '')
+    const pngBytes = Buffer.from(pngB64, 'base64')
+    const sigImage = await pdfDoc.embedPng(pngBytes)
+    try {
+      const sigField  = form.getField('Contractor_Signature')
+      const widgets   = sigField.acroField.getWidgets()
+      const widget    = widgets[0]
+      const rect      = widget.getRectangle()
+      // Slight inset so the signature doesn't touch the field's border
+      const pad = 2
+      const pageRef = widget.P()
+      // Find which page the widget lives on (getPage by dict ref)
+      const pages = pdfDoc.getPages()
+      const page = pages.find(p => p.ref === pageRef) || pages[0]
+      // Scale the signature to fit inside the rect while preserving aspect
+      const scale = Math.min(
+        (rect.width  - pad * 2) / sigImage.width,
+        (rect.height - pad * 2) / sigImage.height
+      )
+      const drawW = sigImage.width  * scale
+      const drawH = sigImage.height * scale
+      const drawX = rect.x + (rect.width  - drawW) / 2
+      const drawY = rect.y + (rect.height - drawH) / 2
+      page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
+    } catch (e) {
+      console.warn('pdf-lib signature overlay failed:', e.message)
+      // Fall through — name/title/date are still applied
+    }
+
+    // Flatten the form so name/title/date render reliably everywhere
+    // (pdf-lib writes /V, but we want no interactive fields remaining
+    // after principal signature either).
+    try { form.flatten() }
+    catch (e) { console.warn('pdf-lib form.flatten failed:', e.message) }
+
+    const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
+
+    // 3. Upload patched bytes to Approved Docs + trash original via Apps Script
+    const result = await callAppsScript('approve_signin_with_bytes', {
+      file_id:   fileId,
+      filename:  filename,
+      bytes_b64: Buffer.from(signedBytes).toString('base64'),
+    })
+    if (result.error) throw new Error(result.error)
+    res.json(result)
+  } catch (err) {
+    console.error(`POST /api/approvals/${fileId}/approve-signin error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/scan-uploads-today
  * Returns today's scan-originated WO Tracker rows grouped by upload.
  * The Scan WO page uses this as its source of truth so the queue

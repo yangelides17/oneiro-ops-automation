@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import PrincipalSignModal from '../components/PrincipalSignModal'
 
 // Wire the pdf.js worker. Using the CDN URL with the same version
 // react-pdf ships with keeps bundle size down and avoids Vite worker
@@ -96,28 +97,49 @@ export default function Approvals() {
 
   const selected = approvals?.find(a => a.file_id === selectedId) || null
 
-  // Approve: move file, remove locally, auto-advance to next in filtered view
+  // Sign-In docs route through PrincipalSignModal; everything else fires
+  // the lightweight direct approve.
+  const [signingItem, setSigningItem] = useState(null)
+
+  // Remove the just-approved item from local state + advance to next in
+  // the filtered view. Shared by direct-approve and signed-approve paths.
+  const removeApprovedAndAdvance = (fileId) => {
+    const idx = filtered.findIndex(a => a.file_id === fileId)
+    const nextItem = filtered[idx + 1] || filtered[idx - 1] || null
+    setApprovals(prev => (prev || []).filter(a => a.file_id !== fileId))
+    setSelectedId(nextItem?.file_id || null)
+  }
+
   const handleApprove = async () => {
     if (!selected || approving) return
     setActionError('')
+    // Sign-In: open modal; it calls the signed endpoint on submit.
+    if (selected.doc_type === 'signin') {
+      setSigningItem(selected)
+      return
+    }
+    // Everything else: direct approve
     setApproving(true)
-    // Compute next-selected from CURRENT filtered list before mutation
-    const idx = filtered.findIndex(a => a.file_id === selected.file_id)
-    const nextItem = filtered[idx + 1] || filtered[idx - 1] || null
+    const fileId = selected.file_id
     try {
       const res = await fetch(
-        `/api/approvals/${encodeURIComponent(selected.file_id)}/approve`,
+        `/api/approvals/${encodeURIComponent(fileId)}/approve`,
         { method: 'POST' })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      // Remove from list; auto-advance
-      setApprovals(prev => (prev || []).filter(a => a.file_id !== selected.file_id))
-      setSelectedId(nextItem?.file_id || null)
+      removeApprovedAndAdvance(fileId)
     } catch (err) {
       setActionError(err.message || 'Approval failed')
     } finally {
       setApproving(false)
     }
+  }
+
+  // Called by PrincipalSignModal after its signed-approve POST succeeds
+  const handleSignedApproved = () => {
+    if (!signingItem) return
+    removeApprovedAndAdvance(signingItem.file_id)
+    setSigningItem(null)
   }
 
   const openInDrive = () => {
@@ -242,7 +264,11 @@ export default function Approvals() {
                                bg-green-600 text-white hover:bg-green-700 transition-colors
                                disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {approving ? 'Approving…' : 'Approve'}
+                    {approving
+                      ? 'Approving…'
+                      : selected.doc_type === 'signin'
+                          ? 'Approve & Sign'
+                          : 'Approve'}
                   </button>
                 </div>
               </div>
@@ -259,6 +285,18 @@ export default function Approvals() {
           )}
         </section>
       </div>
+
+      {/* Sign-In approval modal — collects principal signature + name + title,
+          then POSTs to /api/approvals/:fileId/approve-signin. pdf-lib patches
+          the PDF server-side; on success the item drops out of the list. */}
+      {signingItem && (
+        <PrincipalSignModal
+          filename={signingItem.filename}
+          signUrl={`/api/approvals/${encodeURIComponent(signingItem.file_id)}/approve-signin`}
+          onCancel={() => setSigningItem(null)}
+          onSigned={handleSignedApproved}
+        />
+      )}
     </div>
   )
 }

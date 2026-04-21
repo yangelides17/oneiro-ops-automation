@@ -557,8 +557,6 @@ export default function FieldReport() {
   const [crewMembers,   setCrewMembers]    = useState([newCrew()])
   const [woComplete,    setWoComplete]     = useState('no')
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
-  const [crewLeaderName,      setCrewLeaderName]      = useState('')
-  const [crewLeaderSignature, setCrewLeaderSignature] = useState(null)
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -884,10 +882,9 @@ export default function FieldReport() {
         sig_in_b64:     m.signatureIn  || '',
         sig_out_b64:    m.signatureOut || ''
       })),
-      // Crew-leader block (signs at the bottom of the Sign-In Log)
-      contractor_name:           crewLeaderName.trim(),
-      contractor_title:          'Crew Leader',
-      contractor_signature_b64:  crewLeaderSignature || ''
+      // The Sign-In Log's bottom block (printed name, title, date,
+      // signature) is filled later during the Approvals flow — the
+      // principal signs off, not the crew leader. See PrincipalSignModal.
     }
 
     try {
@@ -1237,23 +1234,8 @@ export default function FieldReport() {
           <button type="button" onClick={addCrew} className="btn-ghost text-xs w-full">+ Add Crew Member</button>
         </div>
 
-        {/* 5 · Crew Leader Sign-Off */}
-        <div className="card p-4 space-y-3">
-          <p className="section-label">Crew Leader Sign-Off</p>
-          <p className="text-[11px] text-slate-400">
-            The crew leader signs at the bottom of the Sign-In Log confirming the day's crew and hours.
-          </p>
-          <Field label="Crew Leader Name">
-            <input type="text" value={crewLeaderName} autoCapitalize="words" placeholder="First Last"
-              onChange={e=>setCrewLeaderName(e.target.value)} className="field-input" />
-          </Field>
-          <SignaturePad
-            label="Crew Leader Signature"
-            onChange={setCrewLeaderSignature}
-          />
-        </div>
-
-        {/* 6 · Completion */}
+        {/* 5 · Completion — Sign-In Log's bottom sign-off now happens
+            at approval time (the principal signs, not the crew leader). */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Completion</p>
           <Field label="Is this Work Order complete?">

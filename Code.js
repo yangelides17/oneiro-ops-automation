@@ -2193,6 +2193,8 @@ function doPost(e) {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
       return handleApproveDoc_(body);
+    } else if (action === 'approve_signin_with_bytes') {
+      return handleApproveSignInWithBytes_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2659,6 +2661,76 @@ function handleApproveDoc_(body) {
     }
 
     return jsonResponse_({ success: true, file_id: fileId });
+  } catch (err) {
+    return jsonResponse_({ error: String(err) }, 500);
+  }
+}
+
+
+// ── action: approve_signin_with_bytes ─────────────────────────
+//
+// Sign-In docs have a principal sign-off block that's filled DURING
+// the approval flow (see webapp PrincipalSignModal + Express
+// /api/approvals/:fileId/approve-signin). Express patches the PDF via
+// pdf-lib and POSTs the resulting bytes here. This handler does the
+// upload + trash + log in one atomic move so the cron sees the signed
+// PDF immediately.
+//
+// body.data = { file_id, filename, bytes_b64 }
+//   file_id   — the ORIGINAL (unsigned) PDF's Drive file ID
+//   filename  — what to name the new signed file
+//   bytes_b64 — the patched PDF bytes, base64-encoded
+function handleApproveSignInWithBytes_(body) {
+  const d        = body.data || {};
+  const fileId   = String(d.file_id  || '').trim();
+  const filename = String(d.filename || '').trim();
+  const b64      = String(d.bytes_b64 || '');
+  if (!fileId || !filename || !b64) {
+    return jsonResponse_({ error: 'Missing required fields: file_id, filename, bytes_b64' }, 400);
+  }
+
+  const props          = PropertiesService.getScriptProperties();
+  const approvedId     = props.getProperty('APPROVED_SENT_ID');
+  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
+  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+
+  try {
+    // Safety gate: make sure the original lives under Docs Needing Review
+    const original = DriveApp.getFileById(fileId);
+    if (original.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+    if (!_isUnderParent_(original, needsReviewId)) {
+      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
+    }
+
+    // Write signed bytes into Approved Docs
+    const approvedFolder = DriveApp.getFolderById(approvedId);
+    const bytes          = Utilities.base64Decode(b64);
+    const blob           = Utilities.newBlob(bytes, 'application/pdf', filename);
+    const newFile        = approvedFolder.createFile(blob);
+
+    // Trash the original unsigned PDF
+    original.setTrashed(true);
+
+    // Log — cron will log its own "emailed" row 0-10 min later
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Signed + Approved', newFile.getName(),
+          'Sign-In signed via webapp; moved to ✅ Approved Docs',
+          'Pending email', '',
+          'Cron will email + archive within 10 min'
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on signed approve: ' + logErr);
+    }
+
+    return jsonResponse_({
+      success:  true,
+      file_id:  newFile.getId(),
+      filename: newFile.getName(),
+    });
   } catch (err) {
     return jsonResponse_({ error: String(err) }, 500);
   }
@@ -4260,10 +4332,14 @@ function generateSignInJson_(d, woRow, ss) {
     })),
     // Crew-leader block at the bottom of the form. The Field Report web app
     // sends these alongside the per-member sigs.
-    contractor_name:            String(d.contractor_name || '').trim(),
-    contractor_title:           String(d.contractor_title || 'Crew Leader').trim(),
-    date_signed:                dateFmt(d.date_signed || d.date),
-    contractor_signature_b64:   d.contractor_signature_b64 || '',
+    // Bottom sign-off block stays blank at generation time. The
+    // principal signs + types name/title during the Approvals flow
+    // (PrincipalSignModal → pdf-lib in Express). Date is injected at
+    // that same step so it matches the actual approval date.
+    contractor_name:            '',
+    contractor_title:           '',
+    date_signed:                '',
+    contractor_signature_b64:   '',
   };
 
   // Filename: SignIn_<WO>_<YYYY-MM-DD>.json — matches the worker's expected
