@@ -239,6 +239,64 @@ app.post('/api/scan-status', async (req, res) => {
 })
 
 /**
+ * GET /api/approvals
+ * Returns every PDF in Docs Needing Review subfolders, grouped per
+ * doc type with subtitle + created_at metadata. Webapp Approvals page
+ * uses this as its master list.
+ */
+app.get('/api/approvals', async (_req, res) => {
+  try {
+    const data = await callAppsScript('list_pending_approvals')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/approvals error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/approvals/:fileId/pdf
+ * Streams the raw PDF bytes for a pending-approval file. Apps Script
+ * returns base64; we decode and send as application/pdf so react-pdf
+ * can consume the URL directly.
+ */
+app.get('/api/approvals/:fileId/pdf', async (req, res) => {
+  try {
+    const data = await callAppsScript('get_drive_file_bytes',
+                                      { file_id: req.params.fileId })
+    if (!data || !data.data) {
+      return res.status(500).json({ error: 'Apps Script returned no bytes' })
+    }
+    const buf = Buffer.from(data.data, 'base64')
+    res.setHeader('Content-Type', data.mime_type || 'application/pdf')
+    res.setHeader('Content-Length', buf.length)
+    res.setHeader('Cache-Control', 'no-store')
+    res.send(buf)
+  } catch (err) {
+    console.error(`GET /api/approvals/${req.params.fileId}/pdf error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/approvals/:fileId/approve
+ * Moves the file from Docs Needing Review → ✅ Approved Docs.
+ * The existing processApprovedDocuments cron picks it up on its next
+ * tick (≤ 10 min) and handles email + archive identically to a manual
+ * Drive drag.
+ */
+app.post('/api/approvals/:fileId/approve', async (req, res) => {
+  try {
+    const data = await callAppsScript('approve_doc',
+                                      { file_id: req.params.fileId })
+    res.json(data)
+  } catch (err) {
+    console.error(`POST /api/approvals/${req.params.fileId}/approve error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/scan-uploads-today
  * Returns today's scan-originated WO Tracker rows grouped by upload.
  * The Scan WO page uses this as its source of truth so the queue

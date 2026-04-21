@@ -2187,6 +2187,12 @@ function doPost(e) {
       return handleGetScanUploadsToday_(body);
     } else if (action === 'log_wo_scan_failure') {
       return handleLogWOScanFailure_(body);
+    } else if (action === 'list_pending_approvals') {
+      return handleListPendingApprovals_(body);
+    } else if (action === 'get_drive_file_bytes') {
+      return handleGetDriveFileBytes_(body);
+    } else if (action === 'approve_doc') {
+      return handleApproveDoc_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2463,6 +2469,199 @@ function handleGetScanUploadsToday_(body) {
   })).sort((a, b) => a.uploaded_at < b.uploaded_at ? 1 : -1);
 
   return jsonResponse_({ uploads });
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// DOCUMENT APPROVALS — webapp "Approvals" tab backend
+// ═══════════════════════════════════════════════════════════════
+
+// Map webapp doc_type → Needs-Review subfolder name.
+const APPROVAL_SUBFOLDERS_ = {
+  signin:            'Sign-In Logs',
+  production_log:    'Production Logs',
+  field_report:      'Field Reports',
+  certified_payroll: 'Certified Payroll',
+};
+
+// Inverse lookup helper — given a subfolder name, return the doc_type.
+function _docTypeFromSubfolderName_(name) {
+  for (const key of Object.keys(APPROVAL_SUBFOLDERS_)) {
+    if (APPROVAL_SUBFOLDERS_[key] === name) return key;
+  }
+  return null;
+}
+
+// Best-effort subtitle extraction from filename. Returns a short string
+// the webapp list shows under the doc_type badge.
+function _approvalSubtitleFromFilename_(docType, filename) {
+  const s = String(filename || '');
+  // WO # pattern, used by signin + CFR + any single-WO doc
+  const woMatch = s.match(/(PT|PM|RM)-\d+/i);
+  if (docType === 'signin' || docType === 'field_report') {
+    return woMatch ? woMatch[0] : s.replace(/\.pdf$/i, '');
+  }
+  if (docType === 'production_log') {
+    // e.g. "Production_Log_2026-04-21_FILLED.pdf" → "2026-04-21"
+    const d = s.match(/\d{4}-\d{2}-\d{2}/);
+    return d ? d[0] : s.replace(/\.pdf$/i, '');
+  }
+  if (docType === 'certified_payroll') {
+    // e.g. "Certified_Payroll_84125MBTP701_BK_2026-04-21_FILLED.pdf"
+    // Pull contract + borough + date if we can; otherwise fall back.
+    const m = s.match(/Certified_Payroll_(\w+)_(\w+)_(\d{4}-\d{2}-\d{2})/);
+    if (m) return `${m[1]}-${m[2]} · ${m[3]}`;
+    return s.replace(/\.pdf$/i, '');
+  }
+  return s.replace(/\.pdf$/i, '');
+}
+
+
+// ── action: list_pending_approvals ────────────────────────────
+//
+// Returns every PDF currently sitting in Docs Needing Review's
+// four subfolders (Sign-In Logs, Production Logs, Field Reports,
+// Certified Payroll). Sorted newest-first. Webapp's Approvals page
+// uses this as its master list.
+function handleListPendingApprovals_(body) {
+  const props          = PropertiesService.getScriptProperties();
+  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+
+  const reviewFolder = DriveApp.getFolderById(needsReviewId);
+  const approvals    = [];
+
+  Object.entries(APPROVAL_SUBFOLDERS_).forEach(([docType, subName]) => {
+    const sub = reviewFolder.getFoldersByName(subName);
+    if (!sub.hasNext()) return;
+    const subFolder = sub.next();
+    const files     = subFolder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      if (f.isTrashed()) continue;
+      // Only PDFs — we intentionally ignore any .json source files that
+      // may still be in-flight. Worker trashes them after the filler
+      // runs, but be defensive.
+      if (f.getMimeType() !== 'application/pdf') continue;
+      const filename = f.getName();
+      approvals.push({
+        file_id:    f.getId(),
+        doc_type:   docType,
+        filename:   filename,
+        subtitle:   _approvalSubtitleFromFilename_(docType, filename),
+        created_at: f.getDateCreated().toISOString(),
+        size:       f.getSize(),
+      });
+    }
+  });
+
+  approvals.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
+  return jsonResponse_({ approvals });
+}
+
+
+// ── action: get_drive_file_bytes ──────────────────────────────
+//
+// Returns a Drive file's raw bytes as base64 so the webapp can pipe
+// it into react-pdf. Scoped to files inside NEEDS_REVIEW_ID — admin
+// shouldn't be able to download arbitrary Drive files via this.
+function handleGetDriveFileBytes_(body) {
+  const d = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+
+  try {
+    const file = DriveApp.getFileById(fileId);
+    if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+
+    // Safety gate: verify the file lives under NEEDS_REVIEW_ID. Walks up
+    // the parents tree (Drive files can have multiple, but Scan Inbox /
+    // Needs Review subfolders are single-parent).
+    const props         = PropertiesService.getScriptProperties();
+    const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
+    if (!_isUnderParent_(file, needsReviewId)) {
+      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
+    }
+
+    const blob = file.getBlob();
+    return jsonResponse_({
+      filename:  file.getName(),
+      mime_type: blob.getContentType(),
+      size:      file.getSize(),
+      data:      Utilities.base64Encode(blob.getBytes()),
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err) }, 500);
+  }
+}
+
+// Helper: is `file` anywhere under the folder with id `ancestorId`?
+// Walks up via getParents(). Cheap since Drive folders rarely have
+// deep nesting here (Docs Needing Review → 1 subfolder → file).
+function _isUnderParent_(file, ancestorId) {
+  if (!ancestorId) return false;
+  const seen = {};
+  let frontier = [];
+  const parents = file.getParents();
+  while (parents.hasNext()) frontier.push(parents.next());
+  while (frontier.length) {
+    const f = frontier.shift();
+    const id = f.getId();
+    if (id === ancestorId) return true;
+    if (seen[id]) continue;
+    seen[id] = true;
+    const p = f.getParents();
+    while (p.hasNext()) frontier.push(p.next());
+  }
+  return false;
+}
+
+
+// ── action: approve_doc ───────────────────────────────────────
+//
+// Moves a pending-approval PDF from Docs Needing Review/{type} into
+// Approved Docs. The existing processApprovedDocuments cron sees the
+// file on its next tick and handles email + archive — same path as if
+// the admin had dragged it in Drive manually.
+function handleApproveDoc_(body) {
+  const d = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+
+  const props          = PropertiesService.getScriptProperties();
+  const approvedId     = props.getProperty('APPROVED_SENT_ID');
+  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
+  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+
+  try {
+    const file = DriveApp.getFileById(fileId);
+    if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+    if (!_isUnderParent_(file, needsReviewId)) {
+      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
+    }
+
+    const approvedFolder = DriveApp.getFolderById(approvedId);
+    file.moveTo(approvedFolder);
+
+    // Log it — processApprovedDocuments will log its own "emailed" row
+    // 0-10 min later when it picks this up.
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Approved', file.getName(),
+          'Moved to ✅ Approved Docs via webapp', 'Pending email',
+          '', 'Cron will email + archive within 10 min'
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on approve: ' + logErr);
+    }
+
+    return jsonResponse_({ success: true, file_id: fileId });
+  } catch (err) {
+    return jsonResponse_({ error: String(err) }, 500);
+  }
 }
 
 

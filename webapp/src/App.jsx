@@ -2,6 +2,7 @@ import { Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import Dashboard   from './pages/Dashboard'
 import FieldReport from './pages/FieldReport'
 import ScanWO      from './pages/ScanWO'
+import Approvals   from './pages/Approvals'
 
 function Header() {
   const loc = useLocation()
@@ -44,6 +45,14 @@ function Header() {
             Scan WO
           </NavLink>
           <NavLink
+            to="/approvals"
+            className={({ isActive }) =>
+              `nav-link ${isActive ? 'active' : ''}`
+            }
+          >
+            Approvals
+          </NavLink>
+          <NavLink
             to="/field-report"
             className={({ isActive }) =>
               `nav-link ${isActive ? 'active' : ''}`
@@ -65,6 +74,7 @@ export default function App() {
         <Routes>
           <Route path="/"             element={<Dashboard />} />
           <Route path="/scan-wo"      element={<ScanWO />} />
+          <Route path="/approvals"    element={<Approvals />} />
           <Route path="/field-report" element={<FieldReport />} />
         </Routes>
       </main>
