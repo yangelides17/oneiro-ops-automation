@@ -64,7 +64,7 @@ warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', modu
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
-    NameObject, BooleanObject, IndirectObject, create_string_object
+    NameObject, BooleanObject, DictionaryObject, IndirectObject, create_string_object
 )
 
 TEMPLATE = os.path.join(
@@ -176,10 +176,18 @@ def build_field_map(data: dict) -> dict:
 
 def _write_fields_via_acroform(writer, payload):
     """
-    For templates where page widgets and /AcroForm/Fields are separate
-    objects (like this CFR template), write /V on the terminal field
-    under /AcroForm/Fields — that's where PDF viewers read text values
-    from. Writing /V on the widget annotation alone doesn't render.
+    This CFR template stores widget annotations (on the page) and
+    terminal AcroForm fields as SEPARATE objects with matching /T names
+    — they're not merged via /Parent like in most templates. Different
+    viewers read /V from different places:
+
+      * Adobe / Preview read /V from the terminal field and regenerate
+        appearances when /AcroForm /NeedAppearances is true.
+      * pdf.js (and therefore react-pdf in our webapp) reads /V from
+        the widget annotation and does NOT regenerate appearances —
+        it renders whatever /V + /AP the widget carries.
+
+    Write /V on BOTH so every viewer shows the filled values.
     """
     acroform = writer._root_object.get('/AcroForm')
     if not acroform:
@@ -188,6 +196,7 @@ def _write_fields_via_acroform(writer, payload):
     if not fields:
         return
 
+    # Terminal fields keyed by /T
     field_by_name = {}
     for fref in fields:
         f = fref.get_object() if isinstance(fref, IndirectObject) else fref
@@ -195,12 +204,42 @@ def _write_fields_via_acroform(writer, payload):
         if t:
             field_by_name[str(t)] = f
 
-    for name, value in payload.items():
-        f = field_by_name.get(name)
-        if f is None:
+    # Widget annotations keyed by /T across every page. Built once so
+    # we don't re-scan pages per-field.
+    widgets_by_name = {}
+    for page in writer.pages:
+        annots = page.get('/Annots')
+        if annots is None:
             continue
-        if f.get('/FT') == '/Tx':
-            f[NameObject('/V')] = create_string_object(str(value))
+        if isinstance(annots, IndirectObject):
+            annots = annots.get_object()
+        for aref in annots:
+            a = aref.get_object() if isinstance(aref, IndirectObject) else aref
+            if not isinstance(a, DictionaryObject):
+                continue
+            if a.get('/Subtype') != '/Widget':
+                continue
+            t = a.get('/T')
+            if not t:
+                continue
+            widgets_by_name.setdefault(str(t), []).append(a)
+
+    for name, value in payload.items():
+        v = create_string_object(str(value))
+
+        # Terminal field (Adobe/Preview read here)
+        f = field_by_name.get(name)
+        if f is not None and f.get('/FT') == '/Tx':
+            f[NameObject('/V')] = v
+
+        # Widget annotations with the same /T (pdf.js reads here)
+        for widget in widgets_by_name.get(name, []):
+            widget[NameObject('/V')] = v
+            # If an existing appearance stream exists, delete it so the
+            # viewer falls back to rendering /V. pdf.js otherwise keeps
+            # showing the stale blank appearance.
+            if '/AP' in widget:
+                del widget[NameObject('/AP')]
 
 
 def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> str:
