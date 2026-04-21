@@ -127,8 +127,59 @@ export default function ScanWO() {
     setSubmittedCount(0)
   }
 
-  // ── Submit (sequential uploads; one at a time keeps Claude Vision
-  //    + the worker's poll loop happy and avoids concurrent sheet writes).
+  // ── Upload one item. Used by initial batch submit + per-item retry
+  //    + retry-all-failed. Returns 'uploaded' | 'error'.
+  const uploadOne = async (item) => {
+    setItems(prev => prev.map(p => p.id === item.id
+      ? { ...p, status: 'uploading', error: null }
+      : p))
+    try {
+      const form = new FormData()
+      form.append('file', item.file, item.name)
+      const res  = await fetch('/api/upload-wo', { method: 'POST', body: form })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      setItems(prev => prev.map(p => p.id === item.id
+        ? { ...p, status: 'uploaded', fileId: data.file_id }
+        : p))
+      return 'uploaded'
+    } catch (err) {
+      setItems(prev => prev.map(p => p.id === item.id
+        ? { ...p, status: 'error', error: err?.message || 'Upload failed' }
+        : p))
+      return 'error'
+    }
+  }
+
+  // Concurrency pool — N in-flight at once. Claude Vision is unaffected
+  // (worker processes Scan Inbox serially); Drive writes for 20 files
+  // go from ~40s sequential to ~8s parallel. Cap at 5 to stay kind to
+  // mobile connections.
+  const UPLOAD_CONCURRENCY = 5
+  const runPool = async (queue, worker) => {
+    let cursor = 0
+    const take = async () => {
+      while (cursor < queue.length) {
+        const idx = cursor++
+        await worker(queue[idx])
+      }
+    }
+    const n = Math.min(UPLOAD_CONCURRENCY, queue.length)
+    await Promise.all(Array.from({ length: n }, take))
+  }
+
+  // Snapshot-count helper — recomputes submittedCount from the current
+  // items list. setItems's functional-update form is used so we never
+  // read stale state.
+  const refreshSubmittedCount = () => {
+    setItems(prev => {
+      const ok = prev.filter(p => p.status === 'uploaded').length
+      setSubmittedCount(ok)
+      return prev
+    })
+  }
+
+  // ── Submit all ready items ────────────────────────────────────
   const handleSubmit = async () => {
     setError('')
     if (items.length === 0) return
@@ -143,28 +194,29 @@ export default function ScanWO() {
     }
 
     setSubmitting(true)
-    let okCount = 0
-    for (const item of toUpload) {
-      setItems(prev => prev.map(p => p.id === item.id
-        ? { ...p, status: 'uploading', error: null }
-        : p))
-      try {
-        const form = new FormData()
-        form.append('file', item.file, item.name)
-        const res  = await fetch('/api/upload-wo', { method: 'POST', body: form })
-        const data = await res.json().catch(() => ({}))
-        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-        okCount++
-        setItems(prev => prev.map(p => p.id === item.id
-          ? { ...p, status: 'uploaded', fileId: data.file_id }
-          : p))
-      } catch (err) {
-        setItems(prev => prev.map(p => p.id === item.id
-          ? { ...p, status: 'error', error: err?.message || 'Upload failed' }
-          : p))
-      }
-    }
-    setSubmittedCount(okCount)
+    await runPool(toUpload, uploadOne)
+    refreshSubmittedCount()
+    setSubmitting(false)
+  }
+
+  // ── Retry a single failed item ────────────────────────────────
+  const retryOne = async (id) => {
+    const item = items.find(i => i.id === id)
+    if (!item || item.status !== 'error') return
+    setSubmitting(true)
+    await uploadOne(item)
+    refreshSubmittedCount()
+    setSubmitting(false)
+  }
+
+  // ── Retry all failed items (uses the same concurrency pool) ──
+  const retryAllFailed = async () => {
+    const failed = items.filter(i => i.status === 'error')
+    if (failed.length === 0) return
+    setError('')
+    setSubmitting(true)
+    await runPool(failed, uploadOne)
+    refreshSubmittedCount()
     setSubmitting(false)
   }
 
@@ -246,8 +298,12 @@ export default function ScanWO() {
           {items.length > 0 && (
             <div className="space-y-2">
               {items.map(item => (
-                <ItemRow key={item.id} item={item} onRemove={remove}
-                  disableRemove={submitting || item.status === 'uploaded'} />
+                <ItemRow
+                  key={item.id} item={item}
+                  onRemove={remove} onRetry={retryOne}
+                  disableRemove={submitting || item.status === 'uploaded'}
+                  disableRetry={submitting}
+                />
               ))}
 
               {/* Status summary */}
@@ -259,8 +315,8 @@ export default function ScanWO() {
                 {errorCount      > 0 && <span className="text-red-600">✕ {errorCount} failed</span>}
               </div>
 
-              {/* Submit */}
-              <div className="pt-3">
+              {/* Submit + bulk retry */}
+              <div className="pt-3 space-y-2">
                 <button
                   onClick={handleSubmit}
                   disabled={submitting || items.length === 0 || processingCount > 0}
@@ -271,6 +327,16 @@ export default function ScanWO() {
                     ? `Uploading… ${uploadedCount + errorCount} of ${items.length}`
                     : `Upload ${items.length} work order${items.length === 1 ? '' : 's'}`}
                 </button>
+                {errorCount > 0 && !submitting && (
+                  <button
+                    onClick={retryAllFailed}
+                    className="w-full py-2.5 rounded-xl font-bold text-sm
+                               bg-red-50 text-red-700 hover:bg-red-100 transition-colors
+                               border border-red-200"
+                  >
+                    Retry all {errorCount} failed
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -281,7 +347,7 @@ export default function ScanWO() {
 }
 
 // ── Single queue row ──────────────────────────────────────────
-function ItemRow({ item, onRemove, disableRemove }) {
+function ItemRow({ item, onRemove, onRetry, disableRemove, disableRetry }) {
   const isImage = (item.type || '').startsWith('image/') && item.status !== 'processing'
   const isPdf   = (item.type || '').toLowerCase().includes('pdf')
 
@@ -320,16 +386,29 @@ function ItemRow({ item, onRemove, disableRemove }) {
         )}
       </div>
 
-      {/* Remove */}
-      {!disableRemove && (
-        <button
-          type="button"
-          onClick={() => onRemove(item.id)}
-          className="w-7 h-7 flex items-center justify-center rounded-full
-                     text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0"
-          title="Remove"
-        >×</button>
-      )}
+      {/* Actions */}
+      <div className="flex items-center gap-1 flex-shrink-0">
+        {item.status === 'error' && onRetry && (
+          <button
+            type="button"
+            onClick={() => onRetry(item.id)}
+            disabled={disableRetry}
+            className="text-[11px] font-bold px-2.5 py-1 rounded-lg
+                       bg-red-50 text-red-700 hover:bg-red-100 transition-colors
+                       border border-red-200 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Retry this upload"
+          >Retry</button>
+        )}
+        {!disableRemove && (
+          <button
+            type="button"
+            onClick={() => onRemove(item.id)}
+            className="w-7 h-7 flex items-center justify-center rounded-full
+                       text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+            title="Remove"
+          >×</button>
+        )}
+      </div>
     </div>
   )
 }
