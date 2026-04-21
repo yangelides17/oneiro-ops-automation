@@ -2022,6 +2022,55 @@ function appendRowWithProbingImpl_(sheet, values, labels, sheetLabel, ctx) {
 }
 
 
+/**
+ * Append many rows to a sheet in a single setValues call (one
+ * round-trip + one flush instead of N). Falls back to per-row
+ * appendRowWithProbing_ if the batch fails, preserving the full
+ * probe-and-diagnose behavior for validation errors.
+ *
+ * All rows must be the same length (will be right-padded with '' if
+ * not). Use this whenever the handler appends 2+ rows with the same
+ * shape — typical savings: 1-2 seconds per additional row on crowded
+ * sheets.
+ */
+function appendRowsWithProbing_(sheet, rows, labels, sheetLabel) {
+  if (!rows || rows.length === 0) return;
+  if (rows.length === 1) {
+    appendRowWithProbing_(sheet, rows[0], labels, sheetLabel);
+    return;
+  }
+
+  // Pad to a consistent width so setValues accepts them
+  const width = Math.max(...rows.map(r => r.length));
+  const padded = rows.map(r => {
+    if (r.length === width) return r.slice();
+    const copy = r.slice();
+    while (copy.length < width) copy.push('');
+    return copy;
+  });
+
+  const targetRow = sheet.getLastRow() + 1;
+  try {
+    sheet.getRange(targetRow, 1, padded.length, width).setValues(padded);
+    SpreadsheetApp.flush();   // force deferred validation to fire now
+    return;
+  } catch (batchErr) {
+    Logger.log(`⚠️ Batched setValues failed on ${sheetLabel} (${rows.length} rows): `
+               + `${batchErr.message}. Falling back to per-row probing.`);
+    // Clean up any partial batch that may have been written before the error
+    try {
+      const lastWritten = sheet.getLastRow();
+      if (lastWritten >= targetRow) {
+        sheet.getRange(targetRow, 1, lastWritten - targetRow + 1, width).clearContent();
+      }
+    } catch (cleanupErr) {
+      Logger.log(`⚠️ post-batch cleanup failed: ${cleanupErr.message}`);
+    }
+    rows.forEach(row => appendRowWithProbing_(sheet, row, labels, sheetLabel));
+  }
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // UPLOAD PROXY — Receives filled PDFs from the Railway worker
 // ═══════════════════════════════════════════════════════════════
@@ -2086,6 +2135,8 @@ function doPost(e) {
       return handleGetActiveWOs_();
     } else if (action === 'submit_field_report') {
       return handleSubmitFieldReport_(body);
+    } else if (action === 'finalize_field_report_docs') {
+      return handleFinalizeFieldReportDocs_(body);
     } else if (action === 'get_dashboard_data') {
       return handleGetDashboardData_();
     } else if (action === 'upload_photo') {
@@ -2747,12 +2798,15 @@ function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
  * SQFT includes all items with a quantity (regardless of status) so the
  * tracker reflects what's been measured even if status is still Pending.
  */
-function computeMarkingRollups_(ss, woId) {
+function computeMarkingRollups_(ss, woId, preloadedData) {
   const blank = { marking_types: '', sqft_completed: '', paint_material: '' };
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return blank;
 
-  const data = sheet.getDataRange().getValues();
+  // Accept data preloaded by an earlier call in the same handler (e.g.
+  // finalizeMarkingStatus_) so we don't re-scan the full sheet when
+  // both run back-to-back.
+  const data = preloadedData || sheet.getDataRange().getValues();
   if (data.length < 2) return blank;
 
   const woItems = data.slice(1).filter(r => String(r[1] || '').trim() === woId);
@@ -3145,10 +3199,10 @@ function handleDeleteMarkingItems_(body) {
  */
 function finalizeMarkingStatus_(ss, woId, dateOfWork) {
   const sheet = ss.getSheetByName('Marking Items');
-  if (!sheet) return 0;
+  if (!sheet) return { touched: 0, data: null };
 
   const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return 0;
+  if (data.length < 2) return { touched: 0, data };
 
   let touched = 0;
   data.forEach((r, idx) => {
@@ -3167,6 +3221,10 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork) {
       if (currentStatus !== 'Completed') {
         sheet.getRange(rowNum, 13).setValue('Completed');
         sheet.getRange(rowNum, 12).setValue(dateOfWork);
+        // Keep the in-memory copy in sync so downstream rollup readers
+        // don't have to re-fetch the sheet.
+        r[12] = 'Completed';
+        r[11] = dateOfWork;
         touched += 2;
       }
     } else {
@@ -3175,6 +3233,7 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork) {
       // directly on the sheet after a prior Completed submit).
       if (currentStatus !== 'Pending') {
         sheet.getRange(rowNum, 13).setValue('Pending');
+        r[12] = 'Pending';
         touched++;
       }
       const currentDate = r[11] instanceof Date
@@ -3182,12 +3241,13 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork) {
         : String(r[11] || '');
       if (currentDate !== '') {
         sheet.getRange(rowNum, 12).setValue('');
+        r[11] = '';
         touched++;
       }
     }
   });
   if (touched) SpreadsheetApp.flush();
-  return touched;
+  return { touched, data };
 }
 
 
@@ -3371,10 +3431,12 @@ function handleSubmitFieldReport_(body) {
   //      crew formally confirms the day's work.)
   //  (2) Recompute WO Tracker cols 19-21 rollups from final sheet state.
   step = 'marking finalize status';
-  const nFinalized = finalizeMarkingStatus_(ss, d.wo_id, d.date);
+  const { touched: nFinalized, data: markingData } = finalizeMarkingStatus_(ss, d.wo_id, d.date);
 
   step = 'marking rollup';
-  const rollups = computeMarkingRollups_(ss, d.wo_id);
+  // Reuse the values finalizeMarkingStatus_ already read (with its
+  // in-memory updates applied). Saves a full-sheet getDataRange call.
+  const rollups = computeMarkingRollups_(ss, d.wo_id, markingData);
   Logger.log(`✅ Marking Items: ${nFinalized} status cells updated; ` +
              `rollup → types=${JSON.stringify(rollups.marking_types)}, ` +
              `sqft=${rollups.sqft_completed}, ` +
@@ -3425,16 +3487,18 @@ function handleSubmitFieldReport_(body) {
   })();
   const isWeekend = (dowOfWork === 0 || dowOfWork === 6);
 
-  d.crew.forEach((member, idx) => {
-    step = `Sign-In Data row ${idx + 1}/${d.crew.length} (${member.name || '<no name>'})`;
+  // Build every crew row in memory first, then hand them to the batched
+  // appender so the whole crew lands in one setValues round-trip instead
+  // of N.
+  step = 'Sign-In Data batch build';
+  const crewRows = d.crew.map(member => {
     const hours    = parseFloat(member.hours) || 0;
     // Apply the OT rule server-side (authoritative). Client-supplied
     // overtime is ignored — the rule is:
     //   Saturday/Sunday → every hour is OT.
     //   Monday–Friday   → hours over 8 in the day are OT; first 8 are ST.
     const overtime = isWeekend ? hours : Math.max(0, hours - 8);
-
-    const row = [
+    return [
       d.date,                              //  0  Date
       d.wo_id,                             //  1  Work Order #
       String(woRow[1]),                    //  2  Prime Contractor
@@ -3451,59 +3515,18 @@ function handleSubmitFieldReport_(body) {
       // cells stay truly blank — the dropdown validator rejects an
       // explicit '' but accepts a truly empty cell.
     ];
-    appendRowWithProbing_(signInSheet, row, signInLabels, 'Daily Sign-In Data');
   });
+  step = `Sign-In Data append x${crewRows.length}`;
+  appendRowsWithProbing_(signInSheet, crewRows, signInLabels, 'Daily Sign-In Data');
 
   Logger.log('✅ Sign-In Data: ' + d.crew.length + ' row(s) appended for WO ' + d.wo_id);
 
-  // ── Sign-In Log JSON export → Python worker fills the PDF ────
-  // Runs on every submit (partial days still need a sign-in sheet).
-  // Wrapped so a failure here doesn't reject the whole submit.
-  step = 'Sign-In JSON export';
-  try {
-    generateSignInJson_(d, woRow, ss);
-  } catch (err) {
-    Logger.log('⚠️ Sign-In JSON export failed: ' + err);
-    // The failure-logging write must never throw over the original sign-in
-    // error (and must never reject the whole submit). If Automation Log's
-    // Status column has dropdown validation that rejects "Error", an
-    // un-wrapped appendRow here would surface as the bare "Invalid Entry"
-    // message with no indication that it came from the error handler.
-    try {
-      ss.getSheetByName('Automation Log').appendRow([
-        new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
-        String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
-      ]);
-    } catch (logErr) {
-      Logger.log('⚠️ Could not write Sign-In failure to Automation Log: ' + logErr);
-    }
-  }
-
-  // ── Contractor Field Report JSON export ──────────────────────
-  // Only when the WO is being marked complete on THIS submit. The
-  // Python worker (watch_and_fill.py) polls "Needs Review / Field
-  // Reports" for this _type and fills the CFR PDF.
-  Logger.log('CFR gate: wo_complete=' + JSON.stringify(d.wo_complete)
-             + ' (typeof=' + typeof d.wo_complete + ')');
-  if (d.wo_complete) {
-    step = 'CFR JSON export';
-    Logger.log('→ entering CFR export block for ' + d.wo_id);
-    try {
-      generateContractorFieldReportJson_(d, woRow, ss, newIssues);
-    } catch (err) {
-      Logger.log('⚠️ CFR JSON export failed: ' + err);
-      try {
-        ss.getSheetByName('Automation Log').appendRow([
-          new Date(), 'CFR JSON Export', 'Failed', d.wo_id,
-          String(err), 'Error', '', 'Check logs — Contractor Field Report PDF will not be generated'
-        ]);
-      } catch (logErr) {
-        Logger.log('⚠️ Could not write CFR failure to Automation Log: ' + logErr);
-      }
-    }
-  } else {
-    Logger.log('→ CFR export skipped: wo_complete is falsy');
-  }
+  // Sign-In JSON + CFR JSON generation moved to a separate action
+  // (`finalize_field_report_docs`) the client fires AFTER it gets this
+  // success response. Keeps the user-facing submit path fast (the JSON
+  // writes are 2-5s of Drive I/O that don't affect the submitted data
+  // integrity — worst case a generated PDF is missing and we see a row
+  // in Automation Log).
 
   // ── Automation Log ────────────────────────────────────────────
   const actionNote = d.wo_complete
@@ -3538,6 +3561,78 @@ function handleSubmitFieldReport_(body) {
     wrapped.stack = err && err.stack ? err.stack : wrapped.stack;
     throw wrapped;
   }
+}
+
+
+/**
+ * Background JSON generation for a Field Report submit. Writes the
+ * Sign-In Log JSON (always) and the Contractor Field Report JSON
+ * (only when `wo_complete === true`) to Drive so the Railway worker
+ * can pick them up and produce the filled PDFs.
+ *
+ * The client fires this as a separate POST right after the main
+ * `submit_field_report` returns success. Failures go to Automation Log
+ * — they never bubble back to the user because by this point the
+ * report data is already safely persisted in the spreadsheet.
+ *
+ * Expects body.data to be the same payload the submit got (includes
+ * signatures). Re-reads the WO Tracker row + the newly-written Issues
+ * Reported aggregate so we don't depend on the client shipping them.
+ */
+function handleFinalizeFieldReportDocs_(body) {
+  const d = body.data || {};
+  if (!d.wo_id) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (!d.date)  return jsonResponse_({ error: 'Missing date' }, 400);
+
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+  const woRowIdx = allRows.findIndex((r, i) => i > 0 && String(r[0]) === String(d.wo_id));
+  if (woRowIdx === -1) return jsonResponse_({ error: 'Work Order not found: ' + d.wo_id }, 404);
+  const woRow = allRows[woRowIdx];
+  const issuesAggregate = String(woRow[22] || '').trim();
+
+  const result = { success: true, wo_id: d.wo_id };
+
+  // Sign-In JSON — always attempted
+  try {
+    generateSignInJson_(d, woRow, ss);
+    result.signin = 'ok';
+  } catch (err) {
+    Logger.log('⚠️ Sign-In JSON export failed: ' + err);
+    result.signin = 'failed';
+    try {
+      ss.getSheetByName('Automation Log').appendRow([
+        new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
+        String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
+      ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Could not write Sign-In failure to Automation Log: ' + logErr);
+    }
+  }
+
+  // CFR JSON — only when this submit marked the WO complete
+  if (d.wo_complete) {
+    try {
+      generateContractorFieldReportJson_(d, woRow, ss, issuesAggregate);
+      result.cfr = 'ok';
+    } catch (err) {
+      Logger.log('⚠️ CFR JSON export failed: ' + err);
+      result.cfr = 'failed';
+      try {
+        ss.getSheetByName('Automation Log').appendRow([
+          new Date(), 'CFR JSON Export', 'Failed', d.wo_id,
+          String(err), 'Error', '', 'Check logs — Contractor Field Report PDF will not be generated'
+        ]);
+      } catch (logErr) {
+        Logger.log('⚠️ Could not write CFR failure to Automation Log: ' + logErr);
+      }
+    }
+  } else {
+    result.cfr = 'skipped';
+  }
+
+  return jsonResponse_(result);
 }
 
 

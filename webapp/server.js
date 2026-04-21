@@ -180,6 +180,22 @@ app.post('/api/field-report', async (req, res) => {
 })
 
 /**
+ * POST /api/field-report/finalize
+ * Triggers Sign-In + CFR JSON generation AFTER the submit returned
+ * success. The client fires this as fire-and-forget so the user sees
+ * the success screen immediately instead of waiting for Drive writes.
+ */
+app.post('/api/field-report/finalize', async (req, res) => {
+  try {
+    const data = await callAppsScript('finalize_field_report_docs', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/field-report/finalize error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/upload-photo
  * Uploads one site photo to Drive inside the WO's Photos folder.
  * Multipart form fields:

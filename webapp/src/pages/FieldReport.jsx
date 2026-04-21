@@ -60,6 +60,55 @@ const calcHours = (tin, tout, workDateIso) => {
 }
 const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
 
+// ── Image compression helper ──────────────────────────────────
+// Phone JPEGs land at 3-10 MB straight from the camera. Shipping those
+// raw through the Apps Script proxy is the single biggest source of
+// submit-time latency. We resize to 2048px long-edge and re-encode at
+// JPEG q=0.85 before upload. Typical output is 300-600 KB with no
+// visible quality loss. Non-JPEG/PNG inputs (or already-small files)
+// pass through untouched.
+const COMPRESS_MAX_EDGE = 2048
+const COMPRESS_QUALITY  = 0.85
+const COMPRESS_SKIP_BELOW_BYTES = 500 * 1024   // <500 KB — not worth recompressing
+async function compressImage(file) {
+  const type = String(file?.type || '').toLowerCase()
+  if (!file) return file
+  // Only attempt to compress JPEG/PNG (HEIC etc. need a library we don't ship)
+  if (type !== 'image/jpeg' && type !== 'image/png') return file
+  if (file.size <= COMPRESS_SKIP_BELOW_BYTES) return file
+
+  let bitmap
+  try {
+    bitmap = await createImageBitmap(file)
+  } catch {
+    return file  // can't decode — fall back to original
+  }
+
+  const { width, height } = bitmap
+  const longEdge = Math.max(width, height)
+  const scale = longEdge > COMPRESS_MAX_EDGE ? COMPRESS_MAX_EDGE / longEdge : 1
+  const w = Math.round(width * scale)
+  const h = Math.round(height * scale)
+
+  const canvas = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(w, h)
+    : Object.assign(document.createElement('canvas'), { width: w, height: h })
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return file
+  ctx.drawImage(bitmap, 0, 0, w, h)
+  bitmap.close?.()
+
+  // Prefer canvas.convertToBlob (OffscreenCanvas) for async; fall back to toBlob
+  const blob = canvas.convertToBlob
+    ? await canvas.convertToBlob({ type: 'image/jpeg', quality: COMPRESS_QUALITY })
+    : await new Promise(r => canvas.toBlob(r, 'image/jpeg', COMPRESS_QUALITY))
+  if (!blob || blob.size >= file.size) return file   // compression made it larger somehow
+
+  // Give the blob a filename so the server sees a sensible name
+  const baseName = (file.name || 'photo').replace(/\.(png|jpg|jpeg|heic|heif|webp)$/i, '')
+  return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' })
+}
+
 
 // ── Field wrapper ─────────────────────────────────────────────
 function Field({ label, required, hint, children }) {
@@ -650,59 +699,104 @@ export default function FieldReport() {
     }
     await waitForSaves()
 
-    // Step 1 — upload photos to Drive
+    // Step 1 — compress + upload photos in parallel. Any upload error
+    // blocks the submit; we surface it to the user instead of silently
+    // proceeding. Compression typically cuts each photo from 3-10 MB
+    // down to 300-600 KB.
     let photosUploaded = false
     if (photoFiles.length > 0) {
-      for (let i = 0; i < photoFiles.length; i++) {
-        setSubmitStep(`Uploading photo ${i+1} of ${photoFiles.length}…`)
+      setSubmitStep(`Preparing ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'}…`)
+      let compressed
+      try {
+        compressed = await Promise.all(photoFiles.map(compressImage))
+      } catch (err) {
+        setSubmitStep('')
+        raiseError('Couldn\u2019t prepare photos for upload. Try again.')
+        setSubmitting(false)
+        return
+      }
+
+      setSubmitStep(`Uploading ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'}…`)
+      const results = await Promise.all(compressed.map(async (file) => {
         const form = new FormData()
-        form.append('photo', photoFiles[i])
+        form.append('photo', file)
         form.append('wo_id', selectedWOId)
         try {
-          const res  = await fetch('/api/upload-photo', { method:'POST', body:form })
-          const data = await res.json()
-          if (!data.error) photosUploaded = true
-        } catch { /* non-fatal */ }
+          const res  = await fetch('/api/upload-photo', { method: 'POST', body: form })
+          const data = await res.json().catch(() => ({}))
+          if (!res.ok || data.error) return { ok: false, err: data.error || `HTTP ${res.status}` }
+          return { ok: true }
+        } catch (err) {
+          return { ok: false, err: err?.message || 'Network error' }
+        }
+      }))
+
+      const failures = results.filter(r => !r.ok)
+      if (failures.length > 0) {
+        setSubmitStep('')
+        const detail = failures[0].err ? ` (${failures[0].err})` : ''
+        raiseError(`${failures.length} of ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'} failed to upload${detail}. Fix and try again.`)
+        setSubmitting(false)
+        return
       }
+      photosUploaded = true
     }
 
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
+    // Shared payload — used by submit AND by the background finalize
+    // call so signatures don't get shipped twice to the browser.
+    const reportBody = {
+      wo_id:       selectedWOId,
+      date:        workDate,
+      wo_complete: woComplete==='yes',
+      work_type:   inferredWorkType,
+      issues:          issues.trim(),
+      photos_uploaded: photosUploaded,
+      crew: validCrew.map(m=>({
+        name:           m.name.trim(),
+        classification: m.classification,
+        time_in:        fmt24to12(m.timeIn),
+        time_out:       fmt24to12(m.timeOut),
+        hours:          parseFloat(m.hours)||0,
+        overtime:       parseFloat(m.overtime)||0,
+        // Base64 PNG data URLs from the SignaturePad canvas. Apps Script
+        // forwards these verbatim into the Sign-In Logs JSON — the Python
+        // worker decodes + embeds them into the filled PDF. Never archived.
+        sig_in_b64:     m.signatureIn  || '',
+        sig_out_b64:    m.signatureOut || ''
+      })),
+      // Crew-leader block (signs at the bottom of the Sign-In Log)
+      contractor_name:           crewLeaderName.trim(),
+      contractor_title:          'Crew Leader',
+      contractor_signature_b64:  crewLeaderSignature || ''
+    }
+
     try {
       // Marking Items are already live-persisted via per-row CRUD
       // endpoints. Submit only sends WO-level data + crew + signatures.
       const res = await fetch('/api/field-report', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wo_id:       selectedWOId,
-          date:        workDate,
-          wo_complete: woComplete==='yes',
-          work_type:   inferredWorkType,
-          issues:          issues.trim(),
-          photos_uploaded: photosUploaded,
-          crew: validCrew.map(m=>({
-            name:           m.name.trim(),
-            classification: m.classification,
-            time_in:        fmt24to12(m.timeIn),
-            time_out:       fmt24to12(m.timeOut),
-            hours:          parseFloat(m.hours)||0,
-            overtime:       parseFloat(m.overtime)||0,
-            // Base64 PNG data URLs from the SignaturePad canvas. Apps Script
-            // forwards these verbatim into the Sign-In Logs JSON — the Python
-            // worker decodes + embeds them into the filled PDF. Never archived.
-            sig_in_b64:     m.signatureIn  || '',
-            sig_out_b64:    m.signatureOut || ''
-          })),
-          // Crew-leader block (signs at the bottom of the Sign-In Log)
-          contractor_name:           crewLeaderName.trim(),
-          contractor_title:          'Crew Leader',
-          contractor_signature_b64:  crewLeaderSignature || ''
-        })
+        body:    JSON.stringify(reportBody),
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
       setSubmitted({ wo_id:data.wo_id, status:data.status, crew_count:validCrew.length, photos:photoFiles.length })
+
+      // Fire-and-forget: kick off Sign-In + CFR JSON generation on the
+      // server after the user's already seen the success screen. Any
+      // failure lands in the Automation Log sheet — not this UI —
+      // because the report data itself is already safely persisted.
+      fetch('/api/field-report/finalize', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(reportBody),
+      }).catch(err => {
+        // Network-level failure reaching the proxy. Log locally; user
+        // doesn't see it because the submit itself succeeded.
+        console.warn('field-report finalize request failed:', err)
+      })
     } catch (err) {
       raiseError('Submission failed: ' + err.message)
     } finally {
