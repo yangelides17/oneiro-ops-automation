@@ -2179,6 +2179,8 @@ function doPost(e) {
       return handleDeleteMarkingItems_(body);
     } else if (action === 'trash_file') {
       return handleTrashFile_(body);
+    } else if (action === 'upload_wo_scan') {
+      return handleUploadWOScan_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2217,6 +2219,48 @@ function handleUploadPdf_(body) {
     file_id:  file.getId(),
     file_url: file.getUrl(),
     filename: file.getName()
+  });
+}
+
+
+// ── action: upload_wo_scan ───────────────────────────────────────
+//
+// Webapp-initiated WO scan upload. Writes the file into the Drive
+// "Scan Inbox" folder so the existing Railway watcher picks it up,
+// parses with Claude Vision, and calls write_wo exactly like a
+// drag-dropped file would. Archive path + all downstream behavior
+// (tracker row, Marking Items seed, archive move, Automation Log)
+// is unchanged.
+//
+// body.data:
+//   filename  — original file name (e.g. "RM-43281 scan.pdf")
+//   mime_type — MIME type (e.g. "application/pdf", "image/jpeg")
+//   data      — base64-encoded file bytes
+
+function handleUploadWOScan_(body) {
+  const d = body.data || {};
+  const { filename, mime_type, data } = d;
+  if (!filename || !data) {
+    return jsonResponse_({ error: 'Missing required fields: filename, data' }, 400);
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const scanInboxId = props.getProperty('SCAN_INBOX_ID');
+  if (!scanInboxId) {
+    return jsonResponse_({ error: 'SCAN_INBOX_ID not configured in Script Properties' }, 500);
+  }
+
+  const bytes = Utilities.base64Decode(data);
+  const blob  = Utilities.newBlob(bytes, mime_type || 'application/pdf', filename);
+  const folder = DriveApp.getFolderById(scanInboxId);
+  const file   = folder.createFile(blob);
+
+  Logger.log('📥 WO scan uploaded via webapp: ' + file.getName() + ' (' + file.getId() + ')');
+  return jsonResponse_({
+    success:  true,
+    file_id:  file.getId(),
+    filename: file.getName(),
+    url:      file.getUrl()
   });
 }
 

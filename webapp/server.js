@@ -196,6 +196,31 @@ app.post('/api/field-report/finalize', async (req, res) => {
 })
 
 /**
+ * POST /api/upload-wo
+ * Uploads one scanned WO file (PDF/JPEG/PNG) to Drive's Scan Inbox
+ * folder so the Railway watcher picks it up and runs the existing
+ * Claude Vision parse + write_wo pipeline.
+ * Multipart form field:
+ *   file  — the WO scan (PDF or image)
+ */
+app.post('/api/upload-wo', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' })
+
+    const base64 = req.file.buffer.toString('base64')
+    const data   = await callAppsScript('upload_wo_scan', {
+      filename:  req.file.originalname,
+      mime_type: req.file.mimetype,
+      data:      base64
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/upload-wo error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/upload-photo
  * Uploads one site photo to Drive inside the WO's Photos folder.
  * Multipart form fields:
