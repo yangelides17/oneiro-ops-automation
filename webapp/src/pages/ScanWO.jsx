@@ -125,6 +125,43 @@ export default function ScanWO() {
   // Clean up stale day keys on mount
   useEffect(() => { purgeOldHistory() }, [])
 
+  // One-shot catch-up poll on mount. If the user refreshed while
+  // something was in flight (or just popped back in an hour later),
+  // the persisted items may be stuck in 'upload_error' / 'parsing'.
+  // Ask the server for the current state of every item that still
+  // has a fileId and isn't confirmed done.
+  useEffect(() => {
+    const candidates = loadTodayHistory().filter(h => h.fileId && h.parseStatus !== 'done')
+    if (candidates.length === 0) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch('/api/scan-status', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ file_ids: candidates.map(c => c.fileId) }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled || !Array.isArray(data.statuses)) return
+        setHistoryItems(prev => prev.map(p => {
+          const s = data.statuses.find(x => x.file_id === p.fileId)
+          if (!s) return p
+          if (s.status === 'done') {
+            return { ...p, parseStatus: 'done', uploadStatus: 'uploaded',
+                     error: null, woIds: s.wo_ids || [] }
+          }
+          if (s.status === 'error') {
+            return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
+          }
+          return p
+        }))
+      } catch (err) {
+        console.warn('scan-status catch-up poll failed:', err)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
+
   // Persist history whenever it changes
   useEffect(() => { persistHistory(historyItems) }, [historyItems])
 
@@ -260,33 +297,6 @@ export default function ScanWO() {
     setSubmitting(false)
   }
 
-  // ── Retry a history item (re-upload the same File) ────────────
-  const retryHistory = async (id) => {
-    const item = historyItems.find(h => h.id === id)
-    if (!item || !item.file) {
-      setError('This upload was lost on page reload — remove it and re-pick the original file.')
-      return
-    }
-    // Mutate in place: reset to uploading
-    setHistoryItems(prev => prev.map(p => p.id === id
-      ? { ...p, uploadStatus: 'uploading', parseStatus: undefined, error: null, fileId: null, woIds: [] }
-      : p))
-    try {
-      const form = new FormData()
-      form.append('file', item.file, item.name)
-      const res  = await fetch('/api/upload-wo', { method: 'POST', body: form })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      setHistoryItems(prev => prev.map(p => p.id === id
-        ? { ...p, uploadStatus: 'uploaded', parseStatus: 'parsing', fileId: data.file_id }
-        : p))
-    } catch (err) {
-      setHistoryItems(prev => prev.map(p => p.id === id
-        ? { ...p, uploadStatus: 'upload_error', error: err?.message || 'Upload failed' }
-        : p))
-    }
-  }
-
   // ── Status polling ────────────────────────────────────────────
   useEffect(() => {
     const parsing = historyItems.filter(h => h.parseStatus === 'parsing' && h.fileId)
@@ -402,7 +412,6 @@ export default function ScanWO() {
           </div>
           {historyItems.map(item => (
             <HistoryRow key={item.id} item={item}
-                        onRetry={retryHistory}
                         onRemove={removeHistory}
                         onToggle={toggleExpand} />
           ))}
@@ -456,7 +465,7 @@ function ReadyRow({ item, onRemove, disableRemove }) {
 }
 
 // ── History row (uploaded / parsing / done / error) ───────────
-function HistoryRow({ item, onRetry, onRemove, onToggle }) {
+function HistoryRow({ item, onRemove, onToggle }) {
   const isError   = item.uploadStatus === 'upload_error' || item.parseStatus === 'error'
   const isPending = item.uploadStatus === 'uploading' || item.parseStatus === 'parsing'
   const isDone    = item.parseStatus === 'done'
@@ -467,9 +476,9 @@ function HistoryRow({ item, onRetry, onRemove, onToggle }) {
                      ${isError   ? 'border-red-200 bg-red-50/30' :
                        isDone    ? 'border-green-200 bg-green-50/20' :
                                    'border-slate-200'}`}>
-      <div className="flex items-center gap-3 p-2.5">
+      <div className="flex items-start gap-3 p-2.5">
         <div className="w-9 h-9 rounded-lg bg-slate-50 border border-slate-200
-                        flex items-center justify-center flex-shrink-0">
+                        flex items-center justify-center flex-shrink-0 mt-0.5">
           {isPending && (
             <div className="w-4 h-4 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
           )}
@@ -477,13 +486,17 @@ function HistoryRow({ item, onRetry, onRemove, onToggle }) {
           {isError && <span className="text-red-600 text-lg">✕</span>}
         </div>
 
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 space-y-0.5">
           <p className="text-sm font-semibold text-slate-800 truncate">{item.name}</p>
-          <p className="text-[11px] flex items-center gap-1.5">
+          <div className="text-[11px] flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
             {item.uploadStatus === 'uploading' && <span className="text-slate-500">Uploading…</span>}
             {item.uploadStatus === 'uploaded' && item.parseStatus === 'parsing' && <span className="text-navy font-semibold">Parsing…</span>}
-            {item.uploadStatus === 'upload_error' && <span className="text-red-600 font-semibold">Upload failed — {item.error}</span>}
-            {item.parseStatus === 'error' && <span className="text-red-600 font-semibold">Parse failed — {item.error}</span>}
+            {item.uploadStatus === 'upload_error' && (
+              <span className="text-red-600 font-semibold">Upload failed — {item.error}</span>
+            )}
+            {item.parseStatus === 'error' && (
+              <span className="text-red-600 font-semibold">Parse failed — {item.error}</span>
+            )}
             {isDone && !multiWo && (
               <span className="text-green-700 font-semibold">{item.woIds[0]}</span>
             )}
@@ -493,25 +506,20 @@ function HistoryRow({ item, onRetry, onRemove, onToggle }) {
                 {item.woIds.length} WOs <span>{item.expanded ? '⌃' : '⌄'}</span>
               </button>
             )}
-          </p>
+          </div>
+          {isError && (
+            <p className="text-[11px] text-slate-500 leading-snug">
+              Dismiss this entry and re-upload the file.
+            </p>
+          )}
         </div>
 
-        <div className="flex items-center gap-1 flex-shrink-0">
-          {isError && item.file && (
-            <button type="button" onClick={() => onRetry(item.id)}
-              className="text-[11px] font-bold px-2.5 py-1 rounded-lg
-                         bg-red-50 text-red-700 hover:bg-red-100 transition-colors
-                         border border-red-200">
-              Retry
-            </button>
-          )}
-          {isError && (
-            <button type="button" onClick={() => onRemove(item.id)}
-              className="w-7 h-7 flex items-center justify-center rounded-full
-                         text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors"
-              title="Dismiss">×</button>
-          )}
-        </div>
+        {isError && (
+          <button type="button" onClick={() => onRemove(item.id)}
+            className="w-7 h-7 flex items-center justify-center rounded-full flex-shrink-0
+                       text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+            title="Dismiss">×</button>
+        )}
       </div>
 
       {/* Multi-WO expansion — show each WO# one per line */}

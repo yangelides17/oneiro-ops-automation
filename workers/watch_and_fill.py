@@ -244,6 +244,19 @@ def _log_scan_failure(file_id: str, filename: str, error: str):
         log(f"  ⚠️   Could not log scan failure for {file_id}: {e}")
 
 
+def _trash_via_apps_script(file_id: str, label: str = ''):
+    """Trash a Drive file via the Apps Script proxy so it runs as the
+       spreadsheet owner (not the Railway OAuth user) — guarantees
+       permission regardless of who owns the file in Scan Inbox."""
+    if not file_id:
+        return
+    try:
+        _apps_script_post('trash_file', {'file_id': file_id})
+        log(f"  🗑️   Trashed{(' ' + label) if label else ''}: {file_id}")
+    except Exception as e:
+        log(f"  ⚠️   Could not trash {label or file_id}: {e}")
+
+
 def _pdf_page_count(file_bytes: bytes) -> int:
     """Returns PDF page count, or 0 if not a PDF / unreadable."""
     try:
@@ -369,6 +382,8 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
     except Exception as e:
         log(f"  ❌  Download failed: {e}")
         _log_scan_failure(file_id, file_name, f'download failed: {e}')
+        # File may or may not exist at this point; trash defensively
+        _trash_via_apps_script(file_id, label=f'failed upload {file_name}')
         return False
 
     # ── Page-count branch ─────────────────────────────────────────
@@ -382,9 +397,11 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
         except Exception as e:
             log(f"  ❌  Parse failed: {e}")
             _log_scan_failure(file_id, file_name, f'parse failed: {e}')
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         if '_parse_error' in wo_data:
             _log_scan_failure(file_id, file_name, wo_data['_parse_error'])
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         return _write_wo_from_parsed(wo_data, file_id)
 
@@ -399,10 +416,12 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             wo_data = parse_wo(file_bytes, mime_type)
         except Exception as e:
             _log_scan_failure(file_id, file_name, f'pass 1 + fallback both failed: {e}')
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         if '_parse_error' in wo_data:
             _log_scan_failure(file_id, file_name,
                               f'pass 1 failed ({detect_result["_parse_error"]}); fallback also failed ({wo_data["_parse_error"]})')
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         return _write_wo_from_parsed(wo_data, file_id)
 
@@ -413,10 +432,12 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             wo_data = parse_wo(file_bytes, mime_type)
         except Exception as e:
             _log_scan_failure(file_id, file_name, f'no WOs detected; fallback failed: {e}')
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         if '_parse_error' in wo_data:
             _log_scan_failure(file_id, file_name,
                               f'no WOs detected; fallback parse error: {wo_data["_parse_error"]}')
+            _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
             return False
         return _write_wo_from_parsed(wo_data, file_id)
 
@@ -430,6 +451,7 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
     except Exception as e:
         log(f"  ❌  Split failed: {e}")
         _log_scan_failure(file_id, file_name, f'pdf split failed: {e}')
+        _trash_via_apps_script(file_id, label=f'failed scan {file_name}')
         return False
 
     # Sequential Pass 2 — upload each split, parse it, write_wo.
@@ -445,6 +467,8 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             split_file_id = _upload_split_to_scan_inbox(service, split_bytes, split_filename)
         except Exception as e:
             log(f"  ❌  Split upload failed for {hint}: {e}")
+            # Log against the ORIGINAL file_id so the webapp surfaces this
+            # on the uploader's history item — the split didn't exist yet.
             _log_scan_failure(file_id, file_name,
                               f'split upload failed for {hint}: {e}')
             continue
@@ -454,26 +478,28 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
             wo_data = parse_wo(split_bytes, 'application/pdf')
         except Exception as e:
             log(f"  ❌  Pass 2 parse failed for {hint}: {e}")
+            # Trash the split and log against BOTH file_ids so either one
+            # looked up in the webapp surfaces the error.
             _log_scan_failure(split_file_id, split_filename, f'parse failed: {e}')
+            _log_scan_failure(file_id, file_name,
+                              f'{hint}: parse failed: {e}')
+            _trash_via_apps_script(split_file_id, label=f'failed split {hint}')
             continue
         if '_parse_error' in wo_data:
             log(f"  ❌  Pass 2 returned _parse_error for {hint}: {wo_data['_parse_error']}")
             _log_scan_failure(split_file_id, split_filename, wo_data['_parse_error'])
+            _log_scan_failure(file_id, file_name,
+                              f'{hint}: {wo_data["_parse_error"]}')
+            _trash_via_apps_script(split_file_id, label=f'failed split {hint}')
             continue
 
         # Write — archive for split, combined_file_id points to original
         if _write_wo_from_parsed(wo_data, split_file_id, combined_file_id=file_id):
             any_success = True
 
-    # Original is redundant once splits are archived — trash it.
-    if any_success:
-        try:
-            service.files().update(fileId=file_id, body={'trashed': True}).execute()
-            log(f"  🗑️   Trashed original combined PDF: {file_name}")
-        except Exception as e:
-            log(f"  ⚠️   Could not trash original combined PDF: {e}")
-    else:
-        log(f"  ⚠️   No splits succeeded — leaving {file_name} in Scan Inbox for retry.")
+    # Original is redundant regardless — trash it. On total failure the
+    # webapp surfaces a per-file error + tells the user to re-upload.
+    _trash_via_apps_script(file_id, label=f'combined PDF {file_name}')
 
     return any_success
 

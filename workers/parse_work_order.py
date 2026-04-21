@@ -151,6 +151,24 @@ intersection_grid rules:
 - For stop_msg and stop_lines cells: copy the directional string verbatim. Values are usually 'North', 'East', 'South', 'West', or concatenations like 'EW' (East AND West), 'NS', 'NSEW'. Preserve the exact letters.
 - Return an empty array if the form has no intersection grid entries.
 - Order intersection_grid top-to-bottom as printed.
+
+intersection_grid — CRITICAL ACCURACY RULES:
+This is a high-stakes section. Misreading a crosswalk direction means
+the crew paints the wrong crosswalk. Density of marks + occasional
+scan skew makes this the most error-prone part of the form. Be
+methodical:
+
+1. Lock in the column x-positions FIRST. Find the column header row
+   (INTERSECTIONS | Order | North | East | South | West | Stop Msg |
+    Sch M 8' | Sch M 10' | Stop lines) and mentally note each column's
+   horizontal position on the page.
+2. For each intersection row, determine the column of each mark (HVX,
+   directional string) by tracing STRAIGHT UP to the column header —
+   do NOT pick the direction that appears "closest". If the scan is
+   slightly skewed, a mark can visually drift toward a neighboring
+   column; the header row is ground truth.
+
+Accuracy matters more than speed on this section.
 """
 
 
