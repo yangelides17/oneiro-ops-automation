@@ -60,6 +60,37 @@ const calcHours = (tin, tout, workDateIso) => {
 }
 const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
 
+// ── HEIC → JPEG converter ─────────────────────────────────────
+// iPhones ship HEIC by default. Browsers can't decode HEIC for
+// <img> preview or canvas, so we convert to JPEG the moment a file
+// is picked. The converted File is what flows through the rest of
+// the pipeline (preview + compressImage + upload), so no other code
+// needs to know HEIC exists. heic2any is dynamically imported so
+// the 180 KB WASM payload only loads when a HEIC actually appears.
+function isHeic(file) {
+  const type = String(file?.type || '').toLowerCase()
+  const name = String(file?.name || '').toLowerCase()
+  return type === 'image/heic' || type === 'image/heif' ||
+         name.endsWith('.heic') || name.endsWith('.heif')
+}
+
+async function convertHeicToJpeg(file) {
+  if (!file || !isHeic(file)) return file
+  try {
+    const mod       = await import('heic2any')
+    const heic2any  = mod.default || mod
+    const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 })
+    const blob      = Array.isArray(converted) ? converted[0] : converted
+    const baseName  = (file.name || 'photo').replace(/\.(heic|heif)$/i, '')
+    return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' })
+  } catch (err) {
+    // Upstream callers can still upload the original — Drive will store
+    // the HEIC bytes. Only the preview stays broken.
+    console.warn('HEIC → JPEG conversion failed; keeping original:', err)
+    return file
+  }
+}
+
 // ── Image compression helper ──────────────────────────────────
 // Phone JPEGs land at 3-10 MB straight from the camera. Shipping those
 // raw through the Apps Script proxy is the single biggest source of
@@ -372,22 +403,73 @@ function WOPanel({ wo }) {
 }
 
 // ── Photo picker (upload happens on submit) ───────────────────
+// Items tracked per-photo:
+//   { id, name, status: 'processing'|'ready'|'error', file, previewUrl, error }
+// HEIC files get converted to JPEG the moment they're picked so the
+// preview works and the submit-time compression can run against a
+// format the browser knows how to decode.
 function PhotoPicker({ onChange }) {
   const fileRef = useRef(null)
-  const [files, setFiles] = useState([])
+  const [items, setItems] = useState([])
+
+  // Emit the final file list to the parent whenever items change.
+  // Errored items are omitted — the user can see them in the UI and
+  // decide to retry or remove. Processing items still emit their
+  // original file so the parent "has" something; the submit flow
+  // blocks on processing state via a separate signal below.
+  useEffect(() => {
+    onChange(items
+      .filter(i => i.status !== 'error')
+      .map(i => i.file))
+  }, [items])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clean up object URLs on unmount so we don't leak blobs
+  useEffect(() => () => {
+    items.forEach(i => { if (i.previewUrl) URL.revokeObjectURL(i.previewUrl) })
+  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const addFiles = (e) => {
-    const added   = Array.from(e.target.files || [])
-    const updated = [...files, ...added]
-    setFiles(updated)
-    onChange(updated)
+    const added = Array.from(e.target.files || [])
     e.target.value = ''
+    if (added.length === 0) return
+
+    const newItems = added.map(f => ({
+      id:         `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name:       f.name || 'photo',
+      status:     isHeic(f) ? 'processing' : 'ready',
+      file:       f,
+      previewUrl: isHeic(f) ? null : URL.createObjectURL(f),
+      error:      null,
+    }))
+    setItems(prev => [...prev, ...newItems])
+
+    // Convert HEICs in the background — non-HEICs are already 'ready'
+    newItems.forEach(item => {
+      if (item.status === 'ready') return
+      convertHeicToJpeg(item.file).then(processed => {
+        const converted   = processed !== item.file
+        const previewUrl  = URL.createObjectURL(processed)
+        setItems(prev => prev.map(p => p.id === item.id
+          ? { ...p, file: processed, previewUrl, status: converted ? 'ready' : 'error',
+              error: converted ? null : 'Couldn\u2019t convert HEIC — preview unavailable' }
+          : p))
+      }).catch(err => {
+        setItems(prev => prev.map(p => p.id === item.id
+          ? { ...p, status: 'error', error: err?.message || 'Failed to prepare photo' }
+          : p))
+      })
+    })
   }
-  const remove = (idx) => {
-    const updated = files.filter((_,i)=>i!==idx)
-    setFiles(updated)
-    onChange(updated)
-  }
+
+  const remove = (id) => setItems(prev => {
+    const target = prev.find(p => p.id === id)
+    if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl)
+    return prev.filter(p => p.id !== id)
+  })
+
+  const processingCount = items.filter(i => i.status === 'processing').length
+  const readyCount      = items.filter(i => i.status === 'ready').length
+  const errorCount      = items.filter(i => i.status === 'error').length
 
   return (
     <div className="space-y-3">
@@ -402,27 +484,55 @@ function PhotoPicker({ onChange }) {
       </div>
 
       {/* Thumbnails */}
-      {files.length > 0 && (
+      {items.length > 0 && (
         <>
           <div className="flex flex-wrap gap-2">
-            {files.map((f,i)=>(
-              <div key={i} className="relative group">
-                <img src={URL.createObjectURL(f)} alt={f.name}
-                  className="w-16 h-16 object-cover rounded-lg border border-slate-200" />
-                <button type="button" onClick={()=>remove(i)}
+            {items.map(item => (
+              <div key={item.id} className="relative group">
+                {item.status === 'ready' && item.previewUrl && (
+                  <img src={item.previewUrl} alt={item.name}
+                    className="w-16 h-16 object-cover rounded-lg border border-slate-200" />
+                )}
+                {item.status === 'processing' && (
+                  <div className="w-16 h-16 rounded-lg border border-slate-200 bg-slate-50
+                                  flex flex-col items-center justify-center gap-0.5">
+                    <div className="w-4 h-4 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
+                    <span className="text-[8px] text-slate-400 uppercase tracking-wider">HEIC</span>
+                  </div>
+                )}
+                {item.status === 'error' && (
+                  <div className="w-16 h-16 rounded-lg border border-red-200 bg-red-50
+                                  flex items-center justify-center text-red-500 text-lg font-bold"
+                       title={item.error || 'Error'}>!</div>
+                )}
+                <button type="button" onClick={()=>remove(item.id)}
                   className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full
                              text-xs font-bold flex items-center justify-center
                              opacity-0 group-hover:opacity-100 transition-opacity">×</button>
               </div>
             ))}
           </div>
-          <p className="text-[11px] text-green-700 font-semibold">
-            ✓ {files.length} photo{files.length!==1?'s':''} selected — will upload to Drive on submit
+          <p className="text-[11px] font-semibold flex flex-wrap gap-x-3 gap-y-1">
+            {readyCount > 0 && (
+              <span className="text-green-700">
+                ✓ {readyCount} ready
+              </span>
+            )}
+            {processingCount > 0 && (
+              <span className="text-slate-500">
+                Preparing {processingCount}…
+              </span>
+            )}
+            {errorCount > 0 && (
+              <span className="text-red-600">
+                ✕ {errorCount} couldn&apos;t prepare
+              </span>
+            )}
           </p>
         </>
       )}
 
-      {files.length === 0 && (
+      {items.length === 0 && (
         <p className="text-[11px] text-slate-400">
           Photos upload to Drive automatically when you submit the report.
         </p>
@@ -703,6 +813,14 @@ export default function FieldReport() {
     // blocks the submit; we surface it to the user instead of silently
     // proceeding. Compression typically cuts each photo from 3-10 MB
     // down to 300-600 KB.
+    // Block if a HEIC is still being converted in PhotoPicker —
+    // otherwise we'd ship the raw HEIC up through the proxy.
+    if (photoFiles.some(f => isHeic(f))) {
+      setSubmitStep('')
+      raiseError('HEIC photos are still being prepared. Wait a moment and try again.')
+      setSubmitting(false)
+      return
+    }
     let photosUploaded = false
     if (photoFiles.length > 0) {
       setSubmitStep(`Preparing ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'}…`)
