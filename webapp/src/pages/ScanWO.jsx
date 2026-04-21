@@ -125,13 +125,13 @@ export default function ScanWO() {
   // Clean up stale day keys on mount
   useEffect(() => { purgeOldHistory() }, [])
 
-  // One-shot catch-up poll on mount. If the user refreshed while
-  // something was in flight (or just popped back in an hour later),
-  // the persisted items may be stuck in 'upload_error' / 'parsing'.
-  // Ask the server for the current state of every item that still
-  // has a fileId and isn't confirmed done.
+  // One-shot catch-up poll on mount. Re-fetches the server state of
+  // EVERY item with a fileId — not just non-done ones. Fixes the
+  // stale-done race where a multi-WO upload's first poll happened to
+  // land between splits and stored an incomplete wo_ids list; each
+  // page reload now reconciles against the tracker's current truth.
   useEffect(() => {
-    const candidates = loadTodayHistory().filter(h => h.fileId && h.parseStatus !== 'done')
+    const candidates = loadTodayHistory().filter(h => h.fileId)
     if (candidates.length === 0) return
     let cancelled = false
     ;(async () => {
@@ -147,8 +147,19 @@ export default function ScanWO() {
           const s = data.statuses.find(x => x.file_id === p.fileId)
           if (!s) return p
           if (s.status === 'done') {
-            return { ...p, parseStatus: 'done', uploadStatus: 'uploaded',
-                     error: null, woIds: s.wo_ids || [] }
+            const prevLen = (p.woIds || []).length
+            const nextLen = (s.wo_ids || []).length
+            return {
+              ...p,
+              parseStatus: 'done',
+              uploadStatus: 'uploaded',
+              error: null,
+              woIds: s.wo_ids || [],
+              // Bump doneAt whenever the count changed (so the ongoing
+              // poll continues to watch for more splits), else keep the
+              // original one.
+              doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
+            }
           }
           if (s.status === 'error') {
             return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
@@ -298,9 +309,24 @@ export default function ScanWO() {
   }
 
   // ── Status polling ────────────────────────────────────────────
+  // Continues while anything is 'parsing' OR while any 'done' item
+  // was last updated within STABLE_WINDOW_MS. That extra window
+  // catches late-arriving splits in a multi-WO upload: get_scan_status
+  // may return {done, wo_ids: [A]} before wo_ids [B, C] have been
+  // written. Polling keeps running until wo_ids count stops changing
+  // for the full window.
+  const STABLE_WINDOW_MS = 30_000
   useEffect(() => {
-    const parsing = historyItems.filter(h => h.parseStatus === 'parsing' && h.fileId)
-    if (parsing.length === 0) return undefined
+    const eligible = historyItems.filter(h => {
+      if (!h.fileId) return false
+      if (h.parseStatus === 'parsing') return true
+      if (h.parseStatus === 'done') {
+        const age = h.doneAt ? (Date.now() - h.doneAt) : Infinity
+        return age < STABLE_WINDOW_MS
+      }
+      return false
+    })
+    if (eligible.length === 0) return undefined
 
     let cancelled = false
     const tick = async () => {
@@ -308,30 +334,39 @@ export default function ScanWO() {
         const res  = await fetch('/api/scan-status', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ file_ids: parsing.map(p => p.fileId) }),
+          body:    JSON.stringify({ file_ids: eligible.map(p => p.fileId) }),
         })
         const data = await res.json().catch(() => ({}))
         if (cancelled || !Array.isArray(data.statuses)) return
         setHistoryItems(prev => prev.map(p => {
-          if (p.parseStatus !== 'parsing') return p
           const s = data.statuses.find(x => x.file_id === p.fileId)
           if (!s) return p
           if (s.status === 'done') {
-            return { ...p, parseStatus: 'done', woIds: s.wo_ids || [] }
+            const prevLen = (p.woIds || []).length
+            const nextLen = (s.wo_ids || []).length
+            // Only bump doneAt if the count actually increased — that's
+            // our signal to keep the stability window open. Unchanged
+            // counts let doneAt age so polling eventually stops.
+            return {
+              ...p,
+              parseStatus: 'done',
+              uploadStatus: 'uploaded',
+              error: null,
+              woIds: s.wo_ids || [],
+              doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
+            }
           }
           if (s.status === 'error') {
             return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
           }
-          // pending or unknown — keep polling
-          return p
+          return p   // pending / unknown — keep polling
         }))
       } catch (err) {
-        // Transient network — try again on next tick
         console.warn('scan-status poll failed:', err)
       }
     }
 
-    // Poll immediately so the user doesn't wait a full interval
+    // Tick immediately so the first poll cycle isn't a full interval behind
     tick()
     const interval = setInterval(tick, POLL_INTERVAL_MS)
     return () => { cancelled = true; clearInterval(interval) }
