@@ -221,6 +221,24 @@ app.post('/api/upload-wo', upload.single('file'), async (req, res) => {
 })
 
 /**
+ * POST /api/scan-status
+ * Batched per-file status lookup for the Scan WO page's polling loop.
+ * Body: { file_ids: [<string>, ...] }
+ * Response: { statuses: [{ file_id, status, wo_ids?, message? }, ...] }
+ */
+app.post('/api/scan-status', async (req, res) => {
+  try {
+    const fileIds = Array.isArray(req.body?.file_ids) ? req.body.file_ids : []
+    if (fileIds.length === 0) return res.json({ statuses: [] })
+    const data = await callAppsScript('get_scan_status', { file_ids: fileIds })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/scan-status error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/upload-photo
  * Uploads one site photo to Drive inside the WO's Photos folder.
  * Multipart form fields:

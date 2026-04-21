@@ -154,6 +154,123 @@ intersection_grid rules:
 """
 
 
+DETECT_WO_PROMPT = """You are examining a multi-page PDF scanned from a stack of NYC DOT Pavement Marking Work Orders.
+
+The stack may contain:
+  • Work Order pages (WO) — the NYC DOT Pavement Marking Work Order Report form
+  • Contractor Field Report pages (CFR) — the form that's usually stapled to each WO
+  • Architectural drawing pages — site diagrams, sometimes attached
+  • Blank / separator pages
+
+Your job: identify each Work Order document and return the page numbers that
+make up its scan. Rules:
+
+1. A Work Order document always contains exactly ONE WO page.
+2. If the page IMMEDIATELY after a WO is a matching CFR (a Contractor Field
+   Report whose WO # printed on it is the SAME as the preceding WO's WO #),
+   include that CFR page as part of the same document.
+3. If the next page is a CFR but the WO # doesn't match, or the CFR's WO #
+   isn't clearly legible, do NOT include it. The WO stands alone.
+4. Never include architectural drawings, blank pages, or CFRs that don't
+   match any preceding WO. Those pages get dropped.
+5. Page numbers are 1-indexed.
+
+Return ONLY this JSON shape (no explanation, no markdown fences):
+
+{
+  "wo_documents": [
+    {
+      "wo_id": "The WO # printed on the Work Order page (e.g. PT-11930 or RM-43281).",
+      "pages": [list of 1-indexed page numbers for this WO's pages]
+    }
+  ]
+}
+
+If the PDF contains NO Work Order pages, return {"wo_documents": []}.
+"""
+
+
+def detect_wo_documents(file_bytes: bytes) -> dict:
+    """
+    Pass 1 of the multi-WO pipeline. Hands a multi-page PDF to Claude
+    Vision and asks which pages make up each individual WO document
+    (optionally bundled with its matching CFR page). Small output,
+    high reliability.
+
+    Returns:
+        { 'wo_documents': [ {wo_id, pages:[1,2,...]}, ... ] }
+        or { '_parse_error': reason } on failure.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        raise RuntimeError("anthropic package not installed — run: pip install anthropic")
+
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY environment variable not set")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    encoded = base64.standard_b64encode(file_bytes).decode('utf-8')
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=2048,  # output is small: a short JSON list of page groups
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "document",
+                     "source": {"type": "base64",
+                                "media_type": "application/pdf",
+                                "data": encoded}},
+                    {"type": "text", "text": DETECT_WO_PROMPT},
+                ]
+            }]
+        )
+
+        raw = response.content[0].text.strip()
+        if raw.startswith('```'):
+            lines = raw.split('\n')
+            raw = '\n'.join(lines[1:-1] if lines[-1] == '```' else lines[1:])
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or 'wo_documents' not in parsed:
+            return {'_parse_error': 'Missing wo_documents key in detection response'}
+
+        # Normalize: strip, dedupe pages within each doc, drop any non-int pages
+        normalized = []
+        for doc in parsed.get('wo_documents') or []:
+            if not isinstance(doc, dict):
+                continue
+            pages = doc.get('pages') or []
+            clean_pages = []
+            seen = set()
+            for p in pages:
+                try:
+                    pi = int(p)
+                except (ValueError, TypeError):
+                    continue
+                if pi < 1 or pi in seen:
+                    continue
+                seen.add(pi)
+                clean_pages.append(pi)
+            if not clean_pages:
+                continue
+            normalized.append({
+                'wo_id': str(doc.get('wo_id') or '').strip(),
+                'pages': sorted(clean_pages),
+            })
+        return {'wo_documents': normalized}
+
+    except json.JSONDecodeError as e:
+        log.error(f"Claude returned non-JSON from detect: {e}")
+        return {'_parse_error': f'JSON decode failed: {e}'}
+    except Exception as e:
+        log.error(f"Claude API call failed in detect: {e}")
+        return {'_parse_error': str(e)}
+
+
 def parse(file_bytes: bytes, mime_type: str = 'application/pdf') -> dict:
     """
     Send a scanned WO file to Claude Vision and return normalized tracker row data.

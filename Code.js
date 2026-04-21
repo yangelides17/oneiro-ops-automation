@@ -2181,6 +2181,10 @@ function doPost(e) {
       return handleTrashFile_(body);
     } else if (action === 'upload_wo_scan') {
       return handleUploadWOScan_(body);
+    } else if (action === 'get_scan_status') {
+      return handleGetScanStatus_(body);
+    } else if (action === 'log_wo_scan_failure') {
+      return handleLogWOScanFailure_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2265,6 +2269,158 @@ function handleUploadWOScan_(body) {
 }
 
 
+// ── action: get_scan_status ───────────────────────────────────
+
+/**
+ * Returns per-file status for WO scans the webapp uploaded. Called by
+ * the Scan WO page's poll loop to transition each item from
+ * "Parsing…" → "Done (RM-xxx)" or "Error".
+ *
+ * body.data = { file_ids: [<string>, ...] }
+ *
+ * For each file_id, response entry shape:
+ *   { file_id,
+ *     status: 'done' | 'pending' | 'error' | 'unknown',
+ *     wo_ids?: [<WO#>, ...]   // present when status='done'
+ *     message?: <string>       // present when status='error'
+ *   }
+ *
+ * Matching rules:
+ *   done    — WO Tracker has at least one row where
+ *             col 38 (Scan File ID) === file_id   OR
+ *             col 39 (Combined Scan File ID) === file_id
+ *   error   — Automation Log has a row where Source='WO Scan' AND
+ *             Action='Parse failed' AND Details contains the file_id
+ *   pending — file is still present in the Scan Inbox folder
+ *   unknown — file absent from Scan Inbox, no tracker match, no error
+ *             log (rare — treat as error in the UI)
+ *
+ * Sheets are read once and reused for the whole batch; Drive lookup
+ * is scoped to the Scan Inbox folder only (1 query per file_id).
+ */
+function handleGetScanStatus_(body) {
+  const d = body.data || {};
+  const fileIds = Array.isArray(d.file_ids) ? d.file_ids.filter(Boolean).map(String) : [];
+  if (fileIds.length === 0) return jsonResponse_({ statuses: [] });
+
+  const ss       = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet  = ss.getSheetByName('Work Order Tracker');
+  const woData   = woSheet.getDataRange().getValues();
+  const logSheet = ss.getSheetByName('Automation Log');
+  const logData  = logSheet ? logSheet.getDataRange().getValues() : [];
+
+  // Index WO Tracker rows by col 38 (Scan File ID) and col 39 (Combined).
+  const byScanId     = {};   // file_id → [wo_id, ...]
+  const byCombinedId = {};
+  woData.slice(1).forEach(r => {
+    const woId     = String(r[0]  || '').trim();
+    const scanId   = String(r[38] || '').trim();
+    const combined = String(r[39] || '').trim();
+    if (!woId) return;
+    if (scanId)   (byScanId[scanId]       = byScanId[scanId]       || []).push(woId);
+    if (combined) (byCombinedId[combined] = byCombinedId[combined] || []).push(woId);
+  });
+
+  // Index Automation Log scan failures by file_id (substring match in Details col).
+  // Only consider the most-recent failure per file_id so a post-retry success
+  // doesn't keep surfacing the old error.
+  const errorsByFileId = {};
+  logData.slice(1).forEach(r => {
+    const source  = String(r[1] || '').trim();
+    const action  = String(r[2] || '').trim();
+    const details = String(r[4] || '');
+    if (source !== 'WO Scan' || action !== 'Parse failed') return;
+    fileIds.forEach(fid => {
+      if (details.indexOf(fid) !== -1) errorsByFileId[fid] = details;
+    });
+  });
+
+  // Look up Scan Inbox presence once (one query per file_id).
+  const props       = PropertiesService.getScriptProperties();
+  const scanInboxId = props.getProperty('SCAN_INBOX_ID');
+  const stillInInbox = {};
+  if (scanInboxId) {
+    fileIds.forEach(fid => {
+      try {
+        const f = DriveApp.getFileById(fid);
+        if (!f.isTrashed()) {
+          // Confirm the file is in Scan Inbox (not already archived)
+          const parents = f.getParents();
+          while (parents.hasNext()) {
+            if (parents.next().getId() === scanInboxId) {
+              stillInInbox[fid] = true;
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        // Not found or inaccessible → falls through to unknown/error
+      }
+    });
+  }
+
+  const statuses = fileIds.map(fid => {
+    const direct   = byScanId[fid]     || [];
+    const combined = byCombinedId[fid] || [];
+    const ids      = direct.concat(combined);
+    if (ids.length > 0) {
+      return { file_id: fid, status: 'done', wo_ids: ids };
+    }
+    if (errorsByFileId[fid]) {
+      return { file_id: fid, status: 'error', message: errorsByFileId[fid] };
+    }
+    if (stillInInbox[fid]) {
+      return { file_id: fid, status: 'pending' };
+    }
+    return { file_id: fid, status: 'unknown' };
+  });
+
+  return jsonResponse_({ statuses });
+}
+
+
+// ── action: log_wo_scan_failure ───────────────────────────────
+
+/**
+ * The Python worker calls this when a scan can't be parsed (Pass 1
+ * empty, Pass 2 returns _parse_error, etc.). Writes a single row to
+ * Automation Log with a shape handleGetScanStatus_ can key on:
+ *   col 1 (Source)  = 'WO Scan'
+ *   col 2 (Action)  = 'Parse failed'
+ *   col 4 (Details) contains the file_id substring so the webapp can
+ *                   surface the error to the user who uploaded it.
+ *
+ * body.data = { file_id, filename, error }
+ */
+function handleLogWOScanFailure_(body) {
+  const d = body.data || {};
+  const fileId   = String(d.file_id  || '').trim();
+  const filename = String(d.filename || '').trim();
+  const err      = String(d.error    || 'unknown error').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+
+  try {
+    const ss  = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const log = ss.getSheetByName('Automation Log');
+    log.appendRow([
+      new Date(),
+      'WO Scan',
+      'Parse failed',
+      filename,
+      // Include file_id verbatim so handleGetScanStatus_ can substring-match on it
+      `file_id=${fileId} | ${err}`,
+      'Error',
+      '',
+      'Webapp will show this to the uploader for retry'
+    ]);
+    return jsonResponse_({ success: true });
+  } catch (e) {
+    Logger.log('⚠️ handleLogWOScanFailure_ write failed: ' + e);
+    return jsonResponse_({ error: String(e) }, 500);
+  }
+}
+
+
 // ── action: write_wo ──────────────────────────────────────────────────────────
 
 /**
@@ -2273,7 +2429,7 @@ function handleUploadWOScan_(body) {
  * body.file_id  — Drive file ID of the original scanned WO PDF
  * body.data     — normalized dict from parse_work_order.normalize_wo_data()
  *
- * WO Tracker columns (0-indexed, 38 total):
+ * WO Tracker columns (0-indexed, 40 total):
  *  0  Work Order #          11  WO Received Date       22  Issues Reported
  *  1  Prime Contractor      12  Water Blast Required?  23  Photos Uploaded?
  *  2  Contract Number       13  Water Blast Confirmed? 24  Production Log Done?
@@ -2287,9 +2443,11 @@ function handleUploadWOScan_(body) {
  * 10  Pavement Work Type    21  Paint / Material Used  32  Certified Payroll Week
  *                                                      33  Filed?
  *                                                      34  Notes
- *                                                      35  Date Entered  (from WO scan, for CFR)
- *                                                      36  School        (from WO scan, default "NA")
- *                                                      37  Prep By       (from WO scan, for CFR)
+ *                                                      35  Date Entered          (from WO scan, for CFR)
+ *                                                      36  School                (from WO scan, default "NA")
+ *                                                      37  Prep By               (from WO scan, for CFR)
+ *                                                      38  Scan File ID          (source PDF / split in Scan Inbox; webapp uses this to poll parse status)
+ *                                                      39  Combined Scan File ID (only set for multi-WO-stack splits — shared by all splits from the same combined PDF)
  */
 function handleWriteWO_(body) {
   const fileId = body.file_id;
@@ -2371,7 +2529,9 @@ function handleWriteWO_(body) {
     '',                          // 34  Notes             ← from crew web app
     d.date_entered || '',        // 35  Date Entered      ← from WO scan (for CFR)
     d.school       || 'NA',      // 36  School            ← from WO scan (default NA)
-    d.prep_by      || ''         // 37  Prep By           ← from WO scan (for CFR)
+    d.prep_by      || '',        // 37  Prep By           ← from WO scan (for CFR)
+    fileId         || '',        // 38  Scan File ID      ← source PDF (or split) in Scan Inbox
+    body.combined_file_id || '' // 39  Combined Scan File ID ← only for multi-WO stack splits; blank otherwise
   ];
 
   woSheet.appendRow(row);
@@ -2446,23 +2606,40 @@ function archiveWOFile_(fileId, d) {
 
 
 /**
- * Idempotently ensures the WO Tracker has the 3 CFR columns at the end
- * (Date Entered, School, Prep By). Safe to call on every scan intake —
- * it only writes if the header cell is actually blank.
+ * Idempotently ensures the WO Tracker has every extra column we've
+ * added over time: the 3 CFR cols (Date Entered, School, Prep By) and
+ * the 2 scan-tracking cols (Scan File ID, Combined Scan File ID).
+ * Safe to call on every scan intake — only writes headers that are
+ * actually missing.
+ *
+ * Column layout (1-indexed): 36 = Date Entered, 37 = School,
+ *   38 = Prep By, 39 = Scan File ID, 40 = Combined Scan File ID.
  */
-function ensureWoTrackerCFRCols_(woSheet) {
-  const CFR_HEADERS = ['Date Entered', 'School', 'Prep By'];
-  const START_COL   = 36;   // 1-indexed → A=1; we want column 36 = AJ (0-indexed 35)
-  const lastCol     = woSheet.getLastColumn();
-  if (lastCol >= START_COL + CFR_HEADERS.length - 1) {
-    // Already wide enough — check headers
-    const hdrs = woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).getValues()[0];
-    const allSet = CFR_HEADERS.every((h, i) => String(hdrs[i]).trim() === h);
+function ensureWoTrackerExtraCols_(woSheet) {
+  const EXTRA_HEADERS = [
+    'Date Entered',            // col 36 / 0-idx 35
+    'School',                  // col 37 / 0-idx 36
+    'Prep By',                 // col 38 / 0-idx 37
+    'Scan File ID',            // col 39 / 0-idx 38
+    'Combined Scan File ID',   // col 40 / 0-idx 39
+  ];
+  const START_COL = 36;
+  const N = EXTRA_HEADERS.length;
+  const lastCol = woSheet.getLastColumn();
+  if (lastCol >= START_COL + N - 1) {
+    const hdrs = woSheet.getRange(1, START_COL, 1, N).getValues()[0];
+    const allSet = EXTRA_HEADERS.every((h, i) => String(hdrs[i]).trim() === h);
     if (allSet) return;
   }
-  woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setValues([CFR_HEADERS]);
-  woSheet.getRange(1, START_COL, 1, CFR_HEADERS.length).setFontWeight('bold');
+  woSheet.getRange(1, START_COL, 1, N).setValues([EXTRA_HEADERS]);
+  woSheet.getRange(1, START_COL, 1, N).setFontWeight('bold');
 }
+
+/**
+ * Back-compat alias — older code paths still call ensureWoTrackerCFRCols_.
+ * Keep both names live so we don't break any callers during rollout.
+ */
+function ensureWoTrackerCFRCols_(woSheet) { return ensureWoTrackerExtraCols_(woSheet); }
 
 
 /**

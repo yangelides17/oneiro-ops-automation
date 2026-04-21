@@ -205,14 +205,156 @@ def list_scan_inbox_files(service, folder_id: str) -> list:
     return result.get('files', [])
 
 
+def _apps_script_post(action: str, body: dict) -> dict:
+    """
+    POST a JSON payload to the Apps Script Web App. Returns the parsed
+    JSON response. Raises on network / non-JSON / error responses.
+    """
+    import requests as _requests
+    import json as _json
+
+    upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
+    upload_key = os.environ.get('APPS_SCRIPT_UPLOAD_KEY', '')
+    if not upload_url:
+        raise RuntimeError('APPS_SCRIPT_UPLOAD_URL not set')
+
+    payload = _json.dumps({'action': action, 'key': upload_key, **body})
+    resp = _requests.post(
+        upload_url, data=payload,
+        headers={'Content-Type': 'application/json'},
+        timeout=120, allow_redirects=True,
+    )
+    if not resp.content.strip():
+        raise RuntimeError(f'Empty Apps Script response (HTTP {resp.status_code})')
+    try:
+        return resp.json()
+    except Exception as e:
+        snippet = resp.text[:300].replace('\n', ' ')
+        raise RuntimeError(f'Non-JSON Apps Script response: {snippet!r}') from e
+
+
+def _log_scan_failure(file_id: str, filename: str, error: str):
+    """Best-effort write of a scan-failure row to Automation Log. The
+       webapp's scan-status poll keys on this."""
+    try:
+        _apps_script_post('log_wo_scan_failure', {'data': {
+            'file_id': file_id, 'filename': filename, 'error': error,
+        }})
+    except Exception as e:
+        log(f"  ⚠️   Could not log scan failure for {file_id}: {e}")
+
+
+def _pdf_page_count(file_bytes: bytes) -> int:
+    """Returns PDF page count, or 0 if not a PDF / unreadable."""
+    try:
+        from pypdf import PdfReader
+        import io
+        return len(PdfReader(io.BytesIO(file_bytes)).pages)
+    except Exception:
+        return 0
+
+
+def split_pdf_by_pages(file_bytes: bytes, page_lists):
+    """
+    Split a PDF into N new PDFs. `page_lists` is a list of lists of
+    1-indexed page numbers. Returns a list of bytes (one per input
+    page list). Pages referenced out of range are silently skipped.
+    """
+    from pypdf import PdfReader, PdfWriter
+    import io
+
+    reader = PdfReader(io.BytesIO(file_bytes))
+    total  = len(reader.pages)
+    outputs = []
+    for pages in page_lists:
+        writer = PdfWriter()
+        for p in pages:
+            # page_lists use 1-indexed page numbers; pypdf is 0-indexed
+            idx = int(p) - 1
+            if 0 <= idx < total:
+                writer.add_page(reader.pages[idx])
+        buf = io.BytesIO()
+        writer.write(buf)
+        outputs.append(buf.getvalue())
+    return outputs
+
+
+def _write_wo_from_parsed(wo_data: dict, file_id: str, combined_file_id: str = '') -> bool:
+    """
+    POST a parsed WO to Apps Script `write_wo`. Returns True on success
+    or duplicate, False on any error. combined_file_id populates col 39
+    of the tracker (only for splits from a multi-WO combined PDF).
+    """
+    if '_parse_error' in wo_data:
+        log(f"  ❌  Parse error: {wo_data['_parse_error']}")
+        return False
+
+    wo_id  = wo_data.get('work_order_id', 'UNKNOWN')
+    top_ct = len(wo_data.get('top_markings') or [])
+    grid_ct = len(wo_data.get('intersection_grid') or [])
+    wtype  = wo_data.get('work_type') or '?'
+    log(f"  ✅  Parsed: {wo_id} — {wo_data.get('prime_contractor')} / "
+        f"{wo_data.get('contract_number')} / {wo_data.get('location')}")
+    log(f"      work_type={wtype}, top_markings={top_ct}, intersection_grid rows={grid_ct}")
+
+    try:
+        result = _apps_script_post('write_wo', {
+            'file_id':          file_id,
+            'combined_file_id': combined_file_id,
+            'data':             wo_data,
+        })
+    except Exception as e:
+        log(f"  ❌  Apps Script POST failed: {e}")
+        return False
+
+    if 'error' in result:
+        log(f"  ❌  Apps Script error: {result['error']}")
+        return False
+    if result.get('duplicate'):
+        log(f"  ℹ️   WO {wo_id} already in tracker — archived file only.")
+    else:
+        log(f"  ✅  WO {wo_id} added to tracker and archived.")
+    return True
+
+
+def _upload_split_to_scan_inbox(service, file_bytes: bytes, filename: str) -> str:
+    """
+    Upload a split WO PDF to Scan Inbox via the Apps Script proxy and
+    return its new file_id. We skip the Drive API direct path because
+    the service account doesn't own Scan Inbox — the proxy runs as the
+    spreadsheet's owner so writes always land cleanly.
+    """
+    import base64
+    encoded = base64.b64encode(file_bytes).decode('utf-8')
+    result  = _apps_script_post('upload_wo_scan', {'data': {
+        'filename':  filename,
+        'mime_type': 'application/pdf',
+        'data':      encoded,
+    }})
+    if 'error' in result:
+        raise RuntimeError(f'upload_wo_scan error: {result["error"]}')
+    fid = result.get('file_id')
+    if not fid:
+        raise RuntimeError('upload_wo_scan returned no file_id')
+    return fid
+
+
 def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
     """
     Download a WO scan from the Scan Inbox, parse it with Claude Vision,
     and post the structured data to the Apps Script doPost handler which
     writes a new row to the Work Order Tracker and archives the PDF.
+
+    Page-count branching:
+      ≤ 2 pages: single-WO flow (original behavior — one parse, one
+                 write_wo, done). Covers single-page WOs and WO+CFR.
+      > 2 pages: two-pass flow — Pass 1 detects WO page groups in the
+                 stack, split the PDF accordingly, then Pass 2 parses
+                 each split individually. Each split is uploaded to
+                 Scan Inbox (fresh file_id) so the existing archive
+                 path (Apps Script archiveWOFile_) works unchanged.
     """
-    import requests as _requests
-    from parse_work_order import parse as parse_wo
+    from parse_work_order import parse as parse_wo, detect_wo_documents
 
     file_id   = file_meta['id']
     file_name = file_meta['name']
@@ -226,74 +368,114 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
         log(f"  📥  Downloaded {len(file_bytes) / 1024:.0f} KB")
     except Exception as e:
         log(f"  ❌  Download failed: {e}")
+        _log_scan_failure(file_id, file_name, f'download failed: {e}')
         return False
 
-    # ── Parse with Claude Vision ──────────────────────────────────
-    try:
-        log("  🔍  Parsing with Claude Vision...")
-        wo_data = parse_wo(file_bytes, mime_type)
-    except Exception as e:
-        log(f"  ❌  Parse failed: {e}")
-        return False
+    # ── Page-count branch ─────────────────────────────────────────
+    page_count = _pdf_page_count(file_bytes) if mime_type == 'application/pdf' else 0
 
-    if '_parse_error' in wo_data:
-        log(f"  ❌  Claude could not parse WO: {wo_data['_parse_error']}")
-        return False
-
-    wo_id = wo_data.get('work_order_id', 'UNKNOWN')
-    log(f"  ✅  Parsed: {wo_id} — {wo_data.get('prime_contractor')} / "
-        f"{wo_data.get('contract_number')} / {wo_data.get('location')}")
-    top_ct = len(wo_data.get('top_markings') or [])
-    grid_ct = len(wo_data.get('intersection_grid') or [])
-    wtype  = wo_data.get('work_type') or '?'
-    log(f"      work_type={wtype}, top_markings={top_ct}, intersection_grid rows={grid_ct}")
-
-    # ── Post to Apps Script ───────────────────────────────────────
-    upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
-    upload_key = os.environ.get('APPS_SCRIPT_UPLOAD_KEY', '')
-
-    if not upload_url:
-        log("  ⚠️   APPS_SCRIPT_UPLOAD_URL not set — cannot write to WO Tracker.")
-        log("      Set this in Railway env vars.")
-        return False
-
-    import json as _json
-    payload = _json.dumps({
-        'action':  'write_wo',
-        'key':     upload_key,
-        'file_id': file_id,
-        'data':    wo_data,
-    })
-
-    try:
-        resp = _requests.post(
-            upload_url,
-            data=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=60,
-            allow_redirects=True,
-        )
-        log(f"  📡  Apps Script response: HTTP {resp.status_code}, {len(resp.content)} bytes")
-
-        if not resp.content.strip():
-            log("  ❌  Empty response from Apps Script — check doPost deployment.")
+    if page_count <= 2:
+        # Single-WO (or single-WO + CFR) — existing flow
+        log(f"  🔍  Single-WO path ({page_count or '?'} page{'s' if page_count != 1 else ''})")
+        try:
+            wo_data = parse_wo(file_bytes, mime_type)
+        except Exception as e:
+            log(f"  ❌  Parse failed: {e}")
+            _log_scan_failure(file_id, file_name, f'parse failed: {e}')
             return False
-
-        result = resp.json()
-        if 'error' in result:
-            log(f"  ❌  Apps Script error: {result['error']}")
+        if '_parse_error' in wo_data:
+            _log_scan_failure(file_id, file_name, wo_data['_parse_error'])
             return False
+        return _write_wo_from_parsed(wo_data, file_id)
 
-        if result.get('duplicate'):
-            log(f"  ℹ️   WO {wo_id} already in tracker — archived file only.")
-        else:
-            log(f"  ✅  WO {wo_id} added to tracker and archived.")
+    # ── Multi-WO: Pass 1 (detect) + split + Pass 2 (parse each) ──
+    log(f"  🔍  Multi-WO path — Pass 1 detecting WO boundaries in {page_count} pages…")
+    detect_result = detect_wo_documents(file_bytes)
+    if '_parse_error' in detect_result:
+        log(f"  ⚠️   Pass 1 detection failed: {detect_result['_parse_error']}")
+        log(f"      Falling back to single-WO parse on whole PDF.")
+        # Fallback: try treating the whole file as a single WO
+        try:
+            wo_data = parse_wo(file_bytes, mime_type)
+        except Exception as e:
+            _log_scan_failure(file_id, file_name, f'pass 1 + fallback both failed: {e}')
+            return False
+        if '_parse_error' in wo_data:
+            _log_scan_failure(file_id, file_name,
+                              f'pass 1 failed ({detect_result["_parse_error"]}); fallback also failed ({wo_data["_parse_error"]})')
+            return False
+        return _write_wo_from_parsed(wo_data, file_id)
 
-        return True
+    wo_docs = detect_result.get('wo_documents') or []
+    if not wo_docs:
+        log(f"  ⚠️   Pass 1 returned zero WO documents — trying single-WO fallback.")
+        try:
+            wo_data = parse_wo(file_bytes, mime_type)
+        except Exception as e:
+            _log_scan_failure(file_id, file_name, f'no WOs detected; fallback failed: {e}')
+            return False
+        if '_parse_error' in wo_data:
+            _log_scan_failure(file_id, file_name,
+                              f'no WOs detected; fallback parse error: {wo_data["_parse_error"]}')
+            return False
+        return _write_wo_from_parsed(wo_data, file_id)
 
+    log(f"  ✅  Pass 1: {len(wo_docs)} WO document(s) detected")
+    for doc in wo_docs:
+        log(f"       • {doc.get('wo_id') or '?'} on pages {doc.get('pages')}")
+
+    # Split once — returns bytes per document in the same order as wo_docs.
+    try:
+        split_bytes_list = split_pdf_by_pages(file_bytes, [d['pages'] for d in wo_docs])
     except Exception as e:
-        log(f"  ❌  Apps Script POST failed: {e}")
+        log(f"  ❌  Split failed: {e}")
+        _log_scan_failure(file_id, file_name, f'pdf split failed: {e}')
         return False
+
+    # Sequential Pass 2 — upload each split, parse it, write_wo.
+    any_success = False
+    base_name = file_name.rsplit('.', 1)[0]
+    for idx, (doc, split_bytes) in enumerate(zip(wo_docs, split_bytes_list), start=1):
+        hint = doc.get('wo_id') or f'part{idx}'
+        split_filename = f'{base_name} — {hint}.pdf'
+        log(f"  📄  Split {idx}/{len(wo_docs)}: {split_filename}")
+
+        # Upload split → fresh file_id
+        try:
+            split_file_id = _upload_split_to_scan_inbox(service, split_bytes, split_filename)
+        except Exception as e:
+            log(f"  ❌  Split upload failed for {hint}: {e}")
+            _log_scan_failure(file_id, file_name,
+                              f'split upload failed for {hint}: {e}')
+            continue
+
+        # Parse split (Pass 2, existing prompt)
+        try:
+            wo_data = parse_wo(split_bytes, 'application/pdf')
+        except Exception as e:
+            log(f"  ❌  Pass 2 parse failed for {hint}: {e}")
+            _log_scan_failure(split_file_id, split_filename, f'parse failed: {e}')
+            continue
+        if '_parse_error' in wo_data:
+            log(f"  ❌  Pass 2 returned _parse_error for {hint}: {wo_data['_parse_error']}")
+            _log_scan_failure(split_file_id, split_filename, wo_data['_parse_error'])
+            continue
+
+        # Write — archive for split, combined_file_id points to original
+        if _write_wo_from_parsed(wo_data, split_file_id, combined_file_id=file_id):
+            any_success = True
+
+    # Original is redundant once splits are archived — trash it.
+    if any_success:
+        try:
+            service.files().update(fileId=file_id, body={'trashed': True}).execute()
+            log(f"  🗑️   Trashed original combined PDF: {file_name}")
+        except Exception as e:
+            log(f"  ⚠️   Could not trash original combined PDF: {e}")
+    else:
+        log(f"  ⚠️   No splits succeeded — leaving {file_name} in Scan Inbox for retry.")
+
+    return any_success
 
 
 def upload_pdf(service, local_path: Path, parent_folder_id: str) -> str:
