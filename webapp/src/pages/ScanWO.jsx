@@ -143,13 +143,18 @@ export default function ScanWO() {
         })
         const data = await res.json().catch(() => ({}))
         if (cancelled || !Array.isArray(data.statuses)) return
-        setHistoryItems(prev => prev.map(p => {
+        setHistoryItems(prev => prev.flatMap(p => {
           const s = data.statuses.find(x => x.file_id === p.fileId)
-          if (!s) return p
+          if (!s) return [p]
+          // If an item that was previously 'done' now returns 'unknown'
+          // (file not in Scan Inbox, no tracker row, no error log), its
+          // tracker rows were deleted. Drop it from the queue so the
+          // count stays in sync with the data hub.
+          if (s.status === 'unknown' && p.parseStatus === 'done') return []
           if (s.status === 'done') {
             const prevLen = (p.woIds || []).length
             const nextLen = (s.wo_ids || []).length
-            return {
+            return [{
               ...p,
               parseStatus: 'done',
               uploadStatus: 'uploaded',
@@ -159,12 +164,12 @@ export default function ScanWO() {
               // poll continues to watch for more splits), else keep the
               // original one.
               doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
-            }
+            }]
           }
           if (s.status === 'error') {
-            return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
+            return [{ ...p, parseStatus: 'error', error: s.message || 'Parse failed' }]
           }
-          return p
+          return [p]
         }))
       } catch (err) {
         console.warn('scan-status catch-up poll failed:', err)
@@ -338,28 +343,32 @@ export default function ScanWO() {
         })
         const data = await res.json().catch(() => ({}))
         if (cancelled || !Array.isArray(data.statuses)) return
-        setHistoryItems(prev => prev.map(p => {
+        setHistoryItems(prev => prev.flatMap(p => {
           const s = data.statuses.find(x => x.file_id === p.fileId)
-          if (!s) return p
+          if (!s) return [p]
+          // Drop items whose tracker rows were deleted (user cleaned up
+          // the data hub while the page was open). Keeps the queue +
+          // "X WOs today" counter honest.
+          if (s.status === 'unknown' && p.parseStatus === 'done') return []
           if (s.status === 'done') {
             const prevLen = (p.woIds || []).length
             const nextLen = (s.wo_ids || []).length
             // Only bump doneAt if the count actually increased — that's
             // our signal to keep the stability window open. Unchanged
             // counts let doneAt age so polling eventually stops.
-            return {
+            return [{
               ...p,
               parseStatus: 'done',
               uploadStatus: 'uploaded',
               error: null,
               woIds: s.wo_ids || [],
               doneAt: nextLen !== prevLen ? Date.now() : (p.doneAt || Date.now()),
-            }
+            }]
           }
           if (s.status === 'error') {
-            return { ...p, parseStatus: 'error', error: s.message || 'Parse failed' }
+            return [{ ...p, parseStatus: 'error', error: s.message || 'Parse failed' }]
           }
-          return p   // pending / unknown — keep polling
+          return [p]   // pending — keep polling
         }))
       } catch (err) {
         console.warn('scan-status poll failed:', err)
