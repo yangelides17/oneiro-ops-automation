@@ -78,7 +78,7 @@ logging.getLogger('pypdf').setLevel(logging.ERROR)
 warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', module='pypdf')
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, create_string_object
+from pypdf.generic import NameObject, DictionaryObject, IndirectObject, create_string_object
 
 TEMPLATE = os.path.join(
     os.path.dirname(__file__),
@@ -292,6 +292,88 @@ def _set_font_size(writer: PdfWriter, field_names: set, pt: float):
                 del field_obj['/AP']
 
 
+def _sync_checkbox_appearance_states(writer):
+    """
+    update_page_form_field_values sets /V on checkbox + radio-group
+    fields (workergroup{N}, PLA, etc) but does NOT set /AS on the
+    individual widget annotations. Adobe + Preview derive the right
+    /AS from /V via /NeedAppearances; pdf.js (react-pdf in the webapp
+    viewer) and Drive's preview render /AS literally and show every
+    box unchecked when /AS stays at /Off.
+
+    Walk every widget. For button-type fields (/FT=/Btn), flip /AS
+    so it matches the parent field's /V:
+      - If parent /V matches one of the widget's /AP/N "on" keys
+        (e.g. /Journeyperson or /Apprentice), set /AS to that key.
+      - Otherwise, set /AS to /Off.
+
+    Resolves the parent via /AcroForm/Fields by /T (rather than via
+    the widget's /Parent reference) so we always read the canonical
+    post-write /V.
+
+    Idempotent — safe to call after update_page_form_field_values.
+    """
+    def _name_str(v):
+        if v is None: return None
+        s = str(v)
+        return s[1:] if s.startswith('/') else s
+
+    # Build a name → terminal-field map from /AcroForm/Fields.
+    terminals_by_name = {}
+    acro = writer._root_object.get('/AcroForm')
+    if acro is not None:
+        fields = acro.get('/Fields') or []
+        for fref in fields:
+            f = fref.get_object() if isinstance(fref, IndirectObject) else fref
+            t = f.get('/T')
+            if t:
+                terminals_by_name[str(t)] = f
+
+    for page in writer.pages:
+        annots = page.get('/Annots')
+        if annots is None:
+            continue
+        if isinstance(annots, IndirectObject):
+            annots = annots.get_object()
+        for aref in annots:
+            a = aref.get_object() if isinstance(aref, IndirectObject) else aref
+            if not isinstance(a, DictionaryObject):
+                continue
+            if a.get('/Subtype') != '/Widget':
+                continue
+
+            # Resolve parent name: widget's /T takes precedence, else parent's /T
+            t = a.get('/T')
+            if t is None:
+                parent = a.get('/Parent')
+                if parent is not None:
+                    parent_obj = parent.get_object() if isinstance(parent, IndirectObject) else parent
+                    t = parent_obj.get('/T')
+            if t is None:
+                continue
+
+            terminal = terminals_by_name.get(str(t))
+            if terminal is None:
+                continue
+            ft = terminal.get('/FT') or a.get('/FT')
+            if ft != '/Btn':
+                continue
+
+            ap = a.get('/AP')
+            if not ap:
+                continue
+            ap_n = ap.get('/N')
+            if not ap_n:
+                continue
+            on_keys = [str(k)[1:] for k in ap_n.keys() if str(k) != '/Off']
+
+            v_str = _name_str(terminal.get('/V'))
+            target = '/Off'
+            if v_str and v_str in on_keys:
+                target = '/' + v_str
+            a[NameObject('/AS')] = NameObject(target)
+
+
 def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> str:
     """Fill template with data dict and write to output_path. Returns output path."""
     if output_path is None:
@@ -314,6 +396,10 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     _set_font_size(writer, narrow_fields, pt=7)
 
     writer.update_page_form_field_values(writer.pages[0], build_field_map(data))
+
+    # Post-process: sync widget /AS to parent /V for every checkbox/radio
+    # so pdf.js + Drive preview render them correctly.
+    _sync_checkbox_appearance_states(writer)
 
     with open(output_path, 'wb') as fh:
         writer.write(fh)
