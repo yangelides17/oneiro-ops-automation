@@ -677,39 +677,68 @@ def get_template(service, doc_type: str) -> Path:
     local_path = TEMPLATE_CACHE / filename
 
     if templates_folder_id:
-        # Find the file in Drive
+        # Find the file in Drive. Ordered by modifiedTime desc so if
+        # duplicates somehow exist (accidental upload without "replace"),
+        # we always pick the freshest one.
         q = (f"'{templates_folder_id}' in parents and name='{filename}' "
              f"and trashed=false")
         result = service.files().list(
-            q=q, fields='files(id,name,modifiedTime)'
+            q=q,
+            fields='files(id,name,modifiedTime,size)',
+            orderBy='modifiedTime desc'
         ).execute()
         files = result.get('files', [])
+        if len(files) > 1:
+            log(f"  ⚠️   Found {len(files)} copies of {filename} in Templates — using newest")
 
         if files:
             drive_file = files[0]
             drive_modified = drive_file['modifiedTime']
+            drive_size     = int(drive_file.get('size') or 0)
+            drive_id       = drive_file['id']
 
-            # Download if local copy is missing or stale
-            needs_download = not local_path.exists()
-            if not needs_download and local_path.exists():
-                import email.utils, calendar
-                local_mtime = local_path.stat().st_mtime
+            # Persist the Drive file-id alongside the cached PDF so we
+            # can detect a file swap (user deleted the old template and
+            # uploaded a replacement → new file-id, possibly-older
+            # modifiedTime if Drive preserves creation time). Without
+            # this, swapping the template back to an older version
+            # silently keeps using the stale local cache forever.
+            marker_path = local_path.with_suffix(local_path.suffix + '.drive_id')
+            cached_id   = marker_path.read_text().strip() if marker_path.exists() else None
+
+            # Size check catches any content change — most reliable
+            # busting signal when mtime is the same but bytes differ.
+            local_size = local_path.stat().st_size if local_path.exists() else -1
+
+            import email.utils, calendar
+            drive_ts = 0
+            if local_path.exists():
                 drive_ts = calendar.timegm(
                     time.strptime(drive_modified, '%Y-%m-%dT%H:%M:%S.%fZ')
                     if '.' in drive_modified else
                     time.strptime(drive_modified, '%Y-%m-%dT%H:%M:%SZ')
                 )
-                needs_download = drive_ts > local_mtime
+                local_mtime = local_path.stat().st_mtime
+            else:
+                local_mtime = 0
+
+            reasons = []
+            if not local_path.exists():                reasons.append('no local cache')
+            if cached_id and cached_id != drive_id:    reasons.append(f'drive file-id changed ({cached_id[:8]}→{drive_id[:8]})')
+            if drive_size and drive_size != local_size: reasons.append(f'size changed ({local_size}→{drive_size})')
+            if drive_ts > local_mtime:                 reasons.append('drive newer')
+            needs_download = bool(reasons)
 
             if needs_download:
-                log(f"  📥  Downloading template from Drive: {filename}")
-                request = service.files().get_media(fileId=drive_file['id'])
+                log(f"  📥  Downloading template from Drive: {filename} ({', '.join(reasons)})")
+                request = service.files().get_media(fileId=drive_id)
                 buf = io.BytesIO()
                 dl = MediaIoBaseDownload(buf, request)
                 done = False
                 while not done:
                     _, done = dl.next_chunk()
                 local_path.write_bytes(buf.getvalue())
+                marker_path.write_text(drive_id)
                 log(f"  ✅  Template cached: {local_path.name}")
         else:
             log(f"  ⚠️   Template '{filename}' not found in Drive Templates folder.")
