@@ -3115,10 +3115,17 @@ function archiveWOFile_(fileId, d) {
  * Scan File ID (col 39 / 0-idx 38), reconstructs the archive context
  * from the same row, and reuses archiveWOFile_.
  *
- * Usage (in the Apps Script editor):
- *   retryArchiveStuckWO('RM-43316')
+ * Usage:
+ *   - From the editor's Run button (no args): edit DEFAULT_WO_TO_RETRY
+ *     below to the stuck WO # and hit Run.
+ *   - From code / console: retryArchiveStuckWO('RM-43316')
  */
 function retryArchiveStuckWO(woId) {
+  // Fallback WO # for one-click runs from the Apps Script editor — edit
+  // this line when you need to rerun the helper on a different stuck WO.
+  const DEFAULT_WO_TO_RETRY = 'RM-43316';
+
+  woId = woId || DEFAULT_WO_TO_RETRY;
   if (!woId) throw new Error('retryArchiveStuckWO requires a WO # (e.g. "RM-43316")');
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
