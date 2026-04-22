@@ -505,60 +505,39 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const dateStr = `${pick('month')}/${pick('day')}`
     const yearStr = pick('year')
 
-    // Match the rest of the form (9pt Arial per the template's /DA).
-    // Without setFontSize, pdf-lib renders at its default ~12pt which
-    // looks huge next to the pre-filled cells.
-    const CERT_PAYROLL_FONT_SIZE = 9
     const trySetText = (fieldName, value) => {
-      try {
-        const tf = form.getTextField(fieldName)
-        tf.setText(String(value || ''))
-        try { tf.setFontSize(CERT_PAYROLL_FONT_SIZE) }
-        catch (e) { /* some templates don't accept setFontSize — soft fail */ }
-      } catch (e) {
-        console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`)
-      }
+      try { form.getTextField(fieldName).setText(String(value || '')) }
+      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
     }
     trySetText('OFFICER OR PRINCIPAL (print)', name)
     trySetText('TITLE',                        title)
     trySetText('DATE',                         dateStr)
     trySetText('YEAR',                         yearStr)
 
-    // Signature overlay — read the rect from the template's
-    // `signature_line` field so we stay in sync with any future
-    // template repositioning. Same padding + center-fit scaling as
-    // the Sign-In flow so the two sign-offs look identical.
-    const LEADER_SIG_H_PAD = 1.0
-    const LEADER_SIG_V_PAD = 3.0
+    // Signature overlay — rect computed relative to the OFFICER field's
+    // rect on page 1 (x=1.7-229.2, y=50.5-79.3).  The printed signature
+    // line sits in the gap above it, so overlay there.
+    const SIG_BOX = {
+      x:      1.7,
+      y:      82,        // just above OFFICER field top (79.3)
+      width:  227.5,     // match OFFICER field width
+      height: 28,        // ~30pt tall band for the ink
+    }
     const pngB64   = String(signature_b64).replace(/^data:image\/png;base64,/, '')
     const pngBytes = Buffer.from(pngB64, 'base64')
     const sigImage = await pdfDoc.embedPng(pngBytes)
     try {
-      const sigField = form.getField('signature_line')
-      const widget   = sigField.acroField.getWidgets()[0]
-      const rect     = widget.getRectangle()
-
-      // Locate the widget's page — the rect is page-local, so we need
-      // the actual page ref. Fall back to page 1 if the lookup misses.
-      const pageRef = widget.P()
-      const pages   = pdfDoc.getPages()
-      const page    = pages.find(p => p.ref === pageRef) || pages[0]
-
-      const boxX = rect.x      - LEADER_SIG_H_PAD
-      const boxY = rect.y      - LEADER_SIG_V_PAD
-      const boxW = rect.width  + 2 * LEADER_SIG_H_PAD
-      const boxH = rect.height + 2 * LEADER_SIG_V_PAD
-
-      const scale = Math.min(boxW / sigImage.width, boxH / sigImage.height)
+      // Target page 1 explicitly — the sign-off block is there.
+      const page  = pdfDoc.getPages()[0]
+      const scale = Math.min(SIG_BOX.width / sigImage.width,
+                             SIG_BOX.height / sigImage.height)
       const drawW = sigImage.width  * scale
       const drawH = sigImage.height * scale
-      const drawX = boxX + (boxW - drawW) / 2
-      const drawY = boxY + (boxH - drawH) / 2
+      const drawX = SIG_BOX.x + (SIG_BOX.width  - drawW) / 2
+      const drawY = SIG_BOX.y + (SIG_BOX.height - drawH) / 2
       page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
     } catch (e) {
       console.warn('pdf-lib cert-payroll signature overlay failed:', e.message)
-      // Non-fatal: the text fields are still filled.  The signed PDF
-      // will lack the drawn signature but be otherwise valid.
     }
 
     // Flatten so the filled text renders identically across viewers.
