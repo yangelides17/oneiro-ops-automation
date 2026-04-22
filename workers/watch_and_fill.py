@@ -742,42 +742,62 @@ def save_state(processed: set):
 
 
 # ── PDF fillers ───────────────────────────────────────────────────────────────
-def fill_production_log(service, data: dict, tmp_dir: Path) -> Path:
+# Fillers accept an optional `source_name` — the source JSON's filename —
+# so we can build PDF filenames like `<JSON stem>_FILLED.pdf`.  The JSON
+# stems are authored by Apps Script with every archive-relevant field
+# already baked in (`Production_Log_YYYY-MM-DD.json`,
+# `Certified_Payroll_{contractNum}_{borough}_YYYY-MM-DD.json`, etc).
+# Reusing them keeps the PDF filenames parseable by archiveDocument_ in
+# Apps Script without duplicating the filename-generation logic here.
+def _filename_from_source(source_name: str | None, fallback: str) -> str:
+    if source_name:
+        stem = source_name
+        if stem.lower().endswith('.json'):
+            stem = stem[:-5]
+        return f"{stem}_FILLED.pdf"
+    return fallback
+
+
+def fill_production_log(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
     from fill_production_log import fill
     template = get_template(service, 'production_log')
     date_str = data.get('date', 'unknown').replace('/', '-')
-    out = tmp_dir / f"Production_Log_{date_str}_FILLED.pdf"
+    fallback = f"Production_Log_{date_str}_FILLED.pdf"
+    out = tmp_dir / _filename_from_source(source_name, fallback)
     fill(data, template_path=str(template), output_path=str(out))
     return out
 
 
-def fill_certified_payroll(service, data: dict, tmp_dir: Path) -> Path:
+def fill_certified_payroll(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
     from fill_certified_payroll import fill
     template = get_template(service, 'certified_payroll')
     week = data.get('week_ending', 'unknown').replace('/', '-')
-    out = tmp_dir / f"Certified_Payroll_{week}_FILLED.pdf"
+    fallback = f"Certified_Payroll_{week}_FILLED.pdf"
+    out = tmp_dir / _filename_from_source(source_name, fallback)
     fill(data, template_path=str(template), output_path=str(out))
     return out
 
 
-def fill_signin(service, data: dict, tmp_dir: Path) -> Path:
+def fill_signin(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
     from fill_signin import fill
     template = get_template(service, 'signin')
     wo_id    = data.get('wo_id', 'unknown')
     date_str = (data.get('date', 'unknown')
                 .replace('/', '-').replace(' ', '_'))
-    out = tmp_dir / f"SignIn_{wo_id}_{date_str}_FILLED.pdf"
+    fallback = f"SignIn_{wo_id}_{date_str}_FILLED.pdf"
+    out = tmp_dir / _filename_from_source(source_name, fallback)
     fill(data, template_path=str(template), output_path=str(out))
     return out
 
 
-def fill_contractor_field_report(service, data: dict, tmp_dir: Path) -> Path:
+def fill_contractor_field_report(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
     from fill_contractor_field_report import fill
     template = get_template(service, 'contractor_field_report')
     wo_id    = data.get('wo_id') or data.get('work_order', 'unknown')
     date_str = str(data.get('install_to') or data.get('date_entered') or 'unknown') \
                   .replace('/', '-').replace(' ', '_')
-    out = tmp_dir / f"Contractor_Field_Report_{wo_id}_{date_str}_FILLED.pdf"
+    fallback = f"Contractor_Field_Report_{wo_id}_{date_str}_FILLED.pdf"
+    out = tmp_dir / _filename_from_source(source_name, fallback)
     fill(data, template_path=str(template), output_path=str(out))
     return out
 
@@ -809,7 +829,10 @@ def process_file(service, file_meta: dict, folder_id: str, tmp_dir: Path) -> boo
         return True  # mark as seen so we don't retry forever
 
     try:
-        pdf_path = filler(service, data, tmp_dir)
+        # Pass the source JSON's filename so the filler can name the
+        # output PDF `<JSON stem>_FILLED.pdf` — the Apps Script archive
+        # step regex-parses those stems for contract/borough/date.
+        pdf_path = filler(service, data, tmp_dir, source_name=name)
     except Exception as e:
         log(f"  ❌  Fill failed: {e}")
         import traceback; traceback.print_exc()
