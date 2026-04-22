@@ -3167,12 +3167,15 @@ function debugGenerateCFRForWO() {
  * Used by the Field Report page to gate submission on MMA jobs — crew
  * toggles Yes when waterblasting has been completed, No to undo.
  *
- * body: { key, wo_id, confirmed: boolean }
+ * body: { key, data: { wo_id, confirmed: boolean } }
  * Writes 'Yes' or 'No' to col 14 and logs to Automation Log.
  */
 function handleSetWaterblastConfirmed_(body) {
-  const woId      = String(body.wo_id || '').trim();
-  const confirmed = !!body.confirmed;
+  // The webapp's callAppsScript helper nests payloads under body.data;
+  // fall back to top-level so direct curl / editor tests still work.
+  const d         = body.data || body;
+  const woId      = String(d.wo_id || '').trim();
+  const confirmed = !!d.confirmed;
   if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
 
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
