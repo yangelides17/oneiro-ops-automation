@@ -214,7 +214,18 @@ app.post('/api/field-report', async (req, res) => {
 app.post('/api/tools/daily-documents', async (req, res) => {
   try {
     const { date } = req.body || {}
-    const data = await callAppsScript('generate_daily_documents', { date: date || '' })
+    // Convert ISO YYYY-MM-DD → MM/DD/YYYY so Apps Script's new Date()
+    // parses it as LOCAL midnight. ISO strings get parsed as UTC per
+    // the spec, which shifted "today" back by one day in Eastern Time
+    // and caused "no sign-in entries" errors.
+    let normalised = ''
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      const [y, m, d] = String(date).split('-')
+      normalised = `${m}/${d}/${y}`
+    } else if (date) {
+      normalised = String(date)
+    }
+    const data = await callAppsScript('generate_daily_documents', { date: normalised })
     res.json(data)
   } catch (err) {
     console.error('POST /api/tools/daily-documents error:', err.message)
