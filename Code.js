@@ -1261,16 +1261,25 @@ function archiveDocument_(file, docType, woId, ss) {
       if (!match) {
         return { success: false, reason: 'Could not parse contract info from Certified Payroll filename' };
       }
-      const [, contractNum, borough, weekStartStr] = match;
-      const weekStart = new Date(weekStartStr + 'T12:00:00');
-
-      // Derive contractor + per-WO list from Daily Sign-In Data — same
-      // source the Production Log branch uses — so archiving works as
-      // long as Field Reports have been submitted for the payroll week.
-      // Contract Lookup is only a last-resort fallback when no activity
-      // has been logged for that week (rare, but leaves an archive path
-      // instead of a failure).
-      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
+      const [, contractNum, borough, weekDateStr] = match;
+      // Current convention: filename encodes the week START (Monday).
+      // Older files generated before that change used the week END
+      // (Sunday). Try the current interpretation first; if it turns up
+      // no Field Reports, fall back to reading the date as week END
+      // (weekStart = parsedDate - 6 days) so pre-change files still
+      // archive cleanly.
+      let weekStart = new Date(weekDateStr + 'T12:00:00');
+      let wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
+      if (wos.length === 0) {
+        const asWeekEnd = new Date(weekDateStr + 'T12:00:00');
+        asWeekEnd.setDate(asWeekEnd.getDate() - 6);
+        const woFallback = getWOsForPayrollWeek_(contractNum, borough, asWeekEnd, ss);
+        if (woFallback.length > 0) {
+          Logger.log(`ℹ️ ${cleanName}: no activity for week-of-${weekDateStr}; matched week-of-${Utilities.formatDate(asWeekEnd, CONFIG.TIMEZONE, 'yyyy-MM-dd')} — legacy weekEnd filename`);
+          weekStart = asWeekEnd;
+          wos = woFallback;
+        }
+      }
       let contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
       if (!contractor) {
         const clSheet = ss.getSheetByName('Contract Lookup');
@@ -1283,7 +1292,7 @@ function archiveDocument_(file, docType, woId, ss) {
       if (!contractor) {
         return {
           success: false,
-          reason: `No contractor found — no Field Reports logged for contract ${contractNum}/${borough} during week of ${weekStartStr}, and Contract Lookup has no matching row either. Add a Field Report for the week or a Contract Lookup entry.`
+          reason: `No contractor found — no Field Reports logged for contract ${contractNum}/${borough} during week of ${weekDateStr}, and Contract Lookup has no matching row either. Add a Field Report for the week or a Contract Lookup entry.`
         };
       }
 
@@ -1763,7 +1772,11 @@ function generateCertifiedPayroll(weekStartStr) {
     const cpFolder = getOrCreateSubfolder_(
       DriveApp.getFolderById(cpProps.getProperty('NEEDS_REVIEW_ID')), 'Certified Payroll'
     );
-    const cpJsonName = `Certified_Payroll_${contractNum}_${borough}_${Utilities.formatDate(weekEnd, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
+    // Filename uses the week START date (Monday) — reads naturally as
+    // "week of 2026-04-20" and matches the semantic in the archive code.
+    // The form still prints "WEEK ENDING DATE" (Sunday) in its header
+    // because that's the standard payroll convention on the form itself.
+    const cpJsonName = `Certified_Payroll_${contractNum}_${borough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
     cpFolder.createFile(cpJsonName, JSON.stringify(cpJson, null, 2), MimeType.PLAIN_TEXT);
     Logger.log(`✅ Certified payroll JSON exported: ${cpJsonName}`);
     // ─────────────────────────────────────────────────────────────────────────
