@@ -1261,25 +1261,9 @@ function archiveDocument_(file, docType, woId, ss) {
       if (!match) {
         return { success: false, reason: 'Could not parse contract info from Certified Payroll filename' };
       }
-      const [, contractNum, borough, weekDateStr] = match;
-      // Current convention: filename encodes the week START (Monday).
-      // Older files generated before that change used the week END
-      // (Sunday). Try the current interpretation first; if it turns up
-      // no Field Reports, fall back to reading the date as week END
-      // (weekStart = parsedDate - 6 days) so pre-change files still
-      // archive cleanly.
-      let weekStart = new Date(weekDateStr + 'T12:00:00');
-      let wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
-      if (wos.length === 0) {
-        const asWeekEnd = new Date(weekDateStr + 'T12:00:00');
-        asWeekEnd.setDate(asWeekEnd.getDate() - 6);
-        const woFallback = getWOsForPayrollWeek_(contractNum, borough, asWeekEnd, ss);
-        if (woFallback.length > 0) {
-          Logger.log(`ℹ️ ${cleanName}: no activity for week-of-${weekDateStr}; matched week-of-${Utilities.formatDate(asWeekEnd, CONFIG.TIMEZONE, 'yyyy-MM-dd')} — legacy weekEnd filename`);
-          weekStart = asWeekEnd;
-          wos = woFallback;
-        }
-      }
+      const [, contractNum, borough, weekStartStr] = match;
+      const weekStart = new Date(weekStartStr + 'T12:00:00');
+      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
       let contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
       if (!contractor) {
         const clSheet = ss.getSheetByName('Contract Lookup');
@@ -1292,7 +1276,7 @@ function archiveDocument_(file, docType, woId, ss) {
       if (!contractor) {
         return {
           success: false,
-          reason: `No contractor found — no Field Reports logged for contract ${contractNum}/${borough} during week of ${weekDateStr}, and Contract Lookup has no matching row either. Add a Field Report for the week or a Contract Lookup entry.`
+          reason: `No contractor found — no Field Reports logged for contract ${contractNum}/${borough} during week of ${weekStartStr}, and Contract Lookup has no matching row either. Add a Field Report for the week or a Contract Lookup entry.`
         };
       }
 
