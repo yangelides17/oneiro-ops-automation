@@ -251,12 +251,11 @@ def build_field_map(data: dict) -> dict:
         f[f'ANNUALIZED HOURLY RATERow{n}']         = str(worker.get('annualized_rate', ''))
 
     # ── Signature ─────────────────────────────────────────────────────────────
-    # Left blank intentionally.  OFFICER OR PRINCIPAL (print), TITLE,
-    # DATE, YEAR, and the signature line are now populated at approval
-    # time by the webapp's /api/approvals/:fileId/approve-cert-payroll
-    # endpoint (pdf-lib fills the text fields + overlays the signature
-    # PNG).  Filling them here would cause overlapping text when the
-    # principal signs.
+    sig = data.get('signatory', {})
+    f['OFFICER OR PRINCIPAL (print)'] = str(sig.get('name', ''))
+    f['TITLE'] = str(sig.get('title', ''))
+    f['DATE']  = str(sig.get('date', ''))
+    f['YEAR']  = str(sig.get('year', ''))
 
     return f
 
