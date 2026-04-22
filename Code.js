@@ -86,6 +86,7 @@ function setupAutomation() {
   Logger.log('NEEDS_REVIEW_ID: ' + props.getProperty('NEEDS_REVIEW_ID'));
   Logger.log('APPROVED_SENT_ID: ' + props.getProperty('APPROVED_SENT_ID'));
   Logger.log('ARCHIVE_ID: ' + props.getProperty('ARCHIVE_ID'));
+  Logger.log('ARCHIVE_ERRORS_ID: ' + props.getProperty('ARCHIVE_ERRORS_ID'));
   Logger.log('TEMPLATES_ID: ' + props.getProperty('TEMPLATES_ID'));
 }
 
@@ -100,18 +101,23 @@ function createFolderStructure_() {
   const archive = root.createFolder('🗂️ Archive');
   const reports = root.createFolder('📊 Reports');
   const templates = root.createFolder('⚙️ Templates');
-  
+
   // Needs Review subfolders
   needsReview.createFolder('Production Logs');
   needsReview.createFolder('Field Reports');
   needsReview.createFolder('Invoices');
   needsReview.createFolder('Certified Payroll');
-  
+
   // Archive subfolders by contractor
   const contractors = ['Metro Express', 'Denville', 'Delan'];
   contractors.forEach(contractor => {
     archive.createFolder(contractor);
   });
+
+  // Fallback bucket for files the approved-docs cron couldn't archive
+  // (bad filename, missing tracker row, etc).  Kept inside Archive so
+  // admins can triage it alongside the rest of the archived content.
+  const archiveErrors = archive.createFolder('⚠️ Archive Errors');
   
   // Reports subfolders
   reports.createFolder('Weekly Payroll Reports');
@@ -123,6 +129,7 @@ function createFolderStructure_() {
   props.setProperty('NEEDS_REVIEW_ID', needsReview.getId());
   props.setProperty('APPROVED_SENT_ID', approvedSent.getId());
   props.setProperty('ARCHIVE_ID', archive.getId());
+  props.setProperty('ARCHIVE_ERRORS_ID', archiveErrors.getId());
   props.setProperty('TEMPLATES_ID', templates.getId());
   
   return root;
@@ -1086,31 +1093,57 @@ function processApprovedDocuments() {
       Logger.log(`📨 Sent ${docType} to ${recipients.map(r => r.email).join(', ')}`);
     }
     
-    // Archive the file
-    archiveDocument_(file, docType, woId, ss);
+    // Archive the file.  archiveDocument_ never throws — it returns a
+    // result so we can branch on failure and preserve the file rather
+    // than trashing it into the void.
+    const archiveResult = archiveDocument_(file, docType, woId, ss);
 
-    // Build detailed log summary
     const recipientList = recipients.length > 0
       ? recipients.map(r => `${r.name} <${r.email}>`).join('; ')
       : 'No recipients (archive only)';
-    const archiveNote = docType === 'Production Log' || docType === 'Certified Payroll'
-      ? `Archived to master folder + duplicated into WO subfolder(s)`
-      : woId
-        ? `Archived to WO folder: ${woId}`
-        : `Archived (doc type: ${docType})`;
-
-    // Log to Automation Log tab before deleting
     const logSheet = ss.getSheetByName('Automation Log');
-    logSheet.appendRow([
-      new Date(), 'Approve & Send', 'File moved to Approved Docs folder',
-      fileName,
-      `Emailed to: ${recipientList} | ${archiveNote}`,
-      'Completed', '', 'No'
-    ]);
 
-    // Delete from Approved Docs — archive is now the single source of truth
-    file.setTrashed(true);
-    Logger.log(`🗑️ Deleted from Approved Docs: ${fileName}`);
+    if (archiveResult.success) {
+      const archiveNote = docType === 'Production Log' || docType === 'Certified Payroll'
+        ? `Archived to master folder + duplicated into WO subfolder(s)`
+        : woId
+          ? `Archived to WO folder: ${woId}`
+          : `Archived (doc type: ${docType})`;
+
+      logSheet.appendRow([
+        new Date(), 'Approve & Send', 'File moved to Approved Docs folder',
+        fileName,
+        `Emailed to: ${recipientList} | ${archiveNote}`,
+        'Completed', '', 'No'
+      ]);
+
+      // Delete from Approved Docs — archive is now the single source of truth
+      file.setTrashed(true);
+      Logger.log(`🗑️ Deleted from Approved Docs: ${fileName}`);
+    } else {
+      // Archive failed — preserve the file in ⚠️ Archive Errors so admin
+      // can diagnose + re-file manually, rather than silently trashing it.
+      const errorsFolder = getOrCreateArchiveErrorsFolder_();
+      if (errorsFolder) {
+        try {
+          file.moveTo(errorsFolder);
+          Logger.log(`⚠️ Archive failed for ${fileName} — moved to ⚠️ Archive Errors (reason: ${archiveResult.reason})`);
+        } catch (moveErr) {
+          // Last-resort: couldn't even move it. Leave it where it is so the
+          // next tick retries; make the failure loud in the log.
+          Logger.log(`❌ Could not move ${fileName} to Archive Errors: ${moveErr && moveErr.stack || moveErr}`);
+        }
+      } else {
+        Logger.log(`❌ Archive failed for ${fileName} AND Archive Errors folder unavailable — leaving in Approved Docs for retry. Reason: ${archiveResult.reason}`);
+      }
+
+      logSheet.appendRow([
+        new Date(), 'Approve & Send', 'Archive failed — moved to Archive Errors',
+        fileName,
+        `Reason: ${archiveResult.reason} | Emailed to: ${recipientList}`,
+        'Error', '', 'Yes'
+      ]);
+    }
   }
 }
 
@@ -1161,14 +1194,18 @@ function getRecipientsForDoc_(docType, woId, ss) {
  *     │     └── Photos/             ← only subfolder inside a WO
  *     ├── Production Logs/          ← master copy; also duplicated into each WO folder
  *     └── Certified Payroll/        ← master copy; also duplicated into each WO folder
+ *
+ * Returns { success: boolean, reason?: string }.  On failure the caller
+ * is responsible for preserving the file (moveTo Archive Errors) rather
+ * than trashing it, so nothing is ever lost to a bad filename, missing
+ * tracker row, or transient Drive error.
  */
 function archiveDocument_(file, docType, woId, ss) {
   try {
     const props = PropertiesService.getScriptProperties();
     const archiveId = props.getProperty('ARCHIVE_ID');
     if (!archiveId) {
-      Logger.log(`⚠️ ARCHIVE_ID not set — skipping archive for ${file.getName()}`);
-      return;
+      return { success: false, reason: 'ARCHIVE_ID not set' };
     }
 
     const archiveRoot = DriveApp.getFolderById(archiveId);
@@ -1177,25 +1214,29 @@ function archiveDocument_(file, docType, woId, ss) {
     if (docType === 'Field Report' || docType === 'Invoice' || docType === 'Sign-In') {
       // Single doc — file directly inside the WO subfolder, no type subfolder
       if (!woId) {
-        Logger.log(`⚠️ ${docType} has no WO # in filename — skipping archive for ${cleanName}`);
-        return;
+        return { success: false, reason: `${docType} has no WO # in filename` };
       }
       const woFolder = getWOFolder_(archiveRoot, woId, ss);
-      if (woFolder) {
-        file.makeCopy(cleanName, woFolder);
-        Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
-      } else {
-        Logger.log(`⚠️ Could not resolve WO folder for ${docType} ${woId} — file will be lost from archive`);
+      if (!woFolder) {
+        return { success: false, reason: `Could not resolve WO folder for ${docType} ${woId} — is it missing from the Work Order Tracker?` };
       }
+      file.makeCopy(cleanName, woFolder);
+      Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
+      return { success: true };
 
     } else if (docType === 'Production Log') {
       // Parse date from filename: Production_Log_YYYY-MM-DD.txt
       const dateMatch = cleanName.match(/(\d{4}-\d{2}-\d{2})/);
-      if (!dateMatch) { Logger.log('❌ Could not parse date from Production Log filename'); return; }
+      if (!dateMatch) {
+        return { success: false, reason: 'Could not parse date from Production Log filename' };
+      }
       const logDate = new Date(dateMatch[1] + 'T12:00:00');
 
       // Group WOs worked that day by contractor/contract/borough
       const wosByContract = getWOsForDate_(logDate, ss);
+      if (Object.keys(wosByContract).length === 0) {
+        return { success: false, reason: `No WOs found in Daily Sign-In Data for ${dateMatch[1]} — nothing to archive the Production Log against` };
+      }
 
       Object.entries(wosByContract).forEach(([key, wos]) => {
         const [contractor, contractNum, borough] = key.split('|');
@@ -1212,18 +1253,24 @@ function archiveDocument_(file, docType, woId, ss) {
         });
         Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
       });
+      return { success: true };
 
     } else if (docType === 'Certified Payroll') {
       // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD.txt
       const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
-      if (!match) { Logger.log('❌ Could not parse contract info from Certified Payroll filename'); return; }
+      if (!match) {
+        return { success: false, reason: 'Could not parse contract info from Certified Payroll filename' };
+      }
       const [, contractNum, borough, weekStartStr] = match;
       const weekStart = new Date(weekStartStr + 'T12:00:00');
 
       // Look up contractor from Contract Lookup
       const clData = ss.getSheetByName('Contract Lookup').getDataRange().getValues();
       const clRow = clData.find(r => String(r[0]).includes(contractNum) && String(r[1]) === borough);
-      const contractor = clRow ? String(clRow[5]).split(',')[0].trim() : 'General';
+      if (!clRow) {
+        return { success: false, reason: `Contract Lookup has no row matching contract ${contractNum} / borough ${borough}` };
+      }
+      const contractor = String(clRow[5]).split(',')[0].trim() || 'General';
 
       const contractFolder = getOrCreateSubfolder_(
         getOrCreateSubfolder_(archiveRoot, contractor),
@@ -1238,14 +1285,45 @@ function archiveDocument_(file, docType, woId, ss) {
         file.makeCopy(cleanName, woFolder);
       });
       Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+      return { success: true };
+
     } else {
-      Logger.log(`⚠️ Unknown docType '${docType}' for ${cleanName} — no archive path defined`);
+      return { success: false, reason: `Unknown docType '${docType}' — no archive path defined` };
     }
   } catch (err) {
-    // Never let an archive failure bubble up into the caller — we want the rest of the
-    // approved-docs loop (email, delete, other files) to keep moving even if one archive fails.
-    Logger.log(`❌ archiveDocument_ failed for ${file.getName()} (${docType}/${woId}): ${err && err.stack || err}`);
+    const stack = err && err.stack || String(err);
+    Logger.log(`❌ archiveDocument_ threw for ${file.getName()} (${docType}/${woId}): ${stack}`);
+    return { success: false, reason: `Exception: ${err && err.message || err}` };
   }
+}
+
+/**
+ * Safety net for the approved-docs pipeline: returns the Drive folder
+ * where files land when archiveDocument_ can't file them normally
+ * (missing tracker row, unparsable filename, Drive hiccup, etc). Sits
+ * inside the Archive folder itself so admins can open it alongside the
+ * rest of the archive to triage.
+ *
+ * Creates the folder + caches the ID the first time it's called, so
+ * old deployments pick it up without needing a re-run of
+ * createFolderStructure_.
+ */
+function getOrCreateArchiveErrorsFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const cached = props.getProperty('ARCHIVE_ERRORS_ID');
+  if (cached) {
+    try { return DriveApp.getFolderById(cached); } catch (e) {
+      Logger.log(`⚠️ Cached ARCHIVE_ERRORS_ID is stale (${cached}) — recreating`);
+    }
+  }
+  const archiveId = props.getProperty('ARCHIVE_ID');
+  if (!archiveId) {
+    Logger.log('❌ Cannot create Archive Errors folder — ARCHIVE_ID is not set');
+    return null;
+  }
+  const errors = getOrCreateSubfolder_(DriveApp.getFolderById(archiveId), '⚠️ Archive Errors');
+  props.setProperty('ARCHIVE_ERRORS_ID', errors.getId());
+  return errors;
 }
 
 /** Get or create the WO-level subfolder: Archive/Contractor/Contract-Borough/WO#-Location */
