@@ -505,19 +505,9 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const dateStr = `${pick('month')}/${pick('day')}`
     const yearStr = pick('year')
 
-    // Match the rest of the form (9pt Arial per the template's /DA).
-    // Without setFontSize, pdf-lib renders at its default ~12pt which
-    // looks huge next to the pre-filled cells.
-    const CERT_PAYROLL_FONT_SIZE = 9
     const trySetText = (fieldName, value) => {
-      try {
-        const tf = form.getTextField(fieldName)
-        tf.setText(String(value || ''))
-        try { tf.setFontSize(CERT_PAYROLL_FONT_SIZE) }
-        catch (e) { /* some templates don't accept setFontSize — soft fail */ }
-      } catch (e) {
-        console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`)
-      }
+      try { form.getTextField(fieldName).setText(String(value || '')) }
+      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
     }
     trySetText('OFFICER OR PRINCIPAL (print)', name)
     trySetText('TITLE',                        title)
