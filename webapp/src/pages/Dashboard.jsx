@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
@@ -12,6 +12,257 @@ async function fetchDashboard() {
   const data = await res.json()
   if (data.error) throw new Error(data.error)
   return data
+}
+
+// ── Date helpers ──────────────────────────────────────────────
+const isoToday = () => {
+  const d = new Date()
+  return [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-')
+}
+// Monday on-or-before the given local-date ISO string. Sun → 6 days
+// back; Mon → 0; otherwise day-1 back.  Operates on parsed local Date
+// so DST transitions don't skew by an hour.
+function mondayOnOrBefore(isoYmd) {
+  const [y, m, d] = isoYmd.split('-').map(Number)
+  const dt = new Date(y, m-1, d)
+  const dow = dt.getDay()   // 0=Sun, 1=Mon, ..., 6=Sat
+  const delta = dow === 0 ? -6 : 1 - dow
+  dt.setDate(dt.getDate() + delta)
+  return [dt.getFullYear(), String(dt.getMonth()+1).padStart(2,'0'), String(dt.getDate()).padStart(2,'0')].join('-')
+}
+const thisWeekMondayIso = () => mondayOnOrBefore(isoToday())
+const lastWeekMondayIso = () => {
+  const [y, m, d] = thisWeekMondayIso().split('-').map(Number)
+  const dt = new Date(y, m-1, d); dt.setDate(dt.getDate() - 7)
+  return [dt.getFullYear(), String(dt.getMonth()+1).padStart(2,'0'), String(dt.getDate()).padStart(2,'0')].join('-')
+}
+
+// Turn a "YYYY-MM-DD" into "M/D/YYYY" for user-facing messages.
+const prettyDate = (iso) => {
+  if (!iso) return ''
+  const [y, m, d] = iso.split('-').map(Number)
+  return `${m}/${d}/${y}`
+}
+
+// ── Tools dropdown ────────────────────────────────────────────
+// Lives next to "Refresh" in the Dashboard header.  Surfaces the
+// same operations that used to live in the spreadsheet's custom menu
+// (generate daily docs, generate certified payroll) so we don't
+// depend on the standalone-script onOpen trigger, which has been
+// flaky to install.
+function ToolsMenu() {
+  const [open,     setOpen]     = useState(false)
+  const [picker,   setPicker]   = useState(null)   // null | 'daily' | 'cert'
+  const [pickerVal,setPickerVal]= useState('')
+  const [busy,     setBusy]     = useState(false)
+  const [toast,    setToast]    = useState(null)   // { ok, msg }
+  const wrapRef = useRef(null)
+
+  // Close on outside-click / Esc (matches RowKebab pattern).
+  useEffect(() => {
+    if (!open && !picker) return
+    const h = (e) => {
+      if (!wrapRef.current) return
+      if (wrapRef.current.contains(e.target)) return
+      setOpen(false); setPicker(null)
+    }
+    const esc = (e) => {
+      if (e.key === 'Escape') { setOpen(false); setPicker(null) }
+    }
+    document.addEventListener('mousedown', h)
+    document.addEventListener('keydown', esc)
+    return () => {
+      document.removeEventListener('mousedown', h)
+      document.removeEventListener('keydown', esc)
+    }
+  }, [open, picker])
+
+  // Auto-dismiss the toast after 6s so it doesn't pile up if the
+  // user clicks several items in succession.
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 6000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  async function runDailyDocs(isoDate) {
+    setBusy(true); setOpen(false); setPicker(null); setToast(null)
+    try {
+      const res = await fetch('/api/tools/daily-documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: isoDate || '' }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      const when = isoDate ? prettyDate(isoDate) : 'today'
+      const n    = data.entries_found ?? 0
+      setToast({
+        ok: true,
+        msg: n > 0
+          ? `Daily documents generated for ${when} — ${n} sign-in entr${n === 1 ? 'y' : 'ies'} processed. Check "Docs Needing Review" in Drive.`
+          : `No sign-in entries found for ${when}. Nothing generated.`,
+      })
+    } catch (err) {
+      setToast({ ok: false, msg: err.message || 'Failed to generate daily documents' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runCertPayroll(isoWeekStart) {
+    setBusy(true); setOpen(false); setPicker(null); setToast(null)
+    try {
+      const res = await fetch('/api/tools/certified-payroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ week_start: isoWeekStart }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      const n = data.contract_groups ?? 0
+      setToast({
+        ok: true,
+        msg: n > 0
+          ? `Certified payroll generated for week of ${prettyDate(isoWeekStart)} — ${n} contract group${n === 1 ? '' : 's'}. Check "Docs Needing Review → Certified Payroll" in Drive.`
+          : `No sign-in entries found for week of ${prettyDate(isoWeekStart)}. Nothing generated.`,
+      })
+    } catch (err) {
+      setToast({ ok: false, msg: err.message || 'Failed to generate certified payroll' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function openPicker(kind) {
+    setPicker(kind)
+    setOpen(false)
+    // Sensible defaults for each picker.
+    setPickerVal(kind === 'daily' ? isoToday() : thisWeekMondayIso())
+  }
+
+  function submitPicker() {
+    if (!pickerVal) return
+    if (picker === 'daily') runDailyDocs(pickerVal)
+    else if (picker === 'cert') {
+      // Snap the chosen date to the Monday of that week so the
+      // generator always receives a valid week-start.
+      runCertPayroll(mondayOnOrBefore(pickerVal))
+    }
+  }
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => setOpen(v => !v)}
+        className="btn-ghost flex items-center gap-1.5 disabled:opacity-50"
+      >
+        {busy ? <span className="animate-spin inline-block">⟳</span> : <span>🛠️</span>}
+        Tools
+        <span className="text-xs opacity-60">▾</span>
+      </button>
+
+      {open && (
+        <div className="absolute right-0 mt-1 z-30 min-w-[280px]
+                        bg-white rounded-lg shadow-lg border border-slate-200
+                        py-1 text-sm overflow-hidden">
+          <p className="px-3 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            Generate Daily Documents
+          </p>
+          <button className="tools-item" onClick={() => runDailyDocs('')}>
+            Today ({prettyDate(isoToday())})
+          </button>
+          <button className="tools-item" onClick={() => openPicker('daily')}>
+            Custom date…
+          </button>
+
+          <div className="my-1 border-t border-slate-100" />
+
+          <p className="px-3 pt-1 pb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            Generate Certified Payroll
+          </p>
+          <button className="tools-item" onClick={() => runCertPayroll(thisWeekMondayIso())}>
+            This week (week of {prettyDate(thisWeekMondayIso())})
+          </button>
+          <button className="tools-item" onClick={() => runCertPayroll(lastWeekMondayIso())}>
+            Last week (week of {prettyDate(lastWeekMondayIso())})
+          </button>
+          <button className="tools-item" onClick={() => openPicker('cert')}>
+            Custom week…
+          </button>
+        </div>
+      )}
+
+      {picker && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}
+          onClick={() => setPicker(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <h2 className="text-lg font-black text-navy">
+              {picker === 'daily' ? 'Pick a date' : 'Pick any date in the target week'}
+            </h2>
+            <p className="text-xs text-slate-500 leading-snug">
+              {picker === 'daily'
+                ? 'Generates Sign-In Log, Production Log, and Contractor Field Reports for every work order with crew activity on this date.'
+                : `We'll run certified payroll for the Monday-Sunday week containing the date you pick. Chosen date snaps to its week's Monday automatically.`}
+            </p>
+            <input
+              type="date"
+              value={pickerVal}
+              onChange={e => setPickerVal(e.target.value)}
+              className="field-input w-full"
+            />
+            {picker === 'cert' && pickerVal && (
+              <p className="text-[11px] text-slate-500">
+                Will run for week of <span className="font-mono">{prettyDate(mondayOnOrBefore(pickerVal))}</span>
+              </p>
+            )}
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setPicker(null)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold bg-slate-100 text-slate-600 hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={!pickerVal || busy}
+                onClick={submitPicker}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold bg-navy text-white hover:opacity-90 disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 max-w-md px-4 py-3 rounded-xl shadow-lg text-sm leading-snug
+          ${toast.ok
+            ? 'bg-green-50 border border-green-200 text-green-800'
+            : 'bg-red-50 border border-red-200 text-red-800'}`}>
+          <div className="flex items-start justify-between gap-3">
+            <span>{toast.msg}</span>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="opacity-60 hover:opacity-100"
+              aria-label="Dismiss"
+            >✕</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 // ── Stat Card ─────────────────────────────────────────────────
@@ -199,6 +450,7 @@ export default function Dashboard() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <ToolsMenu />
           <button
             onClick={load}
             disabled={loading}

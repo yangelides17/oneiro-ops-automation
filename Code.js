@@ -2371,6 +2371,10 @@ function doPost(e) {
       return handleApproveSignInWithBytes_(body);
     } else if (action === 'set_waterblast_confirmed') {
       return handleSetWaterblastConfirmed_(body);
+    } else if (action === 'generate_daily_documents') {
+      return handleGenerateDailyDocuments_(body);
+    } else if (action === 'generate_certified_payroll') {
+      return handleGenerateCertifiedPayroll_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -3365,6 +3369,68 @@ function handleSetWaterblastConfirmed_(body) {
     wo_id: woId,
     water_blast_confirmed: newValue,
   });
+}
+
+
+/**
+ * Trigger the daily-document generator for a given date.  Used by the
+ * webapp's Dashboard "Tools" menu now that the standalone script's
+ * custom menu isn't firing reliably.
+ *
+ * body.data = { date: 'MM/DD/YYYY' | 'YYYY-MM-DD' | '' }
+ *   Empty string → today.
+ *
+ * Returns { success, date_used, entries_found }.
+ */
+function handleGenerateDailyDocuments_(body) {
+  const d       = body.data || {};
+  const dateStr = String(d.date || '').trim();
+  try {
+    // generateDailyDocuments(dateStr) accepts anything Date parses
+    // (MM/DD/YYYY, YYYY-MM-DD, empty → today).  No return value today,
+    // so fetch the entry count ourselves for the UI.
+    generateDailyDocuments(dateStr);
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const targetDate = dateStr ? new Date(dateStr) : new Date();
+    const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+    let entries = 0;
+    data.slice(1).forEach(row => {
+      if (!row[0]) return;
+      if (new Date(row[0]).toDateString() === targetDate.toDateString()) entries += 1;
+    });
+    return jsonResponse_({
+      success:        true,
+      date_used:      Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'MM/dd/yyyy'),
+      entries_found:  entries,
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+
+/**
+ * Trigger the certified-payroll generator for a given week-start
+ * (Monday, MM/DD/YYYY).  Webapp Dashboard "Tools" menu surface.
+ *
+ * body.data = { week_start: 'MM/DD/YYYY' }
+ *
+ * Returns { success, week_start, contract_groups }.
+ */
+function handleGenerateCertifiedPayroll_(body) {
+  const d         = body.data || {};
+  const weekStart = String(d.week_start || '').trim();
+  if (!weekStart) return jsonResponse_({ error: 'Missing week_start' }, 400);
+  try {
+    const count = generateCertifiedPayroll(weekStart);
+    return jsonResponse_({
+      success:          true,
+      week_start:       weekStart,
+      contract_groups:  count,
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
 }
 
 

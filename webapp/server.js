@@ -205,6 +205,46 @@ app.post('/api/field-report', async (req, res) => {
 })
 
 /**
+ * POST /api/tools/daily-documents
+ * Runs the daily-document generator. Body: { date?: 'YYYY-MM-DD' }.
+ * Empty/missing date → today.  Replaces the "Generate Daily Documents"
+ * items on the spreadsheet's custom menu, which stopped firing
+ * reliably from standalone-script installable onOpen.
+ */
+app.post('/api/tools/daily-documents', async (req, res) => {
+  try {
+    const { date } = req.body || {}
+    const data = await callAppsScript('generate_daily_documents', { date: date || '' })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/tools/daily-documents error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/tools/certified-payroll
+ * Runs the certified-payroll generator for a given Monday-starting
+ * week. Body: { week_start: 'YYYY-MM-DD' }.  Converted to MM/DD/YYYY
+ * here so the Apps Script handler can parse it verbatim.
+ */
+app.post('/api/tools/certified-payroll', async (req, res) => {
+  try {
+    const { week_start } = req.body || {}
+    if (!week_start || !/^\d{4}-\d{2}-\d{2}$/.test(String(week_start))) {
+      return res.status(400).json({ error: 'Missing or malformed week_start (expected YYYY-MM-DD)' })
+    }
+    const [y, m, d] = String(week_start).split('-')
+    const mmddyyyy = `${m}/${d}/${y}`
+    const data = await callAppsScript('generate_certified_payroll', { week_start: mmddyyyy })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/tools/certified-payroll error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is
