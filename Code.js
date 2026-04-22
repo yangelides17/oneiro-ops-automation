@@ -1874,6 +1874,41 @@ function sendDailySummary() {
 // 8. CUSTOM MENU (added to spreadsheet)
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * One-off helper — run this from the Apps Script editor if the
+ * "🔧 Oneiro Automation" menu isn't appearing in the spreadsheet.
+ *
+ * Standalone scripts occasionally lose the installable onOpen trigger
+ * after an OAuth re-grant. The symptom is "From spreadsheet" no longer
+ * appearing as an event source in the Triggers UI dropdown, because
+ * the script's binding to the target spreadsheet was cleared.
+ *
+ * This function deletes any stale onOpen triggers, then creates a new
+ * one programmatically via ScriptApp.newTrigger — which also
+ * re-establishes the script→spreadsheet binding and prompts for OAuth
+ * approval on first run.  Does NOT touch other triggers (scan inbox
+ * poll, approved docs cron) or the folder structure.
+ */
+function reinstallMenuTrigger() {
+  // Wipe any existing onOpen triggers on this project
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'onOpen') {
+      ScriptApp.deleteTrigger(t);
+      removed += 1;
+    }
+  });
+
+  // Recreate, bound to the configured spreadsheet
+  ScriptApp.newTrigger('onOpen')
+    .forSpreadsheet(SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID))
+    .onOpen()
+    .create();
+
+  Logger.log(`✅ onOpen trigger reinstalled (removed ${removed} stale trigger(s)). Close + reopen the spreadsheet to see the menu.`);
+}
+
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🔧 Oneiro Automation')
