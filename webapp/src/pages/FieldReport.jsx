@@ -585,12 +585,56 @@ export default function FieldReport() {
 
   const selectedWO = wos.find(w => w.id === selectedWOId) ?? null
 
+  // ── MMA waterblasting gate ──────────────────────────────────────
+  // Only MMA WOs (water_blast_required === 'Yes - MMA') need the
+  // confirmation toggle. Thermo WOs stay "N/A" in col 13 and never
+  // see the gate.  Toggle locks once confirmed — 3-dot menu → Edit
+  // reopens the unlock path for the rare "oops, wasn't actually done"
+  // case.
+  const isMMAJob    = selectedWO?.water_blast_required === 'Yes - MMA'
+  const wbConfirmed = selectedWO?.water_blast_confirmed === 'Yes'
+  const wbGated     = isMMAJob && !wbConfirmed
+  const [wbSubmitting,    setWbSubmitting]    = useState(false)
+  const [wbConfirmModal,  setWbConfirmModal]  = useState(null)  // null | { nextValue: boolean }
+  const [wbEditUnlocked,  setWbEditUnlocked]  = useState(false) // kebab → Edit unlocks the toggle on a confirmed WO
+
+  // Reset the "unlock" state whenever the selected WO changes so the
+  // locked pill is back by default on the next WO.
+  useEffect(() => { setWbEditUnlocked(false) }, [selectedWOId])
+
+  const refreshWOs = async () => {
+    const d = await fetch('/api/wos').then(r => r.json())
+    if (d.error) throw new Error(d.error)
+    setWOs(d.wos ?? [])
+  }
+
   useEffect(() => {
-    fetch('/api/wos').then(r=>r.json())
-      .then(d=>{ if(d.error) throw new Error(d.error); setWOs(d.wos??[]) })
-      .catch(e=>setApiError(e.message))
-      .finally(()=>setLoading(false))
+    refreshWOs()
+      .catch(e => setApiError(e.message))
+      .finally(() => setLoading(false))
   }, [])
+
+  async function doSetWaterblasting(nextValue) {
+    if (!selectedWOId) return
+    setWbSubmitting(true)
+    try {
+      const res = await fetch(`/api/waterblasting/${encodeURIComponent(selectedWOId)}/confirm`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ confirmed: !!nextValue }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      await refreshWOs()
+      // Collapse the unlock once the toggle has been set, so the kebab
+      // pill is the only re-entry point for another edit.
+      setWbEditUnlocked(false)
+    } catch (err) {
+      raiseError('Could not update waterblasting status: ' + err.message)
+    } finally {
+      setWbSubmitting(false)
+    }
+  }
 
   // Load pre-populated marking items from the WO scan whenever the
   // selected WO changes.
@@ -925,6 +969,10 @@ export default function FieldReport() {
     e.preventDefault()
     setFormError('')
     if (!selectedWOId)  { raiseError('Please select a Work Order.'); return }
+    if (wbGated) {
+      raiseError('Waterblasting must be confirmed before this MMA work order can be submitted. Toggle "Waterblasting Confirmed" to Yes at the top of the page.')
+      return
+    }
     if (!workDate)      { raiseError('Please enter the date of work.'); return }
     const valid = crewMembers.filter(m=>m.name.trim())
     if (!valid.length)  { raiseError('Please add at least one crew member.'); return }
@@ -1089,6 +1137,26 @@ export default function FieldReport() {
           {selectedWO && <WOPanel wo={selectedWO} />}
         </div>
 
+        {/* 1b · Waterblasting Confirmation — MMA only */}
+        {isMMAJob && (
+          <WaterblastingCard
+            confirmed={wbConfirmed}
+            submitting={wbSubmitting}
+            editUnlocked={wbEditUnlocked}
+            onRequestToggle={(next) => setWbConfirmModal({ nextValue: next })}
+            onUnlockEdit={() => setWbEditUnlocked(true)}
+          />
+        )}
+
+        {/* Everything below the waterblasting card is gated for unconfirmed
+            MMA WOs — greyed + pointer-events-none + submit blocked, until
+            the toggle flips to Yes (either from the UI or the backend). */}
+        <fieldset
+          disabled={wbGated}
+          className={wbGated ? 'opacity-40 pointer-events-none select-none' : ''}
+        >
+        <div className="space-y-4">
+
         {/* 2 · Work Details */}
         <div className="card p-4 space-y-4">
           <p className="section-label">Work Details</p>
@@ -1244,13 +1312,113 @@ export default function FieldReport() {
           </Field>
         </div>
 
+        </div>
+        </fieldset>
+
         {/* Submit */}
-        <button type="submit" disabled={submitting} className="btn-primary w-full text-base">
-          {submitting ? (submitStep || 'Submitting…') : 'Submit Field Report'}
+        <button
+          type="submit"
+          disabled={submitting || wbGated}
+          title={wbGated ? 'Waterblasting must be confirmed before submitting this MMA work order.' : undefined}
+          className="btn-primary w-full text-base"
+        >
+          {submitting
+            ? (submitStep || 'Submitting…')
+            : wbGated
+              ? 'Waterblasting not confirmed'
+              : 'Submit Field Report'}
         </button>
 
         <div className="h-8" />
       </form>
+
+      {wbConfirmModal && (
+        <ConfirmModal
+          title={wbConfirmModal.nextValue ? 'Confirm waterblasting complete?' : 'Mark waterblasting as NOT confirmed?'}
+          message={wbConfirmModal.nextValue
+            ? 'This Work Order requires waterblasting before MMA can be applied. Confirm it has been completed on-site before the crew starts the field report.'
+            : 'The Field Report will be blocked until waterblasting is confirmed again. Continue?'}
+          confirmLabel={wbConfirmModal.nextValue ? 'Yes, confirmed' : 'Yes, unconfirm'}
+          danger={!wbConfirmModal.nextValue}
+          onConfirm={() => {
+            const next = wbConfirmModal.nextValue
+            setWbConfirmModal(null)
+            doSetWaterblasting(next)
+          }}
+          onCancel={() => setWbConfirmModal(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * WaterblastingCard — renders at the top of the Field Report whenever
+ * the selected WO is MMA work. Drives the full-page gate: crew can't
+ * submit until this flips to Yes.
+ *
+ * Visual states:
+ *   - Unconfirmed: amber banner + unlocked Yes/No toggle, explains
+ *     why the rest of the form is greyed out.
+ *   - Confirmed (locked): green pill + 3-dot kebab → "Edit" unlocks
+ *     the toggle so an accidental Yes can be corrected.
+ *   - Confirmed (unlocked via Edit): same as Unconfirmed but starts
+ *     at Yes and gives the crew a path back.
+ */
+function WaterblastingCard({ confirmed, submitting, editUnlocked, onRequestToggle, onUnlockEdit }) {
+  const showToggle = !confirmed || editUnlocked
+
+  return (
+    <div className={`card p-4 space-y-3 border-2 ${confirmed ? 'border-green-200 bg-green-50/40' : 'border-amber-300 bg-amber-50/40'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="section-label">Waterblasting Confirmation</p>
+          <p className="text-xs text-slate-500 mt-0.5 leading-snug">
+            This is an <span className="font-semibold">MMA</span> work order — waterblasting must be completed before the crew starts applying material.
+          </p>
+        </div>
+        {confirmed && !editUnlocked && (
+          <RowKebab
+            items={[
+              { label: 'Edit', onClick: onUnlockEdit },
+            ]}
+          />
+        )}
+      </div>
+
+      {showToggle ? (
+        <div className="space-y-2">
+          <label className="field-label">Waterblasting Confirmed <span className="text-red-400 ml-0.5">*</span></label>
+          <YNToggle
+            value={confirmed ? 'yes' : 'no'}
+            onChange={(next) => {
+              if (submitting) return
+              const nextBool = next === 'yes'
+              if (nextBool === confirmed) return
+              onRequestToggle(nextBool)
+            }}
+            noLabel="No — not yet"
+            yesLabel="Yes — confirmed ✓"
+          />
+          {submitting && (
+            <p className="text-xs text-slate-500 italic">Saving…</p>
+          )}
+          {!confirmed && (
+            <p className="text-xs text-amber-700 bg-amber-100/60 border border-amber-200 rounded-lg px-3 py-2 leading-snug">
+              The rest of this Field Report is locked until waterblasting is confirmed. Toggle to <span className="font-semibold">Yes</span> once it has been completed on-site.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 bg-green-100 text-green-800
+                           text-xs font-bold px-3 py-1.5 rounded-full">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 11.5L3 8l1.4-1.4L6.5 8.7l5.1-5.1L13 5l-6.5 6.5z"/></svg>
+            Confirmed
+          </span>
+          <span className="text-xs text-slate-500">Use the ⋮ menu to edit.</span>
+        </div>
+      )}
     </div>
   )
 }

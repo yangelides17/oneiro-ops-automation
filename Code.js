@@ -2296,6 +2296,8 @@ function doPost(e) {
       return handleApproveDoc_(body);
     } else if (action === 'approve_signin_with_bytes') {
       return handleApproveSignInWithBytes_(body);
+    } else if (action === 'set_waterblast_confirmed') {
+      return handleSetWaterblastConfirmed_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -3161,6 +3163,57 @@ function debugGenerateCFRForWO() {
 
 
 /**
+ * Flip "Water Blast Confirmed?" (WO Tracker col 14 / 0-idx 13) for a WO.
+ * Used by the Field Report page to gate submission on MMA jobs — crew
+ * toggles Yes when waterblasting has been completed, No to undo.
+ *
+ * body: { key, wo_id, confirmed: boolean }
+ * Writes 'Yes' or 'No' to col 14 and logs to Automation Log.
+ */
+function handleSetWaterblastConfirmed_(body) {
+  const woId      = String(body.wo_id || '').trim();
+  const confirmed = !!body.confirmed;
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+  const idx     = allRows.findIndex((r, i) => i > 0 && String(r[0]) === woId);
+  if (idx === -1) return jsonResponse_({ error: 'Work Order not found: ' + woId }, 404);
+
+  const wbRequired = String(allRows[idx][12] || '');
+  // Only MMA WOs have a meaningful confirm state. For Thermo we'd be stomping
+  // the "N/A" sentinel, which would confuse the UI + downstream logic.
+  if (wbRequired !== 'Yes - MMA') {
+    return jsonResponse_({
+      error: 'Waterblasting confirmation is only valid for MMA work orders (got water_blast_required="' + wbRequired + '")'
+    }, 400);
+  }
+
+  const newValue = confirmed ? 'Yes' : 'No';
+  // Sheet row is 1-indexed (header is row 1). WO Tracker col 13 (0-indexed)
+  // is sheet col 14 (1-indexed).
+  woSheet.getRange(idx + 1, 14).setValue(newValue);
+
+  const logSheet = ss.getSheetByName('Automation Log');
+  if (logSheet) {
+    logSheet.appendRow([
+      new Date(), 'Field Report', 'Waterblasting confirmation toggled',
+      woId,
+      `Water Blast Confirmed → ${newValue}`,
+      'Completed', '', 'No'
+    ]);
+  }
+
+  return jsonResponse_({
+    success: true,
+    wo_id: woId,
+    water_blast_confirmed: newValue,
+  });
+}
+
+
+/**
  * Trash a Drive file by ID. Used by the Python worker after it fills a PDF
  * from a JSON payload — trashing the source JSON prevents the poll loop
  * from re-processing it if the worker's local `.processed_files.json`
@@ -4007,19 +4060,24 @@ function handleGetActiveWOs_() {
   const wos = allRows.slice(1)
     .filter(r => r[0] && String(r[15]).toLowerCase() !== 'completed')
     .map(r => ({
-      id:              String(r[0]),
-      contractor:      String(r[1]),
-      contract_number: String(r[2]),
-      borough:         String(r[3]),
-      location:        String(r[5]),
-      from_street:     String(r[6]),
-      to_street:       String(r[7]),
-      due_date:        String(r[8]),
-      priority:        String(r[9]),
-      work_type:       String(r[10]),
-      status:          String(r[15]),
-      dispatch_date:   String(r[16] || ''),
-      work_start_date: String(r[17] || '')
+      id:                      String(r[0]),
+      contractor:              String(r[1]),
+      contract_number:         String(r[2]),
+      borough:                 String(r[3]),
+      location:                String(r[5]),
+      from_street:             String(r[6]),
+      to_street:               String(r[7]),
+      due_date:                String(r[8]),
+      priority:                String(r[9]),
+      work_type:               String(r[10]),
+      // cols 12/13 drive the Waterblasting Confirmed gate in the Field Report UI.
+      // water_blast_required values: 'Yes - MMA' | 'No - Thermo' | '' — set at scan time.
+      // water_blast_confirmed values: 'Yes' | 'No' | 'N/A' | '' — flipped by the toggle.
+      water_blast_required:    String(r[12] || ''),
+      water_blast_confirmed:   String(r[13] || ''),
+      status:                  String(r[15]),
+      dispatch_date:           String(r[16] || ''),
+      work_start_date:         String(r[17] || '')
     }))
     .sort((a, b) => {
       const aO = ORDER[a.status.toLowerCase()] ?? 99;
@@ -4095,6 +4153,21 @@ function handleSubmitFieldReport_(body) {
     return jsonResponse_({ error: 'Work Order not found: ' + d.wo_id }, 404);
   }
   const woRow = allRows[woRowIdx];
+
+  // ── MMA waterblasting gate ──────────────────────────────────
+  // col 12 "Water Blast Required?" → "Yes - MMA" means this is MMA work and
+  // col 13 "Water Blast Confirmed?" must be "Yes" before we accept a report.
+  // The UI greys out + disables Submit for unconfirmed MMA WOs, but we also
+  // guard server-side so a hand-crafted POST can't slip past.
+  step = 'mma waterblasting gate';
+  const wbRequired  = String(woRow[12] || '');
+  const wbConfirmed = String(woRow[13] || '');
+  if (wbRequired === 'Yes - MMA' && wbConfirmed !== 'Yes') {
+    return jsonResponse_({
+      error: 'Waterblasting not confirmed for this MMA work order — toggle ' +
+             '"Waterblasting Confirmed" at the top of the Field Report before submitting.'
+    }, 400);
+  }
 
   // ── Derive updated WO Tracker values ─────────────────────────
 

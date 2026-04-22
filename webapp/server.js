@@ -180,6 +180,28 @@ app.post('/api/field-report', async (req, res) => {
 })
 
 /**
+ * POST /api/waterblasting/:woId/confirm
+ * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
+ * (col N). MMA jobs can't have a Field Report submitted until this is
+ * "Yes" — enforced both client-side (greyed UI) and server-side (guard
+ * inside handleSubmitFieldReport_).
+ *
+ * Body: { confirmed: boolean }
+ */
+app.post('/api/waterblasting/:woId/confirm', async (req, res) => {
+  try {
+    const data = await callAppsScript('set_waterblast_confirmed', {
+      wo_id:     req.params.woId,
+      confirmed: !!req.body?.confirmed,
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/waterblasting/:woId/confirm error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/field-report/finalize
  * Triggers Sign-In + CFR JSON generation AFTER the submit returned
  * success. The client fires this as fire-and-forget so the user sees
