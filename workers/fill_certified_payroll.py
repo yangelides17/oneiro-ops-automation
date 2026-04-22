@@ -260,6 +260,44 @@ def build_field_map(data: dict) -> dict:
     return f
 
 
+def _ensure_acroform_dr(writer: PdfWriter):
+    """
+    pypdf 4.3.1 falls through to this code path at _writer.py:839 when
+    a form field references a font not in the page's /DR:
+
+        dr = acroform.get("/DR", {})
+        dr = dr.get_object().get("/Font", DictionaryObject()).get_object()
+
+    If /DR is missing the default is a plain `{}` (no .get_object()),
+    and if /DR exists but its /Font is a plain dict (not a pypdf
+    DictionaryObject), the second .get_object() call also blows up with
+    `AttributeError: 'dict' object has no attribute 'get_object'`.
+
+    Templates authored in newer Acrobat / Foxit builds sometimes ship
+    without /DR, or with an inline /DR/Font dict that pypdf doesn't
+    wrap correctly on append().  Normalize both entries so the
+    fallback path survives.  Idempotent — safe to call before every
+    fill.
+    """
+    acro = writer._root_object.get('/AcroForm')
+    if acro is None:
+        return
+    acro_obj = acro.get_object() if isinstance(acro, IndirectObject) else acro
+
+    # Normalize /DR → DictionaryObject
+    dr = acro_obj.get('/DR')
+    dr_obj = dr.get_object() if isinstance(dr, IndirectObject) else dr
+    if not isinstance(dr_obj, DictionaryObject):
+        dr_obj = DictionaryObject()
+        acro_obj[NameObject('/DR')] = dr_obj
+
+    # Normalize /DR/Font → DictionaryObject (so the final .get_object() works)
+    font = dr_obj.get('/Font')
+    font_obj = font.get_object() if isinstance(font, IndirectObject) else font
+    if not isinstance(font_obj, DictionaryObject):
+        dr_obj[NameObject('/Font')] = DictionaryObject()
+
+
 def _set_font_size(writer: PdfWriter, field_names: set, pt: float):
     """Set a fixed font size on specific fields BEFORE fill so pypdf uses it
     when generating appearance streams.  Also widens the /Rect by 4pt to give
@@ -383,6 +421,14 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     reader = PdfReader(template_path)
     writer = PdfWriter()
     writer.append(reader)
+
+    # pypdf 4.3.1 (our pinned version — see requirements.txt) crashes in
+    # _update_field_annotation when the AcroForm /DR or /DR/Font is either
+    # missing or stored as a plain inline dict without .get_object().  New
+    # Certified Payroll templates authored in newer Acrobat versions hit
+    # this.  Normalize both entries to proper DictionaryObject instances
+    # before calling update_page_form_field_values.
+    _ensure_acroform_dr(writer)
 
     # Shrink font + widen day-column fields BEFORE filling so pypdf uses the
     # updated /DA when it generates appearance streams.
