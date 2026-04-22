@@ -637,28 +637,44 @@ export default function FieldReport() {
   }
 
   // Load pre-populated marking items from the WO scan whenever the
-  // selected WO changes.
+  // selected WO changes.  Important: clear the previous WO's items
+  // *synchronously* before the fetch starts — otherwise stale rows
+  // stay visible (and editable) under the loading indicator until the
+  // new fetch returns, which caused crew to edit the wrong WO's
+  // markings. Also guard against a stale fetch clobbering the list if
+  // the user switches WOs again while the first request is still in
+  // flight.
   useEffect(() => {
+    setMarkingItems([])
+    setSelectedIds(new Set())
+    setRowSaving(new Set())
+    inFlightRef.current.clear()
+
     if (!selectedWOId) {
-      setMarkingItems([])
-      setSelectedIds(new Set())
       return
     }
+
+    let cancelled = false
     setMarkingsLoading(true)
     fetch(`/api/wo-markings/${encodeURIComponent(selectedWOId)}`)
       .then(r => r.json())
       .then(d => {
+        if (cancelled) return
         if (d.error) throw new Error(d.error)
         // Preserve sheet row order (= insertion order from the scan + any
         // earlier manual adds) — no client-side sorting needed.
         setMarkingItems(d.items || [])
-        setSelectedIds(new Set())
       })
       .catch(e => {
+        if (cancelled) return
         console.error('Failed to load marking items:', e)
         setMarkingItems([])
       })
-      .finally(() => setMarkingsLoading(false))
+      .finally(() => {
+        if (!cancelled) setMarkingsLoading(false)
+      })
+
+    return () => { cancelled = true }
   }, [selectedWOId])
 
   // Scroll the form-level error banner into view every time it's
