@@ -1030,16 +1030,34 @@ Contact Oneiro Collection LLC to pay.     BALANCE DUE           ${amount.toLocal
 /**
  * Processes documents that the admin has moved to the Approved Docs folder.
  * Automatically emails them to the correct contractor contact and files them.
+ *
+ * Wrapped in a script-wide lock so a manual run from the editor can't
+ * race the 10-min cron. Without the lock, two concurrent invocations
+ * each call file.makeCopy on the same approved doc before either one
+ * trashes it — producing duplicate archive copies in every WO folder.
  */
 function processApprovedDocuments() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    Logger.log('ℹ️ processApprovedDocuments: another invocation holds the lock — skipping this run.');
+    return;
+  }
+  try {
+    return _processApprovedDocumentsImpl_();
+  } finally {
+    try { lock.releaseLock(); } catch (e) { /* never held */ }
+  }
+}
+
+function _processApprovedDocumentsImpl_() {
   const props = PropertiesService.getScriptProperties();
   const approvedId = props.getProperty('APPROVED_SENT_ID');
   if (!approvedId) return;
-  
+
   const approvedFolder = DriveApp.getFolderById(approvedId);
   const files = approvedFolder.getFiles();
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  
+
   while (files.hasNext()) {
     const file = files.next();
     const fileName = file.getName();
