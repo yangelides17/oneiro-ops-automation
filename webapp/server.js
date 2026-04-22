@@ -256,6 +256,23 @@ app.post('/api/tools/certified-payroll', async (req, res) => {
 })
 
 /**
+ * POST /api/tools/process-approved-docs
+ * Manually fire the same function the 10-min cron runs — emails any
+ * pending doc in Approved Docs + archives it (or moves to Archive
+ * Errors on failure). Script-wide lock inside Apps Script means it's
+ * safe to fire concurrently with the cron.
+ */
+app.post('/api/tools/process-approved-docs', async (_req, res) => {
+  try {
+    const data = await callAppsScript('process_approved_documents')
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/tools/process-approved-docs error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is

@@ -110,6 +110,33 @@ function ToolsMenu() {
     }
   }
 
+  async function runProcessApproved() {
+    setBusy(true); setOpen(false); setPicker(null); setToast(null)
+    try {
+      const res = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      const archived = data.archived ?? 0
+      const errored  = data.errored ?? 0
+      let msg
+      if (data.skipped) {
+        msg = 'Another run is already in progress — it will finish shortly. No action taken.'
+      } else if (archived === 0 && errored === 0) {
+        msg = 'No pending docs in Approved Docs folder — nothing to process.'
+      } else {
+        const parts = []
+        if (archived > 0) parts.push(`archived ${archived}`)
+        if (errored > 0)  parts.push(`${errored} failed → Archive Errors`)
+        msg = `Processed approved docs: ${parts.join(', ')}.`
+      }
+      setToast({ ok: errored === 0, msg })
+    } catch (err) {
+      setToast({ ok: false, msg: err.message || 'Failed to process approved docs' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function runCertPayroll(isoWeekStart) {
     setBusy(true); setOpen(false); setPicker(null); setToast(null)
     try {
@@ -191,6 +218,15 @@ function ToolsMenu() {
           </button>
           <button className="tools-item" onClick={() => openPicker('cert')}>
             Custom week…
+          </button>
+
+          <div className="my-1 border-t border-slate-100" />
+
+          <p className="px-3 pt-1 pb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            Approved Docs
+          </p>
+          <button className="tools-item" onClick={runProcessApproved}>
+            Process approved docs now
           </button>
         </div>
       )}

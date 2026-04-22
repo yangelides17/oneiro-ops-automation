@@ -1040,7 +1040,7 @@ function processApprovedDocuments() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     Logger.log('ℹ️ processApprovedDocuments: another invocation holds the lock — skipping this run.');
-    return;
+    return { archived: 0, errored: 0, skipped: true };
   }
   try {
     return _processApprovedDocumentsImpl_();
@@ -1052,11 +1052,15 @@ function processApprovedDocuments() {
 function _processApprovedDocumentsImpl_() {
   const props = PropertiesService.getScriptProperties();
   const approvedId = props.getProperty('APPROVED_SENT_ID');
-  if (!approvedId) return;
+  if (!approvedId) return { archived: 0, errored: 0 };
 
   const approvedFolder = DriveApp.getFolderById(approvedId);
   const files = approvedFolder.getFiles();
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Counts returned to the caller (Tools menu → toast feedback).
+  let archivedCount = 0;
+  let erroredCount  = 0;
 
   while (files.hasNext()) {
     const file = files.next();
@@ -1138,6 +1142,7 @@ function _processApprovedDocumentsImpl_() {
       // Delete from Approved Docs — archive is now the single source of truth
       file.setTrashed(true);
       Logger.log(`🗑️ Deleted from Approved Docs: ${fileName}`);
+      archivedCount += 1;
     } else {
       // Archive failed — preserve the file in ⚠️ Archive Errors so admin
       // can diagnose + re-file manually, rather than silently trashing it.
@@ -1161,8 +1166,11 @@ function _processApprovedDocumentsImpl_() {
         `Reason: ${archiveResult.reason} | Emailed to: ${recipientList}`,
         'Error', '', 'Yes'
       ]);
+      erroredCount += 1;
     }
   }
+
+  return { archived: archivedCount, errored: erroredCount };
 }
 
 function getRecipientsForDoc_(docType, woId, ss) {
@@ -2375,6 +2383,8 @@ function doPost(e) {
       return handleGenerateDailyDocuments_(body);
     } else if (action === 'generate_certified_payroll') {
       return handleGenerateCertifiedPayroll_(body);
+    } else if (action === 'process_approved_documents') {
+      return handleProcessApprovedDocuments_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -3402,6 +3412,30 @@ function handleGenerateDailyDocuments_(body) {
       success:        true,
       date_used:      Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'MM/dd/yyyy'),
       entries_found:  entries,
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+
+/**
+ * Manually trigger the approved-docs email+archive cron from the
+ * webapp Dashboard's Tools menu.  Wraps processApprovedDocuments()
+ * which already uses a script-wide lock, so this is safe to run
+ * concurrently with the 10-min time-based trigger — whichever
+ * grabs the lock first does the work; the other returns 0.
+ *
+ * Returns { success, archived, errored } for the toast summary.
+ */
+function handleProcessApprovedDocuments_(body) {
+  try {
+    const result = processApprovedDocuments() || {};
+    return jsonResponse_({
+      success:   true,
+      archived:  result.archived || 0,
+      errored:   result.errored || 0,
+      skipped:   !!result.skipped,
     });
   } catch (err) {
     return jsonResponse_({ error: String(err && err.message || err) }, 500);
