@@ -97,9 +97,20 @@ export default function Approvals() {
 
   const selected = approvals?.find(a => a.file_id === selectedId) || null
 
-  // Sign-In docs route through PrincipalSignModal; everything else fires
-  // the lightweight direct approve.
+  // Sign-In + Certified Payroll route through PrincipalSignModal — they
+  // each need a principal's wet signature + printed name + title at the
+  // bottom of page 1. Everything else fires the lightweight direct approve.
   const [signingItem, setSigningItem] = useState(null)
+
+  // Map a doc_type to its sign-off endpoint.  Anything not in this map
+  // uses the plain /approve action.
+  const signOffEndpointFor = (docType, fileId) => {
+    const id = encodeURIComponent(fileId)
+    if (docType === 'signin')            return `/api/approvals/${id}/approve-signin`
+    if (docType === 'certified_payroll') return `/api/approvals/${id}/approve-cert-payroll`
+    return null
+  }
+  const needsSignOff = (docType) => !!signOffEndpointFor(docType, 'x')
 
   // Remove the just-approved item from local state + advance to next in
   // the filtered view. Shared by direct-approve and signed-approve paths.
@@ -113,8 +124,9 @@ export default function Approvals() {
   const handleApprove = async () => {
     if (!selected || approving) return
     setActionError('')
-    // Sign-In: open modal; it calls the signed endpoint on submit.
-    if (selected.doc_type === 'signin') {
+    // Sign-In + Certified Payroll: open modal; it calls the signed
+    // endpoint on submit.  Every other doc type fires a direct approve.
+    if (needsSignOff(selected.doc_type)) {
       setSigningItem(selected)
       return
     }
@@ -266,7 +278,7 @@ export default function Approvals() {
                   >
                     {approving
                       ? 'Approving…'
-                      : selected.doc_type === 'signin'
+                      : needsSignOff(selected.doc_type)
                           ? 'Approve & Sign'
                           : 'Approve'}
                   </button>
@@ -286,13 +298,13 @@ export default function Approvals() {
         </section>
       </div>
 
-      {/* Sign-In approval modal — collects principal signature + name + title,
-          then POSTs to /api/approvals/:fileId/approve-signin. pdf-lib patches
+      {/* Sign-off modal — collects principal signature + name + title,
+          then POSTs to the doc-type-specific endpoint.  pdf-lib patches
           the PDF server-side; on success the item drops out of the list. */}
       {signingItem && (
         <PrincipalSignModal
           filename={signingItem.filename}
-          signUrl={`/api/approvals/${encodeURIComponent(signingItem.file_id)}/approve-signin`}
+          signUrl={signOffEndpointFor(signingItem.doc_type, signingItem.file_id)}
           onCancel={() => setSigningItem(null)}
           onSigned={handleSignedApproved}
         />

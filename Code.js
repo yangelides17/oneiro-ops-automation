@@ -2294,8 +2294,8 @@ function doPost(e) {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
       return handleApproveDoc_(body);
-    } else if (action === 'approve_signin_with_bytes') {
-      return handleApproveSignInWithBytes_(body);
+    } else if (action === 'approve_signin_with_bytes' || action === 'approve_signed_doc_with_bytes') {
+      return handleApproveSignedDocWithBytes_(body);
     } else if (action === 'set_waterblast_confirmed') {
       return handleSetWaterblastConfirmed_(body);
     } else {
@@ -2779,15 +2779,25 @@ function handleApproveDoc_(body) {
 // upload + trash + log in one atomic move so the cron sees the signed
 // PDF immediately.
 //
-// body.data = { file_id, filename, bytes_b64 }
-//   file_id   — the ORIGINAL (unsigned) PDF's Drive file ID
-//   filename  — what to name the new signed file
-//   bytes_b64 — the patched PDF bytes, base64-encoded
-function handleApproveSignInWithBytes_(body) {
-  const d        = body.data || {};
-  const fileId   = String(d.file_id  || '').trim();
-  const filename = String(d.filename || '').trim();
-  const b64      = String(d.bytes_b64 || '');
+// body.data = { file_id, filename, bytes_b64, doc_type_label? }
+//   file_id        — the ORIGINAL (unsigned) PDF's Drive file ID
+//   filename       — what to name the new signed file
+//   bytes_b64      — the patched PDF bytes, base64-encoded
+//   doc_type_label — optional human label for the Automation Log row
+//                    (defaults to "Sign-In" for back-compat with the
+//                    original action name).  Pass "Certified Payroll"
+//                    for the cert-payroll sign-off flow.
+//
+// Back-compat: the old `approve_signin_with_bytes` action routes here
+// too.  The only thing that changes between doc types is the log label
+// and filename — everything else (Drive move + trash + audit row) is
+// identical.
+function handleApproveSignedDocWithBytes_(body) {
+  const d         = body.data || {};
+  const fileId    = String(d.file_id  || '').trim();
+  const filename  = String(d.filename || '').trim();
+  const b64       = String(d.bytes_b64 || '');
+  const docLabel  = String(d.doc_type_label || 'Sign-In').trim() || 'Sign-In';
   if (!fileId || !filename || !b64) {
     return jsonResponse_({ error: 'Missing required fields: file_id, filename, bytes_b64' }, 400);
   }
@@ -2821,7 +2831,7 @@ function handleApproveSignInWithBytes_(body) {
         .getSheetByName('Automation Log')
         .appendRow([
           new Date(), 'Approvals', 'Signed + Approved', newFile.getName(),
-          'Sign-In signed via webapp; moved to ✅ Approved Docs',
+          `${docLabel} signed via webapp; moved to ✅ Approved Docs`,
           'Pending email', '',
           'Cron will email + archive within 10 min'
         ]);

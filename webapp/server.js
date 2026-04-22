@@ -415,15 +415,124 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
 
     // 3. Upload patched bytes to Approved Docs + trash original via Apps Script
-    const result = await callAppsScript('approve_signin_with_bytes', {
-      file_id:   fileId,
-      filename:  filename,
-      bytes_b64: Buffer.from(signedBytes).toString('base64'),
+    const result = await callAppsScript('approve_signed_doc_with_bytes', {
+      file_id:        fileId,
+      filename:       filename,
+      doc_type_label: 'Sign-In',
+      bytes_b64:      Buffer.from(signedBytes).toString('base64'),
     })
     if (result.error) throw new Error(result.error)
     res.json(result)
   } catch (err) {
     console.error(`POST /api/approvals/${fileId}/approve-signin error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/approvals/:fileId/approve-cert-payroll
+ * Certified-Payroll sign-off. Mirrors the Sign-In flow: collects the
+ * principal's signature + printed name + title, patches the PDF via
+ * pdf-lib (text fields + signature overlay), and hands the signed
+ * bytes to Apps Script for move-to-Approved-Docs.
+ *
+ * The template's sign-off block (bottom of page 1, landscape letter
+ * 792x612) has four text fields and no signature rect:
+ *   OFFICER OR PRINCIPAL (print)   ← name
+ *   TITLE                          ← title
+ *   DATE                           ← MM/DD (form pre-prints the year century)
+ *   YEAR                           ← last two digits
+ * We overlay the signature PNG in the ~30pt gap directly above the
+ * OFFICER field (the form's printed signature line lives there).
+ *
+ * Body: { signature_b64: string, name: string, title: string }
+ */
+app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5mb' }), async (req, res) => {
+  const fileId = req.params.fileId
+  try {
+    const { signature_b64, name, title } = req.body || {}
+    if (!signature_b64) return res.status(400).json({ error: 'Missing signature_b64' })
+    if (!name || !String(name).trim())   return res.status(400).json({ error: 'Missing name' })
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'Missing title' })
+
+    // 1. Fetch original PDF bytes + filename from Drive
+    const fetched = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
+    if (!fetched || !fetched.data) {
+      return res.status(500).json({ error: 'Couldn\u2019t fetch PDF bytes from Drive' })
+    }
+    const pdfBytes  = Buffer.from(fetched.data, 'base64')
+    const filename  = fetched.filename
+
+    // 2. Patch with pdf-lib
+    const { PDFDocument } = await import('pdf-lib')
+    const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
+    const form   = pdfDoc.getForm()
+
+    // DATE: MM/DD in ET (form has year in the YEAR field, no century preprint mismatch)
+    // YEAR: 2-digit
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      month:    '2-digit',
+      day:      '2-digit',
+      year:     '2-digit',
+    }).formatToParts(new Date())
+    const pick = (t) => parts.find(p => p.type === t)?.value || ''
+    const dateStr = `${pick('month')}/${pick('day')}`
+    const yearStr = pick('year')
+
+    const trySetText = (fieldName, value) => {
+      try { form.getTextField(fieldName).setText(String(value || '')) }
+      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
+    }
+    trySetText('OFFICER OR PRINCIPAL (print)', name)
+    trySetText('TITLE',                        title)
+    trySetText('DATE',                         dateStr)
+    trySetText('YEAR',                         yearStr)
+
+    // Signature overlay — rect computed relative to the OFFICER field's
+    // rect on page 1 (x=1.7-229.2, y=50.5-79.3).  The printed signature
+    // line sits in the gap above it, so overlay there.
+    const SIG_BOX = {
+      x:      1.7,
+      y:      82,        // just above OFFICER field top (79.3)
+      width:  227.5,     // match OFFICER field width
+      height: 28,        // ~30pt tall band for the ink
+    }
+    const pngB64   = String(signature_b64).replace(/^data:image\/png;base64,/, '')
+    const pngBytes = Buffer.from(pngB64, 'base64')
+    const sigImage = await pdfDoc.embedPng(pngBytes)
+    try {
+      // Target page 1 explicitly — the sign-off block is there.
+      const page  = pdfDoc.getPages()[0]
+      const scale = Math.min(SIG_BOX.width / sigImage.width,
+                             SIG_BOX.height / sigImage.height)
+      const drawW = sigImage.width  * scale
+      const drawH = sigImage.height * scale
+      const drawX = SIG_BOX.x + (SIG_BOX.width  - drawW) / 2
+      const drawY = SIG_BOX.y + (SIG_BOX.height - drawH) / 2
+      page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
+    } catch (e) {
+      console.warn('pdf-lib cert-payroll signature overlay failed:', e.message)
+    }
+
+    // Flatten so the filled text renders identically across viewers.
+    try { form.flatten() }
+    catch (e) { console.warn('pdf-lib form.flatten failed:', e.message) }
+
+    const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
+
+    // 3. Hand off to Apps Script — same action as Sign-In, with a
+    //    doc_type_label so the Automation Log row says "Certified Payroll".
+    const result = await callAppsScript('approve_signed_doc_with_bytes', {
+      file_id:        fileId,
+      filename:       filename,
+      doc_type_label: 'Certified Payroll',
+      bytes_b64:      Buffer.from(signedBytes).toString('base64'),
+    })
+    if (result.error) throw new Error(result.error)
+    res.json(result)
+  } catch (err) {
+    console.error(`POST /api/approvals/${fileId}/approve-cert-payroll error:`, err.message)
     res.status(500).json({ error: err.message })
   }
 })
