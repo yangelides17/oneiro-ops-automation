@@ -1040,22 +1040,28 @@ function processApprovedDocuments() {
     // Skip already-processed files
     if (fileName.startsWith('📨')) continue;
     
-    // Determine document type and extract WO info from filename
+    // Determine document type and extract WO info from filename.
+    // WO # covers the three prefixes the parser supports (PT/RM/PM).
+    const WO_REGEX = /(PT|RM|PM)[-_]?\d+/i;
     let docType = 'Unknown';
     let woId = '';
-    
+
     if (fileName.includes('Production_Log')) {
       docType = 'Production Log';
     } else if (fileName.includes('Field_Report')) {
       docType = 'Field Report';
-      const match = fileName.match(/PT[-_]?\d+/i);
+      const match = fileName.match(WO_REGEX);
       if (match) woId = match[0];
     } else if (fileName.includes('Invoice')) {
       docType = 'Invoice';
-      const match = fileName.match(/PT[-_]?\d+/i);
+      const match = fileName.match(WO_REGEX);
       if (match) woId = match[0];
     } else if (fileName.includes('Certified_Payroll')) {
       docType = 'Certified Payroll';
+    } else if (fileName.includes('SignIn') || fileName.includes('Sign_In') || fileName.includes('Sign-In')) {
+      docType = 'Sign-In';
+      const match = fileName.match(WO_REGEX);
+      if (match) woId = match[0];
     }
     
     // Look up who to send this to
@@ -1151,77 +1157,94 @@ function getRecipientsForDoc_(docType, woId, ss) {
  * Archive a document using the correct folder structure:
  *
  *   Archive / [Contractor] / [ContractNum - Borough] /
- *     ├── PT-XXXXX - [Location] /   ← WO folder (Field Reports, Invoices filed directly here)
+ *     ├── PT-XXXXX - [Location] /   ← WO folder (Field Reports, Invoices, Sign-Ins filed directly here)
  *     │     └── Photos/             ← only subfolder inside a WO
  *     ├── Production Logs/          ← master copy; also duplicated into each WO folder
  *     └── Certified Payroll/        ← master copy; also duplicated into each WO folder
  */
 function archiveDocument_(file, docType, woId, ss) {
-  const props = PropertiesService.getScriptProperties();
-  const archiveId = props.getProperty('ARCHIVE_ID');
-  if (!archiveId) return;
-
-  const archiveRoot = DriveApp.getFolderById(archiveId);
-  const cleanName = file.getName().replace('📨 ', '');
-
-  if (docType === 'Field Report' || docType === 'Invoice') {
-    // Single doc — file directly inside the WO subfolder, no type subfolder
-    const woFolder = getWOFolder_(archiveRoot, woId, ss);
-    if (woFolder) {
-      file.makeCopy(cleanName, woFolder);
-      Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const archiveId = props.getProperty('ARCHIVE_ID');
+    if (!archiveId) {
+      Logger.log(`⚠️ ARCHIVE_ID not set — skipping archive for ${file.getName()}`);
+      return;
     }
 
-  } else if (docType === 'Production Log') {
-    // Parse date from filename: Production_Log_YYYY-MM-DD.txt
-    const dateMatch = cleanName.match(/(\d{4}-\d{2}-\d{2})/);
-    if (!dateMatch) { Logger.log('❌ Could not parse date from Production Log filename'); return; }
-    const logDate = new Date(dateMatch[1] + 'T12:00:00');
+    const archiveRoot = DriveApp.getFolderById(archiveId);
+    const cleanName = file.getName().replace('📨 ', '');
 
-    // Group WOs worked that day by contractor/contract/borough
-    const wosByContract = getWOsForDate_(logDate, ss);
+    if (docType === 'Field Report' || docType === 'Invoice' || docType === 'Sign-In') {
+      // Single doc — file directly inside the WO subfolder, no type subfolder
+      if (!woId) {
+        Logger.log(`⚠️ ${docType} has no WO # in filename — skipping archive for ${cleanName}`);
+        return;
+      }
+      const woFolder = getWOFolder_(archiveRoot, woId, ss);
+      if (woFolder) {
+        file.makeCopy(cleanName, woFolder);
+        Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
+      } else {
+        Logger.log(`⚠️ Could not resolve WO folder for ${docType} ${woId} — file will be lost from archive`);
+      }
 
-    Object.entries(wosByContract).forEach(([key, wos]) => {
-      const [contractor, contractNum, borough] = key.split('|');
+    } else if (docType === 'Production Log') {
+      // Parse date from filename: Production_Log_YYYY-MM-DD.txt
+      const dateMatch = cleanName.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!dateMatch) { Logger.log('❌ Could not parse date from Production Log filename'); return; }
+      const logDate = new Date(dateMatch[1] + 'T12:00:00');
+
+      // Group WOs worked that day by contractor/contract/borough
+      const wosByContract = getWOsForDate_(logDate, ss);
+
+      Object.entries(wosByContract).forEach(([key, wos]) => {
+        const [contractor, contractNum, borough] = key.split('|');
+        const contractFolder = getOrCreateSubfolder_(
+          getOrCreateSubfolder_(archiveRoot, contractor),
+          `${contractNum} - ${getBoroughName_(borough)}`
+        );
+        // Master copy at contract level
+        file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Production Logs'));
+        // Duplicate into each WO folder covered by this log
+        wos.forEach(wo => {
+          const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
+          file.makeCopy(cleanName, woFolder);
+        });
+        Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+      });
+
+    } else if (docType === 'Certified Payroll') {
+      // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD.txt
+      const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
+      if (!match) { Logger.log('❌ Could not parse contract info from Certified Payroll filename'); return; }
+      const [, contractNum, borough, weekStartStr] = match;
+      const weekStart = new Date(weekStartStr + 'T12:00:00');
+
+      // Look up contractor from Contract Lookup
+      const clData = ss.getSheetByName('Contract Lookup').getDataRange().getValues();
+      const clRow = clData.find(r => String(r[0]).includes(contractNum) && String(r[1]) === borough);
+      const contractor = clRow ? String(clRow[5]).split(',')[0].trim() : 'General';
+
       const contractFolder = getOrCreateSubfolder_(
         getOrCreateSubfolder_(archiveRoot, contractor),
         `${contractNum} - ${getBoroughName_(borough)}`
       );
       // Master copy at contract level
-      file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Production Logs'));
-      // Duplicate into each WO folder covered by this log
+      file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
+      // Duplicate into each WO folder worked during that payroll week for this contract
+      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
       wos.forEach(wo => {
         const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
         file.makeCopy(cleanName, woFolder);
       });
-      Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
-    });
-
-  } else if (docType === 'Certified Payroll') {
-    // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD.txt
-    const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
-    if (!match) { Logger.log('❌ Could not parse contract info from Certified Payroll filename'); return; }
-    const [, contractNum, borough, weekStartStr] = match;
-    const weekStart = new Date(weekStartStr + 'T12:00:00');
-
-    // Look up contractor from Contract Lookup
-    const clData = ss.getSheetByName('Contract Lookup').getDataRange().getValues();
-    const clRow = clData.find(r => String(r[0]).includes(contractNum) && String(r[1]) === borough);
-    const contractor = clRow ? String(clRow[5]).split(',')[0].trim() : 'General';
-
-    const contractFolder = getOrCreateSubfolder_(
-      getOrCreateSubfolder_(archiveRoot, contractor),
-      `${contractNum} - ${getBoroughName_(borough)}`
-    );
-    // Master copy at contract level
-    file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
-    // Duplicate into each WO folder worked during that payroll week for this contract
-    const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
-    wos.forEach(wo => {
-      const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
-      file.makeCopy(cleanName, woFolder);
-    });
-    Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+      Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+    } else {
+      Logger.log(`⚠️ Unknown docType '${docType}' for ${cleanName} — no archive path defined`);
+    }
+  } catch (err) {
+    // Never let an archive failure bubble up into the caller — we want the rest of the
+    // approved-docs loop (email, delete, other files) to keep moving even if one archive fails.
+    Logger.log(`❌ archiveDocument_ failed for ${file.getName()} (${docType}/${woId}): ${err && err.stack || err}`);
   }
 }
 
