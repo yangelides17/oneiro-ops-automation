@@ -3037,13 +3037,41 @@ function handleWriteWO_(body) {
 /**
  * Archive the original WO PDF scan into:
  *   Archive / [Contractor] / [ContractNum - Borough] / [WO# - Location] /
- * Then rename the original in Scan Inbox with ✅ prefix to prevent reprocessing.
+ * Then trash the original in Scan Inbox so the archive is the single
+ * source of truth. Non-fatal: the WO tracker row is already written
+ * before this runs, so an archive failure never rolls that back.
+ *
+ * Failures + successes are logged to the Automation Log sheet (not just
+ * Logger.log) so admins have a visible trail — a silent try/catch was
+ * previously leaving files stuck in Scan Inbox with no user-facing
+ * signal that anything had gone wrong.
  */
 function archiveWOFile_(fileId, d) {
+  const ss       = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const logSheet = ss.getSheetByName('Automation Log');
+  const woId     = d.work_order_id || '(unknown)';
+
   try {
     const props      = PropertiesService.getScriptProperties();
     const archiveId  = props.getProperty('ARCHIVE_ID');
-    if (!archiveId || !fileId) return;
+    if (!archiveId) {
+      const msg = 'ARCHIVE_ID script property is not set';
+      Logger.log('⚠️ archiveWOFile_: ' + msg);
+      if (logSheet) logSheet.appendRow([
+        new Date(), 'Scan Inbox Parser', 'WO PDF archive failed', woId, msg,
+        'Error', '', 'Yes — file is still in Scan Inbox'
+      ]);
+      return;
+    }
+    if (!fileId) {
+      const msg = 'No fileId provided by the worker — cannot archive';
+      Logger.log('⚠️ archiveWOFile_: ' + msg);
+      if (logSheet) logSheet.appendRow([
+        new Date(), 'Scan Inbox Parser', 'WO PDF archive failed', woId, msg,
+        'Error', '', 'Yes'
+      ]);
+      return;
+    }
 
     const file        = DriveApp.getFileById(fileId);
     const archiveRoot = DriveApp.getFolderById(archiveId);
@@ -3062,11 +3090,55 @@ function archiveWOFile_(fileId, d) {
     file.makeCopy(file.getName(), woFolder);
     file.setTrashed(true);  // delete from Scan Inbox — archive is the single source of truth
 
-    Logger.log('📁 WO PDF archived: ' + d.work_order_id + ' → ' + contractor + '/' + contractNum);
+    const pathNote = `${contractor}/${contractNum}${borough ? ' - ' + getBoroughName_(borough) : ''}/${d.work_order_id} - ${location}`;
+    Logger.log('📁 WO PDF archived: ' + woId + ' → ' + pathNote);
+    if (logSheet) logSheet.appendRow([
+      new Date(), 'Scan Inbox Parser', 'WO PDF archived', woId, pathNote,
+      'Completed', '', 'No'
+    ]);
   } catch (err) {
-    Logger.log('⚠️ Could not archive WO file: ' + err.toString());
+    const msg = (err && err.message) ? err.message : String(err);
+    Logger.log('⚠️ Could not archive WO file: ' + msg + (err && err.stack ? '\n' + err.stack : ''));
+    if (logSheet) logSheet.appendRow([
+      new Date(), 'Scan Inbox Parser', 'WO PDF archive failed', woId, `fileId=${fileId || '(none)'} | ${msg}`,
+      'Error', '', 'Yes — run retryArchiveStuckWO(\'' + woId + '\') to retry'
+    ]);
     // Non-fatal — WO row was already written to tracker
   }
+}
+
+
+/**
+ * One-off helper — run from the Apps Script editor to retry archiving
+ * a WO whose source PDF is still stuck in Scan Inbox because the
+ * original archive step threw. Finds the WO in the tracker, reads its
+ * Scan File ID (col 39 / 0-idx 38), reconstructs the archive context
+ * from the same row, and reuses archiveWOFile_.
+ *
+ * Usage (in the Apps Script editor):
+ *   retryArchiveStuckWO('RM-43316')
+ */
+function retryArchiveStuckWO(woId) {
+  if (!woId) throw new Error('retryArchiveStuckWO requires a WO # (e.g. "RM-43316")');
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const rows    = woSheet.getDataRange().getValues();
+  const row     = rows.slice(1).find(r => String(r[0]) === String(woId));
+  if (!row) throw new Error('WO not found in tracker: ' + woId);
+
+  const fileId = String(row[38] || '');
+  if (!fileId) throw new Error('No Scan File ID on row for ' + woId + ' — nothing to archive');
+
+  const d = {
+    work_order_id:    String(row[0]),
+    prime_contractor: String(row[1]),
+    contract_number:  String(row[2]),
+    borough:          String(row[3]),
+    location:         String(row[5]),
+  };
+  Logger.log('↻ Retrying archive for ' + woId + ' (fileId=' + fileId + ')');
+  archiveWOFile_(fileId, d);
+  Logger.log('✅ retryArchiveStuckWO done — check Automation Log for result');
 }
 
 
