@@ -1,6 +1,53 @@
 import { useEffect, useState } from 'react'
 import SignaturePad from './SignaturePad'
 
+// Mirrors _crop_to_ink in workers/fill_signin.py — crops a PNG data URL
+// to its non-transparent bounding box (with an 8-px margin) so the
+// server-side pdf-lib overlay doesn't scale a bunch of empty canvas.
+// Returns a fresh PNG data URL; falls back to the input on any error.
+async function cropPngToInk(dataUrl, marginPx = 8) {
+  if (!dataUrl) return dataUrl
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image()
+      i.onload = () => resolve(i)
+      i.onerror = reject
+      i.src = dataUrl
+    })
+    const c   = document.createElement('canvas')
+    c.width   = img.width
+    c.height  = img.height
+    const ctx = c.getContext('2d')
+    ctx.drawImage(img, 0, 0)
+    const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height)
+    let minX = width, minY = height, maxX = -1, maxY = -1
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (data[(y * width + x) * 4 + 3] > 0) {
+          if (x < minX) minX = x
+          if (y < minY) minY = y
+          if (x > maxX) maxX = x
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    if (maxX < 0) return dataUrl  // fully transparent → pass through
+    minX = Math.max(0, minX - marginPx)
+    minY = Math.max(0, minY - marginPx)
+    maxX = Math.min(width  - 1, maxX + marginPx)
+    maxY = Math.min(height - 1, maxY + marginPx)
+    const cw = maxX - minX + 1
+    const ch = maxY - minY + 1
+    const out = document.createElement('canvas')
+    out.width  = cw
+    out.height = ch
+    out.getContext('2d').drawImage(c, minX, minY, cw, ch, 0, 0, cw, ch)
+    return out.toDataURL('image/png')
+  } catch {
+    return dataUrl
+  }
+}
+
 /**
  * Opens before a Sign-In document gets approved. Collects the
  * principal's signature (base64 PNG), printed name, and title.
@@ -38,11 +85,14 @@ export default function PrincipalSignModal({ filename, onCancel, onSigned, signU
 
     setSubmitting(true)
     try {
+      // Crop to ink bbox before upload so the server-side overlay scales
+      // the actual signature, not a bunch of empty canvas padding.
+      const cropped = await cropPngToInk(signature)
       const res  = await fetch(signUrl, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
-          signature_b64: signature,
+          signature_b64: cropped,
           name:          name.trim(),
           title:         title.trim(),
         })

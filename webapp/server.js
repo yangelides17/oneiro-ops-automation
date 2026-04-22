@@ -327,9 +327,17 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
     const form   = pdfDoc.getForm()
 
-    // Date: today, M/D/YY (matches what fill_signin.py historically produced)
-    const now = new Date()
-    const dateStr = `${now.getMonth() + 1}/${now.getDate()}/${String(now.getFullYear()).slice(-2)}`
+    // Date: today, M/D/YY in the spreadsheet's timezone (America/New_York).
+    // Without the TZ override Node runs in UTC on Railway, which rolls over
+    // to "tomorrow" at 20:00 ET and causes the printed date to be wrong.
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone:  'America/New_York',
+      month:     'numeric',
+      day:       'numeric',
+      year:      '2-digit',
+    }).formatToParts(new Date())
+    const pick = (t) => parts.find(p => p.type === t)?.value || ''
+    const dateStr = `${pick('month')}/${pick('day')}/${pick('year')}`
 
     // Fill text fields
     const trySetText = (fieldName, value) => {
@@ -341,9 +349,13 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     trySetText('Date_Signature_Block', dateStr)
 
     // Overlay the signature PNG onto the Contractor_Signature field's rect.
-    // pdf-lib's field.acroField.getWidgets()[0].getRectangle() returns
-    // { x, y, width, height } in PDF user-space (origin bottom-left), which
-    // matches page.drawImage's coordinate system.
+    // Matches workers/fill_signin.py's crew-leader overlay: expand the
+    // rect by (h=1, v=3) points, then scale the signature to fit the
+    // expanded box while preserving aspect ratio, centered. The client
+    // already cropped the PNG to its ink bounding box, so the visible
+    // ink fills the space well.
+    const LEADER_SIG_H_PAD = 1.0
+    const LEADER_SIG_V_PAD = 3.0
     const pngB64 = String(signature_b64).replace(/^data:image\/png;base64,/, '')
     const pngBytes = Buffer.from(pngB64, 'base64')
     const sigImage = await pdfDoc.embedPng(pngBytes)
@@ -352,21 +364,20 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
       const widgets   = sigField.acroField.getWidgets()
       const widget    = widgets[0]
       const rect      = widget.getRectangle()
-      // Slight inset so the signature doesn't touch the field's border
-      const pad = 2
       const pageRef = widget.P()
-      // Find which page the widget lives on (getPage by dict ref)
       const pages = pdfDoc.getPages()
       const page = pages.find(p => p.ref === pageRef) || pages[0]
-      // Scale the signature to fit inside the rect while preserving aspect
-      const scale = Math.min(
-        (rect.width  - pad * 2) / sigImage.width,
-        (rect.height - pad * 2) / sigImage.height
-      )
+
+      const boxX = rect.x      - LEADER_SIG_H_PAD
+      const boxY = rect.y      - LEADER_SIG_V_PAD
+      const boxW = rect.width  + 2 * LEADER_SIG_H_PAD
+      const boxH = rect.height + 2 * LEADER_SIG_V_PAD
+
+      const scale = Math.min(boxW / sigImage.width, boxH / sigImage.height)
       const drawW = sigImage.width  * scale
       const drawH = sigImage.height * scale
-      const drawX = rect.x + (rect.width  - drawW) / 2
-      const drawY = rect.y + (rect.height - drawH) / 2
+      const drawX = boxX + (boxW - drawW) / 2
+      const drawY = boxY + (boxH - drawH) / 2
       page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
     } catch (e) {
       console.warn('pdf-lib signature overlay failed:', e.message)
