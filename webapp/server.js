@@ -53,8 +53,33 @@ async function callAppsScript(action, data = null) {
     body:    JSON.stringify(body)
   })
 
-  // Apps Script always returns 200; errors come in the JSON body
-  const json = await res.json()
+  // Apps Script normally returns 200 + JSON. If the deployment is in a
+  // bad state (fresh deploy that needs re-auth, URL pointing at a stale
+  // version, Google outage), it returns an HTML login/error page and
+  // res.json() throws a cryptic "Unexpected token '<'" that bubbles to
+  // the browser as a confusing JSON-parse error. Catch that shape and
+  // raise something the user can actually act on.
+  const text = await res.text()
+  const trimmed = text.trim()
+  if (trimmed.startsWith('<')) {
+    const status = res.status
+    const redirected = res.redirected ? ' (redirected — Apps Script may need re-authorization)' : ''
+    throw new Error(
+      `Apps Script returned HTML instead of JSON${redirected} — ` +
+      `action="${action}", status=${status}. ` +
+      `This usually means the Web App deployment needs to be re-authorized ` +
+      `or APPS_SCRIPT_URL is pointing at a stale deployment.`
+    )
+  }
+  let json
+  try {
+    json = JSON.parse(text)
+  } catch (e) {
+    throw new Error(
+      `Apps Script response wasn't JSON (action="${action}", status=${res.status}): ` +
+      `${text.slice(0, 200)}`
+    )
+  }
   if (json.error) throw new Error(json.error)
   return json
 }
