@@ -3324,6 +3324,33 @@ function jsonResponse_(obj, statusCode) {
 }
 
 
+/**
+ * Append a row to the Automation Log sheet. Soft-fails if the sheet is
+ * missing or append throws — logging must never take down the caller.
+ * Column order matches the rest of the codebase:
+ *   Timestamp | Source | Action | Subject | Details | Status | User | Action Needed
+ */
+function _logAutomation_(source, action, subject, details, status, actionNeeded) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName('Automation Log');
+    if (!sheet) return;
+    sheet.appendRow([
+      new Date(),
+      source   || '',
+      action   || '',
+      subject  || '',
+      details  || '',
+      status   || '',
+      '',                         // User column — no auth yet
+      actionNeeded || 'No'
+    ]);
+  } catch (err) {
+    Logger.log('⚠️ _logAutomation_ failed: ' + (err && err.message || err));
+  }
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // MARKING ITEMS — seed on scan, read for field report
 // ═══════════════════════════════════════════════════════════════
@@ -4966,9 +4993,13 @@ function handleUploadPhoto_(body) {
     return jsonResponse_({ error: 'Missing required fields: wo_id, filename, data' }, 400);
   }
 
-  const photosFolder = getWOSubfolder_(wo_id, 'Photos');
+  const { folder: photosFolder, error: folderErr } = resolveWOSubfolder_(wo_id, 'Photos');
   if (!photosFolder) {
-    return jsonResponse_({ error: 'Could not locate or create WO archive folder' }, 500);
+    _logAutomation_('Photo Upload', 'WO archive folder unreachable', wo_id,
+      `filename=${filename} | error=${folderErr}`, 'Error', 'Yes');
+    return jsonResponse_({
+      error: 'Could not locate or create WO archive folder: ' + folderErr
+    }, 500);
   }
 
   const bytes = Utilities.base64Decode(data);
@@ -5001,9 +5032,13 @@ function handleUploadSignature_(body) {
     return jsonResponse_({ error: 'Missing required fields: wo_id, crew_name, data' }, 400);
   }
 
-  const sigsFolder = getWOSubfolder_(wo_id, 'Signatures');
+  const { folder: sigsFolder, error: folderErr } = resolveWOSubfolder_(wo_id, 'Signatures');
   if (!sigsFolder) {
-    return jsonResponse_({ error: 'Could not locate or create WO archive folder' }, 500);
+    _logAutomation_('Signature Upload', 'WO archive folder unreachable', wo_id,
+      `crew=${crew_name} signature=${signature} | error=${folderErr}`, 'Error', 'Yes');
+    return jsonResponse_({
+      error: 'Could not locate or create WO archive folder: ' + folderErr
+    }, 500);
   }
 
   // Filename: "2026-04-12_John Smith_time_in.png"
@@ -5023,31 +5058,61 @@ function handleUploadSignature_(body) {
  * Helper: returns (creating if needed) a named subfolder inside the WO's archive folder.
  * Path: Archive / Contractor / ContractNum-Borough / WO#-Location / [subfolderName]
  */
+/**
+ * Resolve (and create if needed) Archive/…/WO-Location/<subfolderName>.
+ * One attempt — callers should use resolveWOSubfolder_ to get a retry
+ * wrapper + a readable error message when the whole thing fails.
+ */
 function getWOSubfolder_(wo_id, subfolderName) {
-  try {
-    const props     = PropertiesService.getScriptProperties();
-    const archiveId = props.getProperty('ARCHIVE_ID');
-    if (!archiveId) return null;
+  const props     = PropertiesService.getScriptProperties();
+  const archiveId = props.getProperty('ARCHIVE_ID');
+  if (!archiveId) throw new Error('ARCHIVE_ID script property is not set');
 
-    const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const woSheet = ss.getSheetByName('Work Order Tracker');
-    const allRows = woSheet.getDataRange().getValues();
-    const woRow   = allRows.find(r => r[0] && String(r[0]) === String(wo_id));
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const allRows = woSheet.getDataRange().getValues();
+  const woRow   = allRows.find(r => r[0] && String(r[0]) === String(wo_id));
 
-    const contractor = woRow ? String(woRow[1] || 'Unknown') : 'Unknown';
-    const contractNum = woRow ? String(woRow[2] || '').split('/')[0] : 'Unknown';
-    const borough    = woRow ? String(woRow[3] || '') : '';
-    const location   = woRow ? String(woRow[5] || wo_id) : wo_id;
+  const contractor = woRow ? String(woRow[1] || 'Unknown') : 'Unknown';
+  const contractNum = woRow ? String(woRow[2] || '').split('/')[0] : 'Unknown';
+  const borough    = woRow ? String(woRow[3] || '') : '';
+  const location   = woRow ? String(woRow[5] || wo_id) : wo_id;
 
-    const archiveRoot      = DriveApp.getFolderById(archiveId);
-    const contractorFolder = getOrCreateSubfolder_(archiveRoot, contractor);
-    const contractFolder   = getOrCreateSubfolder_(contractorFolder,
-                               contractNum + (borough ? ' - ' + getBoroughName_(borough) : ''));
-    const woFolder         = getOrCreateSubfolder_(contractFolder, wo_id + ' - ' + location);
+  const archiveRoot      = DriveApp.getFolderById(archiveId);
+  const contractorFolder = getOrCreateSubfolder_(archiveRoot, contractor);
+  const contractFolder   = getOrCreateSubfolder_(contractorFolder,
+                             contractNum + (borough ? ' - ' + getBoroughName_(borough) : ''));
+  const woFolder         = getOrCreateSubfolder_(contractFolder, wo_id + ' - ' + location);
 
-    return getOrCreateSubfolder_(woFolder, subfolderName);
-  } catch (err) {
-    Logger.log('⚠️ getWOSubfolder_ error: ' + err.toString());
-    return null;
+  return getOrCreateSubfolder_(woFolder, subfolderName);
+}
+
+
+/**
+ * Retry wrapper around getWOSubfolder_ — Drive has transient hiccups
+ * (especially under parallel photo uploads for the same WO), and the
+ * previous swallow-and-return-null behaviour turned those into opaque
+ * "Could not locate or create WO archive folder" errors in the UI with
+ * nothing in the logs.
+ *
+ * Returns { folder, error } — exactly one of the two is set. On final
+ * failure the error message is the last exception's message, so the
+ * caller can surface it to the user + record it in Automation Log.
+ */
+function resolveWOSubfolder_(wo_id, subfolderName, maxAttempts) {
+  const attempts = maxAttempts || 3;
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const folder = getWOSubfolder_(wo_id, subfolderName);
+      if (folder) return { folder, error: null };
+      lastErr = new Error('getWOSubfolder_ returned no folder');
+    } catch (err) {
+      lastErr = err;
+      Logger.log(`⚠️ resolveWOSubfolder_ attempt ${i + 1}/${attempts} failed for ${wo_id}/${subfolderName}: ${err && err.message || err}`);
+      // Short backoff — most Drive hiccups clear in well under a second.
+      if (i < attempts - 1) Utilities.sleep(500 * (i + 1));
+    }
   }
+  return { folder: null, error: (lastErr && lastErr.message) ? lastErr.message : String(lastErr) };
 }
