@@ -1264,13 +1264,28 @@ function archiveDocument_(file, docType, woId, ss) {
       const [, contractNum, borough, weekStartStr] = match;
       const weekStart = new Date(weekStartStr + 'T12:00:00');
 
-      // Look up contractor from Contract Lookup
-      const clData = ss.getSheetByName('Contract Lookup').getDataRange().getValues();
-      const clRow = clData.find(r => String(r[0]).includes(contractNum) && String(r[1]) === borough);
-      if (!clRow) {
-        return { success: false, reason: `Contract Lookup has no row matching contract ${contractNum} / borough ${borough}` };
+      // Derive contractor + per-WO list from Daily Sign-In Data — same
+      // source the Production Log branch uses — so archiving works as
+      // long as Field Reports have been submitted for the payroll week.
+      // Contract Lookup is only a last-resort fallback when no activity
+      // has been logged for that week (rare, but leaves an archive path
+      // instead of a failure).
+      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
+      let contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
+      if (!contractor) {
+        const clSheet = ss.getSheetByName('Contract Lookup');
+        const clRow = clSheet
+          ? clSheet.getDataRange().getValues()
+              .find(r => String(r[0]).includes(contractNum) && String(r[1]) === borough)
+          : null;
+        if (clRow) contractor = String(clRow[5] || '').split(',')[0].trim();
       }
-      const contractor = String(clRow[5]).split(',')[0].trim() || 'General';
+      if (!contractor) {
+        return {
+          success: false,
+          reason: `No contractor found — no Field Reports logged for contract ${contractNum}/${borough} during week of ${weekStartStr}, and Contract Lookup has no matching row either. Add a Field Report for the week or a Contract Lookup entry.`
+        };
+      }
 
       const contractFolder = getOrCreateSubfolder_(
         getOrCreateSubfolder_(archiveRoot, contractor),
@@ -1279,7 +1294,6 @@ function archiveDocument_(file, docType, woId, ss) {
       // Master copy at contract level
       file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
       // Duplicate into each WO folder worked during that payroll week for this contract
-      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
       wos.forEach(wo => {
         const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
         file.makeCopy(cleanName, woFolder);
@@ -1360,7 +1374,12 @@ function getWOsForDate_(date, ss) {
   return wosByContract;
 }
 
-/** Return unique WOs for a contract+borough during a payroll week */
+/**
+ * Return unique WOs for a contract+borough during a payroll week.
+ * Each entry: { id, location, contractor } — contractor pulled from
+ * Daily Sign-In Data's Prime Contractor column so the Cert Payroll
+ * archive path can be derived without depending on Contract Lookup.
+ */
 function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
@@ -1375,7 +1394,11 @@ function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
     const woId = row[1];
     if (seen.has(woId)) return;
     seen.add(woId);
-    wos.push({ id: woId, location: row[5] });
+    wos.push({
+      id:         woId,
+      location:   row[5],
+      contractor: String(row[2] || '').trim(),
+    });
   });
   return wos;
 }
