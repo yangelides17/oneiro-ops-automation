@@ -406,11 +406,41 @@ export default function Dashboard() {
 
   useEffect(() => { load() }, [])
 
+  // "Completed Today" is a pseudo-status — the pill adds one extra
+  // filter beyond the real WO Tracker statuses (Received / Dispatched /
+  // In Progress / Completed). Admin uses it at end-of-day to sanity-
+  // check that every WO they expected to close has its docs in the
+  // Approval queue.
+  const COMPLETED_TODAY = 'Completed Today'
+
+  // Compare a WO's Work End Date (col 18 via API `work_end`) to
+  // *today in local time*. Cell can come back as either a Date-like
+  // string ("Mon Apr 20 2026 …") or an ISO "YYYY-MM-DD" depending on
+  // how Sheets stored it, so handle both.
+  function isCompletedTodayLocal(wo) {
+    if (String(wo.status).toLowerCase() !== 'completed') return false
+    const raw = String(wo.work_end || '')
+    if (!raw) return false
+    const todayLocal = isoToday()
+    const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/)
+    if (isoMatch) return isoMatch[1] === todayLocal
+    const d = new Date(raw)
+    if (isNaN(d.getTime())) return false
+    const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0')
+    return `${y}-${m}-${dd}` === todayLocal
+  }
+
   // Filter + search WOs
   const filteredWOs = useMemo(() => {
     if (!data?.wos) return []
     return data.wos.filter(wo => {
-      if (statusFilt  !== ALL && wo.status    !== statusFilt)  return false
+      if (statusFilt !== ALL) {
+        if (statusFilt === COMPLETED_TODAY) {
+          if (!isCompletedTodayLocal(wo)) return false
+        } else if (wo.status !== statusFilt) {
+          return false
+        }
+      }
       if (contFilt    !== ALL && wo.contractor !== contFilt)   return false
       if (boroughFilt !== ALL && wo.borough    !== boroughFilt) return false
       if (search) {
@@ -626,7 +656,7 @@ export default function Dashboard() {
           <div className="space-y-2">
             <FilterBar
               label="Status"
-              options={['Received', 'Dispatched', 'In Progress', 'Completed']}
+              options={['Received', 'Dispatched', 'In Progress', 'Completed', COMPLETED_TODAY]}
               value={statusFilt}
               onChange={setStatusFilt}
             />
