@@ -1077,7 +1077,14 @@ function _processApprovedDocumentsImpl_() {
 
     if (fileName.includes('Production_Log')) {
       docType = 'Production Log';
-    } else if (fileName.includes('Field_Report')) {
+    } else if (
+      // Two filename conventions are in play:
+      //   "Contractor_Field_Report_<WO>_<date>_FILLED.pdf" (legacy)
+      //   "CFR_<WO>_<date>_FILLED.pdf"                     (current — the
+      //     Python worker now reuses the source JSON's stem, and Apps
+      //     Script names the CFR JSON `CFR_<WO>_<date>.json`).
+      fileName.includes('Field_Report') || fileName.startsWith('CFR_')
+    ) {
       docType = 'Field Report';
       const match = fileName.match(WO_REGEX);
       if (match) woId = match[0];
