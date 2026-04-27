@@ -412,6 +412,24 @@ app.post('/api/approvals/:fileId/approve', async (req, res) => {
 })
 
 /**
+ * POST /api/approvals/:fileId/skip-signoff
+ * Approves a document WITHOUT the pdf-lib principal-signature overlay.
+ * Used for manually-uploaded sign-in sheets (filename ends in
+ * `_MANUAL.pdf`) that the principal already wet-signed by hand — we
+ * don't want to drop a second electronic signature on top.
+ */
+app.post('/api/approvals/:fileId/skip-signoff', async (req, res) => {
+  try {
+    const data = await callAppsScript('approve_doc_skip_signoff',
+                                      { file_id: req.params.fileId })
+    res.json(data)
+  } catch (err) {
+    console.error(`POST /api/approvals/${req.params.fileId}/skip-signoff error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/approvals/:fileId/approve-signin
  * Sign-In-specific approval: takes the principal's signature + printed
  * name + title from the webapp modal, patches the PDF via pdf-lib
@@ -517,6 +535,120 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     res.json(result)
   } catch (err) {
     console.error(`POST /api/approvals/${fileId}/approve-signin error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/signin-queue/parse-upload
+ * Accepts a single PDF (≤ 15 MB, multipart "file") that a crew leader
+ * filled by hand and uploaded for one queue entry. Calls Claude Vision
+ * with a strict-JSON prompt and returns the parsed crew rows so the
+ * Sign-In tab can pre-fill its form for the user to confirm.
+ *
+ * Required env: ANTHROPIC_API_KEY (the same key the Python worker uses).
+ */
+app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file)            return res.status(400).json({ error: 'No file attached' })
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on this server' })
+    }
+    const mime = req.file.mimetype || 'application/pdf'
+    if (mime !== 'application/pdf') {
+      return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
+    }
+
+    const base64 = req.file.buffer.toString('base64')
+
+    // The prompt asks Claude to read the hand-filled paper Sign-In Sheet
+    // and emit a structured JSON object. Times normalised to 24-hour
+    // HH:MM. Anything illegible becomes null so the user can fix it
+    // during confirmation rather than having a hallucinated value
+    // silently submitted.
+    const prompt = `You are extracting information from a hand-filled construction crew Sign-In Sheet (often handwritten on a paper template). Return ONLY valid JSON — no markdown fences, no commentary.
+
+Schema:
+{
+  "crew": [
+    {
+      "name":           "<Full Name as written, or null if unreadable>",
+      "classification": "<Either \\"LP\\" or \\"SAT\\" — pick the closest match. LP = Line Person/crew chief, SAT = Stripe Assistant Technician. null if blank.>",
+      "time_in":        "<24-hour HH:MM, e.g. \\"22:00\\". Convert from 12-hour formats. null if unreadable.>",
+      "time_out":       "<24-hour HH:MM, e.g. \\"06:00\\". Convert from 12-hour formats. null if unreadable.>"
+    }
+  ],
+  "contractor_name":  "<Printed name in the Crew Leader sign-off block, or null>",
+  "contractor_title": "<Title in the Crew Leader sign-off block, or null>",
+  "date_inferred":    "<Date written on the sheet in YYYY-MM-DD if parseable, otherwise null>"
+}
+
+Rules:
+- Skip empty rows entirely. Only include rows with at least a name.
+- Never invent or guess values. If a cell is blank, smudged, or unreadable, the field is null.
+- Times: normalize to 24-hour HH:MM (e.g. "10pm" → "22:00", "6 AM" → "06:00", "10:30PM" → "22:30").
+- Classification: only "LP" or "SAT" values are valid. If the sheet uses other codes, pick the closest match; otherwise null.`
+
+    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'x-api-key':         process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type':      'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 2048,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'document',
+              source: {
+                type:       'base64',
+                media_type: 'application/pdf',
+                data:       base64,
+              },
+            },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      }),
+    })
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text()
+      throw new Error(`Anthropic API error ${apiRes.status}: ${errText.slice(0, 300)}`)
+    }
+    const apiJson = await apiRes.json()
+    const textBlock = (apiJson.content || []).find(b => b.type === 'text')
+    if (!textBlock) throw new Error('Anthropic response had no text block')
+
+    // Be defensive: Claude is told no markdown fences but occasionally
+    // wraps JSON in ```json ... ```. Strip if present.
+    let raw = String(textBlock.text || '').trim()
+    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim()
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (e) {
+      throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
+    }
+
+    // Echo the original upload back to the client too, so it can hand
+    // those bytes to /api/signin without re-uploading. Keeps the round
+    // trip simple: parse + hold-bytes in one call.
+    res.json({
+      parsed,
+      upload: {
+        filename:    req.file.originalname,
+        mime_type:   mime,
+        size:        req.file.size,
+        data_b64:    base64,
+      },
+    })
+  } catch (err) {
+    console.error('POST /api/signin-queue/parse-upload error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })

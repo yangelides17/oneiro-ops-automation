@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
 import StatusBadge      from '../components/StatusBadge'
-import SignaturePad     from '../components/SignaturePad'
 import ConfirmModal     from '../components/ConfirmModal'
 import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
@@ -8,13 +7,6 @@ import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
   pickLayout, rowIsCompletable,
 } from '../lib/markingCategories'
-
-// ── Constants ─────────────────────────────────────────────────
-// Must match the dropdown validation on the Daily Sign-In Data sheet's
-// Classification column — LP (Line Person / Crew Chief) and SAT (Stripe
-// Assistant Tech). Adding values here without updating the sheet validation
-// will cause sign-in submissions to fail with "Invalid Entry".
-const CLASSIFICATIONS = ['LP', 'SAT']
 
 const SECTION_HEADERS = {
   'Top Table':          'WO Top Table',
@@ -31,34 +23,6 @@ const isoToday = () => {
   const d = new Date()
   return [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-')
 }
-const fmt24to12 = (t) => {
-  if (!t) return ''
-  const [h, m] = t.split(':').map(Number)
-  return (h%12||12) + ':' + String(m).padStart(2,'0') + (h>=12?' PM':' AM')
-}
-// Day-of-week-aware OT calc. Rule:
-//   Sat/Sun → every hour is overtime.
-//   Mon–Fri → hours over 8 are overtime.
-// workDateIso is the Date of Work as "YYYY-MM-DD" (from <input type="date">).
-// We construct a local-parts Date so there's no UTC-shift in the DOW.
-const calcHours = (tin, tout, workDateIso) => {
-  if (!tin || !tout) return { hours: '', overtime: '' }
-  const [ih,im] = tin.split(':').map(Number)
-  const [oh,om] = tout.split(':').map(Number)
-  const mins = (oh*60+om) - (ih*60+im)
-  if (mins <= 0) return { hours: '', overtime: '' }
-  const hrs = mins / 60
-
-  let isWeekend = false
-  const dm = String(workDateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
-  if (dm) {
-    const dow = new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3])).getDay()
-    isWeekend = (dow === 0 || dow === 6)
-  }
-  const ot = isWeekend ? hrs : Math.max(0, hrs - 8)
-  return { hours: hrs.toFixed(2), overtime: ot.toFixed(2) }
-}
-const newCrew = () => ({ name:'', classification:CLASSIFICATIONS[0], timeIn:'', timeOut:'', hours:'', overtime:'', signatureIn:null, signatureOut:null })
 
 // ── HEIC → JPEG converter ─────────────────────────────────────
 // iPhones ship HEIC by default. Browsers can't decode HEIC for
@@ -307,76 +271,6 @@ function Spinner() {
   )
 }
 
-// ── Crew card (with signature pads) ──────────────────────────
-function CrewCard({ idx, data, onChange, onRemove, workDate }) {
-  const handleTime = (field, val) => {
-    const tin  = field==='timeIn'  ? val : data.timeIn
-    const tout = field==='timeOut' ? val : data.timeOut
-    onChange(idx, { ...data, [field]: val, ...calcHours(tin, tout, workDate) })
-  }
-  return (
-    <div className="border border-slate-200 rounded-xl p-4 space-y-4 bg-slate-50/40">
-      <div className="flex justify-between items-center">
-        <span className="text-xs font-bold text-navy uppercase tracking-wider">Crew Member #{idx+1}</span>
-        <button type="button" onClick={()=>onRemove(idx)} className="text-red-400 hover:text-red-600 text-xl leading-none">×</button>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Field label="Full Name" required>
-          <input type="text" value={data.name} autoCapitalize="words" placeholder="First Last"
-            onChange={e=>onChange(idx,{...data,name:e.target.value})} className="field-input" />
-        </Field>
-        <Field label="Classification" required>
-          <select value={data.classification} onChange={e=>onChange(idx,{...data,classification:e.target.value})} className="field-input">
-            {CLASSIFICATIONS.map(c=><option key={c}>{c}</option>)}
-          </select>
-        </Field>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Time In" required>
-          <input type="time" value={data.timeIn} onChange={e=>handleTime('timeIn',e.target.value)} className="field-input" />
-        </Field>
-        <Field label="Time Out" required>
-          <input type="time" value={data.timeOut} onChange={e=>handleTime('timeOut',e.target.value)} className="field-input" />
-        </Field>
-      </div>
-
-      {data.hours && (
-        <div className="flex gap-4 bg-white rounded-lg px-3 py-2 border border-slate-200">
-          <div>
-            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">Reg. Hours</span>
-            <p className="text-sm font-bold text-navy">{data.hours}</p>
-          </div>
-          <div className="border-l border-slate-200 pl-4">
-            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">OT Hours</span>
-            <p className={`text-sm font-bold ${parseFloat(data.overtime)>0?'text-orange-600':'text-slate-400'}`}>
-              {data.overtime||'0.00'}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Signature pads — captured locally, added to Sign-In PDF later */}
-      <div className="pt-1 border-t border-slate-200 space-y-3">
-        <p className="text-[11px] text-slate-400 font-medium">
-          Employee signs below — signatures will be added to the Sign-In Log
-        </p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <SignaturePad
-            label="Time-In Signature"
-            onChange={dataUrl => onChange(idx, { ...data, signatureIn: dataUrl })}
-          />
-          <SignaturePad
-            label="Time-Out Signature"
-            onChange={dataUrl => onChange(idx, { ...data, signatureOut: dataUrl })}
-          />
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ── WO info panel ─────────────────────────────────────────────
 function WOPanel({ wo }) {
   return (
@@ -554,7 +448,6 @@ export default function FieldReport() {
   const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wo-markings/:woId
   const [markingsLoading, setMarkingsLoading] = useState(false)
   const [issues,        setIssues]         = useState('')
-  const [crewMembers,   setCrewMembers]    = useState([newCrew()])
   const [woComplete,    setWoComplete]     = useState('no')
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
 
@@ -828,24 +721,6 @@ export default function FieldReport() {
     }
   }
 
-  // Crew rows
-  const updateCrew = (i, updated) => setCrewMembers(l=>l.map((m,j)=>j===i?updated:m))
-  const addCrew    = () => setCrewMembers(l=>[...l,newCrew()])
-  const removeCrew = (i) => setCrewMembers(l=>l.filter((_,j)=>j!==i))
-
-  // When the Date of Work changes, re-run the day-of-week OT rule
-  // for every crew member whose times are already filled in. Without
-  // this, flipping the date from Fri → Sat (or vice-versa) would leave
-  // stale OT splits from before the date change.
-  useEffect(() => {
-    setCrewMembers(list => list.map(m => {
-      if (!m.timeIn || !m.timeOut) return m
-      const { hours, overtime } = calcHours(m.timeIn, m.timeOut, workDate)
-      if (m.hours === hours && m.overtime === overtime) return m
-      return { ...m, hours, overtime }
-    }))
-  }, [workDate])
-
   // Infer WO work type from any loaded planned item (Thermo beats MMA if
   // mixed). Falls back to blank if no items are loaded yet.
   const inferredWorkType = markingItems.some(i => String(i.work_type).toLowerCase() === 'thermo')
@@ -856,7 +731,6 @@ export default function FieldReport() {
   async function doSubmit() {
     setFormError('')
     setSubmitting(true)
-    const validCrew = crewMembers.filter(m=>m.name.trim())
 
     // Step 0 — make sure any focused input flushes its save, then wait
     // for all in-flight PATCHes to land so finalize/rollup on the server
@@ -920,8 +794,8 @@ export default function FieldReport() {
 
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
-    // Shared payload — used by submit AND by the background finalize
-    // call so signatures don't get shipped twice to the browser.
+    // Sign-in (crew + signatures) lives on its own tab now — the field
+    // report only carries WO-level state.
     const reportBody = {
       wo_id:       selectedWOId,
       date:        workDate,
@@ -929,27 +803,11 @@ export default function FieldReport() {
       work_type:   inferredWorkType,
       issues:          issues.trim(),
       photos_uploaded: photosUploaded,
-      crew: validCrew.map(m=>({
-        name:           m.name.trim(),
-        classification: m.classification,
-        time_in:        fmt24to12(m.timeIn),
-        time_out:       fmt24to12(m.timeOut),
-        hours:          parseFloat(m.hours)||0,
-        overtime:       parseFloat(m.overtime)||0,
-        // Base64 PNG data URLs from the SignaturePad canvas. Apps Script
-        // forwards these verbatim into the Sign-In Logs JSON — the Python
-        // worker decodes + embeds them into the filled PDF. Never archived.
-        sig_in_b64:     m.signatureIn  || '',
-        sig_out_b64:    m.signatureOut || ''
-      })),
-      // The Sign-In Log's bottom block (printed name, title, date,
-      // signature) is filled later during the Approvals flow — the
-      // principal signs off, not the crew leader. See PrincipalSignModal.
     }
 
     try {
       // Marking Items are already live-persisted via per-row CRUD
-      // endpoints. Submit only sends WO-level data + crew + signatures.
+      // endpoints. Submit only sends WO-level data.
       const res = await fetch('/api/field-report', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -957,12 +815,12 @@ export default function FieldReport() {
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      setSubmitted({ wo_id:data.wo_id, status:data.status, crew_count:validCrew.length, photos:photoFiles.length })
+      setSubmitted({ wo_id:data.wo_id, status:data.status, photos:photoFiles.length })
 
-      // Fire-and-forget: kick off Sign-In + CFR JSON generation on the
-      // server after the user's already seen the success screen. Any
-      // failure lands in the Automation Log sheet — not this UI —
-      // because the report data itself is already safely persisted.
+      // Fire-and-forget: kick off CFR JSON generation on the server after
+      // the user's seen the success screen. (Sign-in JSON is no longer
+      // generated here — it's filed from the Sign-In tab.) Any failure
+      // lands in Automation Log, not this UI.
       fetch('/api/field-report/finalize', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -990,13 +848,6 @@ export default function FieldReport() {
       return
     }
     if (!workDate)      { raiseError('Please enter the date of work.'); return }
-    const valid = crewMembers.filter(m=>m.name.trim())
-    if (!valid.length)  { raiseError('Please add at least one crew member.'); return }
-    for (const m of valid) {
-      if (!m.timeIn||!m.timeOut) {
-        raiseError(`Enter Time In and Time Out for ${m.name||'all crew members'}.`); return
-      }
-    }
     // If the crew is declaring the WO complete, every Marking Item must
     // be completable (already Completed, or Pending with the required
     // fields filled in). Anything else is either missing a measurement
@@ -1029,8 +880,7 @@ export default function FieldReport() {
     setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
     setBulkMode(false); inFlightRef.current.clear()
     setIssues(''); setRowError('')
-    setCrewMembers([newCrew()]); setWoComplete('no'); setPhotoFiles([]); setFormError('')
-    setCrewLeaderName(''); setCrewLeaderSignature(null)
+    setWoComplete('no'); setPhotoFiles([]); setFormError('')
   }
 
   // ── Success ───────────────────────────────────────────────
@@ -1040,7 +890,7 @@ export default function FieldReport() {
       <h2 className="text-2xl font-black text-navy mb-2">Report Submitted!</h2>
       <p className="text-slate-500 mb-1">
         <strong className="font-mono text-navy">{submitted.wo_id}</strong>
-        {' '}— {submitted.crew_count} crew member(s) logged
+        {' '}— queued for sign-in
       </p>
       {submitted.photos > 0 && (
         <p className="text-xs text-green-600 font-semibold mb-1">
@@ -1304,22 +1154,8 @@ export default function FieldReport() {
           }
         </div>
 
-        {/* 4 · Crew & Signatures */}
-        <div className="card p-4 space-y-3">
-          <p className="section-label">Crew & Signatures ({crewMembers.length})</p>
-          <p className="text-[11px] text-slate-400">
-            Each employee signs once at time-in and once at time-out. Signatures will be added to the Sign-In Log.
-          </p>
-          <div className="space-y-4">
-            {crewMembers.map((m,i)=>(
-              <CrewCard key={i} idx={i} data={m} onChange={updateCrew} onRemove={removeCrew} workDate={workDate} />
-            ))}
-          </div>
-          <button type="button" onClick={addCrew} className="btn-ghost text-xs w-full">+ Add Crew Member</button>
-        </div>
-
-        {/* 5 · Completion — Sign-In Log's bottom sign-off now happens
-            at approval time (the principal signs, not the crew leader). */}
+        {/* 4 · Completion — sign-in (crew + signatures) is filed from
+            the Sign-In tab once the night's work is wrapped up. */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Completion</p>
           <Field label="Is this Work Order complete?">

@@ -4,6 +4,16 @@ import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import PrincipalSignModal from '../components/PrincipalSignModal'
+import RowKebab from '../components/RowKebab'
+
+// Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
+// from the Sign-In tab's "Upload PDF" path. The principal usually
+// wet-signed those by hand, so we default the primary approval action
+// to Skip Sign-Off and tuck the electronic-overlay action behind a
+// kebab in case admin still wants it.
+const isManualSignIn = (item) =>
+  item?.doc_type === 'signin' &&
+  /_MANUAL\.pdf$/i.test(item?.filename || '')
 
 // Wire the pdf.js worker. Using the CDN URL with the same version
 // react-pdf ships with keeps bundle size down and avoids Vite worker
@@ -113,12 +123,17 @@ export default function Approvals() {
   const handleApprove = async () => {
     if (!selected || approving) return
     setActionError('')
-    // Sign-In: open modal; it calls the signed endpoint on submit.
+    // Manually-uploaded sign-in: skip the electronic sign-off (already
+    // wet-signed by the principal in person).
+    if (isManualSignIn(selected)) {
+      return doSkipSignoff()
+    }
+    // Generated sign-in: open the principal-signature modal.
     if (selected.doc_type === 'signin') {
       setSigningItem(selected)
       return
     }
-    // Everything else: direct approve
+    // Everything else: direct approve.
     setApproving(true)
     const fileId = selected.file_id
     try {
@@ -130,6 +145,28 @@ export default function Approvals() {
       removeApprovedAndAdvance(fileId)
     } catch (err) {
       setActionError(err.message || 'Approval failed')
+    } finally {
+      setApproving(false)
+    }
+  }
+
+  // Skip Sign-Off: move the file to Approved Docs without overlaying a
+  // principal signature. Default action for `_MANUAL` uploads; available
+  // via kebab for any sign-in where admin wants to bypass.
+  const doSkipSignoff = async () => {
+    if (!selected || approving) return
+    setActionError('')
+    setApproving(true)
+    const fileId = selected.file_id
+    try {
+      const res = await fetch(
+        `/api/approvals/${encodeURIComponent(fileId)}/skip-signoff`,
+        { method: 'POST' })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      removeApprovedAndAdvance(fileId)
+    } catch (err) {
+      setActionError(err.message || 'Skip sign-off failed')
     } finally {
       setApproving(false)
     }
@@ -266,10 +303,27 @@ export default function Approvals() {
                   >
                     {approving
                       ? 'Approving…'
-                      : selected.doc_type === 'signin'
-                          ? 'Approve & Sign'
-                          : 'Approve'}
+                      : isManualSignIn(selected)
+                          ? 'Approve (skip sign-off)'
+                          : selected.doc_type === 'signin'
+                              ? 'Approve & Sign'
+                              : 'Approve'}
                   </button>
+                  {/* Sign-in overrides — kebab keeps the rare alternate
+                      action available without cluttering the row. */}
+                  {selected.doc_type === 'signin' && !approving && (
+                    <RowKebab items={
+                      isManualSignIn(selected)
+                        ? [{
+                            label:   'Approve with sign-off',
+                            onClick: () => setSigningItem(selected),
+                          }]
+                        : [{
+                            label:   'Skip sign-off',
+                            onClick: doSkipSignoff,
+                          }]
+                    } />
+                  )}
                 </div>
               </div>
 
