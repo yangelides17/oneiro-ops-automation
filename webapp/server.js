@@ -522,6 +522,59 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
 })
 
 /**
+ * GET /api/employees
+ * Returns the list of employee names (Employee Registry col B) for the
+ * Sign-In tab's crew dropdown. Apps Script side caches for 5 min.
+ */
+app.get('/api/employees', async (_req, res) => {
+  try {
+    const data = await callAppsScript('list_employees')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/employees error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/signin-queue
+ * Returns outstanding (date, contract) groups derived from the Work Day
+ * Log. Each group lists the WOs that need a sign-in for that contract on
+ * that date.
+ */
+app.get('/api/signin-queue', async (_req, res) => {
+  try {
+    const data = await callAppsScript('list_signin_queue')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/signin-queue error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/signin
+ * Submits a Sign-In sheet for one queue entry. Body:
+ *   { queue_id, date, contract_number, borough, contractor,
+ *     wo_ids: [...], crew: [...],
+ *     contractor_name, contractor_title, date_signed, contractor_signature_b64,
+ *     source: 'generated' | 'uploaded',
+ *     upload_blob_b64?, upload_filename? }
+ * The Apps Script side appends Daily Sign-In Data rows, marks the Work
+ * Day Log entries Submitted, and either drops a JSON for the Python
+ * filler ('generated') or stores the uploaded PDF directly ('uploaded').
+ */
+app.post('/api/signin', async (req, res) => {
+  try {
+    const data = await callAppsScript('submit_signin', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/signin error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/scan-uploads-today
  * Returns today's scan-originated WO Tracker rows grouped by upload.
  * The Scan WO page uses this as its source of truth so the queue

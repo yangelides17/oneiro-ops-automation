@@ -425,19 +425,22 @@ function generateDailyDocuments(dateStr) {
     return;
   }
   
-  // Group entries by Work Order
+  // Group entries by Work Order. WO# column may be a comma-list when one
+  // sign-in covers multiple WOs in the same shift — fan each row out into
+  // every WO it references so each gets the same crew context.
   const byWorkOrder = {};
   todaysEntries.forEach(row => {
-    const woId = row[1]; // Work Order # column
-    if (!byWorkOrder[woId]) byWorkOrder[woId] = [];
-    byWorkOrder[woId].push(row);
+    _splitWOIds_(row[1]).forEach(woId => {
+      if (!byWorkOrder[woId]) byWorkOrder[woId] = [];
+      byWorkOrder[woId].push(row);
+    });
   });
-  
+
   // Get Work Order details from tracker
   const woSheet = ss.getSheetByName('Work Order Tracker');
   const woData = woSheet.getDataRange().getValues();
   const woHeaders = woData[0];
-  
+
   Logger.log(`📋 Processing ${Object.keys(byWorkOrder).length} work orders for ${targetDate.toDateString()}`);
   
   // Generate Production Log (Metro Express format)
@@ -848,9 +851,10 @@ function debugGenerateProductionLogForToday() {
 
   const byWorkOrder = {};
   todaysEntries.forEach(row => {
-    const woId = row[1];
-    if (!byWorkOrder[woId]) byWorkOrder[woId] = [];
-    byWorkOrder[woId].push(row);
+    _splitWOIds_(row[1]).forEach(woId => {
+      if (!byWorkOrder[woId]) byWorkOrder[woId] = [];
+      byWorkOrder[woId].push(row);
+    });
   });
   Logger.log(`WOs with sign-in activity: ${Object.keys(byWorkOrder).join(', ') || '(none)'}`);
 
@@ -1096,8 +1100,16 @@ function _processApprovedDocumentsImpl_() {
       docType = 'Certified Payroll';
     } else if (fileName.includes('SignIn') || fileName.includes('Sign_In') || fileName.includes('Sign-In')) {
       docType = 'Sign-In';
-      const match = fileName.match(WO_REGEX);
-      if (match) woId = match[0];
+      // New multi-WO pattern: SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
+      // The contract number (e.g. "PT-11930") matches WO_REGEX too, so we
+      // explicitly detect the multi-WO shape and skip the regex extraction
+      // there — archiveDocument_ falls back to contract+date lookup when
+      // woId is empty.
+      const isMultiWOPattern = /^SignIn_[^_]+_[^_]+_\d{4}-\d{2}-\d{2}/.test(fileName);
+      if (!isMultiWOPattern) {
+        const match = fileName.match(WO_REGEX);
+        if (match) woId = match[0];
+      }
     }
     
     // Look up who to send this to
@@ -1244,7 +1256,7 @@ function archiveDocument_(file, docType, woId, ss) {
     const archiveRoot = DriveApp.getFolderById(archiveId);
     const cleanName = file.getName().replace('📨 ', '');
 
-    if (docType === 'Field Report' || docType === 'Invoice' || docType === 'Sign-In') {
+    if (docType === 'Field Report' || docType === 'Invoice') {
       // Single doc — file directly inside the WO subfolder, no type subfolder
       if (!woId) {
         return { success: false, reason: `${docType} has no WO # in filename` };
@@ -1255,6 +1267,50 @@ function archiveDocument_(file, docType, woId, ss) {
       }
       file.makeCopy(cleanName, woFolder);
       Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
+      return { success: true };
+
+    } else if (docType === 'Sign-In') {
+      // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
+      // We look up every WO that worked that contract on that day and copy
+      // the same PDF into each WO folder (same pattern as Production Logs).
+      const newPat = cleanName.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
+      if (newPat) {
+        const [, contractNum, borough, dateStr] = newPat;
+        const logDate = new Date(dateStr + 'T12:00:00');
+        const wosByContract = getWOsForDate_(logDate, ss);
+        const matchKey = Object.keys(wosByContract).find(k => {
+          const parts = k.split('|');
+          return parts[1] === contractNum && parts[2] === borough;
+        });
+        if (!matchKey) {
+          return {
+            success: false,
+            reason: `No WOs found in Daily Sign-In Data for ${contractNum}/${borough} on ${dateStr} — sign-in submitted before any matching Work Day Log row?`
+          };
+        }
+        const [contractor] = matchKey.split('|');
+        const wos = wosByContract[matchKey];
+        const contractFolder = getOrCreateSubfolder_(
+          getOrCreateSubfolder_(archiveRoot, contractor),
+          `${contractNum} - ${getBoroughName_(borough)}`
+        );
+        wos.forEach(wo => {
+          const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
+          file.makeCopy(cleanName, woFolder);
+        });
+        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+        return { success: true };
+      }
+      // Legacy single-WO Sign-In (pre-multi-WO refactor) — keep working.
+      if (!woId) {
+        return { success: false, reason: `Sign-In has no contract/WO info in filename` };
+      }
+      const woFolder = getWOFolder_(archiveRoot, woId, ss);
+      if (!woFolder) {
+        return { success: false, reason: `Could not resolve WO folder for Sign-In ${woId} — is it missing from the Work Order Tracker?` };
+      }
+      file.makeCopy(cleanName, woFolder);
+      Logger.log(`📁 Archived Sign-In (legacy): ${cleanName} → WO folder ${woId}`);
       return { success: true };
 
     } else if (docType === 'Production Log') {
@@ -1366,6 +1422,36 @@ function getOrCreateArchiveErrorsFolder_() {
   return errors;
 }
 
+/**
+ * Lazy-create the Work Day Log sheet — the queue source for Sign-In tab.
+ * Each Field Report submit appends one row here. The Sign-In tab reads
+ * rows where Status='Pending' and groups them by (date, contract, borough)
+ * so the user can file a single sign-in covering all WOs touched in a
+ * shift.
+ */
+function _getOrCreateWorkDayLogSheet_(ss) {
+  let sheet = ss.getSheetByName('Work Day Log');
+  if (sheet) return sheet;
+
+  sheet = ss.insertSheet('Work Day Log');
+  const headers = [
+    'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
+    'Location', 'Field Report Submitted At', 'Sign-In Status'
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  // Status dropdown — keeps human-edited corrections sane
+  const statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Pending', 'Submitted', 'Skipped'], true)
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(2, 8, 1000, 1).setDataValidation(statusRule);
+
+  return sheet;
+}
+
 /** Get or create the WO-level subfolder: Archive/Contractor/Contract-Borough/WO#-Location */
 function getWOFolder_(archiveRoot, woId, ss) {
   const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
@@ -1382,20 +1468,45 @@ function getWOFolder_(archiveRoot, woId, ss) {
   return getOrCreateSubfolder_(contractFolder, `${woId} - ${location}`);
 }
 
+/**
+ * Build a fast WO# → Location map from the Work Order Tracker. Used by
+ * the WO-listing helpers below so multi-WO sign-in rows (where the WO#
+ * column is a comma-list "RM-1, RM-2") still resolve each WO's actual
+ * location for archive-folder paths.
+ */
+function _buildLocationByWOMap_(ss) {
+  const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
+  const byId = {};
+  woData.slice(1).forEach(r => {
+    if (r[0]) byId[String(r[0])] = String(r[5] || '');
+  });
+  return byId;
+}
+
+/** Split a Daily Sign-In Data WO# cell into a list (handles comma-list values). */
+function _splitWOIds_(cell) {
+  return String(cell || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 /** Return WOs worked on a given date, grouped by "contractor|contractNum|borough" */
 function getWOsForDate_(date, ss) {
   const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+  const locByWO = _buildLocationByWOMap_(ss);
   const wosByContract = {};
   const seen = new Set();
   data.slice(1).forEach(row => {
     if (!row[0]) return;
     if (new Date(row[0]).toDateString() !== date.toDateString()) return;
-    const woId = row[1];
-    if (seen.has(woId)) return;
-    seen.add(woId);
     const key = `${row[2]}|${String(row[3]).split('/')[0]}|${row[4]}`;
     if (!wosByContract[key]) wosByContract[key] = [];
-    wosByContract[key].push({ id: woId, location: row[5] });
+    _splitWOIds_(row[1]).forEach(woId => {
+      if (seen.has(woId)) return;
+      seen.add(woId);
+      wosByContract[key].push({ id: woId, location: locByWO[woId] || row[5] || '' });
+    });
   });
   return wosByContract;
 }
@@ -1410,6 +1521,7 @@ function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
   const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+  const locByWO = _buildLocationByWOMap_(ss);
   const wos = [];
   const seen = new Set();
   data.slice(1).forEach(row => {
@@ -1417,13 +1529,14 @@ function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
     const d = new Date(row[0]);
     if (d < weekStart || d > weekEnd) return;
     if (String(row[3]).split('/')[0] !== contractNum || row[4] !== borough) return;
-    const woId = row[1];
-    if (seen.has(woId)) return;
-    seen.add(woId);
-    wos.push({
-      id:         woId,
-      location:   row[5],
-      contractor: String(row[2] || '').trim(),
+    _splitWOIds_(row[1]).forEach(woId => {
+      if (seen.has(woId)) return;
+      seen.add(woId);
+      wos.push({
+        id:         woId,
+        location:   locByWO[woId] || row[5] || '',
+        contractor: String(row[2] || '').trim(),
+      });
     });
   });
   return wos;
@@ -2392,6 +2505,14 @@ function doPost(e) {
       return handleGenerateCertifiedPayroll_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
+    } else if (action === 'list_employees') {
+      return handleListEmployees_(body);
+    } else if (action === 'list_signin_queue') {
+      return handleListSignInQueue_(body);
+    } else if (action === 'submit_signin') {
+      return handleSubmitSignIn_(body);
+    } else if (action === 'approve_doc_skip_signoff') {
+      return handleApproveDocSkipSignoff_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -2928,6 +3049,417 @@ function handleApproveSignInWithBytes_(body) {
       file_id:  newFile.getId(),
       filename: newFile.getName(),
     });
+  } catch (err) {
+    return jsonResponse_({ error: String(err) }, 500);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// SIGN-IN TAB — webapp "Sign-In" page backend
+// ═══════════════════════════════════════════════════════════════
+
+// ── action: list_employees ────────────────────────────────────
+//
+// Returns the list of employee names (Employee Registry col B) used
+// by the Sign-In tab's crew-row dropdown. Cached for 5 min in
+// CacheService so a 10-row sign-in form doesn't hit the sheet 10×.
+function handleListEmployees_(body) {
+  const cache  = CacheService.getScriptCache();
+  const cached = cache.get('signin_employees_v1');
+  if (cached) {
+    return jsonResponse_({ employees: JSON.parse(cached) });
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Employee Registry');
+  if (!sheet) return jsonResponse_({ employees: [] });
+
+  const data = sheet.getDataRange().getValues();
+  const seen = new Set();
+  const employees = [];
+  data.slice(1).forEach(r => {
+    const name = String(r[1] || '').trim();
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    employees.push({ name });
+  });
+  employees.sort((a, b) => a.name.localeCompare(b.name));
+
+  cache.put('signin_employees_v1', JSON.stringify(employees), 300);
+  return jsonResponse_({ employees });
+}
+
+// ── action: list_signin_queue ─────────────────────────────────
+//
+// Returns outstanding (date, contract) groups built from the Work Day
+// Log. Each group lists the WOs that had Field Reports submitted that
+// day on that contract. The Sign-In tab uses this as its master list.
+function handleListSignInQueue_(body) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Work Day Log');
+  if (!sheet) return jsonResponse_({ queue: [] });
+
+  const data = sheet.getDataRange().getValues();
+
+  // Contract Lookup gives us contract_id + project name for the right pane.
+  const clSheet = ss.getSheetByName('Contract Lookup');
+  const clData  = clSheet ? clSheet.getDataRange().getValues() : [];
+  const lookupContract = (contractNum, borough) => {
+    const row = clData.slice(1).find(r =>
+      String(r[0] || '').includes(contractNum) && String(r[1] || '') === borough
+    );
+    return row
+      ? { contract_id: String(row[3] || ''), project_name: String(row[4] || '') }
+      : { contract_id: '', project_name: '' };
+  };
+
+  // ISO-format a Sheet date cell (Date object | string) to YYYY-MM-DD
+  // in the local timezone — same logic the rest of the app uses to
+  // avoid UTC-shift drift.
+  const toIsoDate = (cell) => {
+    if (cell instanceof Date && !isNaN(cell.getTime())) {
+      const y = cell.getFullYear();
+      const m = String(cell.getMonth() + 1).padStart(2, '0');
+      const d = String(cell.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+    const s = String(cell || '');
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : s;
+  };
+
+  const groups = new Map();
+  data.slice(1).forEach(row => {
+    if (String(row[7] || '').trim() !== 'Pending') return;
+    const dateStr     = toIsoDate(row[0]);
+    const woId        = String(row[1] || '').trim();
+    const contractor  = String(row[2] || '').trim();
+    const contractNum = String(row[3] || '').split('/')[0].trim();
+    const borough     = String(row[4] || '').trim();
+    const location    = String(row[5] || '').trim();
+    if (!dateStr || !woId || !contractNum || !borough) return;
+
+    const key = `${dateStr}|${contractNum}|${borough}`;
+    if (!groups.has(key)) {
+      const lookup = lookupContract(contractNum, borough);
+      groups.set(key, {
+        queue_id:        key,
+        date:            dateStr,
+        contract_number: contractNum,
+        borough:         borough,
+        contractor:      contractor,
+        contract_id:     lookup.contract_id,
+        project_name:    lookup.project_name,
+        wos:             [],
+      });
+    }
+    const grp = groups.get(key);
+    if (!grp.wos.find(w => w.id === woId)) {
+      grp.wos.push({ id: woId, location: location });
+    }
+  });
+
+  const queue = Array.from(groups.values());
+  queue.sort((a, b) => {
+    if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+    return a.contract_number.localeCompare(b.contract_number);
+  });
+
+  return jsonResponse_({ queue });
+}
+
+// ── action: submit_signin ─────────────────────────────────────
+//
+// Body shape:
+//   data: {
+//     queue_id, date (YYYY-MM-DD, shift START date),
+//     contract_number, borough, contractor,
+//     wo_ids: ["RM-1", "RM-2", ...],
+//     crew: [{name, classification, time_in, time_out, hours, overtime,
+//             sig_in_b64, sig_out_b64}, ...],
+//     contractor_name, contractor_title, date_signed, contractor_signature_b64,
+//     source: 'generated' | 'uploaded',
+//     upload_blob_b64?, upload_filename?  (when source='uploaded')
+//   }
+//
+// Behavior:
+//   1. Append crew rows to Daily Sign-In Data — one row per crew member
+//      with the WO# column being a comma-list of every WO this sign-in
+//      covers. OT recalculated server-side from the date's day-of-week.
+//   2. Mark matching Work Day Log rows as Status='Submitted' so they
+//      drop off the queue.
+//   3. Generate path → write Sign-In JSON to Drive for the Python filler.
+//      Upload path → drop the original PDF directly with _MANUAL suffix.
+//   4. Append to Automation Log.
+function handleSubmitSignIn_(body) {
+  const d = body.data || {};
+
+  if (!d.date)            return jsonResponse_({ error: 'Missing date' }, 400);
+  if (!d.contract_number) return jsonResponse_({ error: 'Missing contract_number' }, 400);
+  if (!d.borough)         return jsonResponse_({ error: 'Missing borough' }, 400);
+  if (!Array.isArray(d.wo_ids) || d.wo_ids.length === 0) {
+    return jsonResponse_({ error: 'wo_ids must be a non-empty array' }, 400);
+  }
+  if (!Array.isArray(d.crew) || d.crew.length === 0) {
+    return jsonResponse_({ error: 'At least one crew member is required' }, 400);
+  }
+  const source = String(d.source || 'generated');
+  if (source !== 'generated' && source !== 'uploaded') {
+    return jsonResponse_({ error: 'source must be "generated" or "uploaded"' }, 400);
+  }
+  if (source === 'uploaded' && !d.upload_blob_b64) {
+    return jsonResponse_({ error: 'upload_blob_b64 required when source=uploaded' }, 400);
+  }
+
+  let step = 'init';
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+    // ── Determine OT rule by start-day DOW (cross-midnight already
+    // collapsed into the start date by the UI) ────────────────────
+    const dowOfWork = (() => {
+      const m = String(d.date).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) return -1;
+      return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
+    })();
+    const isWeekend = (dowOfWork === 0 || dowOfWork === 6);
+
+    // ── Daily Sign-In Data append (one row per crew member) ───────
+    step = 'Daily Sign-In Data append';
+    const signInSheet = ss.getSheetByName('Daily Sign-In Data');
+    const woListNorm  = d.wo_ids.map(s => String(s).trim()).filter(Boolean);
+    const woListStr   = woListNorm.join(', ');
+
+    // First WO's location is a reasonable display value for the Location
+    // column. Archive routing reads each WO's actual location from the
+    // tracker, so this is purely for human readability.
+    const woSheet = ss.getSheetByName('Work Order Tracker');
+    const woData  = woSheet.getDataRange().getValues();
+    const firstWORow = woData.find(r => String(r[0] || '') === woListNorm[0]);
+    const displayLocation = firstWORow ? String(firstWORow[5] || '') : '';
+
+    const crewRows = d.crew.map(member => {
+      const hours    = parseFloat(member.hours) || 0;
+      const overtime = isWeekend ? hours : Math.max(0, hours - 8);
+      return [
+        d.date,                                       //  0  Date (shift START)
+        woListStr,                                    //  1  Work Order # (comma-list)
+        String(d.contractor || '').trim(),            //  2  Prime Contractor
+        String(d.contract_number || '').trim(),       //  3  Contract #
+        String(d.borough || '').trim(),               //  4  Borough
+        displayLocation,                              //  5  Location
+        String(member.name || '').trim(),             //  6  Employee Name
+        String(member.classification || '').trim(),   //  7  Classification
+        String(member.time_in  || ''),                //  8  Time In
+        String(member.time_out || ''),                //  9  Time Out
+        hours,                                        // 10  Hours Worked
+        overtime                                      // 11  Overtime Hours
+      ];
+    });
+
+    appendRowsWithProbing_(
+      signInSheet,
+      crewRows,
+      ['Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
+       'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
+       'Hours Worked', 'Overtime Hours'],
+      'Daily Sign-In Data'
+    );
+
+    // ── Mark Work Day Log rows for these (date, wo) pairs as Submitted ─
+    step = 'Work Day Log update';
+    const wdlSheet = ss.getSheetByName('Work Day Log');
+    if (wdlSheet) {
+      const wdlData = wdlSheet.getDataRange().getValues();
+      const woSet = new Set(woListNorm);
+      // Iterate from the bottom so we can batch sets without index drift,
+      // though we're using setValue per cell here for safety.
+      for (let i = 1; i < wdlData.length; i++) {
+        const row = wdlData[i];
+        const rowDateRaw = row[0];
+        let rowDateStr;
+        if (rowDateRaw instanceof Date && !isNaN(rowDateRaw.getTime())) {
+          const y = rowDateRaw.getFullYear();
+          const m = String(rowDateRaw.getMonth() + 1).padStart(2, '0');
+          const dd = String(rowDateRaw.getDate()).padStart(2, '0');
+          rowDateStr = `${y}-${m}-${dd}`;
+        } else {
+          const m = String(rowDateRaw || '').match(/^(\d{4}-\d{2}-\d{2})/);
+          rowDateStr = m ? m[1] : String(rowDateRaw || '');
+        }
+        if (rowDateStr !== d.date) continue;
+        if (!woSet.has(String(row[1] || '').trim())) continue;
+        if (String(row[7] || '').trim() !== 'Pending') continue;
+        wdlSheet.getRange(i + 1, 8).setValue('Submitted');
+      }
+    }
+
+    // ── Drive write: JSON for filler OR original upload PDF ───────
+    step = 'Drive write';
+    const props         = PropertiesService.getScriptProperties();
+    const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
+    if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
+    const reviewFolder = DriveApp.getFolderById(needsReviewId);
+    const signInFolder = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
+
+    const isoDate = String(d.date).slice(0, 10);
+    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}`;
+
+    let writtenName;
+
+    if (source === 'uploaded') {
+      const fileName = `${baseName}_MANUAL.pdf`;
+      const existing = signInFolder.getFilesByName(fileName);
+      while (existing.hasNext()) existing.next().setTrashed(true);
+      const bytes = Utilities.base64Decode(d.upload_blob_b64);
+      const blob  = Utilities.newBlob(bytes, 'application/pdf', fileName);
+      signInFolder.createFile(blob);
+      writtenName = fileName;
+    } else {
+      // Build the multi-WO Sign-In JSON for fill_signin.py.
+      const dateFmt = (iso) => {
+        const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (!m) return String(iso);
+        const [, yyyy, mm, dd] = m;
+        return `${parseInt(mm, 10)}/${parseInt(dd, 10)}/${yyyy.slice(-2)}`;
+      };
+
+      const locations = woListNorm.map(woId => {
+        const r = woData.find(rr => String(rr[0] || '') === woId);
+        return r ? String(r[5] || '') : '';
+      });
+
+      // Look up address from Contractor Contacts (col 5 = Address).
+      let primeAddress = '';
+      try {
+        const ccSheet = ss.getSheetByName('Contractor Contacts');
+        if (ccSheet) {
+          const ccData = ccSheet.getDataRange().getValues();
+          const ccRow  = ccData.find(r => String(r[0] || '').trim() === String(d.contractor || '').trim());
+          if (ccRow) primeAddress = String(ccRow[5] || '').trim();
+        }
+      } catch (err) {
+        Logger.log(`⚠️ Contractor Contacts lookup failed: ${err}`);
+      }
+
+      const boroughName = getBoroughName_(d.borough);
+      const contractLabel = boroughName
+        ? `${d.contract_number} - ${boroughName}`
+        : d.contract_number;
+
+      // Pre-formatted display string for the "Work Order #" cell on the
+      // sign-in template — saves the filler from having to format it.
+      const woLabel = woListNorm.length > 1
+        ? `${woListNorm.join(', ')} (${woListNorm.length})`
+        : woListNorm[0];
+
+      // Project Name column: prefer Contract Lookup project name; otherwise
+      // fall back to "<wo list> | <first location>".
+      const projectName = d.project_name
+        ? d.project_name
+        : (locations[0] ? `${woListNorm.join(', ')} | ${locations[0]}` : woListNorm.join(', '));
+
+      const payload = {
+        _type:              'signin',
+        date:               dateFmt(d.date),
+        prime_contractor:   String(d.contractor || ''),
+        subcontractor:      CONFIG.EMPLOYER.name,
+        contract_number:    contractLabel,
+        address:            primeAddress,
+        agency:             'NYCDOT',
+        project_name:       projectName,
+        wo_ids:             woListNorm,
+        locations:          locations,
+        wo_label:           woLabel,
+        // Back-compat: older filler builds may still read wo_id (single).
+        // Set it to the first WO so they don't crash; new builds prefer
+        // wo_label / wo_ids.
+        wo_id:              woListNorm[0],
+        crew: d.crew.map(m => ({
+          name:           String(m.name || '').trim(),
+          classification: String(m.classification || '').trim(),
+          time_in:        String(m.time_in  || ''),
+          time_out:       String(m.time_out || ''),
+          sig_in_b64:     m.sig_in_b64  || '',
+          sig_out_b64:    m.sig_out_b64 || '',
+        })),
+        // Principal sign-off block stays blank — filled by Approvals flow
+        // (PrincipalSignModal → pdf-lib in Express).
+        contractor_name:          '',
+        contractor_title:         '',
+        date_signed:              '',
+        contractor_signature_b64: '',
+      };
+
+      const fileName = `${baseName}.json`;
+      const existing = signInFolder.getFilesByName(fileName);
+      while (existing.hasNext()) existing.next().setTrashed(true);
+      signInFolder.createFile(fileName, JSON.stringify(payload, null, 2), MimeType.PLAIN_TEXT);
+      writtenName = fileName;
+    }
+
+    // ── Automation Log ────────────────────────────────────────────
+    step = 'Automation Log';
+    appendRowWithProbing_(
+      ss.getSheetByName('Automation Log'),
+      [
+        new Date(), 'Sign-In Tab', 'Sign-In submitted', writtenName,
+        `${d.crew.length} crew × ${woListNorm.length} WO(s) on ${d.date} (${source})`,
+        'Pending review', '', ''
+      ],
+      ['Timestamp', 'Source', 'Action', 'Related', 'Details', 'Status', 'User', 'Next Steps'],
+      'Automation Log'
+    );
+
+    return jsonResponse_({ success: true, filename: writtenName, source });
+  } catch (err) {
+    const msg = (err && err.message) ? err.message : String(err);
+    const wrapped = new Error(`[step=${step}] ${msg}`);
+    wrapped.stack = err && err.stack ? err.stack : wrapped.stack;
+    throw wrapped;
+  }
+}
+
+// ── action: approve_doc_skip_signoff ───────────────────────────
+//
+// Same as approve_doc but the Approvals UI uses this for manually-
+// uploaded sign-in PDFs the principal already wet-signed by hand. The
+// move to Approved Docs happens with no pdf-lib overlay; the cron
+// archive + email path is identical.
+function handleApproveDocSkipSignoff_(body) {
+  const d = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+
+  const props         = PropertiesService.getScriptProperties();
+  const approvedId    = props.getProperty('APPROVED_SENT_ID');
+  const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
+  if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
+  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+
+  try {
+    const file = DriveApp.getFileById(fileId);
+    if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+    if (!_isUnderParent_(file, needsReviewId)) {
+      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
+    }
+    file.moveTo(DriveApp.getFolderById(approvedId));
+
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Approved (sign-off skipped)', file.getName(),
+          'Moved to ✅ Approved Docs without principal signature overlay (already wet-signed)',
+          'Pending email', '',
+          'Cron will email + archive within 10 min'
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on skip-signoff: ' + logErr);
+    }
+
+    return jsonResponse_({ success: true, file_id: fileId });
   } catch (err) {
     return jsonResponse_({ error: String(err) }, 500);
   }
@@ -4419,9 +4951,9 @@ function handleSubmitFieldReport_(body) {
 
   if (!d.wo_id) return jsonResponse_({ error: 'Missing wo_id' }, 400);
   if (!d.date)  return jsonResponse_({ error: 'Missing date' }, 400);
-  if (!Array.isArray(d.crew) || d.crew.length === 0) {
-    return jsonResponse_({ error: 'At least one crew member is required' }, 400);
-  }
+  // Crew is no longer captured here — sign-in lives in its own tab and is
+  // batched per (date, contract). The Field Report just records what was
+  // worked on the WO and queues a Work Day Log row for sign-in followup.
 
   // Breadcrumb: updated before each risky operation so any uncaught exception
   // inside this handler surfaces with "[step=<phase>]" attached — otherwise
@@ -4539,68 +5071,40 @@ function handleSubmitFieldReport_(body) {
 
   Logger.log('✅ WO Tracker updated: ' + d.wo_id + ' → ' + newStatus);
 
-  // ── Write Daily Sign-In Data rows (one per crew member) ──────
-  // New 14-col schema (cols 12-13 = Admin Reviewed? / Review Notes, filled
-  // later by admin — we leave them truly blank). WO-level fields that used
-  // to live here (SQFT, Paint/Material, WO Complete?, Issues/Notes) moved
-  // to Marking Items rollups + WO Tracker cols 19-22.
-  const signInSheet = ss.getSheetByName('Daily Sign-In Data');
-  const signInLabels = [
-    'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
-    'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
-    'Hours Worked', 'Overtime Hours'
-  ];
+  // ── Write Work Day Log row ─────────────────────────────────────
+  // Each Field Report submission creates exactly one row here. The
+  // Sign-In tab queue reads this sheet (filtered to Status='Pending')
+  // and groups rows by (date, contract # + borough) so the user can
+  // file a single sign-in covering every WO worked that night for a
+  // given contract.
+  step = 'Work Day Log append';
+  const wdlSheet = _getOrCreateWorkDayLogSheet_(ss);
+  appendRowWithProbing_(
+    wdlSheet,
+    [
+      d.date,                              // 0 Date
+      d.wo_id,                             // 1 Work Order #
+      String(woRow[1] || ''),              // 2 Prime Contractor
+      String(woRow[2] || ''),              // 3 Contract #
+      String(woRow[3] || ''),              // 4 Borough
+      String(woRow[5] || ''),              // 5 Location
+      new Date(),                          // 6 Field Report Submitted At
+      'Pending'                            // 7 Sign-In Status
+    ],
+    [
+      'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
+      'Location', 'Field Report Submitted At', 'Sign-In Status'
+    ],
+    'Work Day Log'
+  );
 
-  // Day of work drives the OT rule below. d.date is ISO "YYYY-MM-DD"
-  // (from <input type="date">), so construct in local parts to avoid
-  // UTC-shift (new Date("2026-04-20") is interpreted as UTC midnight).
-  const dowOfWork = (() => {
-    const m = String(d.date || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (!m) return -1;
-    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
-  })();
-  const isWeekend = (dowOfWork === 0 || dowOfWork === 6);
+  Logger.log('✅ Work Day Log: queued ' + d.wo_id + ' for sign-in on ' + d.date);
 
-  // Build every crew row in memory first, then hand them to the batched
-  // appender so the whole crew lands in one setValues round-trip instead
-  // of N.
-  step = 'Sign-In Data batch build';
-  const crewRows = d.crew.map(member => {
-    const hours    = parseFloat(member.hours) || 0;
-    // Apply the OT rule server-side (authoritative). Client-supplied
-    // overtime is ignored — the rule is:
-    //   Saturday/Sunday → every hour is OT.
-    //   Monday–Friday   → hours over 8 in the day are OT; first 8 are ST.
-    const overtime = isWeekend ? hours : Math.max(0, hours - 8);
-    return [
-      d.date,                              //  0  Date
-      d.wo_id,                             //  1  Work Order #
-      String(woRow[1]),                    //  2  Prime Contractor
-      String(woRow[2]),                    //  3  Contract #
-      String(woRow[3]),                    //  4  Borough
-      String(woRow[5]),                    //  5  Location
-      String(member.name   || '').trim(),  //  6  Employee Name
-      String(member.classification || ''), //  7  Classification
-      String(member.time_in  || ''),       //  8  Time In
-      String(member.time_out || ''),       //  9  Time Out
-      hours,                               // 10  Hours Worked
-      overtime                             // 11  Overtime Hours
-      // cols 12 (Admin Reviewed?) and 13 (Review Notes) omitted so the
-      // cells stay truly blank — the dropdown validator rejects an
-      // explicit '' but accepts a truly empty cell.
-    ];
-  });
-  step = `Sign-In Data append x${crewRows.length}`;
-  appendRowsWithProbing_(signInSheet, crewRows, signInLabels, 'Daily Sign-In Data');
-
-  Logger.log('✅ Sign-In Data: ' + d.crew.length + ' row(s) appended for WO ' + d.wo_id);
-
-  // Sign-In JSON + CFR JSON generation moved to a separate action
+  // CFR JSON generation moves through a separate action
   // (`finalize_field_report_docs`) the client fires AFTER it gets this
-  // success response. Keeps the user-facing submit path fast (the JSON
-  // writes are 2-5s of Drive I/O that don't affect the submitted data
-  // integrity — worst case a generated PDF is missing and we see a row
-  // in Automation Log).
+  // success response. Sign-In JSON generation is no longer triggered
+  // here — sign-ins are filed from the Sign-In tab once the user is
+  // ready to gather a whole night's worth of WOs into one sheet.
 
   // ── Automation Log ────────────────────────────────────────────
   const actionNote = d.wo_complete
@@ -4615,7 +5119,7 @@ function handleSubmitFieldReport_(body) {
       'Field Report Web App',
       'Field report submitted',
       d.wo_id,
-      d.crew.length + ' crew member(s) on ' + d.date,
+      'Queued for sign-in on ' + d.date,
       newStatus,
       '',
       actionNote
@@ -4640,18 +5144,17 @@ function handleSubmitFieldReport_(body) {
 
 /**
  * Background JSON generation for a Field Report submit. Writes the
- * Sign-In Log JSON (always) and the Contractor Field Report JSON
- * (only when `wo_complete === true`) to Drive so the Railway worker
- * can pick them up and produce the filled PDFs.
+ * Contractor Field Report JSON when `wo_complete === true` so the
+ * Railway worker can produce the filled CFR PDF.
  *
  * The client fires this as a separate POST right after the main
  * `submit_field_report` returns success. Failures go to Automation Log
  * — they never bubble back to the user because by this point the
  * report data is already safely persisted in the spreadsheet.
  *
- * Expects body.data to be the same payload the submit got (includes
- * signatures). Re-reads the WO Tracker row + the newly-written Issues
- * Reported aggregate so we don't depend on the client shipping them.
+ * Sign-In JSON generation moved out of the Field Report flow entirely:
+ * sign-ins are filed from the Sign-In tab so a single sheet can cover
+ * every WO worked that night for a contract.
  */
 function handleFinalizeFieldReportDocs_(body) {
   const d = body.data || {};
@@ -4667,23 +5170,6 @@ function handleFinalizeFieldReportDocs_(body) {
   const issuesAggregate = String(woRow[22] || '').trim();
 
   const result = { success: true, wo_id: d.wo_id };
-
-  // Sign-In JSON — always attempted
-  try {
-    generateSignInJson_(d, woRow, ss);
-    result.signin = 'ok';
-  } catch (err) {
-    Logger.log('⚠️ Sign-In JSON export failed: ' + err);
-    result.signin = 'failed';
-    try {
-      ss.getSheetByName('Automation Log').appendRow([
-        new Date(), 'Sign-In JSON Export', 'Failed', d.wo_id,
-        String(err), 'Error', '', 'Check logs — sign-in PDF will not be generated'
-      ]);
-    } catch (logErr) {
-      Logger.log('⚠️ Could not write Sign-In failure to Automation Log: ' + logErr);
-    }
-  }
 
   // CFR JSON — only when this submit marked the WO complete
   if (d.wo_complete) {
@@ -4707,120 +5193,6 @@ function handleFinalizeFieldReportDocs_(body) {
   }
 
   return jsonResponse_(result);
-}
-
-
-/**
- * Build a SignIn JSON payload from the submitted field report + WO Tracker row,
- * and write it to Drive folder "Needs Review / Sign-In Logs / ". The Railway
- * Python worker (watch_and_fill.py) polls that folder, fills the Sign-In PDF
- * template with embedded signatures, and uploads the result back.
- *
- * Signatures are expected inline as base64 data URLs on each crew member
- * (sig_in_b64, sig_out_b64) and on the crew-leader block
- * (contractor_signature_b64). They are forwarded verbatim — never persisted
- * separately to Drive.
- *
- * Date formatting: the Sign-In PDF shows "M/D/YY". We accept "YYYY-MM-DD"
- * from the web app and reformat.
- */
-function generateSignInJson_(d, woRow, ss) {
-  const props          = PropertiesService.getScriptProperties();
-  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
-  if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
-
-  const reviewFolder   = DriveApp.getFolderById(needsReviewId);
-  const signInFolder   = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
-
-  // WO Tracker columns: 1=Prime Contractor, 2=Contract #, 3=Borough, 5=Location
-  const primeContractor = String(woRow[1] || '').trim();
-  const contractNum     = String(woRow[2] || '').trim();
-  const boroughCode     = String(woRow[3] || '').trim();
-  const location        = String(woRow[5] || '').trim();
-  const boroughName     = boroughCode ? getBoroughName_(boroughCode) : '';
-
-  // "Contract #" field on the sign-in form shows contract + borough
-  // (user preference — we don't have a separate Registration # field).
-  const contractLabel = boroughName
-    ? `${contractNum} - ${boroughName}`
-    : contractNum;
-
-  // Look up the prime contractor's address from Contractor Contacts.
-  // Sheet layout: col 0 = Contractor, col 5 = Address (billing/yard).
-  // Best-effort — blank if sheet missing or contractor not listed.
-  let primeAddress = '';
-  try {
-    const ccSheet = ss.getSheetByName('Contractor Contacts');
-    if (ccSheet) {
-      const ccData = ccSheet.getDataRange().getValues();
-      const ccRow = ccData.find(r => String(r[0] || '').trim() === primeContractor);
-      if (ccRow) primeAddress = String(ccRow[5] || '').trim();
-    }
-  } catch (err) {
-    Logger.log(`⚠️ Contractor Contacts lookup failed for ${primeContractor}: ${err}`);
-  }
-
-  // Project Name/Location = "<WO#> | <Location>"
-  const projectName = location
-    ? `${d.wo_id} | ${location}`
-    : d.wo_id;
-
-  // Reformat YYYY-MM-DD → M/D/YY to match the paper form's date style
-  const dateFmt = (iso) => {
-    if (!iso) return '';
-    const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (!m) return String(iso);
-    const [, yyyy, mm, dd] = m;
-    return `${parseInt(mm, 10)}/${parseInt(dd, 10)}/${yyyy.slice(-2)}`;
-  };
-  const dateHeader = dateFmt(d.date);
-
-  const payload = {
-    _type:              'signin',
-    wo_id:              d.wo_id,
-    date:               dateHeader,
-    prime_contractor:   primeContractor,
-    subcontractor:      CONFIG.EMPLOYER.name,
-    contract_number:    contractLabel,
-    address:            primeAddress,
-    agency:             'NYCDOT',
-    project_name:       projectName,
-    crew: (d.crew || []).map(m => ({
-      name:            String(m.name || '').trim(),
-      classification:  String(m.classification || '').trim(),
-      time_in:         String(m.time_in  || ''),
-      time_out:        String(m.time_out || ''),
-      sig_in_b64:      m.sig_in_b64  || '',
-      sig_out_b64:     m.sig_out_b64 || '',
-    })),
-    // Crew-leader block at the bottom of the form. The Field Report web app
-    // sends these alongside the per-member sigs.
-    // Bottom sign-off block stays blank at generation time. The
-    // principal signs + types name/title during the Approvals flow
-    // (PrincipalSignModal → pdf-lib in Express). Date is injected at
-    // that same step so it matches the actual approval date.
-    contractor_name:            '',
-    contractor_title:           '',
-    date_signed:                '',
-    contractor_signature_b64:   '',
-  };
-
-  // Filename: SignIn_<WO>_<YYYY-MM-DD>.json — matches the worker's expected
-  // naming so deduplication works if the admin re-submits.
-  const isoDate = (d.date || '').slice(0, 10) || 'unknown';
-  const fileName = `SignIn_${d.wo_id}_${isoDate}.json`;
-
-  // Overwrite any existing file with the same name (same-day re-submit)
-  const existing = signInFolder.getFilesByName(fileName);
-  while (existing.hasNext()) existing.next().setTrashed(true);
-
-  signInFolder.createFile(
-    fileName,
-    JSON.stringify(payload, null, 2),
-    MimeType.PLAIN_TEXT
-  );
-
-  Logger.log('✅ Sign-In JSON exported: ' + fileName);
 }
 
 
