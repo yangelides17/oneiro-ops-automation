@@ -20,7 +20,20 @@ const newCrew = () => ({
   overtime: '',
   signatureIn: null,
   signatureOut: null,
+  // Set when the upload-flow OCR returned a name but it didn't match the
+  // Employee Registry exactly. Surfaces below the dropdown so the user
+  // can see what Claude read and pick the matching employee.
+  parsedNameRaw: '',
 })
+
+// Normalize a name for fuzzy matching — lowercase, collapse spaces,
+// drop punctuation. Used to map OCR'd names against the Employee
+// Registry without tripping on "John A. Smith" vs "John Smith" etc.
+const normName = (s) => String(s || '')
+  .toLowerCase()
+  .replace(/[.,]/g, '')
+  .replace(/\s+/g, ' ')
+  .trim()
 
 // Day-of-week-aware OT calc. Sat/Sun → all OT; weekday over 8 → OT.
 // workDateIso is the SHIFT START date as YYYY-MM-DD. Constructed from
@@ -94,11 +107,20 @@ function CrewRow({ idx, data, employees, onChange, onRemove, workDate }) {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Field label="Employee" required>
+        <Field
+          label="Employee"
+          required
+          hint={data.parsedNameRaw && !data.name
+            ? `Parsed as "${data.parsedNameRaw}" — pick the matching employee, or add them to the Registry first.`
+            : undefined}>
           <select
             value={data.name}
-            onChange={e => onChange(idx, { ...data, name: e.target.value })}
-            className="field-input">
+            onChange={e => onChange(idx, {
+              ...data, name: e.target.value,
+              // Once user makes a manual pick, drop the raw-parse hint.
+              parsedNameRaw: '',
+            })}
+            className={`field-input ${data.parsedNameRaw && !data.name ? 'border-amber-300 bg-amber-50/50' : ''}`}>
             <option value="">— Select —</option>
             {employees.map(emp => (
               <option key={emp.name} value={emp.name}>{emp.name}</option>
@@ -289,9 +311,6 @@ export default function SignIn() {
     if (drafts.has(entry.queue_id)) return drafts.get(entry.queue_id)
     const fresh = {
       crew: [newCrew()],
-      contractorName: '',
-      contractorTitle: '',
-      contractorSignature: null,
       // Default = the queue entry's date (= the WO's Field Report Date of
       // Work). Editable behind a warning modal — see the kebab in the
       // header card. Drives OT calculation: a Fri-night → Sat-morning
@@ -317,8 +336,8 @@ export default function SignIn() {
     setDrafts(prev => {
       const next = new Map(prev)
       const cur = next.get(queueId) || {
-        crew: [newCrew()], contractorName: '', contractorTitle: '',
-        contractorSignature: null, shiftStartDate: '', shiftDateEdited: false,
+        crew: [newCrew()],
+        shiftStartDate: '', shiftDateEdited: false,
         mode: 'generate', uploadFilename: '', uploadMimeType: '',
         uploadDataB64: '', parseStatus: 'idle', parseError: '',
       }
@@ -348,14 +367,22 @@ export default function SignIn() {
 
       const parsed = json.parsed || {}
       const crewIn = Array.isArray(parsed.crew) ? parsed.crew : []
-      // Map Claude's output into the same shape as a Generate-path crew
-      // row. Hours are recomputed locally from time_in/time_out so the
-      // OT preview is consistent with shift-start DOW.
+      // Build a normalized index of registry employees so OCR'd names
+      // like "Yanni Angelides" still match a registry entry like
+      // "YANNI ANGELIDES" or "Yanni  Angelides ". If no match, we keep
+      // the raw OCR'd name on the row so the user can see what Claude
+      // read while picking the correct employee from the dropdown.
+      const normIdx = {}
+      employees.forEach(e => { normIdx[normName(e.name)] = e.name })
+
       const crewMembers = (crewIn.length ? crewIn : [{}]).map(c => {
         const cls = (c.classification === 'LP' || c.classification === 'SAT')
           ? c.classification : CLASSIFICATIONS[0]
-          const m = newCrew()
-        m.name           = c.name || ''
+        const m = newCrew()
+        const rawName = String(c.name || '').trim()
+        const matched = rawName ? normIdx[normName(rawName)] : ''
+        m.name           = matched || ''
+        m.parsedNameRaw  = matched ? '' : rawName
         m.classification = cls
         m.timeIn         = c.time_in  || ''
         m.timeOut        = c.time_out || ''
@@ -369,8 +396,6 @@ export default function SignIn() {
         parseStatus:     'parsed',
         parseError:      '',
         crew:            crewMembers,
-        contractorName:  parsed.contractor_name  || '',
-        contractorTitle: parsed.contractor_title || '',
         uploadFilename:  json.upload?.filename  || file.name,
         uploadMimeType:  json.upload?.mime_type || 'application/pdf',
         uploadDataB64:   json.upload?.data_b64  || '',
@@ -473,9 +498,12 @@ export default function SignIn() {
             sig_in_b64:     m.signatureIn  || '',
             sig_out_b64:    m.signatureOut || '',
           })),
-          contractor_name:            draft.contractorName,
-          contractor_title:           draft.contractorTitle,
-          contractor_signature_b64:   draft.contractorSignature || '',
+          // The principal sign-off block on the PDF is filled at approval
+          // time (PrincipalSignModal → pdf-lib). The Sign-In form
+          // doesn't capture a crew-leader signature anymore.
+          contractor_name:            '',
+          contractor_title:           '',
+          contractor_signature_b64:   '',
           date_signed:                '',
           source: draft.mode === 'upload' ? 'uploaded' : 'generated',
           // Only sent when the user uploaded a hand-filled sheet — Apps
@@ -752,31 +780,6 @@ export default function SignIn() {
                 className="btn-outline w-full">
                 + Add crew member
               </button>
-            </div>
-
-            {/* Contractor sign-off (crew leader at bottom of form) */}
-            <div className="card p-4 space-y-3">
-              <p className="section-label">Crew Leader Sign-Off</p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Field label="Printed Name" required>
-                  <input
-                    type="text"
-                    value={draft.contractorName}
-                    onChange={e => updateDraft(selected.queue_id, { contractorName: e.target.value })}
-                    className="field-input" />
-                </Field>
-                <Field label="Title">
-                  <input
-                    type="text"
-                    value={draft.contractorTitle}
-                    onChange={e => updateDraft(selected.queue_id, { contractorTitle: e.target.value })}
-                    className="field-input" />
-                </Field>
-              </div>
-              <SignaturePad
-                label="Signature"
-                onChange={dataUrl => updateDraft(selected.queue_id, { contractorSignature: dataUrl })}
-              />
             </div>
 
             <div className="sticky bottom-4 z-10">

@@ -559,35 +559,67 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
     }
 
-    const base64 = req.file.buffer.toString('base64')
+    // Pre-rotate any page that's portrait dimensions — most Daily
+    // Sign-In Logs are landscape forms, so a portrait scan means the
+    // paper was held sideways. Rotating to landscape gives Claude
+    // Vision a much cleaner read AND makes the archived PDF readable
+    // without the admin tilting their head.
+    let workingBytes = req.file.buffer
+    let rotatedAny = false
+    try {
+      const { PDFDocument, degrees } = await import('pdf-lib')
+      const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
+      pdfDoc.getPages().forEach(page => {
+        const { width, height } = page.getSize()
+        if (height > width) {
+          // Stack the existing rotation (if any) with +90° so we don't
+          // clobber a PDF that's already been rotated.
+          const existing = page.getRotation().angle || 0
+          page.setRotation(degrees((existing + 90) % 360))
+          rotatedAny = true
+        }
+      })
+      if (rotatedAny) workingBytes = Buffer.from(await pdfDoc.save())
+    } catch (e) {
+      console.warn('Sign-in upload rotation skipped:', e.message)
+    }
 
-    // The prompt asks Claude to read the hand-filled paper Sign-In Sheet
-    // and emit a structured JSON object. Times normalised to 24-hour
-    // HH:MM. Anything illegible becomes null so the user can fix it
-    // during confirmation rather than having a hallucinated value
-    // silently submitted.
-    const prompt = `You are extracting information from a hand-filled construction crew Sign-In Sheet (often handwritten on a paper template). Return ONLY valid JSON — no markdown fences, no commentary.
+    const base64 = workingBytes.toString('base64')
+
+    // Strict-JSON prompt. Tightened over the original to handle the two
+    // failure modes seen in testing:
+    //   1. AM/PM mixups (10:00 PM read as 11:00 AM, etc.)
+    //   2. Handwritten names returned as null even when legible.
+    const prompt = `You are extracting information from a hand-filled construction crew Sign-In Sheet (NYC DOT "EMPLOYEES' DAILY SIGN-IN LOG"). The sheet is filled in by hand by a crew leader at the start and end of a shift. Return ONLY valid JSON — no markdown fences, no commentary.
 
 Schema:
 {
   "crew": [
     {
-      "name":           "<Full Name as written, or null if unreadable>",
-      "classification": "<Either \\"LP\\" or \\"SAT\\" — pick the closest match. LP = Line Person/crew chief, SAT = Stripe Assistant Technician. null if blank.>",
-      "time_in":        "<24-hour HH:MM, e.g. \\"22:00\\". Convert from 12-hour formats. null if unreadable.>",
-      "time_out":       "<24-hour HH:MM, e.g. \\"06:00\\". Convert from 12-hour formats. null if unreadable.>"
+      "name":           "<Full Name as printed on the Employees Name column. Read carefully — names are handwritten and may be cursive. Return your best reading even if uncertain. null only if the cell is truly blank.>",
+      "classification": "<Either \\"LP\\" or \\"SAT\\". LP = Line Person/Crew Chief. SAT = Stripe Assistant Technician. Return null if blank.>",
+      "time_in":        "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>",
+      "time_out":       "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>"
     }
   ],
-  "contractor_name":  "<Printed name in the Crew Leader sign-off block, or null>",
-  "contractor_title": "<Title in the Crew Leader sign-off block, or null>",
-  "date_inferred":    "<Date written on the sheet in YYYY-MM-DD if parseable, otherwise null>"
+  "contractor_name":  "<Printed name at bottom of sheet (Contractor's Representative), or null>",
+  "contractor_title": "<Title at bottom of sheet, or null>",
+  "date_inferred":    "<Date written at the top of the sheet in YYYY-MM-DD if parseable, otherwise null>"
 }
 
+Time interpretation (CRITICAL — most common error):
+- This is night shift work for road striping crews. Time In is typically late evening (8pm–11pm), Time Out is typically early morning (4am–7am).
+- If a row shows Time In near 10–11 with a "P" or "PM" suffix, output "22:00" or "23:00" — never the AM equivalent.
+- If a row shows Time Out near 5–7 with an "A" or "AM" suffix, output "05:00"–"07:00".
+- If the AM/PM marker is illegible BUT the value is consistent with a typical night-shift pattern (e.g. Time In ~22:00, Time Out ~06:00), favor that interpretation over a daytime one.
+- "11PM" → "23:00"; "11AM" → "11:00". Don't conflate them.
+- Convert 12-hour formats: "10pm" → "22:00", "6 AM" → "06:00", "10:30PM" → "22:30".
+
 Rules:
-- Skip empty rows entirely. Only include rows with at least a name.
-- Never invent or guess values. If a cell is blank, smudged, or unreadable, the field is null.
-- Times: normalize to 24-hour HH:MM (e.g. "10pm" → "22:00", "6 AM" → "06:00", "10:30PM" → "22:30").
-- Classification: only "LP" or "SAT" values are valid. If the sheet uses other codes, pick the closest match; otherwise null.`
+- Skip rows that are entirely blank. Only include crew rows that have at least one filled cell (name, time, or classification).
+- For names: return your best reading of handwriting, including unusual or non-English names. Don't return null just because the writing is messy — the user will validate.
+- Classification: only "LP" or "SAT". If the sheet uses other codes, pick the closest match; otherwise null.
+- Never wrap the JSON in markdown fences.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -635,15 +667,17 @@ Rules:
       throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
     }
 
-    // Echo the original upload back to the client too, so it can hand
-    // those bytes to /api/signin without re-uploading. Keeps the round
-    // trip simple: parse + hold-bytes in one call.
+    // Echo the (possibly rotated) bytes back to the client so they go
+    // straight into /api/signin without re-uploading. The archived PDF
+    // is then the user-readable landscape version, not the original
+    // sideways scan.
     res.json({
       parsed,
+      rotated: rotatedAny,
       upload: {
         filename:    req.file.originalname,
         mime_type:   mime,
-        size:        req.file.size,
+        size:        workingBytes.length,
         data_b64:    base64,
       },
     })
