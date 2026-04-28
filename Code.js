@@ -3376,13 +3376,17 @@ function handleSubmitSignIn_(body) {
     const woListNorm  = d.wo_ids.map(s => String(s).trim()).filter(Boolean);
     const woListStr   = woListNorm.join(', ');
 
-    // First WO's location is a reasonable display value for the Location
-    // column. Archive routing reads each WO's actual location from the
-    // tracker, so this is purely for human readability.
-    const woSheet = ss.getSheetByName('Work Order Tracker');
-    const woData  = woSheet.getDataRange().getValues();
-    const firstWORow = woData.find(r => String(r[0] || '') === woListNorm[0]);
-    const displayLocation = firstWORow ? String(firstWORow[5] || '') : '';
+    // Look up each WO's Location from the WO Tracker so the Daily
+    // Sign-In Data Location column mirrors the WO# column (a parallel
+    // list). Both are display-only — archive routing always reads
+    // per-WO location from the tracker directly.
+    const woSheet  = ss.getSheetByName('Work Order Tracker');
+    const woData   = woSheet.getDataRange().getValues();
+    const allLocations = woListNorm.map(woId => {
+      const r = woData.find(rr => String(rr[0] || '') === woId);
+      return r ? String(r[5] || '').trim() : '';
+    });
+    const displayLocation = allLocations.filter(Boolean).join('; ');
 
     const crewRows = d.crew.map(member => {
       const hours    = parseFloat(member.hours) || 0;
@@ -3490,11 +3494,17 @@ function handleSubmitSignIn_(body) {
         ? `${woListNorm.join(', ')} (${woListNorm.length})`
         : woListNorm[0];
 
-      // Project Name column: prefer Contract Lookup project name; otherwise
-      // fall back to "<wo list> | <first location>".
-      const projectName = d.project_name
-        ? d.project_name
-        : (locations[0] ? `${woListNorm.join(', ')} | ${locations[0]}` : woListNorm.join(', '));
+      // Project Name / Location field on the sign-in PDF. We pair every
+      // WO with its OWN location ("<WO> | <Loc>"); Contract Lookup's
+      // project_name is intentionally not used here — that field is
+      // sometimes empty and when it isn't, it's the contract's umbrella
+      // description (e.g. "Manhattan Pavement Marking"), not the
+      // worksite-specific text the form expects.
+      const woLocPairs = woListNorm.map((wo, i) => {
+        const loc = (locations[i] || '').trim();
+        return loc ? `${wo} | ${loc}` : wo;
+      });
+      const projectName = woLocPairs.join('; ');
 
       const payload = {
         _type:              'signin',
