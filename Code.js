@@ -3313,6 +3313,24 @@ function handleListSignInQueue_(body) {
 function handleSubmitSignIn_(body) {
   const d = body.data || {};
 
+  // Idempotency cache. Client sends a stable `submit_id` per draft;
+  // we cache the response under that id for 10 minutes. A retry after
+  // a perceived failure (network blip, slow response, etc) hits the
+  // cache and returns the original success — no duplicate rows in
+  // Daily Sign-In Data.
+  const submitId = String(d.submit_id || '').trim();
+  const _cache = submitId ? CacheService.getScriptCache() : null;
+  if (_cache) {
+    const cached = _cache.get('signin_submit_' + submitId);
+    if (cached) {
+      try {
+        const obj = JSON.parse(cached);
+        return jsonResponse_({ ...obj, duplicate: true });
+      } catch (e) { /* fall through, recompute */ }
+    }
+  }
+
+
   if (!d.date)            return jsonResponse_({ error: 'Missing date' }, 400);
   if (!d.contract_number) return jsonResponse_({ error: 'Missing contract_number' }, 400);
   if (!d.borough)         return jsonResponse_({ error: 'Missing borough' }, 400);
@@ -3530,7 +3548,12 @@ function handleSubmitSignIn_(body) {
       'Automation Log'
     );
 
-    return jsonResponse_({ success: true, filename: writtenName, source });
+    const result = { success: true, filename: writtenName, source };
+    if (_cache) {
+      try { _cache.put('signin_submit_' + submitId, JSON.stringify(result), 600); }
+      catch (e) { /* cache write best-effort */ }
+    }
+    return jsonResponse_(result);
   } catch (err) {
     const msg = (err && err.message) ? err.message : String(err);
     const wrapped = new Error(`[step=${step}] ${msg}`);

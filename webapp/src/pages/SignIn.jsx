@@ -412,6 +412,14 @@ export default function SignIn() {
     if (drafts.has(entry.queue_id)) return drafts.get(entry.queue_id)
     const fresh = {
       crew: [newCrew()],
+      // Idempotency token — sent with every submit attempt for this
+      // draft. The server caches the response keyed by this id, so a
+      // retry after a perceived error (network blip, slow response,
+      // etc.) returns the cached success instead of duplicating Daily
+      // Sign-In Data rows. New ID generated per draft, not per attempt.
+      submitId: (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Math.random().toString(36).slice(2) + Date.now().toString(36)),
       // Default = the queue entry's date (= the WO's Field Report Date of
       // Work). Editable behind a warning modal — see the kebab in the
       // header card. Drives OT calculation: a Fri-night → Sat-morning
@@ -519,6 +527,11 @@ export default function SignIn() {
   // useMemo a few lines down depends on it — referencing the binding
   // before its `const` would TDZ at component init.
   const [existingDayHours, setExistingDayHours] = useState({})
+  // Bump on every successful submit so the existingDayHours useEffect
+  // refetches. Without this, navigating from sign-in #1 to sign-in #2
+  // in the same shift shows stale totals (sign-in #1's hours don't
+  // appear under "Other") until the user reloads the page.
+  const [hoursRefreshTick, setHoursRefreshTick] = useState(0)
 
   // Apply the Mon–Fri-over-8 / Sat-Sun-all-OT rule to a given date+hours.
   const splitStOt = (hours, dateIso) => {
@@ -634,7 +647,7 @@ export default function SignIn() {
         setExistingDayHours({})
       })
     return () => { cancelled = true }
-  }, [effectiveDate])
+  }, [effectiveDate, hoursRefreshTick])
 
   // ── Crew handlers (operate on the selected entry's draft) ────
   const updateCrewMember = (idx, member) => {
@@ -685,6 +698,10 @@ export default function SignIn() {
           source: draft.mode === 'upload' ? 'uploaded' : 'generated',
           upload_blob_b64:            draft.mode === 'upload' ? draft.uploadDataB64 : undefined,
           upload_filename:            draft.mode === 'upload' ? draft.uploadFilename : undefined,
+          // Idempotency token. Server caches the response under this id
+          // so a retry after a perceived failure returns the cached
+          // success rather than writing duplicate Daily Sign-In Data.
+          submit_id:                  draft.submitId,
         }),
       })
       const json = await res.json()
@@ -701,7 +718,16 @@ export default function SignIn() {
       const nextEntry = remaining[idx] || remaining[idx - 1] || null
       setSelectedId(nextEntry ? nextEntry.queue_id : null)
 
-      showToast(`Sign-in submitted for ${selected.contract_number}`, 'success')
+      // Refetch existing day-hours so the next entry's Shift Totals
+      // panel reflects this submit immediately.
+      setHoursRefreshTick(n => n + 1)
+
+      showToast(
+        json.duplicate
+          ? `Already submitted — no changes`
+          : `Sign-in submitted for ${selected.contract_number}`,
+        'success'
+      )
     } catch (err) {
       showToast(err.message || 'Submit failed', 'error')
     } finally {
