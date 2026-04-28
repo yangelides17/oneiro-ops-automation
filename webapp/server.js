@@ -559,16 +559,35 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
     }
 
-    // Orientation handling. Heuristics on raw page dimensions are
-    // unreliable because rotation can live either in PDF metadata OR be
-    // baked into how content was drawn on the page. Instead, we ask
-    // Claude to report `rotation_needed` as part of the same OCR call
-    // (no extra round-trip, no extra cost) and rotate the bytes via
-    // pdf-lib AFTER parsing succeeds. Row order may be off when the
-    // page is upside-down — Claude tends to scan in screen-space — but
-    // the row VALUES (name, times, class) are correct regardless, and
-    // the user can drag-reorder if they care about the visual order.
-    const base64 = req.file.buffer.toString('base64')
+    // Orientation handling.
+    //
+    // Tricky bit: Anthropic Vision and pdf.js may interpret a PDF's
+    // /Rotate metadata flag differently — Vision tends to auto-orient
+    // by content (so Claude sees a "correct" view even on a sideways
+    // file), while pdf.js (powering the React preview) renders strictly
+    // per the metadata. Asking Claude to report rotation against a
+    // viewer it can't simulate is unreliable.
+    //
+    // Fix: strip ALL existing rotation flags before sending to Claude.
+    // Claude then sees the raw drawn content (same view pdf.js would
+    // render at rotation=0). Whatever rotation it reports is the
+    // absolute value we set — no addition / mixing with prior metadata.
+    let probeBuffer = req.file.buffer
+    try {
+      const { PDFDocument, degrees } = await import('pdf-lib')
+      const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
+      let strippedAny = false
+      pdfDoc.getPages().forEach(page => {
+        if ((page.getRotation().angle || 0) !== 0) {
+          page.setRotation(degrees(0))
+          strippedAny = true
+        }
+      })
+      if (strippedAny) probeBuffer = Buffer.from(await pdfDoc.save())
+    } catch (e) {
+      console.warn('Sign-in upload: could not strip rotation before probe:', e.message)
+    }
+    const base64 = probeBuffer.toString('base64')
 
     // Pull the Employee Registry from Apps Script so we can hand
     // Claude the closed list of valid names. The prompt then asks
@@ -629,12 +648,14 @@ Rules:
 - Never wrap the JSON in markdown fences.
 
 Rotation detection:
-- Look at the page as it would render in a normal PDF viewer (no manual rotation applied).
-- The form is a landscape document. The header "THE CITY OF NEW YORK • OFFICE OF THE COMPTROLLER • BUREAU OF LABOR LAW" should appear at the top, reading left-to-right.
-- If the header is at the top reading left-to-right → return 0.
-- If the header is on the right edge reading bottom-to-top → return 90 (rotate 90° clockwise to fix).
-- If the header is at the bottom reading right-to-left → return 180.
-- If the header is on the left edge reading top-to-bottom → return 270.`
+- The PDF you are seeing has had any rotation metadata stripped — what you see is the raw drawn content as it would appear in a default viewer.
+- The form is a landscape document. The header "THE CITY OF NEW YORK • OFFICE OF THE COMPTROLLER • BUREAU OF LABOR LAW" should appear at the TOP of the page, reading left-to-right.
+- Determine where the header actually appears in the PDF you are looking at, and return the clockwise rotation in degrees that would put the header at the top reading left-to-right:
+  - Header already at the top reading left-to-right → 0
+  - Header on the right edge, reading bottom-to-top → 90
+  - Header at the bottom, upside-down (reading right-to-left) → 180
+  - Header on the left edge, reading top-to-bottom → 270
+- Return the SINGLE integer that fixes the orientation.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -682,33 +703,32 @@ Rotation detection:
       throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
     }
 
-    // Apply Claude's rotation_needed to the PDF. We ADD to whatever
-    // rotation metadata is already on the page rather than replacing,
-    // because Claude judged the EFFECTIVE displayed state (Anthropic
-    // Vision honors rotation metadata) — so the value it returned is
-    // the additional clockwise rotation needed beyond what's already
-    // baked in.
+    // Apply Claude's rotation_needed as the ABSOLUTE rotation flag.
+    // Because we stripped existing rotation to 0 before sending to
+    // Claude, what Claude reported is the rotation that should now
+    // appear in the PDF metadata. No addition, no mixing.
     const rotationNeeded = (() => {
       const v = Number(parsed && parsed.rotation_needed)
       return [0, 90, 180, 270].includes(v) ? v : 0
     })()
-    let workingBytes = req.file.buffer
-    let rotatedAny   = false
+    console.log(`Sign-in upload: Claude rotation_needed = ${rotationNeeded}`)
+    let workingBytes = probeBuffer  // already has rotation stripped to 0
+    let rotatedAny   = (rotationNeeded !== 0)
     if (rotationNeeded !== 0) {
       try {
         const { PDFDocument, degrees } = await import('pdf-lib')
-        const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
+        const pdfDoc = await PDFDocument.load(probeBuffer, { updateMetadata: false })
         pdfDoc.getPages().forEach(page => {
-          const existing = page.getRotation().angle || 0
-          page.setRotation(degrees((existing + rotationNeeded) % 360))
-          rotatedAny = true
+          page.setRotation(degrees(rotationNeeded))
         })
-        if (rotatedAny) workingBytes = Buffer.from(await pdfDoc.save())
+        workingBytes = Buffer.from(await pdfDoc.save())
       } catch (e) {
         console.warn('Sign-in upload rotation failed:', e.message)
+        rotatedAny = false
+        workingBytes = probeBuffer
       }
     }
-    const echoBase64 = rotatedAny ? workingBytes.toString('base64') : base64
+    const echoBase64 = workingBytes.toString('base64')
 
     // Echo the (possibly rotated) bytes back to the client so they go
     // straight into /api/signin without re-uploading. The archived PDF
