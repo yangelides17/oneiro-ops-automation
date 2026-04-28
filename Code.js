@@ -700,6 +700,7 @@ function aggregateMarkingItemsForPL_(ss, woId) {
   let sfSum = 0;
   const colorsSet = {};
   let crosswalkSum = 0;
+  let stopLineSum  = 0;
 
   woItems.forEach(r => {
     const category = String(r[4] || '').trim();
@@ -716,11 +717,12 @@ function aggregateMarkingItemsForPL_(ss, woId) {
       return;
     }
 
-    // HVX Crosswalk + Stop Line → combined LF cell
-    if (category === 'HVX Crosswalk' || category === 'Stop Line') {
-      crosswalkSum += qty;
-      return;
-    }
+    // HVX Crosswalk + Stop Line share the same row on the production
+    // log but are tracked SEPARATELY so the cell can render as
+    // "<crosswalk LF> / <stopline LF>" — admin can see both numbers
+    // at a glance instead of an opaque sum.
+    if (category === 'HVX Crosswalk') { crosswalkSum += qty; return; }
+    if (category === 'Stop Line')     { stopLineSum  += qty; return; }
 
     // Standard rename; unmapped categories drop silently
     const plLabel = PL_CATEGORY_MAP_[category];
@@ -728,8 +730,8 @@ function aggregateMarkingItemsForPL_(ss, woId) {
     out.markings[plLabel] = (out.markings[plLabel] || 0) + qty;
   });
 
-  if (crosswalkSum > 0) {
-    out.markings['CrossWalks/Stop Lines'] = crosswalkSum;
+  if (crosswalkSum > 0 || stopLineSum > 0) {
+    out.markings['CrossWalks/Stop Lines'] = `${crosswalkSum}/${stopLineSum}`;
   }
   if (sfSum > 0) {
     out.sqft  = sfSum;
