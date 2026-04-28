@@ -61,12 +61,12 @@ const CONFIG = {
   // Operational-day cutoff hour (local time). Any timestamp with hour
   // strictly less than this value is bucketed to the PREVIOUS calendar
   // day for accounting purposes (Daily Sign-In Data Date column, OT
-  // rule day-of-week, "Completed Today" filters, etc).
-  // 4 = standard for night-shift road striping: any work starting
-  // before 4 AM is treated as a continuation of the previous evening's
-  // shift. Set higher (5/6) only if early-AM continuations stretch
-  // routinely past 4 AM.
-  OPERATIONAL_DAY_CUTOFF_HOUR: 4
+  // rule day-of-week, "Completed Today" filters, etc). 5 covers the
+  // typical road-striping night shift that wraps up between 4–5 AM
+  // (FR submitted just after work ends still buckets to the previous
+  // evening). Edge case: a true 3–5 AM day shift would mis-bucket
+  // backward — use the Sign-In tab kebab to override on those.
+  OPERATIONAL_DAY_CUTOFF_HOUR: 5
 };
 
 

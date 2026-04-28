@@ -9,7 +9,7 @@
 // All date math here is local-parts based (year, month, day, hour) so
 // DST and timezone shifts don't change a date's bucket.
 
-export const OPERATIONAL_DAY_CUTOFF_HOUR = 4
+export const OPERATIONAL_DAY_CUTOFF_HOUR = 5
 
 function isoOf(d) {
   const yyyy = d.getFullYear()
