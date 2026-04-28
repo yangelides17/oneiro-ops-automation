@@ -586,17 +586,31 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
 
     const base64 = workingBytes.toString('base64')
 
-    // Strict-JSON prompt. Tightened over the original to handle the two
-    // failure modes seen in testing:
-    //   1. AM/PM mixups (10:00 PM read as 11:00 AM, etc.)
-    //   2. Handwritten names returned as null even when legible.
+    // Pull the Employee Registry from Apps Script so we can hand
+    // Claude the closed list of valid names. The prompt then asks
+    // Claude to return one of THOSE values exactly — handwriting
+    // matching happens inside the model rather than in our code, so
+    // unusual spelling/cursive variants still resolve correctly.
+    let employeeList = []
+    try {
+      const empRes = await callAppsScript('list_employees')
+      employeeList = (empRes && Array.isArray(empRes.employees))
+        ? empRes.employees.map(e => String(e.name || '').trim()).filter(Boolean)
+        : []
+    } catch (e) {
+      console.warn('Sign-in upload: could not fetch employee list:', e.message)
+    }
+    const employeeListText = employeeList.length
+      ? employeeList.map(n => `  - ${n}`).join('\n')
+      : '  (registry currently empty — return the raw handwriting)'
+
     const prompt = `You are extracting information from a hand-filled construction crew Sign-In Sheet (NYC DOT "EMPLOYEES' DAILY SIGN-IN LOG"). The sheet is filled in by hand by a crew leader at the start and end of a shift. Return ONLY valid JSON — no markdown fences, no commentary.
 
 Schema:
 {
   "crew": [
     {
-      "name":           "<Full Name as printed on the Employees Name column. Read carefully — names are handwritten and may be cursive. Return your best reading even if uncertain. null only if the cell is truly blank.>",
+      "name":           "<EXACTLY one name from the Employee Registry below — see Name matching rules.>",
       "classification": "<Either \\"LP\\" or \\"SAT\\". LP = Line Person/Crew Chief. SAT = Stripe Assistant Technician. Return null if blank.>",
       "time_in":        "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>",
       "time_out":       "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>"
@@ -606,6 +620,15 @@ Schema:
   "contractor_title": "<Title at bottom of sheet, or null>",
   "date_inferred":    "<Date written at the top of the sheet in YYYY-MM-DD if parseable, otherwise null>"
 }
+
+Employee Registry (the ONLY valid values for crew[].name):
+${employeeListText}
+
+Name matching rules:
+- For each handwritten name on the sheet, find the SINGLE registry entry above whose spelling is closest to the handwriting (account for cursive, partial first/last names, smudges, abbreviations, swapped first/last name order, common misspellings — pick the best fit even if not a perfect match).
+- Return that registry entry verbatim — exact capitalization and spelling as listed above.
+- The crew is drawn from this list, so a real crew row WILL match. Do not return null, do not invent a name not in the list.
+- Only return null for the name if the row is completely blank (no handwriting at all).
 
 Time interpretation (CRITICAL — most common error):
 - This is night shift work for road striping crews. Time In is typically late evening (8pm–11pm), Time Out is typically early morning (4am–7am).
@@ -617,7 +640,6 @@ Time interpretation (CRITICAL — most common error):
 
 Rules:
 - Skip rows that are entirely blank. Only include crew rows that have at least one filled cell (name, time, or classification).
-- For names: return your best reading of handwriting, including unusual or non-English names. Don't return null just because the writing is messy — the user will validate.
 - Classification: only "LP" or "SAT". If the sheet uses other codes, pick the closest match; otherwise null.
 - Never wrap the JSON in markdown fences.`
 
@@ -734,6 +756,25 @@ app.post('/api/signin-queue/check-continuation', async (req, res) => {
     res.json(data)
   } catch (err) {
     console.error('POST /api/signin-queue/check-continuation error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/signin-queue/day-hours
+ * Returns a map of employee → total hours already on Daily Sign-In
+ * Data for a given operational day. The Sign-In tab uses this to
+ * compose "Shift Totals" — i.e. what the worker's day will look like
+ * once the in-flight sign-in is added on top.
+ * Body: { date: "YYYY-MM-DD" }
+ * Response: { totals: { "<name>": <hours>, ... } }
+ */
+app.post('/api/signin-queue/day-hours', async (req, res) => {
+  try {
+    const data = await callAppsScript('list_signin_day_hours', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/signin-queue/day-hours error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })

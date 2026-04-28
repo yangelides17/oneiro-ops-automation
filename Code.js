@@ -2588,6 +2588,8 @@ function doPost(e) {
       return handleSubmitSignIn_(body);
     } else if (action === 'check_signin_continuation') {
       return handleCheckSignInContinuation_(body);
+    } else if (action === 'list_signin_day_hours') {
+      return handleListSignInDayHours_(body);
     } else if (action === 'approve_doc_skip_signoff') {
       return handleApproveDocSkipSignoff_(body);
     } else {
@@ -3611,6 +3613,47 @@ function _parseSignInTimeOfDay_(s) {
   m = t.match(/^(\d{1,2}):(\d{2})$/);
   if (m) return { hours: Number(m[1]), minutes: Number(m[2]) };
   return null;
+}
+
+
+// ── action: list_signin_day_hours ──────────────────────────────
+//
+// Sums hours already on Daily Sign-In Data for a given operational day.
+// The Sign-In tab uses this to display "Shift Totals" — what each
+// employee will end up with across ALL sign-ins on this date once the
+// in-progress one is submitted, so the user can sanity-check OT before
+// submitting the second contract's sheet.
+//
+// body.data = { date: "YYYY-MM-DD" }
+// response  = { totals: { "<employee name>": <hours number>, ... } }
+function handleListSignInDayHours_(body) {
+  const d = body.data || {};
+  const targetDate = String(d.date || '').trim();
+  if (!targetDate) return jsonResponse_({ totals: {} });
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Daily Sign-In Data');
+  if (!sheet) return jsonResponse_({ totals: {} });
+  const data = sheet.getDataRange().getValues();
+
+  const totals = {};
+  data.slice(1).forEach(row => {
+    const rowDateRaw = row[0];
+    let rowDateIso;
+    if (rowDateRaw instanceof Date && !isNaN(rowDateRaw.getTime())) {
+      rowDateIso = Utilities.formatDate(rowDateRaw, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    } else {
+      const m = String(rowDateRaw || '').match(/^(\d{4}-\d{2}-\d{2})/);
+      rowDateIso = m ? m[1] : '';
+    }
+    if (rowDateIso !== targetDate) return;
+    const empName = String(row[6] || '').trim();
+    const hours   = Number(row[10]) || 0;
+    if (!empName) return;
+    totals[empName] = (totals[empName] || 0) + hours;
+  });
+
+  return jsonResponse_({ totals });
 }
 
 

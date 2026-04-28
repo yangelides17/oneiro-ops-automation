@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { Document, Page, pdfjs } from 'react-pdf'
+import 'react-pdf/dist/Page/AnnotationLayer.css'
+import 'react-pdf/dist/Page/TextLayer.css'
 import SignaturePad from '../components/SignaturePad'
 import RowKebab     from '../components/RowKebab'
 import ConfirmModal from '../components/ConfirmModal'
 import { opDayFromIsoTime } from '../lib/dateOps'
+
+// Mirror the Approvals page wiring — same pdf.js worker URL, version
+// pinned to the bundled react-pdf so we don't drift if Vite swaps it.
+pdfjs.GlobalWorkerOptions.workerSrc =
+  `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`
 
 // ── Constants ──────────────────────────────────────────────────
 // Mirrors the dropdown validation on Daily Sign-In Data → Classification.
@@ -86,7 +94,10 @@ function Field({ label, required, hint, children }) {
 }
 
 // ── Crew row (with employee dropdown + sig pads) ───────────────
-function CrewRow({ idx, data, employees, onChange, onRemove, workDate }) {
+// `showSignatures` is false for the Upload tab — uploaded scans
+// already carry the crew's signatures on paper, so we only need to
+// confirm the parsed identity / classification / time-in-out values.
+function CrewRow({ idx, data, employees, onChange, onRemove, workDate, showSignatures = true }) {
   const handleTime = (field, val) => {
     const tin  = field === 'timeIn'  ? val : data.timeIn
     const tout = field === 'timeOut' ? val : data.timeOut
@@ -159,36 +170,125 @@ function CrewRow({ idx, data, employees, onChange, onRemove, workDate }) {
         <div className="flex gap-4 bg-white rounded-lg px-3 py-2 border border-slate-200">
           <div>
             <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">
-              Reg. Hours
+              Hours (this sheet)
             </span>
             <p className="text-sm font-bold text-navy">{data.hours}</p>
-          </div>
-          <div className="border-l border-slate-200 pl-4">
-            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">
-              OT Hours
-            </span>
-            <p className={`text-sm font-bold ${parseFloat(data.overtime) > 0 ? 'text-orange-600' : 'text-slate-400'}`}>
-              {data.overtime || '0.00'}
-            </p>
           </div>
         </div>
       )}
 
-      <div className="pt-1 border-t border-slate-200 space-y-3">
-        <p className="text-[11px] text-slate-400 font-medium">
-          Employee signs below — added to the Sign-In Log
-        </p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <SignaturePad
-            label="Time-In Signature"
-            onChange={dataUrl => onChange(idx, { ...data, signatureIn: dataUrl })}
-          />
-          <SignaturePad
-            label="Time-Out Signature"
-            onChange={dataUrl => onChange(idx, { ...data, signatureOut: dataUrl })}
-          />
+      {showSignatures && (
+        <div className="pt-1 border-t border-slate-200 space-y-3">
+          <p className="text-[11px] text-slate-400 font-medium">
+            Employee signs below — added to the Sign-In Log
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <SignaturePad
+              label="Time-In Signature"
+              onChange={dataUrl => onChange(idx, { ...data, signatureIn: dataUrl })}
+            />
+            <SignaturePad
+              label="Time-Out Signature"
+              onChange={dataUrl => onChange(idx, { ...data, signatureOut: dataUrl })}
+            />
+          </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+// ── Inline PDF preview (used in Upload mode after parse) ───────
+// Renders the uploaded handwritten sign-in sheet at fit-width inside
+// a scrollable container so the user can verify the parsed fields
+// without leaving the form.
+function UploadPreview({ url }) {
+  const [numPages, setNumPages] = useState(null)
+  const [width, setWidth]       = useState(640)
+  const wrapRef = useRef(null)
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect?.width || 640
+      setWidth(Math.max(280, Math.floor(w) - 16))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  return (
+    <div ref={wrapRef} className="w-full">
+      <Document
+        file={url}
+        onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+        loading={<p className="text-xs text-slate-500 p-3">Rendering preview…</p>}
+        className="flex flex-col items-center gap-2"
+      >
+        {Array.from({ length: numPages || 0 }, (_, i) => (
+          <Page
+            key={i + 1}
+            pageNumber={i + 1}
+            width={width}
+            renderTextLayer={false}
+            renderAnnotationLayer={false}
+            className="shadow-sm border border-slate-200 bg-white"
+          />
+        ))}
+      </Document>
+    </div>
+  )
+}
+
+// ── Shift Totals panel ─────────────────────────────────────────
+// Per-employee summary across THIS sign-in plus any other Daily
+// Sign-In Data rows already on this operational day. Applies the OT
+// rule (Sat/Sun all OT, weekday over 8 OT) to the full total so the
+// user can see whether multi-contract overnight work has pushed
+// anyone into overtime.
+function ShiftTotalsPanel({ totals, dateLabel }) {
+  if (!totals.length) return null
+  const anyOther = totals.some(t => t.otherSheets > 0)
+  return (
+    <div className="card p-4 space-y-3">
+      <p className="section-label !mb-0">
+        Shift Totals · {dateLabel}
+      </p>
+      <p className="text-[11px] text-slate-400">
+        ST/OT shown is per-employee across ALL sign-ins on this date — the
+        actual values cert payroll will see once this sheet posts.
+      </p>
+      <div className="space-y-2">
+        <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider font-bold text-slate-400 px-1">
+          <span className="col-span-4">Employee</span>
+          <span className="col-span-2 text-right">This sheet</span>
+          <span className="col-span-2 text-right">Other</span>
+          <span className="col-span-2 text-right">Total</span>
+          <span className="col-span-1 text-right">ST</span>
+          <span className="col-span-1 text-right">OT</span>
+        </div>
+        {totals.map(t => (
+          <div key={t.name}
+            className="grid grid-cols-12 gap-2 text-sm py-1.5 px-1 border-t border-slate-100 items-baseline">
+            <span className="col-span-4 font-semibold text-navy truncate">{t.name}</span>
+            <span className="col-span-2 text-right text-slate-700">{t.thisSheet.toFixed(2)}</span>
+            <span className={`col-span-2 text-right ${t.otherSheets > 0 ? 'text-slate-700' : 'text-slate-300'}`}>
+              {t.otherSheets.toFixed(2)}
+            </span>
+            <span className="col-span-2 text-right font-bold text-navy">{t.total.toFixed(2)}</span>
+            <span className="col-span-1 text-right text-slate-700">{t.st.toFixed(2)}</span>
+            <span className={`col-span-1 text-right font-bold ${t.ot > 0 ? 'text-orange-600' : 'text-slate-300'}`}>
+              {t.ot.toFixed(2)}
+            </span>
+          </div>
+        ))}
       </div>
+      {!anyOther && (
+        <p className="text-[11px] text-slate-400">
+          No other sign-ins on this date yet — totals match this sheet.
+        </p>
+      )}
     </div>
   )
 }
@@ -411,6 +511,67 @@ export default function SignIn() {
   const draft = selected ? getDraft(selected) : null
   const effectiveDate = draft?.shiftStartDate || selected?.date || ''
 
+  // Apply the Mon–Fri-over-8 / Sat-Sun-all-OT rule to a given date+hours.
+  const splitStOt = (hours, dateIso) => {
+    const m = String(dateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
+    const dow = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay() : -1
+    const isWeekend = (dow === 0 || dow === 6)
+    if (isWeekend) return { st: 0, ot: hours }
+    if (hours <= 8) return { st: hours, ot: 0 }
+    return { st: 8, ot: hours - 8 }
+  }
+
+  // Aggregate { name → { thisSheet, otherSheets, total, st, ot } } for
+  // the currently-loaded crew. "thisSheet" = sum of crew rows for that
+  // employee in the in-progress form; "otherSheets" = whatever the
+  // server already has for them on effectiveDate. Total ST/OT is the
+  // shift-wide split, not the per-row split.
+  const shiftTotals = useMemo(() => {
+    if (!draft) return []
+    const sums = new Map()
+    draft.crew.forEach(m => {
+      const name = (m.name || '').trim()
+      if (!name) return
+      const h = parseFloat(m.hours) || 0
+      sums.set(name, (sums.get(name) || 0) + h)
+    })
+    // Include any employee with prior hours on this opDay even if they
+    // aren't on this sheet, so the user sees the full picture.
+    Object.keys(existingDayHours).forEach(n => {
+      if (!sums.has(n)) sums.set(n, 0)
+    })
+    const out = []
+    for (const [name, thisSheet] of sums.entries()) {
+      const otherSheets = Number(existingDayHours[name] || 0)
+      const total = thisSheet + otherSheets
+      const split = splitStOt(total, effectiveDate)
+      out.push({ name, thisSheet, otherSheets, total, ...split })
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name))
+    return out
+  }, [draft, existingDayHours, effectiveDate])
+
+  // Build a Blob URL for the uploaded PDF so react-pdf can render a
+  // preview. Revoke when the bytes change so we don't leak.
+  const pdfPreviewUrl = useMemo(() => {
+    const b64 = draft?.uploadDataB64
+    if (!b64) return null
+    try {
+      const binary = atob(b64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      return URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }))
+    } catch (e) {
+      return null
+    }
+  }, [draft?.uploadDataB64])
+
+  useEffect(() => {
+    return () => {
+      if (pdfPreviewUrl) URL.revokeObjectURL(pdfPreviewUrl)
+    }
+  }, [pdfPreviewUrl])
+
   // Editing the shift-start date changes the OT rule (Sat/Sun = all OT).
   // Re-run calcHours on every crew row whenever the date changes so the
   // displayed Hours / OT stay in sync.
@@ -434,6 +595,11 @@ export default function SignIn() {
   // sign-in's metadata + the cleaned crew list to resume submit with
   // either the previous date (Yes) or effectiveDate (No).
   const [continuationPrompt, setContinuationPrompt] = useState(null)
+  // Map { employee_name: hours } of hours ALREADY on Daily Sign-In Data
+  // for the effectiveDate. The Shift Totals panel adds these to the
+  // in-progress crew entries so the user can see whether their worker
+  // will end up over the 8h ST cap once this sheet posts.
+  const [existingDayHours, setExistingDayHours] = useState({})
   // Reset the date-input expansion when switching between queue entries —
   // the modal-acknowledged "yes I'm editing" only applies to the entry
   // that was active at the time of acknowledgement.
@@ -441,6 +607,30 @@ export default function SignIn() {
     setDateEditMode(false)
     setEditDateModal(false)
   }, [selectedId])
+
+  // Pull existing Daily Sign-In Data hours for the effectiveDate so the
+  // Shift Totals panel can show "this sheet plus what's already logged".
+  // Refetch when the date changes (queue switch, kebab edit, etc).
+  useEffect(() => {
+    if (!effectiveDate) { setExistingDayHours({}); return }
+    let cancelled = false
+    fetch('/api/signin-queue/day-hours', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: effectiveDate }),
+    })
+      .then(r => r.json())
+      .then(json => {
+        if (cancelled) return
+        setExistingDayHours(json && json.totals ? json.totals : {})
+      })
+      .catch(err => {
+        if (cancelled) return
+        console.warn('day-hours fetch failed:', err)
+        setExistingDayHours({})
+      })
+    return () => { cancelled = true }
+  }, [effectiveDate])
 
   // ── Crew handlers (operate on the selected entry's draft) ────
   const updateCrewMember = (idx, member) => {
@@ -767,25 +957,31 @@ export default function SignIn() {
               </div>
             )}
 
-            {/* Once parsed, show a thin banner above the crew rows so
-                it's clear this submission will archive the original
-                upload (not a generated PDF). */}
-            {draft.mode === 'upload' && draft.parseStatus === 'parsed' && (
-              <div className="card p-3 bg-emerald-50 border-emerald-200 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-emerald-700">📎</span>
-                  <span className="text-[12px] text-emerald-800">
-                    From upload: <span className="font-semibold">{draft.uploadFilename}</span>
-                  </span>
+            {/* Once parsed, render the uploaded PDF inline so the user
+                can refer back to the handwriting while reviewing the
+                parsed values. Stays above the crew rows; user can
+                scroll past once they're confident. */}
+            {draft.mode === 'upload' && draft.parseStatus === 'parsed' && pdfPreviewUrl && (
+              <div className="card p-3 space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-emerald-700">📎</span>
+                    <span className="text-[12px] text-emerald-800 truncate">
+                      Uploaded: <span className="font-semibold">{draft.uploadFilename}</span>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => updateDraft(selected.queue_id, {
+                      parseStatus: 'idle', uploadDataB64: '', uploadFilename: '',
+                    })}
+                    className="text-[11px] text-emerald-700 font-semibold hover:underline flex-shrink-0">
+                    Re-upload
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => updateDraft(selected.queue_id, {
-                    parseStatus: 'idle', uploadDataB64: '', uploadFilename: '',
-                  })}
-                  className="text-[11px] text-emerald-700 font-semibold hover:underline">
-                  Re-upload
-                </button>
+                <div className="bg-slate-100 border border-slate-200 rounded-lg max-h-[480px] overflow-y-auto p-2 flex justify-center">
+                  <UploadPreview url={pdfPreviewUrl} />
+                </div>
               </div>
             )}
 
@@ -811,6 +1007,7 @@ export default function SignIn() {
                     onChange={updateCrewMember}
                     onRemove={removeCrewMember}
                     workDate={effectiveDate}
+                    showSignatures={draft.mode !== 'upload'}
                   />
                 ))}
               </div>
@@ -821,6 +1018,11 @@ export default function SignIn() {
                 + Add crew member
               </button>
             </div>
+
+            <ShiftTotalsPanel
+              totals={shiftTotals}
+              dateLabel={prettyQueueDate(effectiveDate)}
+            />
 
             <div className="sticky bottom-4 z-10">
               <button
