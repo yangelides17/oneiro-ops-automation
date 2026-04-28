@@ -3396,8 +3396,8 @@ function handleSubmitSignIn_(body) {
         displayLocation,                              //  5  Location
         String(member.name || '').trim(),             //  6  Employee Name
         String(member.classification || '').trim(),   //  7  Classification
-        String(member.time_in  || ''),                //  8  Time In
-        String(member.time_out || ''),                //  9  Time Out
+        _fmt24to12_(member.time_in),                  //  8  Time In  (h:mm AM/PM)
+        _fmt24to12_(member.time_out),                 //  9  Time Out (h:mm AM/PM)
         hours,                                        // 10  Hours Worked
         overtime                                      // 11  Overtime Hours
       ];
@@ -3515,8 +3515,8 @@ function handleSubmitSignIn_(body) {
         crew: d.crew.map(m => ({
           name:           String(m.name || '').trim(),
           classification: String(m.classification || '').trim(),
-          time_in:        String(m.time_in  || ''),
-          time_out:       String(m.time_out || ''),
+          time_in:        _fmt24to12_(m.time_in),
+          time_out:       _fmt24to12_(m.time_out),
           sig_in_b64:     m.sig_in_b64  || '',
           sig_out_b64:    m.sig_out_b64 || '',
         })),
@@ -3658,6 +3658,22 @@ function handleCheckSignInContinuation_(body) {
     previous_time_out: bestMatch.previous_time_out,
     gap_minutes:       Math.round(bestGap),
   });
+}
+
+// Convert "HH:MM" (24-hour, what HTML <input type="time"> emits) into
+// "h:mm AM/PM" for storage in Daily Sign-In Data and the Sign-In JSON.
+// Accepts already-12-hour input as a no-op so the helper is idempotent.
+function _fmt24to12_(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+  if (/\b(AM|PM)\b/i.test(t)) return t;
+  const m = t.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return t;
+  const hh24 = Number(m[1]);
+  const mm   = m[2];
+  const ampm = hh24 >= 12 ? 'PM' : 'AM';
+  const hh12 = (hh24 % 12) || 12;
+  return `${hh12}:${mm} ${ampm}`;
 }
 
 // Parse Daily Sign-In Data Time In/Out cells. Accepts both 24-hour
