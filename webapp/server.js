@@ -559,35 +559,38 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
     }
 
-    // Orientation handling.
+    // Orientation handling. Two pdf-lib passes:
+    //   1. Strip any existing /Rotate metadata so we work from a known
+    //      baseline (raw drawn content).
+    //   2. If the raw page is portrait (height > width), the paper was
+    //      almost certainly a landscape sheet scanned sideways — set
+    //      /Rotate=270 (= 90° CCW display rotation, which un-rotates
+    //      the 90° CW content drawn within a portrait page). Setting
+    //      /Rotate=90 would add ANOTHER 90° CW rotation and end up
+    //      upside-down, which is the bug we hit before.
     //
-    // Tricky bit: Anthropic Vision and pdf.js may interpret a PDF's
-    // /Rotate metadata flag differently — Vision tends to auto-orient
-    // by content (so Claude sees a "correct" view even on a sideways
-    // file), while pdf.js (powering the React preview) renders strictly
-    // per the metadata. Asking Claude to report rotation against a
-    // viewer it can't simulate is unreliable.
-    //
-    // Fix: strip ALL existing rotation flags before sending to Claude.
-    // Claude then sees the raw drawn content (same view pdf.js would
-    // render at rotation=0). Whatever rotation it reports is the
-    // absolute value we set — no addition / mixing with prior metadata.
-    let probeBuffer = req.file.buffer
+    // We do this BEFORE sending to Claude so the OCR pass sees an
+    // upright page, which keeps row order natural and removes any
+    // prompt complexity around orientation.
+    let workingBytes = req.file.buffer
+    let rotatedAny   = false
     try {
       const { PDFDocument, degrees } = await import('pdf-lib')
       const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
-      let strippedAny = false
       pdfDoc.getPages().forEach(page => {
-        if ((page.getRotation().angle || 0) !== 0) {
-          page.setRotation(degrees(0))
-          strippedAny = true
+        page.setRotation(degrees(0))
+        const { width, height } = page.getSize()
+        if (height > width) {
+          page.setRotation(degrees(270))
+          rotatedAny = true
         }
       })
-      if (strippedAny) probeBuffer = Buffer.from(await pdfDoc.save())
+      workingBytes = Buffer.from(await pdfDoc.save())
     } catch (e) {
-      console.warn('Sign-in upload: could not strip rotation before probe:', e.message)
+      console.warn('Sign-in upload: rotation pre-pass failed:', e.message)
+      workingBytes = req.file.buffer
     }
-    const base64 = probeBuffer.toString('base64')
+    const base64 = workingBytes.toString('base64')
 
     // Pull the Employee Registry from Apps Script so we can hand
     // Claude the closed list of valid names. The prompt then asks
@@ -611,13 +614,12 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
 
 Schema:
 {
-  "rotation_needed": "<Integer — degrees of CLOCKWISE rotation that must be applied so the document reads right-side-up (header at top, text left-to-right). One of: 0, 90, 180, 270. If the page is already correct, return 0.>",
   "crew": [
     {
       "name":           "<EXACTLY one name from the Employee Registry below — see Name matching rules.>",
       "classification": "<Either \\"LP\\" or \\"SAT\\". LP = Line Person/Crew Chief. SAT = Stripe Assistant Technician. Return null if blank.>",
-      "time_in":        "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>",
-      "time_out":       "<24-hour HH:MM. See \\"Time interpretation\\" below. null if unreadable.>"
+      "time_in":        "<24-hour HH:MM from the \\"Time In\\" column. See \\"Time interpretation\\" below. null if unreadable.>",
+      "time_out":       "<24-hour HH:MM from the \\"Time Out\\" column. See \\"Time interpretation\\" below. null if unreadable.>"
     }
   ],
   "contractor_name":  "<Printed name at bottom of sheet (Contractor's Representative), or null>",
@@ -642,20 +644,15 @@ Time interpretation (CRITICAL — most common error):
 - "11PM" → "23:00"; "11AM" → "11:00". Don't conflate them.
 - Convert 12-hour formats: "10pm" → "22:00", "6 AM" → "06:00", "10:30PM" → "22:30".
 
+Column layout (CRITICAL — must not be confused):
+- The form has these columns left-to-right: Employees Name | Classification | Time In | Employees Signature | Time Out | Employees Signature.
+- Time In is to the LEFT of the signature column; Time Out is to the RIGHT of that signature column.
+- For each row, return the time written in the "Time In" column as time_in and the time written in the "Time Out" column as time_out. Do NOT swap them.
+
 Rules:
 - Skip rows that are entirely blank. Only include crew rows that have at least one filled cell (name, time, or classification).
 - Classification: only "LP" or "SAT". If the sheet uses other codes, pick the closest match; otherwise null.
-- Never wrap the JSON in markdown fences.
-
-Rotation detection:
-- The PDF you are seeing has had any rotation metadata stripped — what you see is the raw drawn content as it would appear in a default viewer.
-- The form is a landscape document. The header "THE CITY OF NEW YORK • OFFICE OF THE COMPTROLLER • BUREAU OF LABOR LAW" should appear at the TOP of the page, reading left-to-right.
-- Determine where the header actually appears in the PDF you are looking at, and return the clockwise rotation in degrees that would put the header at the top reading left-to-right:
-  - Header already at the top reading left-to-right → 0
-  - Header on the right edge, reading bottom-to-top → 90
-  - Header at the bottom, upside-down (reading right-to-left) → 180
-  - Header on the left edge, reading top-to-bottom → 270
-- Return the SINGLE integer that fixes the orientation.`
+- Never wrap the JSON in markdown fences.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -703,46 +700,18 @@ Rotation detection:
       throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
     }
 
-    // Apply Claude's rotation_needed as the ABSOLUTE rotation flag.
-    // Because we stripped existing rotation to 0 before sending to
-    // Claude, what Claude reported is the rotation that should now
-    // appear in the PDF metadata. No addition, no mixing.
-    const rotationNeeded = (() => {
-      const v = Number(parsed && parsed.rotation_needed)
-      return [0, 90, 180, 270].includes(v) ? v : 0
-    })()
-    console.log(`Sign-in upload: Claude rotation_needed = ${rotationNeeded}`)
-    let workingBytes = probeBuffer  // already has rotation stripped to 0
-    let rotatedAny   = (rotationNeeded !== 0)
-    if (rotationNeeded !== 0) {
-      try {
-        const { PDFDocument, degrees } = await import('pdf-lib')
-        const pdfDoc = await PDFDocument.load(probeBuffer, { updateMetadata: false })
-        pdfDoc.getPages().forEach(page => {
-          page.setRotation(degrees(rotationNeeded))
-        })
-        workingBytes = Buffer.from(await pdfDoc.save())
-      } catch (e) {
-        console.warn('Sign-in upload rotation failed:', e.message)
-        rotatedAny = false
-        workingBytes = probeBuffer
-      }
-    }
-    const echoBase64 = workingBytes.toString('base64')
-
-    // Echo the (possibly rotated) bytes back to the client so they go
+    // Echo the (already-rotated) bytes back to the client so they go
     // straight into /api/signin without re-uploading. The archived PDF
     // is then the user-readable landscape version, not the original
     // sideways scan.
     res.json({
       parsed,
       rotated: rotatedAny,
-      rotation_needed: rotationNeeded,
       upload: {
         filename:    req.file.originalname,
         mime_type:   mime,
         size:        workingBytes.length,
-        data_b64:    echoBase64,
+        data_b64:    base64,
       },
     })
   } catch (err) {
