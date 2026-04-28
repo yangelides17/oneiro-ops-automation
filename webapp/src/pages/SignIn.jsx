@@ -511,6 +511,15 @@ export default function SignIn() {
   const draft = selected ? getDraft(selected) : null
   const effectiveDate = draft?.shiftStartDate || selected?.date || ''
 
+  // Map { employee_name: hours } of hours ALREADY on Daily Sign-In Data
+  // for the effectiveDate. The Shift Totals panel adds these to the
+  // in-progress crew entries so the user can see whether their worker
+  // will end up over the 8h ST cap once this sheet posts. Declared
+  // here (NOT later in the function body) because the shiftTotals
+  // useMemo a few lines down depends on it — referencing the binding
+  // before its `const` would TDZ at component init.
+  const [existingDayHours, setExistingDayHours] = useState({})
+
   // Apply the Mon–Fri-over-8 / Sat-Sun-all-OT rule to a given date+hours.
   const splitStOt = (hours, dateIso) => {
     const m = String(dateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
@@ -595,11 +604,6 @@ export default function SignIn() {
   // sign-in's metadata + the cleaned crew list to resume submit with
   // either the previous date (Yes) or effectiveDate (No).
   const [continuationPrompt, setContinuationPrompt] = useState(null)
-  // Map { employee_name: hours } of hours ALREADY on Daily Sign-In Data
-  // for the effectiveDate. The Shift Totals panel adds these to the
-  // in-progress crew entries so the user can see whether their worker
-  // will end up over the 8h ST cap once this sheet posts.
-  const [existingDayHours, setExistingDayHours] = useState({})
   // Reset the date-input expansion when switching between queue entries —
   // the modal-acknowledged "yes I'm editing" only applies to the entry
   // that was active at the time of acknowledgement.
