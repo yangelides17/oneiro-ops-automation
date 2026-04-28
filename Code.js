@@ -56,8 +56,68 @@ const CONFIG = {
   CLAUDE_API_KEY: '',
 
   // Timezone
-  TIMEZONE: 'America/New_York'
+  TIMEZONE: 'America/New_York',
+
+  // Operational-day cutoff hour (local time). Any timestamp with hour
+  // strictly less than this value is bucketed to the PREVIOUS calendar
+  // day for accounting purposes (Daily Sign-In Data Date column, OT
+  // rule day-of-week, "Completed Today" filters, etc).
+  // 4 = standard for night-shift road striping: any work starting
+  // before 4 AM is treated as a continuation of the previous evening's
+  // shift. Set higher (5/6) only if early-AM continuations stretch
+  // routinely past 4 AM.
+  OPERATIONAL_DAY_CUTOFF_HOUR: 4
 };
+
+
+/**
+ * Operational-day bucket. Returns YYYY-MM-DD (local time, no UTC shift).
+ * If the given Date's local hour is strictly below CONFIG cutoff,
+ * the date returned is the calendar day BEFORE — so 02:30 on Tue
+ * with cutoff=4 returns Mon's date.
+ *
+ * Used everywhere a date represents an "accounting day" (when did this
+ * shift effectively start) rather than a literal calendar day. The
+ * canonical write-points are handleSubmitFieldReport_ and
+ * handleSubmitSignIn_; downstream readers (cert payroll, production
+ * log, "Completed Today") just consume the resulting Date column.
+ */
+function opDay_(date, cutoffHour) {
+  const cutoff = (typeof cutoffHour === 'number')
+    ? cutoffHour
+    : (CONFIG.OPERATIONAL_DAY_CUTOFF_HOUR || 4);
+  const d = (date instanceof Date) ? date : new Date(date);
+  if (isNaN(d.getTime())) return '';
+  const target = (d.getHours() < cutoff)
+    ? new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1)
+    : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const yyyy = target.getFullYear();
+  const mm   = String(target.getMonth() + 1).padStart(2, '0');
+  const dd   = String(target.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
+ * Combine an ISO YYYY-MM-DD calendar date with an HH:MM time of day
+ * (24-hour) into a local-parts Date, then opDay_() it. This is the
+ * authoritative shift-start date when both the calendar date and the
+ * Time In are known (e.g. Sign-In submit).
+ */
+function opDayFromIsoTime_(isoDate, hhmm, cutoffHour) {
+  const md = String(isoDate || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const tm = String(hhmm   || '').match(/^(\d{1,2}):(\d{2})/);
+  if (!md || !tm) return String(isoDate || '');
+  const dt = new Date(
+    Number(md[1]), Number(md[2]) - 1, Number(md[3]),
+    Number(tm[1]), Number(tm[2])
+  );
+  return opDay_(dt, cutoffHour);
+}
+
+/** Today's operational day in the script timezone. */
+function opToday_(cutoffHour) {
+  return opDay_(new Date(), cutoffHour);
+}
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -402,11 +462,26 @@ function checkScanInbox() {
 /**
  * Generate all daily documents for a given date.
  * Call this from the spreadsheet via a custom menu or manually.
- * 
- * @param {string} dateStr - Date in MM/DD/YYYY format (defaults to today)
+ *
+ * @param {string} dateStr - Date in MM/DD/YYYY format. Defaults to the
+ *   current OPERATIONAL day, not raw calendar today — so a 3 AM run
+ *   correctly bucketed to yesterday's shift will pick up yesterday's
+ *   Daily Sign-In Data rows.
  */
 function generateDailyDocuments(dateStr) {
-  const targetDate = dateStr ? new Date(dateStr) : new Date();
+  let targetDate;
+  if (dateStr) {
+    targetDate = new Date(dateStr);
+  } else {
+    // Construct a local-parts Date from opToday_() so .toDateString()
+    // comparisons against Daily Sign-In Data's Date column work
+    // regardless of timezone shifts.
+    const iso = opToday_();
+    const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    targetDate = m
+      ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12, 0, 0)
+      : new Date();
+  }
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   
   // Get all sign-in data for this date
@@ -2511,6 +2586,8 @@ function doPost(e) {
       return handleListSignInQueue_(body);
     } else if (action === 'submit_signin') {
       return handleSubmitSignIn_(body);
+    } else if (action === 'check_signin_continuation') {
+      return handleCheckSignInContinuation_(body);
     } else if (action === 'approve_doc_skip_signoff') {
       return handleApproveDocSkipSignoff_(body);
     } else {
@@ -3216,10 +3293,19 @@ function handleSubmitSignIn_(body) {
   try {
     const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
 
-    // ── Determine OT rule by start-day DOW (cross-midnight already
-    // collapsed into the start date by the UI) ────────────────────
+    // ── Resolve the authoritative shift-start date ────────────────
+    // The client sends d.date as the SHIFT START day — already
+    // operational-day-correct, either because the FR's Work Day Log
+    // row was opDay-bucketed at FR submit time, or because the user
+    // explicitly kebab-edited the shift start date in the Sign-In tab.
+    // We trust it verbatim. (Re-running opDay here would double-correct
+    // since Time In is interpreted on the shift start date — a 02:00
+    // Time In on a Monday-shift would wrongly slip back to Sunday.)
+    const effectiveDate = String(d.date);
+
+    // ── Determine OT rule by start-day DOW ────────────────────────
     const dowOfWork = (() => {
-      const m = String(d.date).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      const m = String(effectiveDate).match(/^(\d{4})-(\d{2})-(\d{2})/);
       if (!m) return -1;
       return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
     })();
@@ -3243,7 +3329,7 @@ function handleSubmitSignIn_(body) {
       const hours    = parseFloat(member.hours) || 0;
       const overtime = isWeekend ? hours : Math.max(0, hours - 8);
       return [
-        d.date,                                       //  0  Date (shift START)
+        effectiveDate,                                //  0  Date (shift START, opDay-derived)
         woListStr,                                    //  1  Work Order # (comma-list)
         String(d.contractor || '').trim(),            //  2  Prime Contractor
         String(d.contract_number || '').trim(),       //  3  Contract #
@@ -3267,28 +3353,19 @@ function handleSubmitSignIn_(body) {
       'Daily Sign-In Data'
     );
 
-    // ── Mark Work Day Log rows for these (date, wo) pairs as Submitted ─
+    // ── Mark Work Day Log rows for these WOs as Submitted ─────────
+    // Match by (WO# in this submission, Status='Pending'). We DO NOT
+    // filter by date because the user may have kebab-overridden the
+    // shift start date, OR opDay may have shifted the effective date
+    // away from the FR's recorded date. Either way, the user has
+    // confirmed work was done on these WOs — clear the queue.
     step = 'Work Day Log update';
     const wdlSheet = ss.getSheetByName('Work Day Log');
     if (wdlSheet) {
       const wdlData = wdlSheet.getDataRange().getValues();
       const woSet = new Set(woListNorm);
-      // Iterate from the bottom so we can batch sets without index drift,
-      // though we're using setValue per cell here for safety.
       for (let i = 1; i < wdlData.length; i++) {
         const row = wdlData[i];
-        const rowDateRaw = row[0];
-        let rowDateStr;
-        if (rowDateRaw instanceof Date && !isNaN(rowDateRaw.getTime())) {
-          const y = rowDateRaw.getFullYear();
-          const m = String(rowDateRaw.getMonth() + 1).padStart(2, '0');
-          const dd = String(rowDateRaw.getDate()).padStart(2, '0');
-          rowDateStr = `${y}-${m}-${dd}`;
-        } else {
-          const m = String(rowDateRaw || '').match(/^(\d{4}-\d{2}-\d{2})/);
-          rowDateStr = m ? m[1] : String(rowDateRaw || '');
-        }
-        if (rowDateStr !== d.date) continue;
         if (!woSet.has(String(row[1] || '').trim())) continue;
         if (String(row[7] || '').trim() !== 'Pending') continue;
         wdlSheet.getRange(i + 1, 8).setValue('Submitted');
@@ -3303,7 +3380,7 @@ function handleSubmitSignIn_(body) {
     const reviewFolder = DriveApp.getFolderById(needsReviewId);
     const signInFolder = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
 
-    const isoDate = String(d.date).slice(0, 10);
+    const isoDate = String(effectiveDate).slice(0, 10);
     const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}`;
 
     let writtenName;
@@ -3362,7 +3439,7 @@ function handleSubmitSignIn_(body) {
 
       const payload = {
         _type:              'signin',
-        date:               dateFmt(d.date),
+        date:               dateFmt(effectiveDate),
         prime_contractor:   String(d.contractor || ''),
         subcontractor:      CONFIG.EMPLOYER.name,
         contract_number:    contractLabel,
@@ -3405,7 +3482,7 @@ function handleSubmitSignIn_(body) {
       ss.getSheetByName('Automation Log'),
       [
         new Date(), 'Sign-In Tab', 'Sign-In submitted', writtenName,
-        `${d.crew.length} crew × ${woListNorm.length} WO(s) on ${d.date} (${source})`,
+        `${d.crew.length} crew × ${woListNorm.length} WO(s) on ${effectiveDate} (${source})`,
         'Pending review', '', ''
       ],
       ['Timestamp', 'Source', 'Action', 'Related', 'Details', 'Status', 'User', 'Next Steps'],
@@ -3420,6 +3497,122 @@ function handleSubmitSignIn_(body) {
     throw wrapped;
   }
 }
+
+// ── action: check_signin_continuation ──────────────────────────
+//
+// Sanity check before a Sign-In submit. If the user just entered
+// Time In = X on date D, scan Daily Sign-In Data for a previous row
+// whose Time-Out datetime falls within 60 minutes BEFORE D+X. If one
+// is found AND it's on a different operational day, return it as a
+// suggested "continuation" — the client prompts the user to confirm
+// they want to bucket this sign-in under the previous shift's date
+// (matters most for shifts that cross weekend or week boundaries).
+//
+// body.data: { time_in: "HH:MM", default_date: "YYYY-MM-DD" }
+// response: { continuation: bool, previous_date?, previous_contract?,
+//             previous_time_out?, gap_minutes? }
+function handleCheckSignInContinuation_(body) {
+  const d = body.data || {};
+  const targetTimeIn = String(d.time_in     || '').trim();
+  const targetDate   = String(d.default_date || '').trim();
+  if (!targetTimeIn || !targetDate) {
+    return jsonResponse_({ continuation: false });
+  }
+
+  const tParts = _parseSignInTimeOfDay_(targetTimeIn);
+  const dParts = targetDate.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!tParts || !dParts) return jsonResponse_({ continuation: false });
+  const targetDt = new Date(
+    Number(dParts[1]), Number(dParts[2]) - 1, Number(dParts[3]),
+    tParts.hours, tParts.minutes
+  );
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Daily Sign-In Data');
+  if (!sheet) return jsonResponse_({ continuation: false });
+  const data = sheet.getDataRange().getValues();
+
+  let bestMatch = null;
+  let bestGap   = Infinity;
+
+  data.slice(1).forEach(row => {
+    const rowDateRaw = row[0];
+    const rowTimeIn  = row[8];
+    const rowTimeOut = row[9];
+    if (!rowDateRaw || !rowTimeOut) return;
+
+    // Parse row date
+    let rowDateObj;
+    if (rowDateRaw instanceof Date && !isNaN(rowDateRaw.getTime())) {
+      rowDateObj = new Date(
+        rowDateRaw.getFullYear(), rowDateRaw.getMonth(), rowDateRaw.getDate()
+      );
+    } else {
+      const m = String(rowDateRaw).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) return;
+      rowDateObj = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    }
+
+    const tin  = _parseSignInTimeOfDay_(rowTimeIn);
+    const tout = _parseSignInTimeOfDay_(rowTimeOut);
+    if (!tout) return;
+
+    // If Time Out total-mins <= Time In total-mins, the shift crossed
+    // midnight — so the actual Time-Out datetime is on row.date + 1.
+    const tinMins  = tin ? (tin.hours * 60 + tin.minutes) : 0;
+    const toutMins = tout.hours * 60 + tout.minutes;
+    const cross = tin && toutMins <= tinMins;
+    const toutDate = new Date(
+      rowDateObj.getFullYear(),
+      rowDateObj.getMonth(),
+      rowDateObj.getDate() + (cross ? 1 : 0),
+      tout.hours, tout.minutes
+    );
+
+    const gapMin = (targetDt.getTime() - toutDate.getTime()) / 60000;
+    if (gapMin < 0)   return;   // row is in the future / concurrent
+    if (gapMin > 60)  return;   // too far in the past
+    if (gapMin >= bestGap) return;
+
+    const rowDateIso = Utilities.formatDate(rowDateObj, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    if (rowDateIso === targetDate) return;   // same day; no continuation prompt needed
+
+    bestMatch = {
+      previous_date:     rowDateIso,
+      previous_contract: String(row[3] || '').trim() +
+        (row[4] ? ' / ' + String(row[4]).trim() : ''),
+      previous_time_out: String(rowTimeOut).trim(),
+    };
+    bestGap = gapMin;
+  });
+
+  if (!bestMatch) return jsonResponse_({ continuation: false });
+  return jsonResponse_({
+    continuation:      true,
+    previous_date:     bestMatch.previous_date,
+    previous_contract: bestMatch.previous_contract,
+    previous_time_out: bestMatch.previous_time_out,
+    gap_minutes:       Math.round(bestGap),
+  });
+}
+
+// Parse Daily Sign-In Data Time In/Out cells. Accepts both 24-hour
+// "HH:MM" (what the new Sign-In form posts) and 12-hour "h:mm AM/PM"
+// (legacy data from the old Field Report flow).
+function _parseSignInTimeOfDay_(s) {
+  const t = String(s || '').trim();
+  if (!t) return null;
+  let m = t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (m) {
+    let h = Number(m[1]) % 12;
+    if (m[3].toUpperCase() === 'PM') h += 12;
+    return { hours: h, minutes: Number(m[2]) };
+  }
+  m = t.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) return { hours: Number(m[1]), minutes: Number(m[2]) };
+  return null;
+}
+
 
 // ── action: approve_doc_skip_signoff ───────────────────────────
 //
@@ -4954,6 +5147,20 @@ function handleSubmitFieldReport_(body) {
   // Crew is no longer captured here — sign-in lives in its own tab and is
   // batched per (date, contract). The Field Report just records what was
   // worked on the WO and queues a Work Day Log row for sign-in followup.
+
+  // Operational-day correction. If the client sent calendar-today (the
+  // default) but submission is happening before the cutoff hour (e.g.
+  // crew finishing at 3:30 AM), bucket to yesterday's operational day
+  // instead — that's the day the shift actually started. We DON'T
+  // touch d.date when the client sent a date other than calendar-today
+  // (that's the user explicitly overriding from the picker).
+  const _calendarToday = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  if (d.date === _calendarToday) {
+    const opTodayIso = opToday_();
+    if (opTodayIso && opTodayIso !== _calendarToday) {
+      d.date = opTodayIso;
+    }
+  }
 
   // Breadcrumb: updated before each risky operation so any uncaught exception
   // inside this handler surfaces with "[step=<phase>]" attached — otherwise

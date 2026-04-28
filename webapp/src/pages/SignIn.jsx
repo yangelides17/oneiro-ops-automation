@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import SignaturePad from '../components/SignaturePad'
 import RowKebab     from '../components/RowKebab'
 import ConfirmModal from '../components/ConfirmModal'
+import { opDayFromIsoTime } from '../lib/dateOps'
 
 // ── Constants ──────────────────────────────────────────────────
 // Mirrors the dropdown validation on Daily Sign-In Data → Classification.
@@ -428,6 +429,11 @@ export default function SignIn() {
 
   const [editDateModal, setEditDateModal] = useState(false)
   const [dateEditMode,  setDateEditMode]  = useState(false)
+  // Set when the server's continuation sanity check returns a likely
+  // recent shift this submission should attach to. Holds the previous
+  // sign-in's metadata + the cleaned crew list to resume submit with
+  // either the previous date (Yes) or effectiveDate (No).
+  const [continuationPrompt, setContinuationPrompt] = useState(null)
   // Reset the date-input expansion when switching between queue entries —
   // the modal-acknowledged "yes I'm editing" only applies to the entry
   // that was active at the time of acknowledgement.
@@ -453,22 +459,7 @@ export default function SignIn() {
   }
 
   // ── Submit ───────────────────────────────────────────────────
-  const handleSubmit = async () => {
-    if (!selected || !draft || submitting) return
-
-    // Light validation — server enforces the rest.
-    const crewClean = draft.crew.filter(m => m.name && m.name.trim())
-    if (crewClean.length === 0) {
-      showToast('Add at least one crew member with a name', 'error')
-      return
-    }
-    for (const m of crewClean) {
-      if (!m.timeIn || !m.timeOut) {
-        showToast(`Crew member "${m.name}" needs Time In and Time Out`, 'error')
-        return
-      }
-    }
-
+  const submitWithDate = async (crewClean, dateToSend) => {
     setSubmitting(true)
     try {
       const res = await fetch('/api/signin', {
@@ -476,12 +467,7 @@ export default function SignIn() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           queue_id:        selected.queue_id,
-          // The shift start date drives OT — defaults to the Field
-          // Report's Date of Work, but the user can override behind the
-          // warning kebab. Always send the chosen value, not the queue
-          // entry's date, so the server's OT rule matches what the UI
-          // displayed at submit time.
-          date:            effectiveDate,
+          date:            dateToSend,
           contract_number: selected.contract_number,
           borough:         selected.borough,
           contractor:      selected.contractor,
@@ -498,17 +484,11 @@ export default function SignIn() {
             sig_in_b64:     m.signatureIn  || '',
             sig_out_b64:    m.signatureOut || '',
           })),
-          // The principal sign-off block on the PDF is filled at approval
-          // time (PrincipalSignModal → pdf-lib). The Sign-In form
-          // doesn't capture a crew-leader signature anymore.
           contractor_name:            '',
           contractor_title:           '',
           contractor_signature_b64:   '',
           date_signed:                '',
           source: draft.mode === 'upload' ? 'uploaded' : 'generated',
-          // Only sent when the user uploaded a hand-filled sheet — Apps
-          // Script archives those bytes as `_MANUAL.pdf` instead of
-          // generating one from the JSON.
           upload_blob_b64:            draft.mode === 'upload' ? draft.uploadDataB64 : undefined,
           upload_filename:            draft.mode === 'upload' ? draft.uploadFilename : undefined,
         }),
@@ -516,7 +496,6 @@ export default function SignIn() {
       const json = await res.json()
       if (!res.ok || json.error) throw new Error(json.error || `HTTP ${res.status}`)
 
-      // Drop submitted entry, auto-advance
       const remaining = (queue || []).filter(q => q.queue_id !== selected.queue_id)
       setDrafts(prev => {
         const next = new Map(prev)
@@ -534,6 +513,67 @@ export default function SignIn() {
     } finally {
       setSubmitting(false)
     }
+  }
+
+  const handleSubmit = async () => {
+    if (!selected || !draft || submitting) return
+
+    const crewClean = draft.crew.filter(m => m.name && m.name.trim())
+    if (crewClean.length === 0) {
+      showToast('Add at least one crew member with a name', 'error')
+      return
+    }
+    for (const m of crewClean) {
+      if (!m.timeIn || !m.timeOut) {
+        showToast(`Crew member "${m.name}" needs Time In and Time Out`, 'error')
+        return
+      }
+    }
+
+    // Sanity check: if there's a Daily Sign-In Data row from any
+    // contractor whose Time-Out fell within 60 minutes before this
+    // submission's Time-In, the user might be filing a continuation
+    // of last night's shift. Prompt them to confirm before submit.
+    // The user's kebab override (shiftDateEdited=true) skips the check
+    // entirely — they've explicitly chosen the date.
+    if (!draft.shiftDateEdited) {
+      try {
+        const checkRes = await fetch('/api/signin-queue/check-continuation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            time_in:      crewClean[0].timeIn,
+            default_date: effectiveDate,
+          }),
+        })
+        const checkJson = await checkRes.json()
+        if (checkJson && checkJson.continuation) {
+          // Open the prompt; resume on user choice.
+          setContinuationPrompt({
+            previousDate:     checkJson.previous_date,
+            previousContract: checkJson.previous_contract,
+            previousTimeOut:  checkJson.previous_time_out,
+            gapMinutes:       checkJson.gap_minutes,
+            crewClean,
+          })
+          return
+        }
+      } catch (err) {
+        // Sanity check is best-effort; failures shouldn't block submit.
+        console.warn('check-continuation failed; proceeding with default date:', err)
+      }
+    }
+
+    await submitWithDate(crewClean, effectiveDate)
+  }
+
+  // Resolved by the continuation modal. yes = use previous_date; no = use effectiveDate.
+  const resolveContinuation = async (useChoice) => {
+    if (!continuationPrompt) return
+    const { crewClean, previousDate } = continuationPrompt
+    const chosen = useChoice === 'yes' ? previousDate : effectiveDate
+    setContinuationPrompt(null)
+    await submitWithDate(crewClean, chosen)
   }
 
   // ── Render ───────────────────────────────────────────────────
@@ -810,6 +850,17 @@ export default function SignIn() {
           cancelLabel="Cancel"
           onConfirm={() => { setEditDateModal(false); setDateEditMode(true) }}
           onCancel={() => setEditDateModal(false)}
+        />
+      )}
+
+      {continuationPrompt && (
+        <ConfirmModal
+          title="Part of last night's shift?"
+          message={`A recent sign-in for ${continuationPrompt.previousContract} signed out at ${continuationPrompt.previousTimeOut} on ${prettyQueueDate(continuationPrompt.previousDate)} — only ${continuationPrompt.gapMinutes} min before this Time In. Bucket this sign-in under ${prettyQueueDate(continuationPrompt.previousDate)} so OT and certified payroll attribute the hours to that shift?`}
+          confirmLabel={`Yes — bucket under ${prettyQueueDate(continuationPrompt.previousDate)}`}
+          cancelLabel="No — separate shift"
+          onConfirm={() => resolveContinuation('yes')}
+          onCancel={() => resolveContinuation('no')}
         />
       )}
     </div>

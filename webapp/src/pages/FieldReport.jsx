@@ -7,6 +7,7 @@ import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
   pickLayout, rowIsCompletable,
 } from '../lib/markingCategories'
+import { opToday } from '../lib/dateOps'
 
 const SECTION_HEADERS = {
   'Top Table':          'WO Top Table',
@@ -19,10 +20,9 @@ const SECTION_HEADERS = {
 // Add/Edit modal.
 
 // ── Helpers ───────────────────────────────────────────────────
-const isoToday = () => {
-  const d = new Date()
-  return [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-')
-}
+// Today's date as YYYY-MM-DD comes from `opToday()` in lib/dateOps —
+// that's the operational-day-aware variant which buckets pre-cutoff
+// (e.g. 02:30 AM) submissions back to yesterday's shift.
 
 // ── HEIC → JPEG converter ─────────────────────────────────────
 // iPhones ship HEIC by default. Browsers can't decode HEIC for
@@ -444,7 +444,7 @@ export default function FieldReport() {
 
   // Form fields
   const [selectedWOId,  setSelectedWOId]  = useState('')
-  const [workDate,      setWorkDate]       = useState(isoToday())
+  const [workDate,      setWorkDate]       = useState(opToday())
   const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wo-markings/:woId
   const [markingsLoading, setMarkingsLoading] = useState(false)
   const [issues,        setIssues]         = useState('')
@@ -876,7 +876,7 @@ export default function FieldReport() {
 
   // ── Reset ─────────────────────────────────────────────────
   function reset() {
-    setSubmitted(null); setSelectedWOId(''); setWorkDate(isoToday())
+    setSubmitted(null); setSelectedWOId(''); setWorkDate(opToday())
     setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
     setBulkMode(false); inFlightRef.current.clear()
     setIssues(''); setRowError('')

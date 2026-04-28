@@ -719,6 +719,26 @@ app.get('/api/signin-queue', async (_req, res) => {
 })
 
 /**
+ * POST /api/signin-queue/check-continuation
+ * Sanity check before a Sign-In submit. Given the user's chosen
+ * Time-In + default date, asks Apps Script whether there's a
+ * recent Daily Sign-In Data row whose Time-Out fell within 60 minutes
+ * before this submission. The Sign-In tab uses the response to decide
+ * whether to prompt the user "is this a continuation of last night's
+ * shift?" before posting the actual sign-in.
+ * Body: { time_in: "HH:MM", default_date: "YYYY-MM-DD" }
+ */
+app.post('/api/signin-queue/check-continuation', async (req, res) => {
+  try {
+    const data = await callAppsScript('check_signin_continuation', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/signin-queue/check-continuation error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/signin
  * Submits a Sign-In sheet for one queue entry. Body:
  *   { queue_id, date, contract_number, borough, contractor,

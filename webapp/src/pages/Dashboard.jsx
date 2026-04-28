@@ -4,6 +4,7 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from 'recharts'
 import StatusBadge from '../components/StatusBadge'
+import { opToday } from '../lib/dateOps'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -15,10 +16,10 @@ async function fetchDashboard() {
 }
 
 // ── Date helpers ──────────────────────────────────────────────
-const isoToday = () => {
-  const d = new Date()
-  return [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-')
-}
+// "Today" everywhere in the dashboard means the *operational* day —
+// pre-cutoff (default 4 AM) submissions bucket back to yesterday's
+// shift, matching how the Apps Script side writes Daily Sign-In Data.
+const isoToday = () => opToday()
 // Monday on-or-before the given local-date ISO string. Sun → 6 days
 // back; Mon → 0; otherwise day-1 back.  Operates on parsed local Date
 // so DST transitions don't skew by an hour.
