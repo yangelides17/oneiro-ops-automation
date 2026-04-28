@@ -52,6 +52,7 @@ logging.getLogger('pypdf').setLevel(logging.ERROR)
 warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', module='pypdf')
 
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject, DictionaryObject, IndirectObject
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as rl_canvas
 from PIL import Image
@@ -149,14 +150,158 @@ def _field_rects(template_path: str) -> dict:
     return rects
 
 
+# Project Name / Location overlay tuning. The AcroForm field on the
+# template is a single-line text box that silently clips when the
+# string is too long for its visible rect — fine for one WO, useless
+# for multi-WO sign-ins where the field carries every "<WO> | <Loc>"
+# pair. Instead of relying on the field's appearance stream, we draw
+# the text ourselves on the overlay PDF: starting at the field's
+# bottom-left corner and wrapping into the whitespace beneath until
+# we hit the table headers. Width spans nearly the full page width
+# (we have nothing to the field's right except the Date label, which
+# sits one row UP).
+PROJECT_NAME_FONT_NAME    = 'Helvetica'
+PROJECT_NAME_FONT_MAX     = 9      # try 9pt first; shrink as needed
+PROJECT_NAME_FONT_MIN     = 6      # below 6pt readability falls off a cliff —
+                                   # if the text still doesn't fit at 6pt
+                                   # we ellipsize and signal a follow-up
+PROJECT_NAME_LINE_RATIO   = 1.5    # line height = font_size × ratio. 1.5×
+                                   # keeps line 2 clear of the printed
+                                   # underline that runs across the field
+                                   # row, instead of clipping into it.
+PROJECT_NAME_MAX_LINES    = 2      # both lines stay within the Project
+                                   # Name/Location row's left half (i.e.,
+                                   # never extend under the Date field area)
+                                   # so the layout stays unambiguous
+PROJECT_NAME_DATE_GAP     = 28     # pt gap between text-wrap edge and the
+                                   # Date_Header field's left edge — wide
+                                   # enough that even Helvetica's bolder
+                                   # glyphs don't crowd the "Date" label
+                                   # next to the field
+
+
+def _wrap_project_name(canvas, text: str, line_widths: list[float],
+                       font_name: str, font_size: float) -> list[str]:
+    """Greedy wrap with VARIABLE per-line widths. line_widths is a list
+    of pt widths — line N uses line_widths[min(N, len-1)]. This lets us
+    keep line 1 narrow (must stop short of the Date field on the same
+    row) while lines 2+ can extend to the full page width since they
+    flow into empty space below.
+
+    Tries to keep '<WO> | <Loc>; ' tokens atomic so a pair never gets
+    split across lines, and falls back to word-level wrap only if a
+    single token is wider than the available width."""
+    if not text:
+        return []
+    parts = text.split('; ')
+    tokens = [p + ('; ' if i < len(parts) - 1 else '') for i, p in enumerate(parts)]
+
+    def width_for(idx: int) -> float:
+        return line_widths[min(idx, len(line_widths) - 1)] if line_widths else 0.0
+
+    lines: list[str] = []
+    current = ''
+    for tok in tokens:
+        idx = len(lines)
+        max_w = width_for(idx)
+        cand = current + tok
+        if canvas.stringWidth(cand, font_name, font_size) <= max_w:
+            current = cand
+            continue
+        if current:
+            lines.append(current.rstrip())
+            current = ''
+            idx = len(lines)
+            max_w = width_for(idx)
+        # Token alone — try by spaces if even it's too wide.
+        if canvas.stringWidth(tok, font_name, font_size) <= max_w:
+            current = tok
+        else:
+            words = tok.split(' ')
+            buf = ''
+            for w in words:
+                idx2 = len(lines)
+                max_w2 = width_for(idx2)
+                trial = (buf + (' ' if buf else '') + w)
+                if canvas.stringWidth(trial, font_name, font_size) <= max_w2:
+                    buf = trial
+                else:
+                    if buf:
+                        lines.append(buf)
+                    buf = w
+            current = buf
+    if current:
+        lines.append(current.rstrip())
+    return lines
+
+
 def _build_overlay(crew: list, crew_leader_sig_b64: str | None,
-                   rects: dict, page_size: tuple) -> BytesIO | None:
+                   rects: dict, page_size: tuple,
+                   project_name: str = '') -> BytesIO | None:
     """Build a one-page PDF with signature PNGs drawn at each field rect
-    (expanded for breathing room). Returns None if nothing to draw."""
+    (expanded for breathing room) plus the Project Name text wrapped
+    into the whitespace below the field. Returns None if nothing to draw."""
     page_w, page_h = page_size
     buf = BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=(page_w, page_h))
     drew_anything = False
+
+    # ── Project Name / Location wrapped overlay ──────────────────
+    if project_name and 'Project_Name' in rects:
+        _pg, (px1, py1, px2, _py2) = rects['Project_Name']
+
+        # Both lines stop short of the Date field's left edge — even
+        # the second line (which sits in the empty row below) is kept
+        # narrow on purpose so the rendered text feels confined to the
+        # Project Name / Location half of the form rather than
+        # ambiguously spilling under the Date area.
+        date_rect = rects.get('Date_Header')
+        if date_rect:
+            _date_pg, (date_x1, _, _, _) = date_rect
+            right_x = date_x1 - PROJECT_NAME_DATE_GAP
+        else:
+            right_x = page_w * 0.6
+        narrow_w = max(60.0, right_x - px1)
+        line_widths = [narrow_w] * PROJECT_NAME_MAX_LINES
+
+        # Adaptive font sizing. Walk PROJECT_NAME_FONT_MAX → MIN, picking
+        # the largest size that wraps the text into ≤ MAX_LINES. Falls
+        # through to MIN with ellipsis if even the smallest still
+        # overflows (signals to the caller / form-reader that text was
+        # truncated rather than silently dropping it).
+        chosen_size = PROJECT_NAME_FONT_MIN
+        chosen_lines: list[str] = []
+        for size in range(PROJECT_NAME_FONT_MAX, PROJECT_NAME_FONT_MIN - 1, -1):
+            c.setFont(PROJECT_NAME_FONT_NAME, size)
+            wrapped = _wrap_project_name(
+                c, project_name, line_widths, PROJECT_NAME_FONT_NAME, size,
+            )
+            if len(wrapped) <= PROJECT_NAME_MAX_LINES:
+                chosen_size, chosen_lines = size, wrapped
+                break
+        else:
+            # Fell through — overflow at MIN size; ellipsize.
+            c.setFont(PROJECT_NAME_FONT_NAME, PROJECT_NAME_FONT_MIN)
+            wrapped = _wrap_project_name(
+                c, project_name, line_widths,
+                PROJECT_NAME_FONT_NAME, PROJECT_NAME_FONT_MIN,
+            )
+            wrapped = wrapped[:PROJECT_NAME_MAX_LINES]
+            last = wrapped[-1].rstrip(',; ')
+            while c.stringWidth(last + '…', PROJECT_NAME_FONT_NAME,
+                                PROJECT_NAME_FONT_MIN) > narrow_w and last:
+                last = last[:-1]
+            wrapped[-1] = last + '…'
+            chosen_size, chosen_lines = PROJECT_NAME_FONT_MIN, wrapped
+
+        c.setFont(PROJECT_NAME_FONT_NAME, chosen_size)
+        line_height = chosen_size * PROJECT_NAME_LINE_RATIO
+        # Nudge the first line a couple points above the field bottom so
+        # its descenders stay clear of the printed underline beneath.
+        baseline_y = py1 + 2
+        for i, line in enumerate(chosen_lines):
+            c.drawString(px1, baseline_y - i * line_height, line)
+        drew_anything = True
 
     def draw_at(field_name: str, b64: str | None, h_pad: float, v_pad: float):
         nonlocal drew_anything
@@ -193,12 +338,35 @@ def _build_overlay(crew: list, crew_leader_sig_b64: str | None,
     return buf
 
 
+def _ensure_acroform_dr(writer: PdfWriter):
+    """pypdf 4.3.1 crashes inside _update_field_annotation when a form
+    field references a font not in the page's /DR — the fallback path
+    expects /DR and /DR/Font to be DictionaryObject, but newer-Acrobat
+    templates sometimes ship them as plain dicts (or omit /DR entirely).
+    Normalize both. Same shape as the fix applied to fill_certified_payroll.
+    Idempotent — safe to call before every fill."""
+    acro = writer._root_object.get('/AcroForm')
+    if acro is None:
+        return
+    acro_obj = acro.get_object() if isinstance(acro, IndirectObject) else acro
+    dr = acro_obj.get('/DR')
+    dr_obj = dr.get_object() if isinstance(dr, IndirectObject) else dr
+    if not isinstance(dr_obj, DictionaryObject):
+        dr_obj = DictionaryObject()
+        acro_obj[NameObject('/DR')] = dr_obj
+    font = dr_obj.get('/Font')
+    font_obj = font.get_object() if isinstance(font, IndirectObject) else font
+    if not isinstance(font_obj, DictionaryObject):
+        dr_obj[NameObject('/Font')] = DictionaryObject()
+
+
 def fill(data: dict, template_path: str, output_path: str) -> str:
     """Fill the Sign-In Log template and write to output_path. Returns the
     output path on success."""
     # ── 1. Fill text fields via pypdf form-fill ─────────────────────────
     reader = PdfReader(template_path)
     writer = PdfWriter(clone_from=reader)
+    _ensure_acroform_dr(writer)
 
     f: dict[str, str] = {
         'Prime_Contractor':     data.get('prime_contractor', ''),
@@ -206,7 +374,12 @@ def fill(data: dict, template_path: str, output_path: str) -> str:
         'Contract_Number':      data.get('contract_number', ''),
         'Contractor_Address':   data.get('address', ''),
         'Agency':               data.get('agency', ''),
-        'Project_Name':         data.get('project_name', ''),
+        # Project_Name is intentionally left empty in the AcroForm fill
+        # — the actual text is rendered as a wrapped overlay (see
+        # _build_overlay) so multi-WO sign-ins don't get clipped. If we
+        # ALSO filled the AcroForm here, its truncated value would draw
+        # underneath the overlay and show through.
+        'Project_Name':         '',
         'Date_Header':          data.get('date', ''),
         'Contractor_Name':      data.get('contractor_name', ''),
         'Contractor_Title':     data.get('contractor_title', ''),
@@ -237,6 +410,7 @@ def fill(data: dict, template_path: str, output_path: str) -> str:
         data.get('contractor_signature_b64'),
         rects,
         page_size,
+        project_name=data.get('project_name', ''),
     )
 
     # ── 3. Merge overlay (if any) onto filled PDF ──────────────────────
