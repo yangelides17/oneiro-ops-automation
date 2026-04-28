@@ -2969,28 +2969,38 @@ function handleGetDriveFileBytes_(body) {
   const fileId = String(d.file_id || '').trim();
   if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
 
+  let step = 'init';
   try {
-    const file = DriveApp.getFileById(fileId);
+    step = 'getFileById';
+    const file = _withDriveRetry_('getFileById preview', () => DriveApp.getFileById(fileId));
+
+    step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
 
     // Safety gate: verify the file lives under NEEDS_REVIEW_ID. Walks up
     // the parents tree (Drive files can have multiple, but Scan Inbox /
     // Needs Review subfolders are single-parent).
+    step = 'isUnderParent';
     const props         = PropertiesService.getScriptProperties();
     const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
     if (!_isUnderParent_(file, needsReviewId)) {
       return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
     }
 
-    const blob = file.getBlob();
-    return jsonResponse_({
-      filename:  file.getName(),
-      mime_type: blob.getContentType(),
-      size:      file.getSize(),
-      data:      Utilities.base64Encode(blob.getBytes()),
+    step = 'getBlob/getBytes';
+    const result = _withDriveRetry_('getBlob preview', () => {
+      const blob = file.getBlob();
+      return {
+        filename:  file.getName(),
+        mime_type: blob.getContentType(),
+        size:      file.getSize(),
+        data:      Utilities.base64Encode(blob.getBytes()),
+      };
     });
+    return jsonResponse_(result);
   } catch (err) {
-    return jsonResponse_({ error: String(err) }, 500);
+    Logger.log(`❌ handleGetDriveFileBytes_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
 }
 
@@ -3015,6 +3025,29 @@ function _isUnderParent_(file, ancestorId) {
   return false;
 }
 
+/**
+ * Retry a Drive op up to N times with linear backoff. The Apps Script
+ * Drive service throws transient "Service error: Drive" exceptions for
+ * eventual-consistency races (e.g. moveTo on a file that was created
+ * milliseconds ago) and brief backend hiccups — both are retryable.
+ * `label` shows up in Logger.log for diagnosis.
+ */
+function _withDriveRetry_(label, fn, attempts) {
+  const maxAttempts = attempts || 3;
+  let lastErr;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && err.message || err);
+      Logger.log(`⚠️ Drive op "${label}" attempt ${i + 1}/${maxAttempts} failed: ${msg}`);
+      if (i < maxAttempts - 1) Utilities.sleep(500 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
 
 // ── action: approve_doc ───────────────────────────────────────
 //
@@ -3033,15 +3066,23 @@ function handleApproveDoc_(body) {
   if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
   if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
 
+  let step = 'init';
   try {
-    const file = DriveApp.getFileById(fileId);
+    step = 'getFileById';
+    const file = _withDriveRetry_('getFileById', () => DriveApp.getFileById(fileId));
+
+    step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+
+    step = 'isUnderParent';
     if (!_isUnderParent_(file, needsReviewId)) {
       return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
     }
 
-    const approvedFolder = DriveApp.getFolderById(approvedId);
-    file.moveTo(approvedFolder);
+    step = 'moveTo Approved Docs';
+    _withDriveRetry_('moveTo approve', () => {
+      file.moveTo(DriveApp.getFolderById(approvedId));
+    });
 
     // Log it — processApprovedDocuments will log its own "emailed" row
     // 0-10 min later when it picks this up.
@@ -3059,7 +3100,8 @@ function handleApproveDoc_(body) {
 
     return jsonResponse_({ success: true, file_id: fileId });
   } catch (err) {
-    return jsonResponse_({ error: String(err) }, 500);
+    Logger.log(`❌ handleApproveDoc_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
 }
 
@@ -3674,13 +3716,23 @@ function handleApproveDocSkipSignoff_(body) {
   if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
   if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
 
+  let step = 'init';
   try {
-    const file = DriveApp.getFileById(fileId);
+    step = 'getFileById';
+    const file = _withDriveRetry_('getFileById', () => DriveApp.getFileById(fileId));
+
+    step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+
+    step = 'isUnderParent';
     if (!_isUnderParent_(file, needsReviewId)) {
       return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
     }
-    file.moveTo(DriveApp.getFolderById(approvedId));
+
+    step = 'moveTo Approved Docs';
+    _withDriveRetry_('moveTo skip-signoff', () => {
+      file.moveTo(DriveApp.getFolderById(approvedId));
+    });
 
     try {
       SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
@@ -3697,7 +3749,8 @@ function handleApproveDocSkipSignoff_(body) {
 
     return jsonResponse_({ success: true, file_id: fileId });
   } catch (err) {
-    return jsonResponse_({ error: String(err) }, 500);
+    Logger.log(`❌ handleApproveDocSkipSignoff_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
 }
 
