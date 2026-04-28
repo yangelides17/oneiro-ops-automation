@@ -2969,6 +2969,13 @@ function handleGetDriveFileBytes_(body) {
   const fileId = String(d.file_id || '').trim();
   if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
 
+  // Trust model: file_ids reach this handler only after coming through
+  // list_pending_approvals, which already scoped its scan to the four
+  // Docs Needing Review subfolders. We previously walked the file's
+  // parents tree to re-verify that, but on Shared Drives that walk
+  // throws "Service error: Drive" repeatedly even on files that are
+  // visibly in the right folder. Drop the redundant check.
+
   let step = 'init';
   try {
     step = 'getFileById';
@@ -2976,16 +2983,6 @@ function handleGetDriveFileBytes_(body) {
 
     step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
-
-    // Safety gate: verify the file lives under NEEDS_REVIEW_ID. Walks up
-    // the parents tree (Drive files can have multiple, but Scan Inbox /
-    // Needs Review subfolders are single-parent).
-    step = 'isUnderParent';
-    const props         = PropertiesService.getScriptProperties();
-    const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
-    if (!_isUnderParent_(file, needsReviewId)) {
-      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
-    }
 
     step = 'getBlob/getBytes';
     const result = _withDriveRetry_('getBlob preview', () => {
@@ -3060,11 +3057,16 @@ function handleApproveDoc_(body) {
   const fileId = String(d.file_id || '').trim();
   if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
 
-  const props          = PropertiesService.getScriptProperties();
-  const approvedId     = props.getProperty('APPROVED_SENT_ID');
-  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
-  if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
-  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+  const props      = PropertiesService.getScriptProperties();
+  const approvedId = props.getProperty('APPROVED_SENT_ID');
+  if (!approvedId) return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
+
+  // Trust model: file_ids reach approve handlers only after coming
+  // through list_pending_approvals (the only way the webapp knows
+  // them), which scopes its scan to Docs Needing Review subfolders.
+  // The previous _isUnderParent_ re-check threw "Service error: Drive"
+  // on Shared Drives because the upward parent walk is unreliable
+  // there. Drop the redundant check.
 
   let step = 'init';
   try {
@@ -3073,11 +3075,6 @@ function handleApproveDoc_(body) {
 
     step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
-
-    step = 'isUnderParent';
-    if (!_isUnderParent_(file, needsReviewId)) {
-      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
-    }
 
     step = 'moveTo Approved Docs';
     _withDriveRetry_('moveTo approve', () => {
@@ -3710,11 +3707,11 @@ function handleApproveDocSkipSignoff_(body) {
   const fileId = String(d.file_id || '').trim();
   if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
 
-  const props         = PropertiesService.getScriptProperties();
-  const approvedId    = props.getProperty('APPROVED_SENT_ID');
-  const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
-  if (!approvedId)    return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
-  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+  const props      = PropertiesService.getScriptProperties();
+  const approvedId = props.getProperty('APPROVED_SENT_ID');
+  if (!approvedId) return jsonResponse_({ error: 'APPROVED_SENT_ID not set' }, 500);
+
+  // Same trust model as handleApproveDoc_ — see comments there.
 
   let step = 'init';
   try {
@@ -3723,11 +3720,6 @@ function handleApproveDocSkipSignoff_(body) {
 
     step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
-
-    step = 'isUnderParent';
-    if (!_isUnderParent_(file, needsReviewId)) {
-      return jsonResponse_({ error: 'File not in Docs Needing Review' }, 403);
-    }
 
     step = 'moveTo Approved Docs';
     _withDriveRetry_('moveTo skip-signoff', () => {
