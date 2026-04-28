@@ -559,11 +559,17 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
     }
 
-    // Pre-rotate any page that's portrait dimensions — most Daily
-    // Sign-In Logs are landscape forms, so a portrait scan means the
-    // paper was held sideways. Rotating to landscape gives Claude
-    // Vision a much cleaner read AND makes the archived PDF readable
-    // without the admin tilting their head.
+    // Pre-rotate any page whose EFFECTIVE orientation (after applying
+    // the existing rotation metadata) is portrait — most Daily Sign-In
+    // Logs are landscape forms, so an effectively-portrait page means
+    // the paper was scanned sideways and would render that way for the
+    // admin too. Rotating it to landscape gives Claude Vision a cleaner
+    // read AND archives a human-readable scan.
+    //
+    // We MUST compute "effective" orientation because many PDFs have
+    // raw portrait dimensions but a 90°/270° rotation flag baked in,
+    // making them effectively landscape already. Naively rotating those
+    // again would flip them upside-down (the bug we hit on first ship).
     let workingBytes = req.file.buffer
     let rotatedAny = false
     try {
@@ -571,13 +577,13 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
       pdfDoc.getPages().forEach(page => {
         const { width, height } = page.getSize()
-        if (height > width) {
-          // Stack the existing rotation (if any) with +90° so we don't
-          // clobber a PDF that's already been rotated.
-          const existing = page.getRotation().angle || 0
-          page.setRotation(degrees((existing + 90) % 360))
-          rotatedAny = true
-        }
+        const existing = page.getRotation().angle || 0
+        const swapped  = (existing === 90 || existing === 270)
+        // Effective orientation = raw dims swapped if rotation is ±90.
+        const effPortrait = swapped ? (width > height) : (height > width)
+        if (!effPortrait) return
+        page.setRotation(degrees((existing + 90) % 360))
+        rotatedAny = true
       })
       if (rotatedAny) workingBytes = Buffer.from(await pdfDoc.save())
     } catch (e) {
