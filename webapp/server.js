@@ -559,38 +559,16 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
       return res.status(400).json({ error: 'Only PDF uploads are supported (got ' + mime + ')' })
     }
 
-    // Pre-rotate any page whose EFFECTIVE orientation (after applying
-    // the existing rotation metadata) is portrait — most Daily Sign-In
-    // Logs are landscape forms, so an effectively-portrait page means
-    // the paper was scanned sideways and would render that way for the
-    // admin too. Rotating it to landscape gives Claude Vision a cleaner
-    // read AND archives a human-readable scan.
-    //
-    // We MUST compute "effective" orientation because many PDFs have
-    // raw portrait dimensions but a 90°/270° rotation flag baked in,
-    // making them effectively landscape already. Naively rotating those
-    // again would flip them upside-down (the bug we hit on first ship).
-    let workingBytes = req.file.buffer
-    let rotatedAny = false
-    try {
-      const { PDFDocument, degrees } = await import('pdf-lib')
-      const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
-      pdfDoc.getPages().forEach(page => {
-        const { width, height } = page.getSize()
-        const existing = page.getRotation().angle || 0
-        const swapped  = (existing === 90 || existing === 270)
-        // Effective orientation = raw dims swapped if rotation is ±90.
-        const effPortrait = swapped ? (width > height) : (height > width)
-        if (!effPortrait) return
-        page.setRotation(degrees((existing + 90) % 360))
-        rotatedAny = true
-      })
-      if (rotatedAny) workingBytes = Buffer.from(await pdfDoc.save())
-    } catch (e) {
-      console.warn('Sign-in upload rotation skipped:', e.message)
-    }
-
-    const base64 = workingBytes.toString('base64')
+    // Orientation handling. Heuristics on raw page dimensions are
+    // unreliable because rotation can live either in PDF metadata OR be
+    // baked into how content was drawn on the page. Instead, we ask
+    // Claude to report `rotation_needed` as part of the same OCR call
+    // (no extra round-trip, no extra cost) and rotate the bytes via
+    // pdf-lib AFTER parsing succeeds. Row order may be off when the
+    // page is upside-down — Claude tends to scan in screen-space — but
+    // the row VALUES (name, times, class) are correct regardless, and
+    // the user can drag-reorder if they care about the visual order.
+    const base64 = req.file.buffer.toString('base64')
 
     // Pull the Employee Registry from Apps Script so we can hand
     // Claude the closed list of valid names. The prompt then asks
@@ -614,6 +592,7 @@ app.post('/api/signin-queue/parse-upload', upload.single('file'), async (req, re
 
 Schema:
 {
+  "rotation_needed": "<Integer — degrees of CLOCKWISE rotation that must be applied so the document reads right-side-up (header at top, text left-to-right). One of: 0, 90, 180, 270. If the page is already correct, return 0.>",
   "crew": [
     {
       "name":           "<EXACTLY one name from the Employee Registry below — see Name matching rules.>",
@@ -647,7 +626,15 @@ Time interpretation (CRITICAL — most common error):
 Rules:
 - Skip rows that are entirely blank. Only include crew rows that have at least one filled cell (name, time, or classification).
 - Classification: only "LP" or "SAT". If the sheet uses other codes, pick the closest match; otherwise null.
-- Never wrap the JSON in markdown fences.`
+- Never wrap the JSON in markdown fences.
+
+Rotation detection:
+- Look at the page as it would render in a normal PDF viewer (no manual rotation applied).
+- The form is a landscape document. The header "THE CITY OF NEW YORK • OFFICE OF THE COMPTROLLER • BUREAU OF LABOR LAW" should appear at the top, reading left-to-right.
+- If the header is at the top reading left-to-right → return 0.
+- If the header is on the right edge reading bottom-to-top → return 90 (rotate 90° clockwise to fix).
+- If the header is at the bottom reading right-to-left → return 180.
+- If the header is on the left edge reading top-to-bottom → return 270.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -695,6 +682,34 @@ Rules:
       throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
     }
 
+    // Apply Claude's rotation_needed to the PDF. We ADD to whatever
+    // rotation metadata is already on the page rather than replacing,
+    // because Claude judged the EFFECTIVE displayed state (Anthropic
+    // Vision honors rotation metadata) — so the value it returned is
+    // the additional clockwise rotation needed beyond what's already
+    // baked in.
+    const rotationNeeded = (() => {
+      const v = Number(parsed && parsed.rotation_needed)
+      return [0, 90, 180, 270].includes(v) ? v : 0
+    })()
+    let workingBytes = req.file.buffer
+    let rotatedAny   = false
+    if (rotationNeeded !== 0) {
+      try {
+        const { PDFDocument, degrees } = await import('pdf-lib')
+        const pdfDoc = await PDFDocument.load(req.file.buffer, { updateMetadata: false })
+        pdfDoc.getPages().forEach(page => {
+          const existing = page.getRotation().angle || 0
+          page.setRotation(degrees((existing + rotationNeeded) % 360))
+          rotatedAny = true
+        })
+        if (rotatedAny) workingBytes = Buffer.from(await pdfDoc.save())
+      } catch (e) {
+        console.warn('Sign-in upload rotation failed:', e.message)
+      }
+    }
+    const echoBase64 = rotatedAny ? workingBytes.toString('base64') : base64
+
     // Echo the (possibly rotated) bytes back to the client so they go
     // straight into /api/signin without re-uploading. The archived PDF
     // is then the user-readable landscape version, not the original
@@ -702,11 +717,12 @@ Rules:
     res.json({
       parsed,
       rotated: rotatedAny,
+      rotation_needed: rotationNeeded,
       upload: {
         filename:    req.file.originalname,
         mime_type:   mime,
         size:        workingBytes.length,
-        data_b64:    base64,
+        data_b64:    echoBase64,
       },
     })
   } catch (err) {
