@@ -1331,17 +1331,33 @@ function archiveDocument_(file, docType, woId, ss) {
     const archiveRoot = DriveApp.getFolderById(archiveId);
     const cleanName = file.getName().replace('📨 ', '');
 
-    if (docType === 'Field Report' || docType === 'Invoice') {
-      // Single doc — file directly inside the WO subfolder, no type subfolder
+    if (docType === 'Field Report') {
+      // Field Report PDFs from the worker now embed the FULL WO document
+      // (original scan pages + the freshly-rendered CFR page). They
+      // REPLACE the prior WO doc in the archive folder — atomic swap so
+      // there's never a window where the WO is missing.
       if (!woId) {
-        return { success: false, reason: `${docType} has no WO # in filename` };
+        return { success: false, reason: 'CFR has no WO # in filename' };
       }
       const woFolder = getWOFolder_(archiveRoot, woId, ss);
       if (!woFolder) {
-        return { success: false, reason: `Could not resolve WO folder for ${docType} ${woId} — is it missing from the Work Order Tracker?` };
+        return { success: false, reason: `Could not resolve WO folder for CFR ${woId} — is it missing from the Work Order Tracker?` };
+      }
+      _replaceArchivedWODoc_(woFolder, file, woId);
+      Logger.log(`📁 Archived merged CFR → WO folder ${woId} (replaced prior WO doc)`);
+      return { success: true };
+
+    } else if (docType === 'Invoice') {
+      // Invoice files alongside the WO doc — no replacement.
+      if (!woId) {
+        return { success: false, reason: `Invoice has no WO # in filename` };
+      }
+      const woFolder = getWOFolder_(archiveRoot, woId, ss);
+      if (!woFolder) {
+        return { success: false, reason: `Could not resolve WO folder for Invoice ${woId} — is it missing from the Work Order Tracker?` };
       }
       file.makeCopy(cleanName, woFolder);
-      Logger.log(`📁 Archived ${docType}: ${cleanName} → WO folder ${woId}`);
+      Logger.log(`📁 Archived Invoice: ${cleanName} → WO folder ${woId}`);
       return { success: true };
 
     } else if (docType === 'Sign-In') {
@@ -1525,6 +1541,93 @@ function _getOrCreateWorkDayLogSheet_(ss) {
   sheet.getRange(2, 8, 1000, 1).setDataValidation(statusRule);
 
   return sheet;
+}
+
+/**
+ * Filename prefixes that identify an "auxiliary" archived doc (sign-ins,
+ * invoices, etc) sitting alongside the WO doc in a WO archive folder.
+ * Anything in the WO folder whose name does NOT start with one of these
+ * is treated as the WO document itself — i.e. either the original scan
+ * (with whatever filename the user uploaded under) or the canonical
+ * `WO_<woId>.pdf` produced by a prior merged-CFR archive run.
+ */
+const _AUX_DOC_PREFIXES_ = Object.freeze([
+  'SignIn_', 'Invoice_', 'CFR_', 'Contractor_Field_Report_',
+  'Production_Log_', 'Certified_Payroll_'
+]);
+
+function _isAuxDocName_(name) {
+  return _AUX_DOC_PREFIXES_.some(p => String(name || '').startsWith(p));
+}
+
+/**
+ * Atomic-swap the WO doc in a WO archive folder. Trashes any existing
+ * "WO doc" file (canonical name OR a non-auxiliary PDF — i.e. the
+ * original scan upload) and copies `newFile` in as `WO_<woId>.pdf`.
+ * Aux docs (sign-ins, invoices, etc) are left untouched.
+ */
+function _replaceArchivedWODoc_(woFolder, newFile, woId) {
+  const canonical = `WO_${woId}.pdf`;
+  const files = woFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getMimeType() !== 'application/pdf') continue;
+    const name = f.getName();
+    const isWODoc = (name === canonical) || !_isAuxDocName_(name);
+    if (isWODoc) f.setTrashed(true);
+  }
+  newFile.makeCopy(canonical, woFolder);
+}
+
+/**
+ * action: lookup_archived_wo_pdf
+ *
+ * Finds the current "WO document" in the WO's archive folder and
+ * returns its Drive file ID + filename so the Python worker can fetch
+ * it via Drive API and merge a freshly-rendered CFR page into it.
+ *
+ * body.data: { wo_id }
+ * response: { found: bool, file_id?, filename? }
+ *
+ * Lookup precedence:
+ *   1. Canonical name `WO_<woId>.pdf` (produced by a prior merged-CFR
+ *      archive run).
+ *   2. Any PDF in the folder whose name doesn't match a known aux-doc
+ *      prefix (the original scan, before its first CFR was merged).
+ */
+function handleLookupArchivedWOPdf_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+
+  const props       = PropertiesService.getScriptProperties();
+  const archiveId   = props.getProperty('ARCHIVE_ID');
+  if (!archiveId) return jsonResponse_({ error: 'ARCHIVE_ID not set' }, 500);
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+  const ss          = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  const woFolder = getWOFolder_(archiveRoot, woId, ss);
+  if (!woFolder) return jsonResponse_({ found: false });
+
+  const canonical = `WO_${woId}.pdf`;
+  let canonicalHit = null;
+  let fallbackHit  = null;
+  const files = woFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getMimeType() !== 'application/pdf') continue;
+    const name = f.getName();
+    if (name === canonical) { canonicalHit = f; break; }
+    if (!_isAuxDocName_(name) && !fallbackHit) fallbackHit = f;
+  }
+
+  const target = canonicalHit || fallbackHit;
+  if (!target) return jsonResponse_({ found: false });
+  return jsonResponse_({
+    found:    true,
+    file_id:  target.getId(),
+    filename: target.getName(),
+  });
 }
 
 /** Get or create the WO-level subfolder: Archive/Contractor/Contract-Borough/WO#-Location */
@@ -2592,6 +2695,8 @@ function doPost(e) {
       return handleListSignInDayHours_(body);
     } else if (action === 'approve_doc_skip_signoff') {
       return handleApproveDocSkipSignoff_(body);
+    } else if (action === 'lookup_archived_wo_pdf') {
+      return handleLookupArchivedWOPdf_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }

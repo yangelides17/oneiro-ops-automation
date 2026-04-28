@@ -53,11 +53,13 @@ Implementation note — template quirk:
   directly. See _write_fields_via_acroform() below.
 """
 
+import base64
 import json
 import logging
 import os
 import sys
 import warnings
+from io import BytesIO
 
 logging.getLogger('pypdf').setLevel(logging.ERROR)
 warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', module='pypdf')
@@ -263,6 +265,135 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     with open(output_path, 'wb') as f:
         writer.write(f)
     return output_path
+
+
+# ── Vision-based page classification + merge ────────────────────────
+#
+# When a CFR is generated for a WO that already has a scan (and possibly
+# a prior CFR) in the archive, we merge the new CFR page INTO that PDF
+# instead of filing it as a separate document. We use Claude Vision to
+# label each page so the merge can decide whether to REPLACE an existing
+# CFR page or INSERT a new one — content-based detection is robust to
+# however the prior PDF was constructed.
+
+_VISION_PROMPT = """You're labeling pages of a multi-page PDF based on the title text printed at the top of each page.
+
+Return ONLY a JSON array of strings, one entry per page, in page order. Each entry MUST be exactly one of:
+  "WO"    — the page header reads "Work Order Report" or any other work-order title
+  "CFR"   — the page header reads "Contractor Field Report" / "Daily Field Report" / similar field-report title
+  "OTHER" — anything else (blank pages, supplementary scans, unknown content)
+
+Example for a 3-page PDF where page 1 is the work order, page 2 is supplementary, and page 3 is the contractor field report:
+["WO", "OTHER", "CFR"]
+
+Do NOT include any explanation. Output the raw JSON array only — no markdown fences."""
+
+
+def classify_pages_via_vision(pdf_bytes: bytes) -> list[str]:
+    """Ask Claude Vision to classify each page of a PDF as WO / CFR /
+    OTHER. Returns one label per page. On any failure (network, API,
+    malformed response, length mismatch with the actual page count) it
+    returns an empty list — the caller should treat that as "no CFR
+    detected" and append the new CFR at the end."""
+    if not pdf_bytes:
+        return []
+    try:
+        import anthropic
+    except ImportError:
+        return []
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        return []
+
+    # Page count for length-validation of Claude's response below.
+    try:
+        n_pages = len(PdfReader(BytesIO(pdf_bytes)).pages)
+    except Exception:
+        n_pages = 0
+
+    client  = anthropic.Anthropic(api_key=api_key)
+    encoded = base64.standard_b64encode(pdf_bytes).decode('utf-8')
+    try:
+        response = client.messages.create(
+            model='claude-sonnet-4-5',  # Vision-capable, fast, cheap enough
+            max_tokens=512,
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'type': 'document',
+                     'source': {'type': 'base64',
+                                'media_type': 'application/pdf',
+                                'data': encoded}},
+                    {'type': 'text', 'text': _VISION_PROMPT},
+                ],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        # Defensive: strip any markdown fences Claude might have added.
+        if raw.startswith('```'):
+            lines = raw.split('\n')
+            raw = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        valid = {'WO', 'CFR', 'OTHER'}
+        result = []
+        for v in parsed:
+            tag = str(v).strip().upper() if isinstance(v, str) else ''
+            result.append(tag if tag in valid else 'OTHER')
+        # Length sanity: if Claude returned a list whose length doesn't
+        # match the PDF, we can't trust the indices it implies.
+        if n_pages and len(result) != n_pages:
+            return []
+        return result
+    except Exception:
+        return []
+
+
+def merge_cfr_into_wo(wo_pdf_bytes: bytes,
+                     cfr_pdf_path: str,
+                     page_types: list[str]) -> bytes:
+    """Build a merged PDF: every page of the WO PDF in its original
+    position, with the freshly-rendered CFR either replacing the
+    existing CFR page (if `page_types` flagged one) or inserted right
+    after the first WO-titled page.
+
+    `page_types` should be the output of `classify_pages_via_vision`.
+    An empty list means "no detection ran / nothing identified" — we
+    treat that as no existing CFR and append the new one at the end.
+    """
+    wo_reader  = PdfReader(BytesIO(wo_pdf_bytes))
+    cfr_reader = PdfReader(cfr_pdf_path)
+    cfr_page   = cfr_reader.pages[0]
+    writer     = PdfWriter()
+
+    cfr_idx = next((i for i, t in enumerate(page_types) if t == 'CFR'), None)
+
+    if cfr_idx is not None:
+        # Replace in place — preserves every non-CFR page (including
+        # supplementary pages that may sit AFTER the existing CFR).
+        for i, page in enumerate(wo_reader.pages):
+            writer.add_page(cfr_page if i == cfr_idx else page)
+    else:
+        # Insert right after the first 'WO'-titled page. If Vision
+        # returned no labels at all (empty list), we append at the end.
+        if page_types:
+            wo_idx = next((i for i, t in enumerate(page_types) if t == 'WO'), 0)
+            insert_after = wo_idx
+        else:
+            insert_after = len(wo_reader.pages) - 1  # append at end
+        n = len(wo_reader.pages)
+        if n == 0:
+            writer.add_page(cfr_page)
+        else:
+            for i, page in enumerate(wo_reader.pages):
+                writer.add_page(page)
+                if i == insert_after:
+                    writer.add_page(cfr_page)
+
+    out = BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 if __name__ == '__main__':

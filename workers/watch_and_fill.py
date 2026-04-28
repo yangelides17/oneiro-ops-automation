@@ -820,15 +820,98 @@ def fill_signin(service, data: dict, tmp_dir: Path, source_name: str | None = No
 
 
 def fill_contractor_field_report(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
-    from fill_contractor_field_report import fill
+    """Render the CFR page, then MERGE it into the archived WO PDF (so
+    the final document carries the original WO scan + the new CFR as
+    its last page). Falls back to a CFR-only PDF — today's behavior —
+    at every external dependency that might fail (no archived WO,
+    Drive download error, Vision blow-up, post-merge validation fail).
+    Each fallback is logged so admin can audit when degraded paths
+    fired."""
+    from fill_contractor_field_report import (
+        fill, classify_pages_via_vision, merge_cfr_into_wo
+    )
+    from pypdf import PdfReader as _PdfReader
     template = get_template(service, 'contractor_field_report')
     wo_id    = data.get('wo_id') or data.get('work_order', 'unknown')
     date_str = str(data.get('install_to') or data.get('date_entered') or 'unknown') \
                   .replace('/', '-').replace(' ', '_')
     fallback = f"Contractor_Field_Report_{wo_id}_{date_str}_FILLED.pdf"
-    out = tmp_dir / _filename_from_source(source_name, fallback)
-    fill(data, template_path=str(template), output_path=str(out))
-    return out
+    out_path = tmp_dir / _filename_from_source(source_name, fallback)
+
+    # Render the standalone CFR page first — it's cheap, and we need
+    # it both for the merge AND as the fallback if the merge can't
+    # complete.
+    cfr_only_path = tmp_dir / ('cfr_only_' + out_path.name)
+    fill(data, template_path=str(template), output_path=str(cfr_only_path))
+
+    def _fallback_cfr_only(reason: str) -> Path:
+        """Copy the CFR-only PDF into the final output path and log."""
+        log(f"  ⚠️   CFR merge fallback for {wo_id}: {reason}")
+        # If output and CFR-only are different paths, replace.
+        if cfr_only_path.resolve() != out_path.resolve():
+            out_path.write_bytes(cfr_only_path.read_bytes())
+            try: cfr_only_path.unlink()
+            except Exception: pass
+        return out_path
+
+    # 1. Look up the archived WO PDF via Apps Script.
+    try:
+        lookup = _apps_script_post('lookup_archived_wo_pdf',
+                                   {'data': {'wo_id': wo_id}})
+    except Exception as e:
+        return _fallback_cfr_only(f'lookup_archived_wo_pdf failed: {e}')
+    if not lookup or not lookup.get('found'):
+        return _fallback_cfr_only('no archived WO PDF for this WO')
+
+    wo_file_id = lookup.get('file_id')
+    wo_filename = lookup.get('filename')
+    if not wo_file_id:
+        return _fallback_cfr_only('lookup returned no file_id')
+
+    # 2. Download the WO PDF bytes via Drive API.
+    try:
+        wo_pdf_bytes = download_binary(service, wo_file_id)
+    except Exception as e:
+        return _fallback_cfr_only(f'WO PDF download failed ({wo_filename}): {e}')
+    if not wo_pdf_bytes:
+        return _fallback_cfr_only(f'WO PDF download empty ({wo_filename})')
+
+    # 3. Classify the WO PDF's pages with Claude Vision so the merge
+    #    knows whether to replace an existing CFR or insert a new one.
+    page_types = classify_pages_via_vision(wo_pdf_bytes)
+    log(f"  ℹ️   CFR merge: WO doc '{wo_filename}' → page types: {page_types or '(no labels)'}")
+
+    # 4. Merge.
+    try:
+        merged_bytes = merge_cfr_into_wo(
+            wo_pdf_bytes, str(cfr_only_path), page_types,
+        )
+    except Exception as e:
+        return _fallback_cfr_only(f'merge failed: {e}')
+
+    # 5. Validate: re-open the merged bytes; expect at least 1 page and
+    #    a sensible page count given the input.
+    try:
+        merged_reader = _PdfReader(io.BytesIO(merged_bytes))
+        n_in  = len(_PdfReader(io.BytesIO(wo_pdf_bytes)).pages)
+        n_out = len(merged_reader.pages)
+        cfr_existed = any(t == 'CFR' for t in page_types)
+        expected = n_in if cfr_existed else n_in + 1
+        if n_out == 0 or n_out != expected:
+            return _fallback_cfr_only(
+                f'merged page count {n_out} != expected {expected} '
+                f'(input {n_in}, cfr_existed={cfr_existed})'
+            )
+    except Exception as e:
+        return _fallback_cfr_only(f'merged PDF validation failed: {e}')
+
+    # 6. Write the merged PDF to the output path; clean up the CFR-only
+    #    intermediate.
+    out_path.write_bytes(merged_bytes)
+    try: cfr_only_path.unlink()
+    except Exception: pass
+    log(f"  ✅  CFR merged into WO PDF for {wo_id} ({n_out} pages)")
+    return out_path
 
 
 FILLERS = {
