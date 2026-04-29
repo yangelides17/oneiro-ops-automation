@@ -654,15 +654,21 @@ def _upload_direct(service, local_path: Path, parent_folder_id: str) -> str:
     return created.get('id')
 
 
-def get_template(service, doc_type: str) -> Path:
+def get_template(service, doc_type: str, filename: str | None = None) -> Path:
     """Return a local path to the template PDF, downloading from Drive if needed.
 
     Templates are cached in _template_cache/ and re-downloaded only when
     the Drive copy is newer than the local copy.
+
+    `filename` overrides the default doc_type → filename mapping. Use it
+    when a doc_type has multiple templates (e.g. one Production Log
+    template per prime contractor) — pass the specific Drive filename
+    you want fetched.
     """
     from googleapiclient.http import MediaIoBaseDownload
 
-    filename = TEMPLATE_FILES.get(doc_type)
+    if filename is None:
+        filename = TEMPLATE_FILES.get(doc_type)
     if not filename:
         raise ValueError(f"No template configured for doc_type={doc_type!r}")
 
@@ -788,8 +794,12 @@ def _filename_from_source(source_name: str | None, fallback: str) -> str:
 
 
 def fill_production_log(service, data: dict, tmp_dir: Path, source_name: str | None = None) -> Path:
-    from fill_production_log import fill
-    template = get_template(service, 'production_log')
+    from fill_production_log import fill, get_template_filename
+    # Each contractor can have its own Production Log template — the
+    # filler module owns the contractor → filename mapping; we just
+    # ask which Drive file to fetch and route through get_template.
+    template_filename = get_template_filename(data)
+    template = get_template(service, 'production_log', filename=template_filename)
     date_str = data.get('date', 'unknown').replace('/', '-')
     fallback = f"Production_Log_{date_str}_FILLED.pdf"
     out = tmp_dir / _filename_from_source(source_name, fallback)

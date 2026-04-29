@@ -78,28 +78,32 @@ TEMPLATE = os.path.join(
     "templates/Metro_Production_Log_Fillable.pdf"
 )
 
-# Per-contractor template registry. Adding another prime later means
-# (1) drop their fillable PDF in workers/templates/, (2) register it
-# here, and (3) add the contractor name to CONFIG.PRODUCTION_LOG_CONTRACTORS
-# in Code.js. No other code changes needed.
+# Per-contractor Production Log template registry. Each entry is the
+# Drive filename of that contractor's fillable template — watch_and_fill
+# resolves it through get_template(..., filename=<this>) and caches
+# locally. When a second prime is onboarded:
+#   1. Drop their fillable PDF in the Drive Templates folder.
+#   2. Add a row here: 'Their Name': 'Their Template_FORM.pdf'
+#   3. Add 'Their Name' to CONFIG.PRODUCTION_LOG_CONTRACTORS in Code.js.
+# No other code changes required.
 _TEMPLATE_BY_CONTRACTOR = {
-    'Metro Express': TEMPLATE,
+    'Metro Express': 'Metro Thermoplastic Daily Production Log Template_FORM.pdf',
 }
+_DEFAULT_CONTRACTOR = 'Metro Express'
 
 
-def _resolve_template(data: dict, fallback: str) -> str:
-    """Pick a Production Log template based on data['contractor']. Falls
-    back to the default Metro template (and logs a warning) if the
-    contractor isn't registered — keeps the worker rendering something
-    even when a new prime is being onboarded but the template hasn't
-    been wired up yet."""
+def get_template_filename(data: dict) -> str:
+    """Drive filename for the template to fill, based on data['contractor'].
+    Falls back to the default Metro template if the contractor isn't
+    registered (so a freshly-onboarded prime keeps producing SOMETHING
+    until their template is wired up)."""
     contractor = str((data or {}).get('contractor') or '').strip()
     if contractor and contractor in _TEMPLATE_BY_CONTRACTOR:
         return _TEMPLATE_BY_CONTRACTOR[contractor]
     if contractor:
         print(f'[fill_production_log] no template registered for contractor '
-              f'{contractor!r} — falling back to default template')
-    return fallback
+              f'{contractor!r} — falling back to {_DEFAULT_CONTRACTOR}')
+    return _TEMPLATE_BY_CONTRACTOR[_DEFAULT_CONTRACTOR]
 
 # Borough code → field suffix mapping
 BOROUGH_MAP = {
@@ -476,10 +480,9 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
         date_str = str(data.get('date', 'unknown')).replace('/', '-')
         output_path = f'Production_Log_{date_str}_FILLED.pdf'
 
-    # Resolve which contractor's template to use (falls back to the
-    # supplied template_path if the contractor isn't registered).
-    template_path = _resolve_template(data, template_path)
-
+    # template_path is whichever contractor's template watch_and_fill
+    # fetched (it asks `get_template_filename(data)` first, then
+    # `get_template(filename=…)`); this fill() just renders against it.
     wos = list(data.get('work_orders') or [])
     chunks = (
         [wos[i:i + WOS_PER_PAGE] for i in range(0, len(wos), WOS_PER_PAGE)]
