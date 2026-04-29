@@ -1673,6 +1673,117 @@ function handleLookupArchivedWOPdf_(body) {
   });
 }
 
+/**
+ * action: list_metro_completed_docs
+ *
+ * One-off bundling helper. Returns metadata for:
+ *   - every Status='Completed' Metro Express WO's archived PDF (the
+ *     merged WO/CFR doc), and
+ *   - every Metro Express production log archived under
+ *     Archive/Metro Express/<contract-borough>/Production Logs/
+ *     (deduped by filename — the same daily log lives under each
+ *     contract folder it covers).
+ *
+ * Caller fetches each file's bytes via the existing
+ * get_drive_file_bytes action.
+ */
+function handleListMetroCompletedDocs_(body) {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData  = woSheet.getDataRange().getValues();
+
+  const props       = PropertiesService.getScriptProperties();
+  const archiveId   = props.getProperty('ARCHIVE_ID');
+  if (!archiveId) return jsonResponse_({ error: 'ARCHIVE_ID not set' }, 500);
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+
+  // ── Collect every completed Metro Express WO doc ───────────────
+  const wos = [];
+  woData.slice(1).forEach(r => {
+    if (!r[0]) return;
+    const contractor = String(r[1] || '').trim();
+    const status     = String(r[15] || '').trim().toLowerCase();
+    if (contractor !== 'Metro Express') return;
+    if (status     !== 'completed')     return;
+
+    const woId = String(r[0]);
+    const woFolder = getWOFolder_(archiveRoot, woId, ss);
+    if (!woFolder) {
+      wos.push({ wo_id: woId, error: 'WO folder not found' });
+      return;
+    }
+    // Find the WO doc — canonical first, else any non-aux PDF.
+    const canonical = `WO_${woId}.pdf`;
+    let canonicalHit = null, fallbackHit = null;
+    const files = woFolder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      if (f.getMimeType() !== 'application/pdf') continue;
+      const name = f.getName();
+      if (name === canonical) { canonicalHit = f; break; }
+      if (!_isAuxDocName_(name) && !fallbackHit) fallbackHit = f;
+    }
+    const target = canonicalHit || fallbackHit;
+    if (!target) {
+      wos.push({ wo_id: woId, error: 'WO PDF not found in folder' });
+      return;
+    }
+
+    const workEnd = r[18];
+    let workEndIso = '';
+    if (workEnd instanceof Date && !isNaN(workEnd.getTime())) {
+      workEndIso = Utilities.formatDate(workEnd, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    } else if (workEnd) {
+      const d = new Date(workEnd);
+      if (!isNaN(d.getTime())) {
+        workEndIso = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+      }
+    }
+
+    wos.push({
+      wo_id:         woId,
+      file_id:       target.getId(),
+      filename:      target.getName(),
+      work_end_date: workEndIso,
+      contract_num:  String(r[2] || '').split('/')[0],
+      borough:       String(r[3] || ''),
+      location:      String(r[5] || ''),
+    });
+  });
+
+  // ── Collect every Metro production log (master copies) ─────────
+  // Path: Archive / Metro Express / <contract-borough> / Production Logs /
+  const productionLogs = [];
+  const metroIt = archiveRoot.getFoldersByName('Metro Express');
+  if (metroIt.hasNext()) {
+    const metroFolder = metroIt.next();
+    const seenNames = {};
+    const contractFolders = metroFolder.getFolders();
+    while (contractFolders.hasNext()) {
+      const cf = contractFolders.next();
+      const plIt = cf.getFoldersByName('Production Logs');
+      if (!plIt.hasNext()) continue;
+      const plFolder = plIt.next();
+      const plFiles = plFolder.getFiles();
+      while (plFiles.hasNext()) {
+        const f = plFiles.next();
+        if (f.getMimeType() !== 'application/pdf') continue;
+        const name = f.getName();
+        if (seenNames[name]) continue;
+        seenNames[name] = true;
+        const m = name.match(/(\d{4}-\d{2}-\d{2})/);
+        productionLogs.push({
+          date:     m ? m[1] : '',
+          file_id:  f.getId(),
+          filename: name,
+        });
+      }
+    }
+  }
+
+  return jsonResponse_({ wos, production_logs: productionLogs });
+}
+
 /** Get or create the WO-level subfolder: Archive/Contractor/Contract-Borough/WO#-Location */
 function getWOFolder_(archiveRoot, woId, ss) {
   const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
@@ -2740,6 +2851,8 @@ function doPost(e) {
       return handleApproveDocSkipSignoff_(body);
     } else if (action === 'lookup_archived_wo_pdf') {
       return handleLookupArchivedWOPdf_(body);
+    } else if (action === 'list_metro_completed_docs') {
+      return handleListMetroCompletedDocs_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }

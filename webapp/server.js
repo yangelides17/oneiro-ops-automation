@@ -721,6 +721,22 @@ Rules:
 })
 
 /**
+ * GET /api/metro-delivery/list
+ * One-off bundling helper. Returns metadata for every Metro Express
+ * Status='Completed' WO's archived PDF + every Metro production log.
+ * Used to compile a manual Metro delivery batch.
+ */
+app.get('/api/metro-delivery/list', async (_req, res) => {
+  try {
+    const data = await callAppsScript('list_metro_completed_docs')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/metro-delivery/list error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/employees
  * Returns the list of employee names (Employee Registry col B) for the
  * Sign-In tab's crew dropdown. Apps Script side caches for 5 min.
