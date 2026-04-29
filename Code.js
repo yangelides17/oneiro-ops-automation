@@ -58,6 +58,14 @@ const CONFIG = {
   // Timezone
   TIMEZONE: 'America/New_York',
 
+  // Prime contractors that get daily production logs generated. Each
+  // listed contractor gets ONE production log per day (filtered to
+  // their own WOs only). Other primes' WOs are silently skipped — they
+  // don't require production logs today. Add a name here AND drop a
+  // matching template in workers/templates + register it in the
+  // Python worker's _TEMPLATE_BY_CONTRACTOR dict to enable a new prime.
+  PRODUCTION_LOG_CONTRACTORS: ['Metro Express'],
+
   // Operational-day cutoff hour (local time). Any timestamp with hour
   // strictly less than this value is bucketed to the PREVIOUS calendar
   // day for accounting purposes (Daily Sign-In Data Date column, OT
@@ -680,7 +688,7 @@ const PL_CATEGORY_MAP_ = {
  * Categories not in PL_CATEGORY_MAP_ are ignored (except HVX Crosswalk,
  * Stop Line, and the MMA SF trio, which have their own paths).
  */
-function aggregateMarkingItemsForPL_(ss, woId) {
+function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
   const out = { markings: {}, sqft: '', paint: '' };
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return out;
@@ -690,10 +698,21 @@ function aggregateMarkingItemsForPL_(ss, woId) {
 
   // Col indices (15-col Marking Items schema):
   //   1 WO#, 4 Marking Type, 5 Intersection, 6 Direction,
-  //   8 Quantity, 9 Unit, 10 Color/Material, 12 Status
+  //   8 Quantity, 9 Unit, 10 Color/Material,
+  //  11 Date Completed (set by finalizeMarkingStatus_ at FR submit),
+  //  12 Status
+  const tgt = String(targetDateIso || '').slice(0, 10);
+  const matchesDate = (cell) => {
+    if (!tgt) return true;          // no target date filter (legacy callers)
+    if (cell instanceof Date && !isNaN(cell.getTime())) {
+      return Utilities.formatDate(cell, CONFIG.TIMEZONE, 'yyyy-MM-dd') === tgt;
+    }
+    return String(cell || '').slice(0, 10) === tgt;
+  };
   const woItems = data.slice(1).filter(r =>
-    String(r[1] || '').trim() === woId &&
-    String(r[12] || '').toLowerCase() === 'completed'
+    String(r[1]  || '').trim() === woId &&
+    String(r[12] || '').toLowerCase() === 'completed' &&
+    matchesDate(r[11])
   );
   if (woItems.length === 0) return out;
 
@@ -742,166 +761,166 @@ function aggregateMarkingItemsForPL_(ss, woId) {
 
 
 /**
- * Generate Metro Thermoplastic Production Daily Log
+ * Generate daily Production Log JSONs.
  *
- * Filter rule: only include WOs where the WO Tracker has
- * `Status = 'Completed'` AND `Work End Date = targetDate`. A multi-day
- * WO therefore appears only on the PL for the day the work was
- * finished, and the quantities shown are the WO's full cumulative
- * Marking Items totals (acknowledged skew for now; ops manager to
- * weigh in).
+ * - One JSON per contractor in CONFIG.PRODUCTION_LOG_CONTRACTORS that
+ *   had ANY work-order activity on targetDate (Status doesn't matter
+ *   — an in-progress multi-day WO appears on each day's log it was
+ *   worked).
+ * - Marking-item LF totals are filtered to items whose Date Completed
+ *   equals targetDate, so cumulative WO totals don't leak into other
+ *   days' logs.
+ * - Returns an array of created Drive files (or empty array if no
+ *   enabled contractor had work that day).
  */
 function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss) {
   const props = PropertiesService.getScriptProperties();
   const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
   const targetDayStr = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
 
-  // ── Filter WOs to those COMPLETED on targetDate ───────────────
-  // WO Tracker col 15 = Status, col 18 = Work End Date.
-  const completedByWO = {};
+  const enabled = (CONFIG.PRODUCTION_LOG_CONTRACTORS || [])
+    .map(s => String(s).trim()).filter(Boolean);
+  if (enabled.length === 0) {
+    Logger.log('No contractors enabled for production logs — skipping.');
+    return [];
+  }
+
+  // ── Group every WO with sign-in activity today by contractor ──
+  // (no longer filters on status / Work End Date — an ongoing
+  //  multi-day WO appears on each day's log it had crew presence)
+  const wosByContractor = {};
   Object.entries(byWorkOrder).forEach(([woId, entries]) => {
     const woRow = woData.find(r => String(r[0]) === String(woId));
     if (!woRow) return;
-    const status = String(woRow[15] || '').trim().toLowerCase();
-    if (status !== 'completed') return;
-
-    // Work End Date can come back as a Date object or a string
-    const workEndRaw = woRow[18];
-    let workEndStr = '';
-    if (workEndRaw instanceof Date && !isNaN(workEndRaw.getTime())) {
-      workEndStr = Utilities.formatDate(workEndRaw, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-    } else if (workEndRaw) {
-      const d = new Date(workEndRaw);
-      if (!isNaN(d.getTime())) {
-        workEndStr = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-      }
-    }
-    if (workEndStr !== targetDayStr) return;
-
-    completedByWO[woId] = entries;
+    const contractor = String(woRow[1] || '').trim();
+    if (!contractor) return;
+    if (!wosByContractor[contractor]) wosByContractor[contractor] = {};
+    wosByContractor[contractor][woId] = entries;
   });
 
-  if (Object.keys(completedByWO).length === 0) {
-    Logger.log('No WOs completed on ' + targetDayStr + ' — skipping Production Log.');
-    return null;
-  }
-
-  // Only the crew that worked on completed WOs shows up on this PL
-  const relevantEntries = [];
-  Object.values(completedByWO).forEach(rows => relevantEntries.push(...rows));
-
-  // Get unique employees — track earliest time-in and latest time-out across all completed WOs for the day
-  const employees = {};
-  relevantEntries.forEach(row => {
-    const name = row[6];
-    const timeInMins  = parseTimeToMinutes_(row[8]);
-    const timeOutMins = parseTimeToMinutes_(row[9]);
-    if (!employees[name]) {
-      employees[name] = {
-        timeIn: formatTime_(row[8]), timeOut: formatTime_(row[9]),
-        timeInMins, timeOutMins,
-        classification: row[7]
-      };
-    } else {
-      // Correct numeric comparison — not string comparison
-      if (timeInMins  < employees[name].timeInMins)  { employees[name].timeIn  = formatTime_(row[8]); employees[name].timeInMins  = timeInMins;  }
-      if (timeOutMins > employees[name].timeOutMins) { employees[name].timeOut = formatTime_(row[9]); employees[name].timeOutMins = timeOutMins; }
-    }
-  });
-
-  const dateFormatted = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'MM/dd/yyyy');
-
-  // ── Build a plain-text summary for admin review ──────────────
-  let logContent = `METRO THERMOPLASTIC PRODUCTION DAILY LOG\n`;
-  logContent += `Date: ${dateFormatted}\n\n`;
-  Object.entries(employees).forEach(([name, info]) => {
-    const role = info.classification === 'LP' ? 'Crew Chief' : 'Individual';
-    logContent += `${role}: ${name} | In: ${info.timeIn} | Out: ${info.timeOut}\n`;
-  });
-  logContent += `\n${'─'.repeat(80)}\n\n`;
-  logContent += `WORK ORDERS COMPLETED ${dateFormatted}:\n\n`;
-  logContent += `${'Borough'.padEnd(8)} ${'WO #'.padEnd(12)} ${'Location'.padEnd(25)} ${'SQFT'.padEnd(10)} ${'Paint/Material'}\n`;
-  logContent += `${'─'.repeat(80)}\n`;
-
-  // ── Build the per-WO payload for the filler ──────────────────
-  const workOrdersJson = Object.entries(completedByWO).map(([woId, entries]) => {
-    const woRow   = woData.find(r => String(r[0]) === String(woId));
-    const borough = woRow ? String(woRow[3]).toUpperCase() : '';
-    const location = woRow ? String(woRow[5]).toUpperCase() : String(entries[0][5] || '').toUpperCase();
-    const agg     = aggregateMarkingItemsForPL_(ss, woId);
-
-    const sqftStr  = agg.sqft  !== '' ? String(agg.sqft)  : '';
-    const paintStr = agg.paint !== '' ? String(agg.paint) : '';
-
-    logContent += `${String(borough).padEnd(8)} ${String(woId).padEnd(12)} ${String(location).padEnd(25)} ${sqftStr.padEnd(10)} ${paintStr}\n`;
-
-    return {
-      wo_number:    String(woId),
-      borough:      borough,
-      location:     location,
-      sqft:         sqftStr,
-      paint:        paintStr,
-      complete:     'Y',        // filter guarantees this
-      layout_yn:    '',
-      layout_hours: '',
-      markings:     agg.markings,
-    };
-  });
-
-  // Production Logs folder — JSON gets written below; the Python worker
-  // produces the filled PDF.
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
   const subFolder    = getOrCreateSubfolder_(reviewFolder, 'Production Logs');
-
-  // ── Plain-text skeleton (disabled; kept in case admin wants it back) ──
-  // const fileName = `Production_Log_${targetDayStr}.txt`;
-  // const file     = subFolder.createFile(fileName, logContent, MimeType.PLAIN_TEXT);
-
-  // ── JSON export for the Python filler ──────────────────────
-  const sortedNames = Object.keys(employees);
-  const crewChiefName = sortedNames.find(n => employees[n].classification === 'LP') || sortedNames[0];
-  const crewMemberNames = sortedNames.filter(n => n !== crewChiefName);
-
-  const logJson = {
-    _type:             'production_log',
-    date:              dateFormatted,
-    crew_number:       '',
-    truck_number:      '',
-    inspector_present: '',
-    gas_tank_refilled: '',
-    materials: {
-      thermo_white_bags:  '',
-      thermo_yellow_bags: '',
-      beads_bags:         '',
-      paint_cans:         ''
-    },
-    crew_chief: crewChiefName ? {
-      name:     crewChiefName,
-      time_in:  employees[crewChiefName].timeIn,
-      time_out: employees[crewChiefName].timeOut
-    } : { name: '', time_in: '', time_out: '' },
-    crew: crewMemberNames.map(n => ({
-      name:     n,
-      time_in:  employees[n].timeIn,
-      time_out: employees[n].timeOut
-    })),
-    work_orders: workOrdersJson
-  };
-
-  const jsonFileName = `Production_Log_${targetDayStr}.json`;
-  const jsonFile = subFolder.createFile(jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
-
-  // Log it
+  const dateFormatted = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'MM/dd/yyyy');
   const logSheet = ss.getSheetByName('Automation Log');
-  logSheet.appendRow([
-    new Date(), 'Production Log Generator', 'Daily trigger',
-    `${Object.keys(completedByWO).length} completed WO(s) on ${dateFormatted}`,
-    jsonFileName, 'Generated',
-    '', 'Yes — Review and send to Claudia'
-  ]);
 
-  Logger.log('✅ Production log JSON exported: ' + jsonFileName);
-  return jsonFile;
+  const generated = [];
+
+  enabled.forEach(contractor => {
+    const wosForContractor = wosByContractor[contractor];
+    if (!wosForContractor || Object.keys(wosForContractor).length === 0) {
+      Logger.log(`No WOs for ${contractor} on ${targetDayStr} — skipping their Production Log.`);
+      return;
+    }
+
+    // Crew is derived from THIS contractor's WO sign-in rows only.
+    const relevantEntries = [];
+    Object.values(wosForContractor).forEach(rows => relevantEntries.push(...rows));
+
+    const employees = {};
+    relevantEntries.forEach(row => {
+      const name = row[6];
+      const timeInMins  = parseTimeToMinutes_(row[8]);
+      const timeOutMins = parseTimeToMinutes_(row[9]);
+      if (!employees[name]) {
+        employees[name] = {
+          timeIn: formatTime_(row[8]), timeOut: formatTime_(row[9]),
+          timeInMins, timeOutMins,
+          classification: row[7],
+        };
+      } else {
+        if (timeInMins  < employees[name].timeInMins)  {
+          employees[name].timeIn = formatTime_(row[8]);
+          employees[name].timeInMins = timeInMins;
+        }
+        if (timeOutMins > employees[name].timeOutMins) {
+          employees[name].timeOut = formatTime_(row[9]);
+          employees[name].timeOutMins = timeOutMins;
+        }
+      }
+    });
+
+    // ── Per-WO payload ────────────────────────────────────────
+    const workOrdersJson = Object.entries(wosForContractor).map(([woId, entries]) => {
+      const woRow    = woData.find(r => String(r[0]) === String(woId));
+      const borough  = woRow ? String(woRow[3]).toUpperCase() : '';
+      const location = woRow ? String(woRow[5]).toUpperCase()
+                             : String(entries[0][5] || '').toUpperCase();
+      const status   = woRow ? String(woRow[15] || '').trim().toLowerCase() : '';
+
+      // Marking-item LF totals filtered to items completed ON targetDate
+      // (so a multi-day WO doesn't replay yesterday's LF on today's log).
+      const agg = aggregateMarkingItemsForPL_(ss, woId, targetDayStr);
+
+      return {
+        wo_number:    String(woId),
+        borough:      borough,
+        location:     location,
+        sqft:         agg.sqft  !== '' ? String(agg.sqft)  : '',
+        paint:        agg.paint !== '' ? String(agg.paint) : '',
+        complete:     status === 'completed' ? 'Y' : 'N',
+        layout_yn:    '',
+        layout_hours: '',
+        markings:     agg.markings,
+      };
+    });
+
+    const sortedNames = Object.keys(employees);
+    const crewChiefName = sortedNames.find(n => employees[n].classification === 'LP')
+                       || sortedNames[0];
+    const crewMemberNames = sortedNames.filter(n => n !== crewChiefName);
+
+    const logJson = {
+      _type:             'production_log',
+      contractor:        contractor,
+      date:              dateFormatted,
+      crew_number:       '',
+      truck_number:      '',
+      inspector_present: '',
+      gas_tank_refilled: '',
+      materials: {
+        thermo_white_bags:  '',
+        thermo_yellow_bags: '',
+        beads_bags:         '',
+        paint_cans:         '',
+      },
+      crew_chief: crewChiefName ? {
+        name:     crewChiefName,
+        time_in:  employees[crewChiefName].timeIn,
+        time_out: employees[crewChiefName].timeOut,
+      } : { name: '', time_in: '', time_out: '' },
+      crew: crewMemberNames.map(n => ({
+        name:     n,
+        time_in:  employees[n].timeIn,
+        time_out: employees[n].timeOut,
+      })),
+      work_orders: workOrdersJson,
+    };
+
+    // Filename includes a contractor slug so each contractor's daily
+    // log is a distinct file in the Production Logs folder; the
+    // archive routing parses the slug back to contractor name to know
+    // which contractor's WO folders to file the PDF in.
+    const slug = contractor.replace(/\s+/g, '_');
+    const jsonFileName = `Production_Log_${targetDayStr}_${slug}.json`;
+    const jsonFile = subFolder.createFile(
+      jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
+    generated.push(jsonFile);
+
+    if (logSheet) {
+      logSheet.appendRow([
+        new Date(), 'Production Log Generator', 'Daily trigger',
+        `${Object.keys(wosForContractor).length} WO(s) for ${contractor} on ${dateFormatted}`,
+        jsonFileName, 'Generated',
+        '', 'Yes — review in Approvals tab',
+      ]);
+    }
+    Logger.log('✅ Production log JSON exported: ' + jsonFileName);
+  });
+
+  if (generated.length === 0) {
+    Logger.log(`No enabled contractors had WOs on ${targetDayStr} — no Production Log generated.`);
+  }
+  return generated;
 }
 
 
@@ -1407,12 +1426,24 @@ function archiveDocument_(file, docType, woId, ss) {
       return { success: true };
 
     } else if (docType === 'Production Log') {
-      // Parse date from filename: Production_Log_YYYY-MM-DD.txt
+      // Filename patterns:
+      //   New (per-contractor):  Production_Log_<YYYY-MM-DD>_<Contractor_Slug>_FILLED.pdf
+      //   Legacy (single combined): Production_Log_<YYYY-MM-DD>_FILLED.pdf
       const dateMatch = cleanName.match(/(\d{4}-\d{2}-\d{2})/);
       if (!dateMatch) {
         return { success: false, reason: 'Could not parse date from Production Log filename' };
       }
       const logDate = new Date(dateMatch[1] + 'T12:00:00');
+
+      // Pull contractor slug between the date and "_FILLED" (or end).
+      // Empty string means legacy filename → file under every contractor
+      // that had work that day (old behavior).
+      const contractorSlug = (() => {
+        const m = cleanName.match(
+          /Production_Log_\d{4}-\d{2}-\d{2}_(.+?)(?:_FILLED)?\.pdf$/);
+        return m ? m[1] : '';
+      })();
+      const contractorTarget = contractorSlug.replace(/_/g, ' ').trim();
 
       // Group WOs worked that day by contractor/contract/borough
       const wosByContract = getWOsForDate_(logDate, ss);
@@ -1420,7 +1451,17 @@ function archiveDocument_(file, docType, woId, ss) {
         return { success: false, reason: `No WOs found in Daily Sign-In Data for ${dateMatch[1]} — nothing to archive the Production Log against` };
       }
 
-      Object.entries(wosByContract).forEach(([key, wos]) => {
+      const matchingEntries = contractorTarget
+        ? Object.entries(wosByContract).filter(([key]) =>
+            String(key.split('|')[0] || '').trim() === contractorTarget)
+        : Object.entries(wosByContract);
+
+      if (matchingEntries.length === 0) {
+        return { success: false,
+          reason: `No WOs in Daily Sign-In Data for contractor "${contractorTarget}" on ${dateMatch[1]}` };
+      }
+
+      matchingEntries.forEach(([key, wos]) => {
         const [contractor, contractNum, borough] = key.split('|');
         const contractFolder = getOrCreateSubfolder_(
           getOrCreateSubfolder_(archiveRoot, contractor),
