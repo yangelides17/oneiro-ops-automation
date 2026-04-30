@@ -132,6 +132,18 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
   const selected = wos.find(w => w.id === selectedWOId) || null
   const labelOf  = (wo) => `${wo.id} — ${wo.location} (${wo.borough})`
 
+  // Sort WOs by the numeric portion of their ID (e.g. "RM-43282" → 43282)
+  // so the dropdown reads in WO-number order regardless of how /api/wos
+  // returned them. WOs whose ID has no digits sink to the end.
+  const sortedWOs = [...wos].sort((a, b) => {
+    const na = parseInt(String(a.id || '').match(/\d+/)?.[0] ?? '', 10)
+    const nb = parseInt(String(b.id || '').match(/\d+/)?.[0] ?? '', 10)
+    if (Number.isNaN(na) && Number.isNaN(nb)) return String(a.id).localeCompare(String(b.id))
+    if (Number.isNaN(na)) return 1
+    if (Number.isNaN(nb)) return -1
+    return na - nb
+  })
+
   // When closed, mirror the selected WO's label into the input. When
   // open, leave whatever the user typed alone so filtering works.
   useEffect(() => {
@@ -154,8 +166,8 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
   const showingSelectedLabel = selected && query === labelOf(selected)
   const trimmed = query.trim().toLowerCase()
   const filtered = (showingSelectedLabel || !trimmed)
-    ? wos
-    : wos.filter(wo =>
+    ? sortedWOs
+    : sortedWOs.filter(wo =>
         `${wo.id} ${wo.location || ''} ${wo.borough || ''}`
           .toLowerCase()
           .includes(trimmed)
