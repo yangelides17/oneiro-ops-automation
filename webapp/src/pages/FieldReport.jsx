@@ -7,6 +7,8 @@ import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
   pickLayout, rowIsCompletable,
 } from '../lib/markingCategories'
+import { parseQty }    from '../lib/parseQty'
+import { validateQty } from '../lib/qtyValidation'
 import { opToday } from '../lib/dateOps'
 
 const SECTION_HEADERS = {
@@ -173,9 +175,13 @@ function MarkingItemRow({
     <input type="text" readOnly value={item.category ?? ''}
       placeholder="Marking Type" className={RO} />
   )
+  // type="text" inputMode="decimal" — keeps the numeric keyboard on
+  // iOS/Android while removing the spinner buttons and the wheel-/arrow-
+  // key value-stepping that fire on type=number. Multiplication
+  // shorthand ("15x10" → 150) is parsed on commit; see parseQty.
   const QtyBox = (
     <input
-      type="number" min="0" inputMode="numeric" placeholder="Qty"
+      type="text" inputMode="decimal" placeholder="Qty"
       value={item.quantity == null ? '' : item.quantity}
       onChange={onLocalText('quantity')}
       onBlur={onCommitText('quantity')}
@@ -450,6 +456,7 @@ export default function FieldReport() {
   const [issues,        setIssues]         = useState('')
   const [woComplete,    setWoComplete]     = useState('no')
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
+  const [woSearch,      setWoSearch]       = useState('')   // dropdown filter
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -457,6 +464,7 @@ export default function FieldReport() {
   const [rowSaving,     setRowSaving]     = useState(new Set())
   const [formModal,     setFormModal]     = useState(null)  // {mode, item} or null
   const [deleteConfirm, setDeleteConfirm] = useState(null)  // {ids:[...], label?} or null
+  const [qtyConfirm,    setQtyConfirm]    = useState(null)  // {itemId, category, parsedStr, message} or null
   const [rowError,      setRowError]      = useState('')
   // In-flight saves mirror of rowSaving for awaitable access from doSubmit.
   const inFlightRef = useRef(new Set())
@@ -650,14 +658,33 @@ export default function FieldReport() {
   }
 
   // Commit a value to the server. Called on blur/Enter for text inputs
-  // and on-change for dropdowns. Skips the PATCH if the value already
-  // matches what's in state (i.e. no real change).
+  // and on-change for dropdowns. For Qty: parse "15x10"-style
+  // multiplication shorthand, then range-validate against the row's
+  // Marking Type — out-of-range values open a confirmation modal
+  // instead of saving directly.
   const onRowCommit = (itemId, field, value) => {
-    // Coerce quantity to a number for comparison / send
-    const normalized = field === 'quantity'
-      ? (value === '' || value == null ? null : parseFloat(value))
-      : value
-    saveField(itemId, { [field]: normalized })
+    if (field !== 'quantity') {
+      saveField(itemId, { [field]: value })
+      return
+    }
+    const parsedStr = parseQty(value)
+    // If the multiplication shorthand resolved to a different string,
+    // show the resolved number in the input immediately so what the
+    // user sees matches what we'll save (and what the modal references).
+    if (parsedStr !== value) {
+      onRowLocalChange(itemId, 'quantity', parsedStr)
+    }
+    const item     = markingItems.find(i => i.item_id === itemId)
+    const category = item?.category || ''
+    const check    = validateQty(category, parsedStr)
+    if (!check.ok) {
+      setQtyConfirm({ itemId, category, parsedStr, message: check.message })
+      return
+    }
+    const normalized = (parsedStr === '' || parsedStr == null)
+      ? null
+      : parseFloat(parsedStr)
+    saveField(itemId, { quantity: normalized })
   }
 
   // Wait for every in-flight save to finish — called before the
@@ -816,6 +843,14 @@ export default function FieldReport() {
       const data = await res.json()
       if (data.error) throw new Error(data.error)
       setSubmitted({ wo_id:data.wo_id, status:data.status, photos:photoFiles.length })
+
+      // Refresh the WO dropdown so a just-completed WO drops out without
+      // the user having to hard-reload. Apps Script updates the Tracker
+      // status synchronously on wo_complete=true, so /api/wos already
+      // reflects the new state by the time we get here. Cheap GET.
+      refreshWOs().catch(err => {
+        console.warn('post-submit WO refresh failed:', err)
+      })
 
       // Fire-and-forget: kick off CFR JSON generation on the server after
       // the user's seen the success screen. (Sign-in JSON is no longer
@@ -993,11 +1028,26 @@ export default function FieldReport() {
         <div className="card p-4 space-y-3">
           <p className="section-label">Work Order</p>
           <Field label="Select Work Order" required>
+            <input
+              type="text"
+              value={woSearch}
+              onChange={e => setWoSearch(e.target.value)}
+              placeholder="Search by WO #, location, or borough"
+              className="field-input mb-2"
+            />
             <select value={selectedWOId} onChange={e=>setSelectedWOId(e.target.value)} className="field-input">
               <option value="">— Choose a Work Order —</option>
-              {wos.map(wo=>(
-                <option key={wo.id} value={wo.id}>{wo.id} — {wo.location} ({wo.borough})</option>
-              ))}
+              {wos
+                .filter(wo => {
+                  const q = woSearch.trim().toLowerCase()
+                  if (!q) return true
+                  return `${wo.id} ${wo.location || ''} ${wo.borough || ''}`
+                    .toLowerCase()
+                    .includes(q)
+                })
+                .map(wo=>(
+                  <option key={wo.id} value={wo.id}>{wo.id} — {wo.location} ({wo.borough})</option>
+                ))}
             </select>
           </Field>
           {selectedWO && <WOPanel wo={selectedWO} />}
@@ -1183,6 +1233,28 @@ export default function FieldReport() {
 
         <div className="h-8" />
       </form>
+
+      {qtyConfirm && (
+        <ConfirmModal
+          title="Quantity outside typical range"
+          message={qtyConfirm.message}
+          confirmLabel="Yes, keep it"
+          cancelLabel="Edit value"
+          onConfirm={() => {
+            const { itemId, parsedStr } = qtyConfirm
+            const normalized = (parsedStr === '' || parsedStr == null)
+              ? null
+              : parseFloat(parsedStr)
+            setQtyConfirm(null)
+            saveField(itemId, { quantity: normalized })
+          }}
+          onCancel={() => {
+            setQtyConfirm(null)
+            // Revert to whatever the server still has saved for this row.
+            refetchMarkings()
+          }}
+        />
+      )}
 
       {wbConfirmModal && (
         <ConfirmModal

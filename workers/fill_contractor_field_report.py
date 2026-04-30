@@ -40,9 +40,8 @@ Expected data shape (any key may be missing — blank fields stay blank):
 
 Fields intentionally NOT filled (out of scope — blank on output PDF):
   Work Type, Associated WO, Traffic #, Punch dates, Order # / Drawing # per
-  marking row, Road Condition radio, Crew Chief, Contractor Notes,
-  Liquidated Damages, entire bottom signature section (prime contractor
-  signs physically).
+  marking row, Road Condition radio, Liquidated Damages, entire bottom
+  signature section (prime contractor signs physically).
 
 Implementation note — template quirk:
   The CFR template's widget annotations (on the page) and terminal fields
@@ -169,8 +168,11 @@ def build_field_map(data: dict) -> dict:
             if v not in (None, ''):
                 f[field_name] = str(v)
 
-    # Bottom block — only Prep By in scope
+    # Bottom block — Prep By, Crew Chief(s) (right of Prep By),
+    # Contractor Notes (below Prep By)
     f['page0_field146'] = data.get('prep_by', '')
+    f['page0_field147'] = data.get('crew_chief', '')
+    f['page0_field150'] = data.get('contractor_notes', '')
 
     # Filter out empties so we don't overwrite pre-existing template text
     return {k: v for k, v in f.items() if v not in (None, '')}

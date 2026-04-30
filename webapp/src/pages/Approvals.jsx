@@ -50,6 +50,8 @@ export default function Approvals() {
   const [selectedId, setSelectedId] = useState(null)
   const [approving,  setApproving]  = useState(false)
   const [actionError, setActionError] = useState('')
+  const [processing, setProcessing] = useState(false)
+  const [toast,      setToast]      = useState(null)  // { ok, msg }
   const containerRef = useRef(null)
   const [viewerWidth, setViewerWidth] = useState(700)
 
@@ -67,6 +69,46 @@ export default function Approvals() {
     }
   }
   useEffect(() => { refresh() }, [])
+
+  // Auto-dismiss toast after 6s
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 6000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  // Manually trigger the same job the 10-min cron runs. Mirrors the
+  // Dashboard Tools menu's "Process approved docs now" with toast +
+  // approvals-list refresh on success.
+  const runProcessApproved = async () => {
+    if (processing) return
+    setToast(null)
+    setProcessing(true)
+    try {
+      const res  = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      const archived = data.archived ?? 0
+      const errored  = data.errored  ?? 0
+      let msg
+      if (data.skipped) {
+        msg = 'Another run is already in progress — it will finish shortly.'
+      } else if (archived === 0 && errored === 0) {
+        msg = 'No pending docs to process.'
+      } else {
+        const parts = []
+        if (archived > 0) parts.push(`archived ${archived}`)
+        if (errored  > 0) parts.push(`${errored} failed → Archive Errors`)
+        msg = `Processed: ${parts.join(', ')}.`
+      }
+      setToast({ ok: errored === 0, msg })
+      await refresh()
+    } catch (err) {
+      setToast({ ok: false, msg: err.message || 'Failed to process approved docs' })
+    } finally {
+      setProcessing(false)
+    }
+  }
 
   // Keep the viewer width in sync with its container (react-pdf needs
   // an explicit width to scale pages; letting it auto-fill the flex
@@ -189,7 +231,7 @@ export default function Approvals() {
   return (
     <div className="max-w-6xl mx-auto px-4 py-6 space-y-4">
       {/* Header */}
-      <div className="flex items-baseline justify-between">
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-black text-navy">Approvals</h1>
           <p className="text-sm text-slate-500 mt-1">
@@ -198,9 +240,22 @@ export default function Approvals() {
             triggers the email + archive job within ~10 minutes.
           </p>
         </div>
-        <span className="text-xs font-bold text-slate-600">
-          {pendingCount} pending
-        </span>
+        <div className="flex items-center gap-3 flex-shrink-0">
+          <button
+            type="button"
+            onClick={runProcessApproved}
+            disabled={processing}
+            title="Run the same archive + email job the 10-minute cron runs"
+            className="text-xs font-bold px-3 py-1.5 rounded-lg
+                       bg-navy text-white hover:opacity-90
+                       disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {processing ? 'Processing…' : 'Process Approved Docs now'}
+          </button>
+          <span className="text-xs font-bold text-slate-600">
+            {pendingCount} pending
+          </span>
+        </div>
       </div>
 
       {/* Filter pills */}
@@ -339,6 +394,24 @@ export default function Approvals() {
           )}
         </section>
       </div>
+
+      {/* Toast for the manual "Process Approved Docs now" trigger */}
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 max-w-md px-4 py-3 rounded-xl shadow-lg text-sm leading-snug
+          ${toast.ok
+            ? 'bg-green-50 border border-green-200 text-green-800'
+            : 'bg-red-50  border border-red-200  text-red-800'}`}>
+          <div className="flex items-start justify-between gap-3">
+            <span>{toast.msg}</span>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="opacity-60 hover:opacity-100"
+              aria-label="Dismiss"
+            >✕</button>
+          </div>
+        </div>
+      )}
 
       {/* Sign-In approval modal — collects principal signature + name + title,
           then POSTs to /api/approvals/:fileId/approve-signin. pdf-lib patches

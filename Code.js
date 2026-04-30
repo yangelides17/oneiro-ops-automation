@@ -6037,6 +6037,8 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
     markings:          aggregated.top_table,
     grid:              aggregated.grid,
     prep_by:           prepBy,
+    crew_chief:        'Stamati Angelides',
+    contractor_notes:  'Oneiro Collection - WBE',
   };
 
   const isoDate  = (d.date || '').slice(0, 10) || 'unknown';
