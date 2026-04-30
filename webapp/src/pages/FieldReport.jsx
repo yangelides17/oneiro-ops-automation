@@ -118,6 +118,104 @@ function Field({ label, required, hint, children }) {
   )
 }
 
+// ── Work Order combobox ───────────────────────────────────────
+// Single control: input doubles as both the selected-WO display and
+// the live filter. Clicking/focusing opens the dropdown panel below;
+// typing filters; clicking a row selects + closes. Replaces the old
+// "search input + native <select>" pair so the search and the list
+// feel like one element.
+function WOCombobox({ wos, selectedWOId, onSelect }) {
+  const [query, setQuery] = useState('')
+  const [open,  setOpen]  = useState(false)
+  const wrapRef = useRef(null)
+
+  const selected = wos.find(w => w.id === selectedWOId) || null
+  const labelOf  = (wo) => `${wo.id} — ${wo.location} (${wo.borough})`
+
+  // When closed, mirror the selected WO's label into the input. When
+  // open, leave whatever the user typed alone so filtering works.
+  useEffect(() => {
+    if (!open) setQuery(selected ? labelOf(selected) : '')
+  }, [selectedWOId, open])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Click outside closes the panel.
+  useEffect(() => {
+    if (!open) return
+    function onMouseDown(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onMouseDown)
+    return () => document.removeEventListener('mousedown', onMouseDown)
+  }, [open])
+
+  // If the input still shows the selected WO's label verbatim, treat
+  // that as "no active query" so the panel lists everything for
+  // browsing. Once the user edits it, filter normally.
+  const showingSelectedLabel = selected && query === labelOf(selected)
+  const trimmed = query.trim().toLowerCase()
+  const filtered = (showingSelectedLabel || !trimmed)
+    ? wos
+    : wos.filter(wo =>
+        `${wo.id} ${wo.location || ''} ${wo.borough || ''}`
+          .toLowerCase()
+          .includes(trimmed)
+      )
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <input
+        type="text"
+        value={query}
+        onChange={e => { setQuery(e.target.value); setOpen(true) }}
+        onFocus={() => {
+          // Clear the mirrored label so the user can type fresh; the
+          // selection itself is preserved in selectedWOId.
+          if (showingSelectedLabel) setQuery('')
+          setOpen(true)
+        }}
+        onKeyDown={e => { if (e.key === 'Escape') setOpen(false) }}
+        placeholder="— Choose or search Work Order —"
+        className="field-input pr-8"
+      />
+      {/* down chevron — purely decorative, the input stays the focus target */}
+      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs">▾</span>
+
+      {open && (
+        <ul
+          role="listbox"
+          className="absolute z-20 left-0 right-0 mt-1 max-h-72 overflow-auto
+                     bg-white border border-slate-200 rounded-lg shadow-lg"
+        >
+          {filtered.length === 0 && (
+            <li className="px-3 py-2 text-sm text-slate-400 italic">
+              No matching work orders
+            </li>
+          )}
+          {filtered.map(wo => (
+            <li
+              key={wo.id}
+              role="option"
+              aria-selected={wo.id === selectedWOId}
+              // onMouseDown (with preventDefault) so the click registers
+              // before the input's blur fires and tears down the panel.
+              onMouseDown={e => {
+                e.preventDefault()
+                onSelect(wo.id)
+                setQuery(labelOf(wo))
+                setOpen(false)
+              }}
+              className={`px-3 py-2 text-sm cursor-pointer hover:bg-slate-100
+                ${wo.id === selectedWOId ? 'bg-navy/5 font-semibold' : ''}`}
+            >
+              {labelOf(wo)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 // ── Yes / No toggle ───────────────────────────────────────────
 function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
   return (
@@ -456,7 +554,6 @@ export default function FieldReport() {
   const [issues,        setIssues]         = useState('')
   const [woComplete,    setWoComplete]     = useState('no')
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
-  const [woSearch,      setWoSearch]       = useState('')   // dropdown filter
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -1028,27 +1125,11 @@ export default function FieldReport() {
         <div className="card p-4 space-y-3">
           <p className="section-label">Work Order</p>
           <Field label="Select Work Order" required>
-            <input
-              type="text"
-              value={woSearch}
-              onChange={e => setWoSearch(e.target.value)}
-              placeholder="Search by WO #, location, or borough"
-              className="field-input mb-2"
+            <WOCombobox
+              wos={wos}
+              selectedWOId={selectedWOId}
+              onSelect={setSelectedWOId}
             />
-            <select value={selectedWOId} onChange={e=>setSelectedWOId(e.target.value)} className="field-input">
-              <option value="">— Choose a Work Order —</option>
-              {wos
-                .filter(wo => {
-                  const q = woSearch.trim().toLowerCase()
-                  if (!q) return true
-                  return `${wo.id} ${wo.location || ''} ${wo.borough || ''}`
-                    .toLowerCase()
-                    .includes(q)
-                })
-                .map(wo=>(
-                  <option key={wo.id} value={wo.id}>{wo.id} — {wo.location} ({wo.borough})</option>
-                ))}
-            </select>
           </Field>
           {selectedWO && <WOPanel wo={selectedWO} />}
         </div>
