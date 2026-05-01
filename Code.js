@@ -1801,6 +1801,37 @@ function getWOFolder_(archiveRoot, woId, ss) {
 }
 
 /**
+ * Read-only counterpart to getWOFolder_. Walks the same path but never
+ * creates anything — returns the folder if every level already exists,
+ * `null` otherwise. Use this in dashboard / read paths so we don't
+ * silently spawn empty folders for every WO on every refresh.
+ *
+ * Optional `woRowsCache` is the WO Tracker's getDataRange().getValues()
+ * — pass it in when calling repeatedly to avoid re-fetching the sheet.
+ */
+function findWOFolder_(archiveRoot, woId, ss, woRowsCache) {
+  const woData = woRowsCache || ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
+  const woRow  = woData.find(r => r[0] === woId);
+  if (!woRow) return null;
+  const contractor  = woRow[1] || 'General';
+  const contractNum = String(woRow[2]).split('/')[0];
+  const borough     = woRow[3];
+  const location    = woRow[5];
+
+  const cIt = archiveRoot.getFoldersByName(contractor);
+  if (!cIt.hasNext()) return null;
+  const contractorFolder = cIt.next();
+
+  const cnIt = contractorFolder.getFoldersByName(`${contractNum} - ${getBoroughName_(borough)}`);
+  if (!cnIt.hasNext()) return null;
+  const contractFolder = cnIt.next();
+
+  const woIt = contractFolder.getFoldersByName(`${woId} - ${location}`);
+  if (!woIt.hasNext()) return null;
+  return woIt.next();
+}
+
+/**
  * Build a fast WO# → Location map from the Work Order Tracker. Used by
  * the WO-listing helpers below so multi-WO sign-in rows (where the WO#
  * column is a comma-list "RM-1, RM-2") still resolve each WO's actual
@@ -4117,7 +4148,7 @@ function handleLogWOScanFailure_(body) {
  *  6  From Street           17  Work Start Date        28  Invoice Amount
  *  7  To Street             18  Work End Date          29  Invoice Sent?
  *  8  Due Date              19  Marking Types          30  Payment Received?
- *  9  Priority Level        20  SQFT Completed         31  Payment Date
+ *  9  Priority Level        20  Quantity Completed     31  Payment Date
  * 10  Pavement Work Type    21  Paint / Material Used  32  Certified Payroll Week
  *                                                      33  Filed?
  *                                                      34  Notes
@@ -4200,7 +4231,7 @@ function handleWriteWO_(body) {
     // ── Operational columns (filled from web app / generated docs) ──
     '', '', '',                  // 16-18  Dispatch / Work Start / Work End dates
     '',                          // 19  Marking Types    ← from crew web app
-    '', '', '',                  // 20-22  SQFT Completed, Paint/Material, Issues
+    '', '', '',                  // 20-22  Quantity Completed, Paint/Material, Issues
     'No', 'No', 'No',            // 23-25  Photos, Prod Log, Field Report Done
     '', '', '', 'No',            // 26-29  Invoice #, Date, Amount, Sent
     'No', '',                    // 30-31  Payment Received, Date
@@ -4963,20 +4994,24 @@ function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
 /**
  * Recompute WO Tracker cols 19-21 rollups from the Marking Items sheet.
  *
- * MMA:    marking_types = distinct Category joined by ", "
- *         paint_material = distinct Color/Material joined by ", "
- *         sqft_completed = SUM(Quantity WHERE Unit = 'SF')
+ * MMA:    marking_types     = distinct Category joined by ", "
+ *         paint_material    = distinct Color/Material joined by ", "
+ *         quantity_completed = SUM(Quantity WHERE Unit = 'SF')   ← MMA → SF
  *
- * Thermo: marking_types = "N/A"     (too many categories to rollup)
- *         paint_material = "N/A"    (Thermo doesn't record material)
- *         sqft_completed = SUM(Quantity WHERE Unit = 'SF')
+ * Thermo: marking_types     = "N/A"   (too many categories to rollup)
+ *         paint_material    = "N/A"   (Thermo doesn't record material)
+ *         quantity_completed = SUM(Quantity WHERE Unit = 'LF')   ← Thermo → LF
+ *
+ * EA-unit items are always excluded (counts of messages, arrows, etc.
+ * don't roll up into a square-foot or linear-foot total).
  *
  * Only COMPLETED items contribute to marking_types / paint_material.
- * SQFT includes all items with a quantity (regardless of status) so the
- * tracker reflects what's been measured even if status is still Pending.
+ * Quantity Completed includes all items with a quantity (regardless of
+ * status) so the tracker reflects what's been measured even if status
+ * is still Pending.
  */
 function computeMarkingRollups_(ss, woId, preloadedData) {
-  const blank = { marking_types: '', sqft_completed: '', paint_material: '' };
+  const blank = { marking_types: '', quantity_completed: '', paint_material: '' };
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return blank;
 
@@ -4990,28 +5025,29 @@ function computeMarkingRollups_(ss, woId, preloadedData) {
   if (woItems.length === 0) return blank;
 
   const anyThermo = woItems.some(r => String(r[2] || '').toLowerCase() === 'thermo');
+  const targetUnit = anyThermo ? 'LF' : 'SF';
 
   // Column indices (0-based) under the 15-col schema:
   //   0 Item ID     4 Marking Type   8 Quantity      12 Status
   //   1 WO#         5 Intersection   9 Unit          13 Added By
   //   2 Work Type   6 Direction      10 Material     14 Notes
   //   3 WO Section  7 Description    11 Date Completed
-  let sqftSum = 0;
-  let hasQty  = false;
+  let qtySum = 0;
+  let hasQty = false;
   woItems.forEach(r => {
     const unit = String(r[9] || '').toUpperCase();
-    if (unit !== 'SF') return;
+    if (unit !== targetUnit) return;   // skips EA + the off-type unit
     const qty = parseFloat(r[8]);
     if (isNaN(qty) || qty <= 0) return;
-    sqftSum += qty;
+    qtySum += qty;
     hasQty = true;
   });
 
   if (anyThermo) {
     return {
-      marking_types:  'N/A',
-      sqft_completed: hasQty ? sqftSum : '',
-      paint_material: 'N/A',
+      marking_types:      'N/A',
+      quantity_completed: hasQty ? qtySum : '',
+      paint_material:     'N/A',
     };
   }
 
@@ -5026,10 +5062,52 @@ function computeMarkingRollups_(ss, woId, preloadedData) {
   });
 
   return {
-    marking_types:  Object.keys(cats).sort().join(', '),
-    sqft_completed: hasQty ? sqftSum : '',
-    paint_material: Object.keys(mats).sort().join(', '),
+    marking_types:      Object.keys(cats).sort().join(', '),
+    quantity_completed: hasQty ? qtySum : '',
+    paint_material:     Object.keys(mats).sort().join(', '),
   };
+}
+
+
+/**
+ * One-shot migration — recompute Quantity Completed (col 20) for every
+ * WO in the Tracker using the updated SF/LF branch logic. Run once from
+ * the Apps Script editor after the SQFT → Quantity rename. Idempotent —
+ * safe to re-run; the rollup is deterministic per WO.
+ *
+ * Also rewrites the col 20 header to "Quantity Completed" so the sheet
+ * label matches the new value semantics.
+ */
+function migrateQuantityCompleted_() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) throw new Error('Work Order Tracker sheet not found');
+
+  // Step 1 — rename the col 20 header. Col 21 is the 1-indexed position.
+  woSheet.getRange(1, 21).setValue('Quantity Completed');
+
+  // Step 2 — preload Marking Items once so each WO's recompute is cheap.
+  const miSheet = ss.getSheetByName('Marking Items');
+  const miData  = miSheet ? miSheet.getDataRange().getValues() : null;
+
+  // Step 3 — walk every WO row, recompute, write back to col 20.
+  const data = woSheet.getDataRange().getValues();
+  let processed = 0, updated = 0, skipped = 0;
+  for (let i = 1; i < data.length; i++) {
+    const woId = String(data[i][0] || '').trim();
+    if (!woId) { skipped += 1; continue; }
+    processed += 1;
+    const rollups = computeMarkingRollups_(ss, woId, miData);
+    const newVal  = rollups.quantity_completed;
+    const oldVal  = data[i][20];
+    if (String(oldVal) !== String(newVal)) {
+      woSheet.getRange(i + 1, 21).setValue(newVal);  // col 21 (1-indexed) = col 20 (0-indexed)
+      updated += 1;
+    }
+  }
+
+  Logger.log(`migrateQuantityCompleted_: processed=${processed}, updated=${updated}, skipped=${skipped}`);
+  return { processed, updated, skipped };
 }
 
 
@@ -5514,9 +5592,9 @@ function handleGetActiveWOs_() {
  *   date            — Date of work (YYYY-MM-DD). Used to auto-set Dispatch Date,
  *                     Work Start Date (if blank), and Work End Date (if complete).
  *   wo_complete     — boolean — marks WO complete, sets Work End Date = date
- *   marking_types   — string ("Crosswalk: 500 SF, Stop Bar: 10 LF")
- *   sqft_completed  — number
- *   paint_material  — string
+ *   marking_types       — string ("Crosswalk: 500 SF, Stop Bar: 10 LF")
+ *   quantity_completed  — number (SF for MMA, LF for Thermo)
+ *   paint_material      — string
  *   issues          — string (appended to existing issues with date prefix)
  *   photos_uploaded — boolean
  *   crew            — [{name, classification, time_in, time_out, hours, overtime}]
@@ -5533,7 +5611,7 @@ function handleGetActiveWOs_() {
  *
  * WO Tracker columns updated (0-indexed):
  *   15  Status             19  Marking Types      23  Photos Uploaded?
- *   16  Dispatch Date      20  SQFT Completed
+ *   16  Dispatch Date      20  Quantity Completed
  *   17  Work Start Date    21  Paint/Material Used
  *   18  Work End Date      22  Issues Reported
  */
@@ -5650,7 +5728,7 @@ function handleSubmitFieldReport_(body) {
   const rollups = computeMarkingRollups_(ss, d.wo_id, markingData);
   Logger.log(`✅ Marking Items: ${nFinalized} status cells updated; ` +
              `rollup → types=${JSON.stringify(rollups.marking_types)}, ` +
-             `sqft=${rollups.sqft_completed}, ` +
+             `quantity=${rollups.quantity_completed}, ` +
              `material=${JSON.stringify(rollups.paint_material)}`);
 
   // ── Write WO Tracker cols 15–23 (0-indexed) ──────────────────
@@ -5661,14 +5739,14 @@ function handleSubmitFieldReport_(body) {
     newWorkStart,                       // col 17: Work Start Date
     newWorkEnd,                         // col 18: Work End Date
     rollups.marking_types,              // col 19: Marking Types (rollup)
-    rollups.sqft_completed,             // col 20: SQFT Completed (rollup)
+    rollups.quantity_completed,         // col 20: Quantity Completed (rollup)
     rollups.paint_material,             // col 21: Paint/Material Used (rollup)
     newIssues,                          // col 22: Issues Reported
     newPhotos                           // col 23: Photos Uploaded?
   ];
   const woLabels = [
     'Status', 'Dispatch Date', 'Work Start Date', 'Work End Date',
-    'Marking Types', 'SQFT Completed', 'Paint/Material',
+    'Marking Types', 'Quantity Completed', 'Paint/Material',
     'Issues Reported', 'Photos Uploaded?'
   ];
   step = 'WO Tracker write';
@@ -6070,36 +6148,81 @@ function handleGetDashboardData_() {
   const woSheet = ss.getSheetByName('Work Order Tracker');
   const allRows = woSheet.getDataRange().getValues();
 
+  // ── Marking Items counts: read once, group by WO #. ────────────────
+  // Marking Items col 1 = WO #, col 12 = Status.
+  const miCounts = {};   // { woId: { total, completed } }
+  const miSheet  = ss.getSheetByName('Marking Items');
+  if (miSheet) {
+    const miData = miSheet.getDataRange().getValues();
+    miData.slice(1).forEach(r => {
+      const woId = String(r[1] || '').trim();
+      if (!woId) return;
+      const bucket = miCounts[woId] || (miCounts[woId] = { total: 0, completed: 0 });
+      bucket.total += 1;
+      if (String(r[12] || '').toLowerCase() === 'completed') bucket.completed += 1;
+    });
+  }
+
+  // ── Drive folder URLs: resolve once per WO via the read-only lookup.
+  // findWOFolder_ caches the WO Tracker rows so we don't re-fetch the
+  // sheet for each call.
+  const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
+  const archiveRoot = archiveId ? DriveApp.getFolderById(archiveId) : null;
+
+  // Format a Date cell as YYYY-MM-DD, leaving non-date values untouched.
+  const fmtDate = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    return v == null ? '' : String(v);
+  };
+
   const wos = allRows.slice(1)
     .filter(r => r[0])   // skip blank rows
-    .map(r => ({
-      id:            String(r[0]),
-      contractor:    String(r[1]),
-      contract_num:  String(r[2]),
-      borough:       String(r[3]),
-      contract_id:   String(r[4]),
-      location:      String(r[5]),
-      from_street:   String(r[6]),
-      to_street:     String(r[7]),
-      due_date:      String(r[8]  || ''),
-      priority:      String(r[9]  || ''),
-      work_type:     String(r[10] || ''),
-      wo_received:   String(r[11] || ''),
-      water_blast:   String(r[12] || ''),
-      status:        String(r[15] || 'Received'),
-      dispatch_date: String(r[16] || ''),
-      work_start:    String(r[17] || ''),
-      work_end:      String(r[18] || ''),
-      marking_types: String(r[19] || ''),
-      sqft:          r[20] != null ? String(r[20]) : '',
-      paint:         String(r[21] || ''),
-      issues:        String(r[22] || ''),
-      photos:        String(r[23] || ''),
-      prod_log:      String(r[24] || ''),
-      field_report:  String(r[25] || ''),
-      invoice_sent:  String(r[29] || ''),
-      payment_recv:  String(r[30] || '')
-    }));
+    .map(r => {
+      const woId      = String(r[0]);
+      const workType  = String(r[10] || '');
+      const isMMA     = workType.toUpperCase() === 'MMA';
+      const counts    = miCounts[woId] || { total: 0, completed: 0 };
+      let folderUrl = null;
+      if (archiveRoot) {
+        const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
+        if (folder) folderUrl = folder.getUrl();
+      }
+      return {
+        id:                  woId,
+        contractor:          String(r[1]),
+        contract_num:        String(r[2]),
+        borough:             String(r[3]),
+        contract_id:         String(r[4]),
+        location:            String(r[5]),
+        from_street:         String(r[6]),
+        to_street:           String(r[7]),
+        due_date:            fmtDate(r[8]),
+        priority:            String(r[9]  || ''),
+        work_type:           workType,
+        wo_received:         fmtDate(r[11]),
+        water_blast:         String(r[12] || ''),
+        status:              String(r[15] || 'Received'),
+        dispatch_date:       fmtDate(r[16]),
+        work_start:          fmtDate(r[17]),
+        work_end:            fmtDate(r[18]),
+        marking_types:       String(r[19] || ''),
+        // Quantity Completed (col 20) — SF total for MMA, LF total for Thermo.
+        quantity:            r[20] != null ? String(r[20]) : '',
+        quantity_unit:       isMMA ? 'SF' : 'LF',
+        paint:               String(r[21] || ''),
+        issues:              String(r[22] || ''),
+        photos:              String(r[23] || ''),
+        prod_log:            String(r[24] || ''),
+        field_report:        String(r[25] || ''),
+        invoice_sent:        String(r[29] || ''),
+        payment_recv:        String(r[30] || ''),
+        markings_total:      counts.total,
+        markings_completed:  counts.completed,
+        folder_url:          folderUrl,
+      };
+    });
 
   // Pipeline summary counts
   const count = (statusStr) =>

@@ -346,11 +346,27 @@ function WORow({ wo, flagged }) {
   const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
     && wo.status.toLowerCase() !== 'completed'
 
+  // Quantity cell: e.g. "1500 SF" or "240 LF". Empty / zero → em-dash.
+  const qtyNum = parseFloat(wo.quantity)
+  const qtyText = (!wo.quantity || isNaN(qtyNum) || qtyNum === 0)
+    ? '—'
+    : `${wo.quantity} ${wo.quantity_unit || ''}`.trim()
+
+  // Progress cell: thin bar + "x / y" label. 0 / 0 → em-dash.
+  const total = wo.markings_total ?? 0
+  const done  = wo.markings_completed ?? 0
+  const pct   = total > 0 ? Math.round((done / total) * 100) : 0
+
   return (
     <tr className={`border-b border-slate-100 text-sm transition-colors
                     hover:bg-slate-50 ${flagged ? 'bg-amber-50/60' : ''}`}>
-      <td className="py-2.5 px-3 font-mono font-semibold text-navy whitespace-nowrap">
-        {wo.id}
+      <td className="py-2.5 px-3 font-mono font-semibold whitespace-nowrap">
+        <Link
+          to={`/field-report?wo=${encodeURIComponent(wo.id)}`}
+          className="text-navy hover:underline"
+        >
+          {wo.id}
+        </Link>
         {flagged && (
           <span className="ml-1.5 text-amber-500" title="Needs attention">⚠</span>
         )}
@@ -366,15 +382,45 @@ function WORow({ wo, flagged }) {
       </td>
       <td className={`py-2.5 px-3 whitespace-nowrap text-xs font-medium
                       ${isOverdue ? 'text-red-600 font-bold' : 'text-slate-500'}`}>
-        {wo.due_date || '—'}
+        {prettyDate(wo.due_date) || '—'}
         {isOverdue && ' ⚡'}
       </td>
       <td className="py-2.5 px-3"><StatusBadge status={wo.status} /></td>
-      <td className="py-2.5 px-3 text-slate-400 text-xs">{wo.sqft || '—'}</td>
+      <td className="py-2.5 px-3 text-slate-600 text-xs whitespace-nowrap">
+        {qtyText}
+      </td>
+      <td className="py-2.5 px-3 min-w-[120px]">
+        {total === 0 ? (
+          <span className="text-slate-300 text-xs">—</span>
+        ) : (
+          <div className="flex items-center gap-2">
+            <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-navy"
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="text-[11px] text-slate-500 whitespace-nowrap">
+              {done} / {total}
+            </span>
+          </div>
+        )}
+      </td>
       <td className="py-2.5 px-3">
-        {wo.photos === 'Yes'
-          ? <span className="text-green-600 text-xs font-semibold">✓ Yes</span>
-          : <span className="text-slate-300 text-xs">—</span>}
+        {wo.folder_url ? (
+          <a
+            href={wo.folder_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open WO folder in Google Drive"
+            className="text-xs font-bold px-2 py-1 rounded-lg
+                       bg-slate-100 text-slate-700 hover:bg-slate-200"
+          >
+            📁
+          </a>
+        ) : (
+          <span className="text-slate-300 text-xs px-2 py-1" title="Folder not yet created">—</span>
+        )}
       </td>
     </tr>
   )
@@ -685,7 +731,7 @@ export default function Dashboard() {
           <table className="w-full min-w-[700px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
-                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'SQFT', 'Photos'].map(h => (
+                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Drive'].map(h => (
                   <th
                     key={h}
                     className="py-2.5 px-3 text-left text-[10px] font-extrabold
@@ -699,7 +745,7 @@ export default function Dashboard() {
             <tbody>
               {filteredWOs.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-400 text-sm">
+                  <td colSpan={9} className="py-12 text-center text-slate-400 text-sm">
                     No work orders match your filters.
                   </td>
                 </tr>

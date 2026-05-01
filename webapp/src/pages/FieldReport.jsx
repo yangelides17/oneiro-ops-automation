@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import StatusBadge      from '../components/StatusBadge'
 import ConfirmModal     from '../components/ConfirmModal'
 import MarkingFormModal from '../components/MarkingFormModal'
@@ -623,6 +624,17 @@ export default function FieldReport() {
       .catch(e => setApiError(e.message))
       .finally(() => setLoading(false))
   }, [])
+
+  // Deep-link from the Dashboard: /field-report?wo=RM-43282 pre-selects
+  // the matching WO. Wait until wos are loaded so we can verify the id
+  // exists — a stale link silently no-ops rather than locking the form
+  // to a missing WO.
+  const [searchParams] = useSearchParams()
+  const deepLinkedWO   = searchParams.get('wo')
+  useEffect(() => {
+    if (!deepLinkedWO || selectedWOId) return
+    if (wos.some(w => w.id === deepLinkedWO)) setSelectedWOId(deepLinkedWO)
+  }, [deepLinkedWO, wos])  // eslint-disable-line react-hooks/exhaustive-deps
 
   async function doSetWaterblasting(nextValue) {
     if (!selectedWOId) return
