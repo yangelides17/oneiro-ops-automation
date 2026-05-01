@@ -9,18 +9,18 @@
 const RULES = {
   'HVX Crosswalk': {
     unit: 'LF',
-    inRange: (n) => n > 100,
+    inRange: (n) => n > 75,
     message: (n) =>
       `You entered ${formatQty(n)} LF for HVX Crosswalk. ` +
-      `Typical crosswalks run more than 100 LF. ` +
+      `Typical crosswalks run more than 75 LF. ` +
       `Are you sure?`,
   },
   'Stop Line': {
     unit: 'LF',
-    inRange: (n) => n > 10 && n < 75,
+    inRange: (n) => n > 6 && n < 75,
     message: (n) =>
       `You entered ${formatQty(n)} LF for Stop Line. ` +
-      `Typical stop lines are between 10 LF and 75 LF. ` +
+      `Typical stop lines are between 6 LF and 75 LF. ` +
       `Are you sure?`,
   },
   'Stop Msg': {
