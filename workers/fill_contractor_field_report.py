@@ -42,14 +42,6 @@ Fields intentionally NOT filled (out of scope — blank on output PDF):
   Work Type, Associated WO, Traffic #, Punch dates, Order # / Drawing # per
   marking row, Road Condition radio, Liquidated Damages, entire bottom
   signature section (prime contractor signs physically).
-
-Implementation note — template quirk:
-  The CFR template's widget annotations (on the page) and terminal fields
-  (under /AcroForm/Fields) are SEPARATE PDF objects (not merged, as in
-  the Production Log template). pypdf's update_page_form_field_values()
-  writes /V on the widget, but viewers read text-field values from the
-  terminal field. So we bypass the helper and walk /AcroForm/Fields
-  directly. See _write_fields_via_acroform() below.
 """
 
 import base64
@@ -65,7 +57,7 @@ warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', modu
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
-    NameObject, BooleanObject, DictionaryObject, IndirectObject, create_string_object
+    NameObject, BooleanObject, IndirectObject, NumberObject,
 )
 
 TEMPLATE = os.path.join(
@@ -178,76 +170,50 @@ def build_field_map(data: dict) -> dict:
     return {k: v for k, v in f.items() if v not in (None, '')}
 
 
-def _write_fields_via_acroform(writer, payload):
-    """
-    This CFR template stores widget annotations (on the page) and
-    terminal AcroForm fields as SEPARATE objects with matching /T names
-    — they're not merged via /Parent like in most templates. Different
-    viewers read /V from different places:
+# Bit 13 of /Ff: Multiline. Some pdffiller-added text fields land in
+# the template with this flag set. Acrobat's regenerate path centers
+# them; pdf.js / Preview honor the flag and apply their own multi-row
+# layout, which mis-aligns single-line values. The template was
+# normalized in Acrobat to clear this on every form field — this
+# helper is a defense-in-depth pass that strips the flag at fill time
+# in case any future template revision re-introduces it.
+_MULTILINE_FLAG = 1 << 12
 
-      * Adobe / Preview read /V from the terminal field and regenerate
-        appearances when /AcroForm /NeedAppearances is true.
-      * pdf.js (and therefore react-pdf in our webapp) reads /V from
-        the widget annotation and does NOT regenerate appearances —
-        it renders whatever /V + /AP the widget carries.
+# General Remarks is the only CFR text field that legitimately wraps
+# across lines, so its multiline flag stays.
+_REMARKS_FIELD = 'Text_21'
 
-    Write /V on BOTH so every viewer shows the filled values.
-    """
-    acroform = writer._root_object.get('/AcroForm')
-    if not acroform:
-        return
-    fields = acroform.get('/Fields')
-    if not fields:
-        return
 
-    # Terminal fields keyed by /T
-    field_by_name = {}
-    for fref in fields:
-        f = fref.get_object() if isinstance(fref, IndirectObject) else fref
-        t = f.get('/T')
-        if t:
-            field_by_name[str(t)] = f
-
-    # Widget annotations keyed by /T across every page. Built once so
-    # we don't re-scan pages per-field.
-    widgets_by_name = {}
+def _clear_text_multiline_flags(writer: PdfWriter) -> int:
+    cleared = 0
     for page in writer.pages:
         annots = page.get('/Annots')
         if annots is None:
             continue
-        if isinstance(annots, IndirectObject):
-            annots = annots.get_object()
         for aref in annots:
             a = aref.get_object() if isinstance(aref, IndirectObject) else aref
-            if not isinstance(a, DictionaryObject):
+            if a.get('/Subtype') != '/Widget' or a.get('/FT') != '/Tx':
                 continue
-            if a.get('/Subtype') != '/Widget':
+            if str(a.get('/T', '')) == _REMARKS_FIELD:
                 continue
-            t = a.get('/T')
-            if not t:
+            ff = a.get('/Ff')
+            if ff is None:
                 continue
-            widgets_by_name.setdefault(str(t), []).append(a)
-
-    for name, value in payload.items():
-        v = create_string_object(str(value))
-
-        # Terminal field (Adobe/Preview read here)
-        f = field_by_name.get(name)
-        if f is not None and f.get('/FT') == '/Tx':
-            f[NameObject('/V')] = v
-
-        # Widget annotations with the same /T (pdf.js reads here)
-        for widget in widgets_by_name.get(name, []):
-            widget[NameObject('/V')] = v
-            # If an existing appearance stream exists, delete it so the
-            # viewer falls back to rendering /V. pdf.js otherwise keeps
-            # showing the stale blank appearance.
-            if '/AP' in widget:
-                del widget[NameObject('/AP')]
+            try:
+                ff_val = int(ff)
+            except (TypeError, ValueError):
+                continue
+            if ff_val & _MULTILINE_FLAG:
+                a[NameObject('/Ff')] = NumberObject(ff_val & ~_MULTILINE_FLAG)
+                cleared += 1
+    return cleared
 
 
 def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> str:
-    """Fill the template with data and write to output_path. Returns the path."""
+    """Fill the CFR template using pypdf's standard form-fill path
+    (same call fill_production_log.py uses). The template's structure
+    has been normalized in Acrobat: merged widget+field objects, /Helv
+    in /AcroForm/DR, multiline flags cleared. Returns the output path."""
     if output_path is None:
         wo  = data.get('work_order', 'unknown')
         dt  = str(data.get('install_to') or data.get('date_entered') or 'unknown').replace('/', '-')
@@ -256,13 +222,20 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     reader = PdfReader(template_path)
     writer = PdfWriter(clone_from=reader)
 
-    payload = build_field_map(data)
-    _write_fields_via_acroform(writer, payload)
+    field_map = build_field_map(data)
+    writer.update_page_form_field_values(writer.pages[0], field_map)
 
-    if '/AcroForm' in writer._root_object:
-        writer._root_object['/AcroForm'].update({
-            NameObject('/NeedAppearances'): BooleanObject(True)
-        })
+    # Belt-and-suspenders against pdffiller-added single-line text
+    # fields that snuck through with the multiline flag set.
+    _clear_text_multiline_flags(writer)
+
+    # /NeedAppearances=true is required for Acrobat to regenerate
+    # appearance streams on render — that's what produces correct
+    # vertical centering AND what the print path uses.
+    acro_ref = writer._root_object.get('/AcroForm')
+    acro = acro_ref.get_object() if isinstance(acro_ref, IndirectObject) else acro_ref
+    if acro is not None:
+        acro[NameObject('/NeedAppearances')] = BooleanObject(True)
 
     with open(output_path, 'wb') as f:
         writer.write(f)

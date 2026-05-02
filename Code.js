@@ -5078,7 +5078,7 @@ function computeMarkingRollups_(ss, woId, preloadedData) {
  * Also rewrites the col 20 header to "Quantity Completed" so the sheet
  * label matches the new value semantics.
  */
-function migrateQuantityCompleted_() {
+function migrateQuantityCompleted() {
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
   if (!woSheet) throw new Error('Work Order Tracker sheet not found');
@@ -5106,7 +5106,7 @@ function migrateQuantityCompleted_() {
     }
   }
 
-  Logger.log(`migrateQuantityCompleted_: processed=${processed}, updated=${updated}, skipped=${skipped}`);
+  Logger.log(`migrateQuantityCompleted: processed=${processed}, updated=${updated}, skipped=${skipped}`);
   return { processed, updated, skipped };
 }
 
