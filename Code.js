@@ -2235,11 +2235,14 @@ function generateCertifiedPayroll(weekStartStr) {
 
     // ── JSON export for local PDF filler ─────────────────────────────────────
     const weekEndFormatted = Utilities.formatDate(weekEnd, CONFIG.TIMEZONE, 'MM/dd/yyyy');
-    const sigDate  = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'MM/dd'); // MM/DD only — form pre-prints the year separately
-    const sigYear  = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yy');    // last 2 digits — form pre-prints "20"
 
     const cpContractNumber = clRow ? String(clRow[0] || '') : '';
 
+    // Note: no `signatory` block here. The OFFICER/TITLE/DATE/YEAR fields
+    // are intentionally left blank at fill time — they're populated when
+    // the admin clicks "Approve & Sign" in the Approvals tab, which runs
+    // POST /api/approvals/:fileId/approve-cert-payroll and overlays the
+    // principal signature + name + title + today's date via pdf-lib.
     const cpJson = {
       _type:                 'certified_payroll',
       payroll_number:        '',
@@ -2254,12 +2257,6 @@ function generateCertifiedPayroll(weekStartStr) {
       pla:                   false,
       days:                  daysJson,
       workers:               workersJson,
-      signatory: {
-        name:  CONFIG.SIGNATORY.name,
-        title: CONFIG.SIGNATORY.title,
-        date:  sigDate,
-        year:  sigYear
-      }
     };
     const cpProps = PropertiesService.getScriptProperties();
     const cpFolder = getOrCreateSubfolder_(
