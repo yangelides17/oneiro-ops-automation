@@ -79,12 +79,13 @@ warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', modu
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
-    BooleanObject,
     DictionaryObject,
     IndirectObject,
     NameObject,
     create_string_object,
 )
+
+from _appearances import regenerate_appearances
 
 TEMPLATE = os.path.join(
     os.path.dirname(__file__),
@@ -460,25 +461,13 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     # so pdf.js + Drive preview render them correctly.
     _sync_checkbox_appearance_states(writer)
 
-    # /NeedAppearances=false locks in the /AP streams pypdf just generated.
-    # Without this, pypdf's default writes /NeedAppearances=true, which makes
-    # Acrobat regenerate every field's appearance on render using its own
-    # auto-fit logic — addresses get truncated, font spacing changes, the
-    # whole form stops looking like the source. Other viewers (Preview,
-    # pdf.js, Drive preview) trust /AP regardless of the flag, so they
-    # render the same correct output either way; the flag exists purely to
-    # keep Acrobat in line.
-    #
-    # Note: this is the OPPOSITE setting from fill_contractor_field_report.py
-    # — CFR's /AP is wrong out of pypdf, so CFR *needs* Acrobat to regenerate.
-    # CP's /AP is correct, so CP needs Acrobat to leave it alone.
-    acro_ref = writer._root_object.get('/AcroForm')
-    acro = acro_ref.get_object() if isinstance(acro_ref, IndirectObject) else acro_ref
-    if acro is not None:
-        acro[NameObject('/NeedAppearances')] = BooleanObject(False)
-
     with open(output_path, 'wb') as fh:
         writer.write(fh)
+
+    # Regenerate /AP for every widget via PyMuPDF (mupdf renderer) and
+    # set /NeedAppearances=false.  See workers/_appearances.py for why
+    # this replaces every per-doc-type /AP workaround we used to have.
+    regenerate_appearances(output_path)
     return output_path
 
 

@@ -7,6 +7,8 @@ warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', modu
 
 from pypdf import PdfReader, PdfWriter
 
+from _appearances import normalize_acroform_dr, regenerate_appearances
+
 # Painter row — Journey-Level, Helper, Apprentice, Trainee, New Hires, Layoffs
 # Each section: TOT B H A NA FEM
 PAINTER_FIELDS = {
@@ -45,6 +47,9 @@ def fill(data: dict, template_path: str, output_path: str) -> str:
     writer = PdfWriter()
     writer.append(reader)
 
+    # Defend against pypdf's /DR/Font crash on Acrobat-edited templates.
+    normalize_acroform_dr(writer)
+
     f = {}
     f['Month']            = data['month']
     f['Year']             = data['year']
@@ -69,6 +74,9 @@ def fill(data: dict, template_path: str, output_path: str) -> str:
 
     with open(output_path, 'wb') as fh:
         writer.write(fh)
+
+    # Regenerate /AP for text widgets via PyMuPDF + lock /NeedAppearances=false.
+    regenerate_appearances(output_path)
     print(f'✅  Filled → {output_path}')
     return output_path
 

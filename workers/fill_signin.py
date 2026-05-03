@@ -53,6 +53,8 @@ warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', modu
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject, DictionaryObject, IndirectObject
+
+from _appearances import regenerate_appearances
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as rl_canvas
 from PIL import Image
@@ -425,6 +427,10 @@ def fill(data: dict, template_path: str, output_path: str) -> str:
 
     with open(output_path, 'wb') as fh:
         out.write(fh)
+
+    # Regenerate /AP via PyMuPDF + lock /NeedAppearances=false. See
+    # workers/_appearances.py — applies to every doc type now.
+    regenerate_appearances(output_path)
     print(f'✅  Filled Sign-In Log → {output_path}')
     return output_path
 

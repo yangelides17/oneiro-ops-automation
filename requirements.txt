@@ -9,6 +9,11 @@ google-auth-oauthlib>=1.1.0
 # "'int' object has no attribute 'encode'" when rendering
 # filled text-field appearance streams.
 pypdf==4.3.1
+# Post-fill /AP regeneration (workers/_appearances.py).  pypdf 4.3.1's
+# auto /AP generator has font-fallback + multi-line-wrap bugs we hit
+# on every doc type; PyMuPDF wraps mupdf's mature text engine and
+# produces correct /AP that renders identically across viewers.
+PyMuPDF>=1.27.0,<1.28.0
 # Signature overlay on Sign-In Log PDFs
 Pillow>=10.0.0
 reportlab>=4.0.0

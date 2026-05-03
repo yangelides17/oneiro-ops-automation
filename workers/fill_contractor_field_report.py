@@ -55,9 +55,10 @@ from io import BytesIO
 logging.getLogger('pypdf').setLevel(logging.ERROR)
 warnings.filterwarnings('ignore', message='.*Font dictionary.*not found.*', module='pypdf')
 
+from _appearances import regenerate_appearances
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
-    NameObject, BooleanObject, IndirectObject, NumberObject,
+    NameObject, IndirectObject, NumberObject,
 )
 
 TEMPLATE = os.path.join(
@@ -229,16 +230,14 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
     # fields that snuck through with the multiline flag set.
     _clear_text_multiline_flags(writer)
 
-    # /NeedAppearances=true is required for Acrobat to regenerate
-    # appearance streams on render — that's what produces correct
-    # vertical centering AND what the print path uses.
-    acro_ref = writer._root_object.get('/AcroForm')
-    acro = acro_ref.get_object() if isinstance(acro_ref, IndirectObject) else acro_ref
-    if acro is not None:
-        acro[NameObject('/NeedAppearances')] = BooleanObject(True)
-
     with open(output_path, 'wb') as f:
         writer.write(f)
+
+    # Regenerate /AP via PyMuPDF + lock /NeedAppearances=false. See
+    # workers/_appearances.py for the rationale — this replaces the
+    # previous /NeedAppearances=true workaround that relied on each
+    # viewer doing its own (variable-quality) regeneration.
+    regenerate_appearances(output_path)
     return output_path
 
 

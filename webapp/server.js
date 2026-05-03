@@ -463,19 +463,15 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     // pypdf-rendered content already on the form (the crew-leader rows).
     //
     // Instead we draw the principal name + title + date + signature
-    // image directly onto the page content stream, set
-    // /NeedAppearances=false so viewers trust the existing /AP streams
-    // pypdf wrote, and save without touching appearances.
-    const { PDFDocument, PDFName, PDFBool, StandardFonts } = await import('pdf-lib')
+    // image directly onto the page content stream and save without
+    // touching appearances. The PDF arrives from the worker with
+    // /NeedAppearances=false and correct PyMuPDF-rendered /AP streams
+    // already in place — pdf-lib's save({ updateFieldAppearances: false })
+    // preserves both, so no extra setup is needed here.
+    const { PDFDocument, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
     const form   = pdfDoc.getForm()
     const helv   = await pdfDoc.embedFont(StandardFonts.Helvetica)
-
-    // Lock in the existing /AP streams so viewers don't try to regenerate
-    // appearances when opening or printing the doc. Same approach that
-    // fixed the CFR printing-blank issue.
-    try { form.acroForm.dict.set(PDFName.of('NeedAppearances'), PDFBool.False) }
-    catch (e) { console.warn('Set NeedAppearances=false failed:', e.message) }
 
     // Date: today, M/D/YY in the spreadsheet's timezone (America/New_York).
     // Without the TZ override Node runs in UTC on Railway, which rolls over
@@ -605,18 +601,13 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     //
     // Same approach as the sign-in route: draw the four signature-block
     // values + the signature image directly onto the page content
-    // stream, set /NeedAppearances=false so viewers trust the existing
-    // /AP streams, and save without touching appearances.
-    const { PDFDocument, PDFName, PDFBool, StandardFonts } = await import('pdf-lib')
+    // stream and save without touching appearances. The PDF arrives
+    // from the worker with /NeedAppearances=false and correct PyMuPDF-
+    // rendered /AP streams already in place; pdf-lib preserves both.
+    const { PDFDocument, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
     const form   = pdfDoc.getForm()
     const helv   = await pdfDoc.embedFont(StandardFonts.Helvetica)
-
-    // Lock in the existing /AP streams so viewers don't try to regenerate
-    // appearances when opening or printing the doc. Same approach that
-    // fixed the CFR printing-blank issue.
-    try { form.acroForm.dict.set(PDFName.of('NeedAppearances'), PDFBool.False) }
-    catch (e) { console.warn('Set NeedAppearances=false failed:', e.message) }
 
     // Date: today in America/New_York. Same TZ rationale as the sign-in
     // route — without the override Node runs in UTC and rolls over at 20:00 ET.
