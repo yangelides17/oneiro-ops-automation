@@ -175,6 +175,14 @@ export default function Approvals() {
       setSigningItem(selected)
       return
     }
+    // Certified Payroll: same modal, different signing endpoint.
+    if (selected.doc_type === 'certified_payroll') {
+      setSigningItem({
+        ...selected,
+        signUrl: `/api/approvals/${encodeURIComponent(selected.file_id)}/approve-cert-payroll`,
+      })
+      return
+    }
     // Everything else: direct approve.
     setApproving(true)
     const fileId = selected.file_id
@@ -360,7 +368,7 @@ export default function Approvals() {
                       ? 'Approving…'
                       : isManualSignIn(selected)
                           ? 'Approve (skip sign-off)'
-                          : selected.doc_type === 'signin'
+                          : (selected.doc_type === 'signin' || selected.doc_type === 'certified_payroll')
                               ? 'Approve & Sign'
                               : 'Approve'}
                   </button>
@@ -413,13 +421,14 @@ export default function Approvals() {
         </div>
       )}
 
-      {/* Sign-In approval modal — collects principal signature + name + title,
-          then POSTs to /api/approvals/:fileId/approve-signin. pdf-lib patches
-          the PDF server-side; on success the item drops out of the list. */}
+      {/* Approval-with-signature modal — used for both Sign-In sheets and
+          Certified Payroll. CP pre-binds its own signUrl on the signingItem;
+          sign-ins fall back to the default /approve-signin endpoint. */}
       {signingItem && (
         <PrincipalSignModal
           filename={signingItem.filename}
-          signUrl={`/api/approvals/${encodeURIComponent(signingItem.file_id)}/approve-signin`}
+          signUrl={signingItem.signUrl ||
+            `/api/approvals/${encodeURIComponent(signingItem.file_id)}/approve-signin`}
           onCancel={() => setSigningItem(null)}
           onSigned={handleSignedApproved}
         />

@@ -3397,12 +3397,19 @@ function handleApproveDoc_(body) {
 
 // ── action: approve_signin_with_bytes ─────────────────────────
 //
-// Sign-In docs have a principal sign-off block that's filled DURING
-// the approval flow (see webapp PrincipalSignModal + Express
-// /api/approvals/:fileId/approve-signin). Express patches the PDF via
-// pdf-lib and POSTs the resulting bytes here. This handler does the
-// upload + trash + log in one atomic move so the cron sees the signed
-// PDF immediately.
+// Doc-type-agnostic "approve with patched bytes" handler: takes a PDF
+// already patched server-side (signature image + flattened text fields)
+// and atomically uploads it to Approved Docs while trashing the original.
+//
+// Used by both:
+//   - /api/approvals/:fileId/approve-signin       (Sign-In sheets)
+//   - /api/approvals/:fileId/approve-cert-payroll (Certified Payroll)
+//
+// Express patches the PDF via pdf-lib and POSTs the resulting bytes
+// here. This handler does upload + trash + log in one atomic move so
+// the cron sees the signed PDF immediately. The legacy name is kept
+// for backward compatibility — it's the "signed bytes" flow regardless
+// of the source doc type.
 //
 // body.data = { file_id, filename, bytes_b64 }
 //   file_id   — the ORIGINAL (unsigned) PDF's Drive file ID

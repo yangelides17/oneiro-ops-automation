@@ -251,11 +251,18 @@ def build_field_map(data: dict) -> dict:
         f[f'ANNUALIZED HOURLY RATERow{n}']         = str(worker.get('annualized_rate', ''))
 
     # ── Signature ─────────────────────────────────────────────────────────────
-    sig = data.get('signatory', {})
-    f['OFFICER OR PRINCIPAL (print)'] = str(sig.get('name', ''))
-    f['TITLE'] = str(sig.get('title', ''))
-    f['DATE']  = str(sig.get('date', ''))
-    f['YEAR']  = str(sig.get('year', ''))
+    # The four signing-block fields are populated by the webapp's Approve &
+    # Sign modal at approval time — the principal signature, printed name,
+    # title, and signature-line date are overlaid via pdf-lib in the
+    # /approve-cert-payroll route. The production fill path therefore
+    # leaves these blank. The CLI / test path can still pass a `signatory`
+    # block to pre-fill them for quick visual checks.
+    if 'signatory' in data:
+        sig = data['signatory']
+        f['OFFICER OR PRINCIPAL (print)'] = str(sig.get('name', ''))
+        f['TITLE'] = str(sig.get('title', ''))
+        f['DATE']  = str(sig.get('date', ''))
+        f['YEAR']  = str(sig.get('year', ''))
 
     return f
 

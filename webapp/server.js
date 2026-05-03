@@ -540,6 +540,120 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
 })
 
 /**
+ * POST /api/approvals/:fileId/approve-cert-payroll
+ * Certified-Payroll-specific approval: same modal-driven flow as
+ * /approve-signin (signature + printed name + title from
+ * PrincipalSignModal), but targets the CP form's field names and
+ * the Signature_Block rect added in Acrobat.
+ *
+ * Date format on the CP signature line is "<Month> <D>, 20YY"
+ * (e.g. "May 2, 2026"). The form has the literal "20" pre-printed
+ * between the DATE and YEAR fields, so:
+ *   - DATE field gets "<Full Month> <Day>,"   e.g. "May 2,"
+ *   - YEAR field gets the 2-digit year         e.g. "26"
+ *
+ * Body: { signature_b64: string, name: string, title: string }
+ */
+app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5mb' }), async (req, res) => {
+  const fileId = req.params.fileId
+  try {
+    const { signature_b64, name, title } = req.body || {}
+    if (!signature_b64) return res.status(400).json({ error: 'Missing signature_b64' })
+    if (!name || !String(name).trim())   return res.status(400).json({ error: 'Missing name' })
+    if (!title || !String(title).trim()) return res.status(400).json({ error: 'Missing title' })
+
+    // 1. Fetch original PDF bytes + filename from Drive
+    const fetched = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
+    if (!fetched || !fetched.data) {
+      return res.status(500).json({ error: 'Couldn\u2019t fetch PDF bytes from Drive' })
+    }
+    const pdfBytes  = Buffer.from(fetched.data, 'base64')
+    const filename  = fetched.filename
+
+    // 2. Patch with pdf-lib
+    const { PDFDocument } = await import('pdf-lib')
+    const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
+    const form   = pdfDoc.getForm()
+
+    // Date: today in America/New_York. Same TZ rationale as the sign-in
+    // route — without the override Node runs in UTC and rolls over at 20:00 ET.
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone:  'America/New_York',
+      month:     'long',
+      day:       'numeric',
+      year:      '2-digit',
+    }).formatToParts(new Date())
+    const pick = (t) => parts.find(p => p.type === t)?.value || ''
+    const dateStr = `${pick('month')} ${pick('day')},`
+    const yearStr = pick('year')
+
+    // Fill text fields
+    const trySetText = (fieldName, value) => {
+      try { form.getTextField(fieldName).setText(String(value || '')) }
+      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
+    }
+    trySetText('OFFICER OR PRINCIPAL (print)', name)
+    trySetText('TITLE',                        title)
+    trySetText('DATE',                         dateStr)
+    trySetText('YEAR',                         yearStr)
+
+    // Overlay the signature PNG onto the Signature_Block field's rect.
+    // Same padding + scaling approach as the sign-in route.
+    const SIG_H_PAD = 1.0
+    const SIG_V_PAD = 3.0
+    const pngB64 = String(signature_b64).replace(/^data:image\/png;base64,/, '')
+    const pngBytes = Buffer.from(pngB64, 'base64')
+    const sigImage = await pdfDoc.embedPng(pngBytes)
+    try {
+      const sigField  = form.getField('Signature_Block')
+      const widgets   = sigField.acroField.getWidgets()
+      const widget    = widgets[0]
+      const rect      = widget.getRectangle()
+      const pageRef = widget.P()
+      const pages = pdfDoc.getPages()
+      const page = pages.find(p => p.ref === pageRef) || pages[0]
+
+      const boxX = rect.x      - SIG_H_PAD
+      const boxY = rect.y      - SIG_V_PAD
+      const boxW = rect.width  + 2 * SIG_H_PAD
+      const boxH = rect.height + 2 * SIG_V_PAD
+
+      const scale = Math.min(boxW / sigImage.width, boxH / sigImage.height)
+      const drawW = sigImage.width  * scale
+      const drawH = sigImage.height * scale
+      const drawX = boxX + (boxW - drawW) / 2
+      const drawY = boxY + (boxH - drawH) / 2
+      page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
+    } catch (e) {
+      console.warn('pdf-lib signature overlay failed:', e.message)
+      // Fall through — name/title/date are still applied
+    }
+
+    // Flatten the form so all written values render reliably and no
+    // interactive fields remain after principal signature.
+    try { form.flatten() }
+    catch (e) { console.warn('pdf-lib form.flatten failed:', e.message) }
+
+    const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
+
+    // 3. Upload patched bytes to Approved Docs + trash original via Apps Script.
+    // Reuses approve_signin_with_bytes — that handler is doc-type
+    // agnostic (just swaps bytes and routes to Approved Docs), so it
+    // serves both sign-ins and certified payrolls.
+    const result = await callAppsScript('approve_signin_with_bytes', {
+      file_id:   fileId,
+      filename:  filename,
+      bytes_b64: Buffer.from(signedBytes).toString('base64'),
+    })
+    if (result.error) throw new Error(result.error)
+    res.json(result)
+  } catch (err) {
+    console.error(`POST /api/approvals/${fileId}/approve-cert-payroll error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/signin-queue/parse-upload
  * Accepts a single PDF (≤ 15 MB, multipart "file") that a crew leader
  * filled by hand and uploaded for one queue entry. Calls Claude Vision
