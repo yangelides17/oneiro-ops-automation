@@ -456,9 +456,26 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     const filename  = fetched.filename
 
     // 2. Patch with pdf-lib
-    const { PDFDocument } = await import('pdf-lib')
+    //
+    // We do NOT flatten and do NOT use form.setText() for the principal
+    // sign-off fields. Both of those paths cause pdf-lib to regenerate
+    // /AP streams using its own font/sizing logic, which destroys any
+    // pypdf-rendered content already on the form (the crew-leader rows).
+    //
+    // Instead we draw the principal name + title + date + signature
+    // image directly onto the page content stream, set
+    // /NeedAppearances=false so viewers trust the existing /AP streams
+    // pypdf wrote, and save without touching appearances.
+    const { PDFDocument, PDFName, PDFBool, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
     const form   = pdfDoc.getForm()
+    const helv   = await pdfDoc.embedFont(StandardFonts.Helvetica)
+
+    // Lock in the existing /AP streams so viewers don't try to regenerate
+    // appearances when opening or printing the doc. Same approach that
+    // fixed the CFR printing-blank issue.
+    try { form.acroForm.dict.set(PDFName.of('NeedAppearances'), PDFBool.False) }
+    catch (e) { console.warn('Set NeedAppearances=false failed:', e.message) }
 
     // Date: today, M/D/YY in the spreadsheet's timezone (America/New_York).
     // Without the TZ override Node runs in UTC on Railway, which rolls over
@@ -472,14 +489,34 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     const pick = (t) => parts.find(p => p.type === t)?.value || ''
     const dateStr = `${pick('month')}/${pick('day')}/${pick('year')}`
 
-    // Fill text fields
-    const trySetText = (fieldName, value) => {
-      try { form.getTextField(fieldName).setText(String(value || '')) }
-      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
+    // Helper: locate a field's widget rect + page.
+    const locateField = (fieldName) => {
+      const field   = form.getField(fieldName)
+      const widget  = field.acroField.getWidgets()[0]
+      const rect    = widget.getRectangle()
+      const pageRef = widget.P()
+      const pages   = pdfDoc.getPages()
+      const page    = pages.find(p => p.ref === pageRef) || pages[0]
+      return { rect, page }
     }
-    trySetText('Contractor_Name',      name)
-    trySetText('Contractor_Title',     title)
-    trySetText('Date_Signature_Block', dateStr)
+
+    // Draw centered text on the page directly (no setText — that would
+    // force /AP regeneration on flatten/save).
+    const drawCenteredText = (fieldName, text, fontSize) => {
+      try {
+        const { rect, page } = locateField(fieldName)
+        const w = helv.widthOfTextAtSize(text, fontSize)
+        const h = helv.heightAtSize(fontSize)
+        const x = rect.x + (rect.width  - w) / 2
+        const y = rect.y + (rect.height - h) / 2
+        page.drawText(text, { x, y, size: fontSize, font: helv })
+      } catch (e) {
+        console.warn(`drawCenteredText failed on ${fieldName}: ${e.message}`)
+      }
+    }
+    drawCenteredText('Contractor_Name',      String(name),  11)
+    drawCenteredText('Contractor_Title',     String(title), 11)
+    drawCenteredText('Date_Signature_Block', dateStr,       11)
 
     // Overlay the signature PNG onto the Contractor_Signature field's rect.
     // Matches workers/fill_signin.py's crew-leader overlay: expand the
@@ -493,13 +530,7 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
     const pngBytes = Buffer.from(pngB64, 'base64')
     const sigImage = await pdfDoc.embedPng(pngBytes)
     try {
-      const sigField  = form.getField('Contractor_Signature')
-      const widgets   = sigField.acroField.getWidgets()
-      const widget    = widgets[0]
-      const rect      = widget.getRectangle()
-      const pageRef = widget.P()
-      const pages = pdfDoc.getPages()
-      const page = pages.find(p => p.ref === pageRef) || pages[0]
+      const { rect, page } = locateField('Contractor_Signature')
 
       const boxX = rect.x      - LEADER_SIG_H_PAD
       const boxY = rect.y      - LEADER_SIG_V_PAD
@@ -514,14 +545,8 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
       page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
     } catch (e) {
       console.warn('pdf-lib signature overlay failed:', e.message)
-      // Fall through — name/title/date are still applied
+      // Fall through — name/title/date are still applied via drawText
     }
-
-    // Flatten the form so name/title/date render reliably everywhere
-    // (pdf-lib writes /V, but we want no interactive fields remaining
-    // after principal signature either).
-    try { form.flatten() }
-    catch (e) { console.warn('pdf-lib form.flatten failed:', e.message) }
 
     const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
 
@@ -571,9 +596,27 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const filename  = fetched.filename
 
     // 2. Patch with pdf-lib
-    const { PDFDocument } = await import('pdf-lib')
+    //
+    // CP has many pypdf-rendered worker rows already on the form. We
+    // must not let pdf-lib regenerate /AP streams (default behavior of
+    // form.flatten() and form.setText()) — that would re-render every
+    // worker field with pdf-lib's default font/sizing and destroy the
+    // formatting (truncated addresses, missing checkboxes, etc).
+    //
+    // Same approach as the sign-in route: draw the four signature-block
+    // values + the signature image directly onto the page content
+    // stream, set /NeedAppearances=false so viewers trust the existing
+    // /AP streams, and save without touching appearances.
+    const { PDFDocument, PDFName, PDFBool, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
     const form   = pdfDoc.getForm()
+    const helv   = await pdfDoc.embedFont(StandardFonts.Helvetica)
+
+    // Lock in the existing /AP streams so viewers don't try to regenerate
+    // appearances when opening or printing the doc. Same approach that
+    // fixed the CFR printing-blank issue.
+    try { form.acroForm.dict.set(PDFName.of('NeedAppearances'), PDFBool.False) }
+    catch (e) { console.warn('Set NeedAppearances=false failed:', e.message) }
 
     // Date: today in America/New_York. Same TZ rationale as the sign-in
     // route — without the override Node runs in UTC and rolls over at 20:00 ET.
@@ -587,15 +630,37 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const dateStr = `${pick('month')} ${pick('day')},`
     const yearStr = pick('year')
 
-    // Fill text fields
-    const trySetText = (fieldName, value) => {
-      try { form.getTextField(fieldName).setText(String(value || '')) }
-      catch (e) { console.warn(`pdf-lib setText failed on ${fieldName}: ${e.message}`) }
+    // Helper: locate a field's widget rect + page.
+    const locateField = (fieldName) => {
+      const field   = form.getField(fieldName)
+      const widget  = field.acroField.getWidgets()[0]
+      const rect    = widget.getRectangle()
+      const pageRef = widget.P()
+      const pages   = pdfDoc.getPages()
+      const page    = pages.find(p => p.ref === pageRef) || pages[0]
+      return { rect, page }
     }
-    trySetText('OFFICER OR PRINCIPAL (print)', name)
-    trySetText('TITLE',                        title)
-    trySetText('DATE',                         dateStr)
-    trySetText('YEAR',                         yearStr)
+
+    // Draw centered text on the page directly (no setText — that would
+    // force /AP regeneration on flatten/save). 12pt Helvetica fits the
+    // CP signature-block field rects (~29pt tall) with comfortable padding.
+    const SIG_TEXT_SIZE = 12
+    const drawCenteredText = (fieldName, text) => {
+      try {
+        const { rect, page } = locateField(fieldName)
+        const w = helv.widthOfTextAtSize(text, SIG_TEXT_SIZE)
+        const h = helv.heightAtSize(SIG_TEXT_SIZE)
+        const x = rect.x + (rect.width  - w) / 2
+        const y = rect.y + (rect.height - h) / 2
+        page.drawText(text, { x, y, size: SIG_TEXT_SIZE, font: helv })
+      } catch (e) {
+        console.warn(`drawCenteredText failed on ${fieldName}: ${e.message}`)
+      }
+    }
+    drawCenteredText('OFFICER OR PRINCIPAL (print)', String(name))
+    drawCenteredText('TITLE',                        String(title))
+    drawCenteredText('DATE',                         dateStr)
+    drawCenteredText('YEAR',                         yearStr)
 
     // Overlay the signature PNG onto the Signature_Block field's rect.
     // Same padding + scaling approach as the sign-in route.
@@ -605,13 +670,7 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const pngBytes = Buffer.from(pngB64, 'base64')
     const sigImage = await pdfDoc.embedPng(pngBytes)
     try {
-      const sigField  = form.getField('Signature_Block')
-      const widgets   = sigField.acroField.getWidgets()
-      const widget    = widgets[0]
-      const rect      = widget.getRectangle()
-      const pageRef = widget.P()
-      const pages = pdfDoc.getPages()
-      const page = pages.find(p => p.ref === pageRef) || pages[0]
+      const { rect, page } = locateField('Signature_Block')
 
       const boxX = rect.x      - SIG_H_PAD
       const boxY = rect.y      - SIG_V_PAD
@@ -626,13 +685,8 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
       page.drawImage(sigImage, { x: drawX, y: drawY, width: drawW, height: drawH })
     } catch (e) {
       console.warn('pdf-lib signature overlay failed:', e.message)
-      // Fall through — name/title/date are still applied
+      // Fall through — name/title/date are still applied via drawText
     }
-
-    // Flatten the form so all written values render reliably and no
-    // interactive fields remain after principal signature.
-    try { form.flatten() }
-    catch (e) { console.warn('pdf-lib form.flatten failed:', e.message) }
 
     const signedBytes = await pdfDoc.save({ updateFieldAppearances: false })
 
