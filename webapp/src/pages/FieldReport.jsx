@@ -286,13 +286,18 @@ function MarkingItemRow({
     <input type="text" readOnly value={item.category ?? ''}
       placeholder="Marking Type" className={RO} />
   )
-  // type="text" inputMode="decimal" — keeps the numeric keyboard on
-  // iOS/Android while removing the spinner buttons and the wheel-/arrow-
-  // key value-stepping that fire on type=number. Multiplication
-  // shorthand ("15x10" → 150) is parsed on commit; see parseQty.
+  // type="text" inputMode="tel" — keeps a compact numeric keypad on
+  // iOS / Android while removing the spinner buttons and the wheel-/
+  // arrow-key value-stepping that fire on type=number. We use `tel`
+  // rather than `decimal` so the iOS keypad exposes `*` (bottom-left
+  // of the dial pad) — that lets crews type the multiplication
+  // shorthand the parser supports ("15*10" → 150 on commit; see
+  // parseQty, which accepts x / X / *). Decimal point access is lost
+  // on the keypad itself, but Qty values in the field are whole
+  // numbers (LF / EA) so this is a reasonable trade.
   const QtyBox = (
     <input
-      type="text" inputMode="decimal" placeholder="Qty"
+      type="text" inputMode="tel" placeholder="Qty"
       value={item.quantity == null ? '' : item.quantity}
       onChange={onLocalText('quantity')}
       onBlur={onCommitText('quantity')}
