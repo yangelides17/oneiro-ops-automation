@@ -1059,14 +1059,12 @@ export default function SignIn() {
               dateLabel={prettyQueueDate(effectiveDate)}
             />
 
-            <div className="sticky bottom-4 z-10">
-              <button
-                onClick={handleSubmit}
-                disabled={submitting}
-                className="btn-primary w-full text-base">
-                {submitting ? 'Submitting…' : 'Submit Sign-In'}
-              </button>
-            </div>
+            <button
+              onClick={handleSubmit}
+              disabled={submitting}
+              className="btn-primary w-full text-base">
+              {submitting ? 'Submitting…' : 'Submit Sign-In'}
+            </button>
             </>
             )}
           </div>
