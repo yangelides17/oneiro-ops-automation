@@ -266,7 +266,10 @@ function MarkingItemRow({
   const layout = pickLayout(item)
   const locked = item.status === 'Completed'
 
-  const INPUT = 'field-input text-sm py-2'
+  // text-base on mobile (16px) so iOS Safari doesn't auto-zoom the
+  // viewport when a Qty / intersection / direction input is focused;
+  // sm: drops back to the compact 14px we use on desktop.
+  const INPUT = 'field-input text-base sm:text-sm py-2'
   const RO    = INPUT + ' bg-slate-50 text-slate-500 cursor-default focus:ring-0'
   const LOCK  = INPUT + ' bg-slate-50 text-slate-500 cursor-not-allowed focus:ring-0'
   const QTY_LIVE   = INPUT + ' text-center'
