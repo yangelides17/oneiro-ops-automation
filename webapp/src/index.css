@@ -29,9 +29,11 @@
     @apply text-[11px] font-extrabold uppercase tracking-widest text-navy mb-3;
   }
 
-  /* Form input / select / textarea */
+  /* Form input / select / textarea.
+     Mobile (< sm) uses 16px to disable iOS Safari's auto-zoom on
+     focus; desktop keeps the compact 14px we've always shipped. */
   .field-input {
-    @apply w-full px-3 py-2.5 text-sm border border-slate-200 rounded-lg
+    @apply w-full px-3 py-2.5 text-base sm:text-sm border border-slate-200 rounded-lg
            bg-white text-slate-900 outline-none transition-all duration-150
            focus:border-navy focus:ring-2 focus:ring-navy/10;
     -webkit-appearance: none;

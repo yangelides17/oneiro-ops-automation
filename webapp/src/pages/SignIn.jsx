@@ -853,7 +853,7 @@ export default function SignIn() {
           <div className="space-y-4">
             {/* Header card — read-only context except the kebab-editable date */}
             <div className="card p-4 space-y-2">
-              <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                 <div>
                   <div className="flex items-start justify-between">
                     <span className="field-label">Shift Start Date</span>

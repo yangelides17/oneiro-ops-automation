@@ -343,36 +343,81 @@ function MarkingItemRow({
   // 0px when bulk mode is off (hidden entirely).
   const CB  = bulkMode ? '24px ' : ''
   const END = ' 28px'
-  const tpl = layout === 'grid'
+  // Desktop (sm+) — single-line, identical to the original layout.
+  const tplDesktop = layout === 'grid'
     ? `${CB}1fr 110px 64px 90px 56px${END}`
     : layout === 'mma'
       ? `${CB}1fr 1fr 90px 56px${END}`
       : `${CB}1fr 90px 56px${END}`
+  // Mobile (< sm) — for grid + mma layouts the row stacks onto two
+  // lines: line 1 = [bulk-cb?] [type] [action], line 2 = the
+  // contextual fields. Top-table only has 3 cells so it stays
+  // single-line on mobile too — just slightly tighter.
+  const tplMobileLine1   = `${CB}1fr ${END.trim()}`
+  const tplMobileLine2Grid = '1fr 56px 80px 48px'
+  const tplMobileLine2Mma  = '1fr 80px 48px'
+
+  // Extract the intersection / direction cells so the same input
+  // node can render in both the desktop and mobile branches.
+  const IntersectionBox = layout === 'grid' ? (
+    <input type="text" readOnly value={item.intersection ?? ''}
+      placeholder="Intersection" className={RO} />
+  ) : null
+  const DirectionBox = layout === 'grid' ? (
+    <input type="text" readOnly value={item.direction ?? ''}
+      placeholder="Direction" className={RO + ' text-center'} />
+  ) : null
 
   const DescNote = item.description
     ? <p className={`text-[11px] text-slate-400 ${bulkMode ? 'pl-9' : 'pl-1'}`}>Note: {item.description}</p>
     : null
 
+  const isMultiCell = layout === 'grid' || layout === 'mma'
+
   return (
     <div className="space-y-0.5">
-      <div className="grid items-center gap-2" style={{ gridTemplateColumns: tpl }}>
+      {/* Desktop — single-line grid (unchanged from before). */}
+      <div className="hidden sm:grid items-center gap-2"
+           style={{ gridTemplateColumns: tplDesktop }}>
         {CheckboxCell}
         {CategoryBox}
-
-        {layout === 'grid' && (
-          <>
-            <input type="text" readOnly value={item.intersection ?? ''}
-              placeholder="Intersection" className={RO} />
-            <input type="text" readOnly value={item.direction ?? ''}
-              placeholder="Direction" className={RO + ' text-center'} />
-          </>
-        )}
+        {layout === 'grid' && <>{IntersectionBox}{DirectionBox}</>}
         {layout === 'mma' && ColorBox}
-
         {QtyBox}
         {UnitBox}
         {ActionCell}
       </div>
+
+      {/* Mobile — two lines for grid/mma, single line for top-table. */}
+      <div className="sm:hidden">
+        {isMultiCell ? (
+          <div className="space-y-2">
+            <div className="grid items-center gap-2"
+                 style={{ gridTemplateColumns: tplMobileLine1 }}>
+              {CheckboxCell}
+              {CategoryBox}
+              {ActionCell}
+            </div>
+            <div className="grid items-center gap-2"
+                 style={{ gridTemplateColumns: layout === 'grid' ? tplMobileLine2Grid : tplMobileLine2Mma }}>
+              {layout === 'grid' && <>{IntersectionBox}{DirectionBox}</>}
+              {layout === 'mma' && ColorBox}
+              {QtyBox}
+              {UnitBox}
+            </div>
+          </div>
+        ) : (
+          <div className="grid items-center gap-2"
+               style={{ gridTemplateColumns: tplDesktop }}>
+            {CheckboxCell}
+            {CategoryBox}
+            {QtyBox}
+            {UnitBox}
+            {ActionCell}
+          </div>
+        )}
+      </div>
+
       {/* Top-table / MMA items may carry a description; grid items don't. */}
       {layout !== 'grid' && DescNote}
     </div>
@@ -389,6 +434,21 @@ function Spinner() {
 }
 
 // ── WO info panel ─────────────────────────────────────────────
+// `due_date` arrives from Apps Script as a value the JS Date
+// constructor can parse (ISO string, epoch ms, or already a Date).
+// Render it as e.g. "May 25, 2026" — the raw `Date.toString()` slips
+// out as "Mon May 25 2026 00:00:00 GMT-0400 (Eastern Daylight Time)"
+// when the value reaches the field via JSON, which is unreadable.
+function formatDueDate(raw) {
+  if (!raw) return '—'
+  const d = raw instanceof Date ? raw : new Date(raw)
+  if (isNaN(d.getTime())) return String(raw)
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+    timeZone: 'America/New_York',
+  }).format(d)
+}
+
 function WOPanel({ wo }) {
   return (
     <div className="bg-slate-50 rounded-xl p-3 border border-slate-200 space-y-1.5">
@@ -401,11 +461,11 @@ function WOPanel({ wo }) {
         ['Borough',    wo.borough],
         ['Location',   wo.location],
         ['From → To',  [wo.from_street,wo.to_street].filter(Boolean).join(' → ')||'—'],
-        ['Due Date',   wo.due_date||'—'],
+        ['Due Date',   formatDueDate(wo.due_date)],
         ['Work Type',  wo.work_type||'—'],
       ].map(([k,v])=>(
         <div key={k} className="flex gap-3">
-          <span className="text-[11px] text-slate-400 font-semibold min-w-[72px]">{k}</span>
+          <span className="text-[11px] text-slate-400 font-semibold min-w-[60px] sm:min-w-[72px]">{k}</span>
           <span className="text-sm text-slate-700 font-medium">{v}</span>
         </div>
       ))}
@@ -1081,7 +1141,7 @@ export default function FieldReport() {
   )
 
   return (
-    <div className="max-w-2xl mx-auto px-4 py-6 space-y-4">
+    <div className="max-w-2xl mx-auto px-4 py-4 sm:py-6 space-y-4">
 
       {/* No-photo confirmation modal */}
       {showPhotoModal && (
