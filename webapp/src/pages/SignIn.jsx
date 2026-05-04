@@ -1030,7 +1030,12 @@ export default function SignIn() {
               <div className="space-y-3">
                 {draft.crew.map((m, i) => (
                   <CrewRow
-                    key={i}
+                    /* Key includes queue_id so moving to the next entry
+                       after a successful submit forces every CrewRow
+                       (and its SignaturePads) to remount with a fresh
+                       canvas — otherwise the previous submission's
+                       strokes stay drawn on the reused canvas DOM. */
+                    key={`${selected.queue_id}-${i}`}
                     idx={i}
                     data={m}
                     employees={employees}
