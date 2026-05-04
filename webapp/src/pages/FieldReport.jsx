@@ -288,13 +288,15 @@ function MarkingItemRow({
   )
   // type="text" inputMode="tel" — keeps a compact numeric keypad on
   // iOS / Android while removing the spinner buttons and the wheel-/
-  // arrow-key value-stepping that fire on type=number. We use `tel`
-  // rather than `decimal` so the iOS keypad exposes `*` (bottom-left
-  // of the dial pad) — that lets crews type the multiplication
-  // shorthand the parser supports ("15*10" → 150 on commit; see
-  // parseQty, which accepts x / X / *). Decimal point access is lost
-  // on the keypad itself, but Qty values in the field are whole
-  // numbers (LF / EA) so this is a reasonable trade.
+  // arrow-key value-stepping that fire on type=number. The dial pad
+  // also exposes the operators the Qty parser supports:
+  //   * — bottom-left of the keypad → multiplication
+  //   + — long-press 0 on iOS dial pad → addition (cumulative
+  //       block-by-block measurements: "15+20" → 35; "15+20+12" → 47)
+  // See parseQty: accepts x / X / * for product, + for sum, with
+  // standard precedence ("15*10+12" → 162). Decimal point access is
+  // lost on the keypad itself, but Qty values in the field are
+  // whole numbers (LF / EA) so this is a reasonable trade.
   const QtyBox = (
     <input
       type="text" inputMode="tel" placeholder="Qty"

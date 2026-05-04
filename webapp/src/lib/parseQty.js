@@ -1,19 +1,42 @@
-// Parse a Qty cell string. If the user typed a strict
-// "<number> [x|X|*] <number>" expression, return the product as a
-// string. Otherwise return the input unchanged so plain numbers and
-// invalid inputs flow through to the existing PATCH normalizer.
+// Parse a Qty cell string. Accepts plain numbers and short
+// arithmetic expressions made of `+`, `*` (or `x` / `X`), and
+// numeric literals — `*` binds tighter than `+`, the conventional
+// math precedence.
 //
-// The regex is intentionally narrow — it requires exactly two numeric
-// operands and a single x/X/* between them — so values like
-// "2x4 SF" or "12 x 8 + extra" never silently multiply.
+// Examples:
+//   "15"          → "15"
+//   "15x10"       → "150"
+//   "15*10"       → "150"
+//   "15+10"       → "25"
+//   "15+10+20"    → "45"            (cumulative addition for block-by-block measurements)
+//   "15*10+12"    → "162"           (run length × width + a tail)
+//   "15*2+10*3"   → "60"            (mixed)
+//   "15.5+10.5"   → "26"            (decimals)
+//   "abc"         → "abc"           (no match — falls through to the existing PATCH normalizer)
+//   "15+"         → "15+"           (incomplete — passthrough)
+//
+// The expression must be a closed chain: every operator sits between
+// two valid numeric operands.  Anything else (units, stray text,
+// dangling operators) is returned untouched so the existing PATCH
+// normalizer can do its thing.
 
-const MUL_RE = /^\s*(\d+(?:\.\d+)?)\s*[xX*]\s*(\d+(?:\.\d+)?)\s*$/
+const EXPR_RE = /^\s*(\d+(?:\.\d+)?)(\s*[+xX*]\s*\d+(?:\.\d+)?)*\s*$/
 
 export function parseQty(raw) {
   if (raw == null || raw === '') return raw
-  const m = MUL_RE.exec(String(raw))
-  if (!m) return raw
-  const product = parseFloat(m[1]) * parseFloat(m[2])
-  if (!isFinite(product)) return raw
-  return String(product)
+  const s = String(raw)
+  if (!EXPR_RE.test(s)) return raw
+
+  // Split on '+' for addition terms, then each term on '*'/'x'/'X'
+  // for multiplication factors.  This naturally enforces the
+  // standard precedence (multiply within a term, then sum terms).
+  let total = 0
+  for (const term of s.split('+')) {
+    const factors = term.split(/[*xX]/).map(f => parseFloat(f.trim()))
+    if (factors.some(f => !isFinite(f))) return raw
+    const product = factors.reduce((a, b) => a * b, 1)
+    total += product
+  }
+  if (!isFinite(total)) return raw
+  return String(total)
 }
