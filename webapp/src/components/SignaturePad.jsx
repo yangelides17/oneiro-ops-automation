@@ -95,6 +95,10 @@ export default function SignaturePad({ label, onChange }) {
   // Snapshot of the inline canvas at expand time, so the modal can
   // pre-render existing strokes.
   const expandSeed = useRef(null)
+  // Aspect ratio of the inline pad at expand time — the modal canvas
+  // matches this so strokes drawn in the modal don't get squashed when
+  // transferred back to the narrow inline pad.
+  const expandAspect = useRef(null)
 
   // Initial inline-canvas setup
   useEffect(() => {
@@ -133,9 +137,14 @@ export default function SignaturePad({ label, onChange }) {
   }
 
   // Open the fullscreen modal — capture the current inline drawing as
-  // a seed so the modal can pre-render it.
+  // a seed so the modal can pre-render it, and capture the inline
+  // pad's aspect ratio so the modal canvas matches.
   const openExpand = () => {
-    expandSeed.current = signed ? inlineRef.current.toDataURL('image/png') : null
+    const canvas = inlineRef.current
+    if (!canvas) return
+    expandSeed.current = signed ? canvas.toDataURL('image/png') : null
+    const rect = canvas.getBoundingClientRect()
+    expandAspect.current = rect.height > 0 ? rect.width / rect.height : 4
     setExpanded(true)
   }
 
@@ -220,6 +229,7 @@ export default function SignaturePad({ label, onChange }) {
         <ExpandedSignatureModal
           label={label}
           seedDataUrl={expandSeed.current}
+          aspectRatio={expandAspect.current}
           onClose={closeExpand}
         />
       )}
@@ -235,48 +245,67 @@ export default function SignaturePad({ label, onChange }) {
 // `onClose(dataUrl)`. On Cancel `onClose(undefined)` — the inline
 // pad is left untouched. Tapping Clear in the modal then Done returns
 // null, which clears the inline pad.
-function ExpandedSignatureModal({ label, seedDataUrl, onClose }) {
-  const canvasRef = useRef(null)
-  const drawing   = useRef(false)
-  const lastPt    = useRef(null)
-  const [hasInk,  setHasInk]  = useState(!!seedDataUrl)
+function ExpandedSignatureModal({ label, seedDataUrl, aspectRatio, onClose }) {
+  const containerRef = useRef(null)
+  const canvasRef    = useRef(null)
+  const drawing      = useRef(false)
+  const lastPt       = useRef(null)
+  const [hasInk, setHasInk] = useState(!!seedDataUrl)
   // Latest data URL captured after every stroke (and after resize)
   // so phone rotation can re-paint without losing strokes.
   const latestRef = useRef(seedDataUrl)
+  // Computed canvas size that matches the inline pad's aspect ratio
+  // and fits inside the modal body (re-computed on resize / rotation).
+  const [size, setSize] = useState({ width: 0, height: 0 })
 
-  const setupAndPaint = useCallback((paintWith) => {
+  // Fall back to a typical inline-pad ratio if the prop is missing.
+  const ratio = aspectRatio && aspectRatio > 0 ? aspectRatio : 4
+
+  // Compute the largest canvas that fits the available container space
+  // while preserving the inline aspect ratio. Padding gives the canvas
+  // some breathing room from the modal edges.
+  const computeSize = useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const PAD  = 16
+    const availW = Math.max(0, rect.width  - PAD * 2)
+    const availH = Math.max(0, rect.height - PAD * 2)
+    let w = availW
+    let h = w / ratio
+    if (h > availH) {
+      h = availH
+      w = h * ratio
+    }
+    setSize({ width: Math.floor(w), height: Math.floor(h) })
+  }, [ratio])
+
+  // Initial size computation + listen for resize / rotation.
+  useEffect(() => {
+    computeSize()
+    window.addEventListener('resize', computeSize)
+    window.addEventListener('orientationchange', computeSize)
+    return () => {
+      window.removeEventListener('resize', computeSize)
+      window.removeEventListener('orientationchange', computeSize)
+    }
+  }, [computeSize])
+
+  // When size changes (initial mount, resize, rotate) re-configure the
+  // canvas at the new pixel dimensions and re-paint the latest snapshot.
+  // Stretching across resize is fine because the aspect ratio stays
+  // constant — strokes scale uniformly, no distortion.
+  useEffect(() => {
+    if (size.width === 0 || size.height === 0 || !canvasRef.current) return
     const canvas = canvasRef.current
-    if (!canvas) return
     configureCanvas(canvas)
-    if (paintWith) {
-      paintDataUrl(canvas, paintWith, () => {
+    const snapshot = latestRef.current
+    if (snapshot) {
+      paintDataUrl(canvas, snapshot, () => {
         latestRef.current = canvas.toDataURL('image/png')
       })
     }
-  }, [])
-
-  // Initial setup + paint the seed.
-  useEffect(() => {
-    setupAndPaint(seedDataUrl)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // Resize / orientation changes — preserve current strokes by
-  // capturing → resizing → repainting.
-  useEffect(() => {
-    const onResize = () => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const snapshot = latestRef.current
-      setupAndPaint(snapshot)
-    }
-    window.addEventListener('resize', onResize)
-    window.addEventListener('orientationchange', onResize)
-    return () => {
-      window.removeEventListener('resize', onResize)
-      window.removeEventListener('orientationchange', onResize)
-    }
-  }, [setupAndPaint])
+  }, [size])
 
   const onPointerDown = (e) => {
     e.preventDefault()
@@ -337,25 +366,38 @@ function ExpandedSignatureModal({ label, seedDataUrl, onClose }) {
         </button>
       </div>
 
-      {/* Canvas fills available space. touchAction:none stops iOS from
+      {/* Canvas centered inside the body. Sized to match the inline
+          pad's aspect ratio so strokes don't get squashed when
+          transferred back. touchAction:none stops iOS from
           interpreting drags as scroll/zoom gestures. */}
-      <div className="relative flex-1 bg-white">
-        <canvas
-          ref={canvasRef}
-          style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
-          onMouseDown={onPointerDown}
-          onMouseMove={onPointerMove}
-          onMouseUp={onPointerEnd}
-          onMouseLeave={onPointerEnd}
-          onTouchStart={onPointerDown}
-          onTouchMove={onPointerMove}
-          onTouchEnd={onPointerEnd}
-        />
-        {!hasInk && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <span className="text-slate-300 text-base select-none">
-              Sign anywhere — rotate phone for more room
-            </span>
+      <div ref={containerRef}
+           className="relative flex-1 bg-slate-50 flex items-center justify-center">
+        {size.width > 0 && (
+          <div className="relative" style={{ width: size.width, height: size.height }}>
+            <canvas
+              ref={canvasRef}
+              style={{
+                width: size.width, height: size.height,
+                display: 'block', touchAction: 'none',
+                background: 'white',
+                borderRadius: 12,
+                border: '1px solid #e2e8f0',
+              }}
+              onMouseDown={onPointerDown}
+              onMouseMove={onPointerMove}
+              onMouseUp={onPointerEnd}
+              onMouseLeave={onPointerEnd}
+              onTouchStart={onPointerDown}
+              onTouchMove={onPointerMove}
+              onTouchEnd={onPointerEnd}
+            />
+            {!hasInk && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <span className="text-slate-300 text-base select-none px-4 text-center">
+                  Sign here — rotate phone for more room
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
