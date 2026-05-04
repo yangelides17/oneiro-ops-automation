@@ -274,7 +274,19 @@ function MarkingItemRow({
 
   // onChange handlers. Text inputs update local state only; commits
   // happen in onBlur/onKeyDown. Unit (dropdown) commits immediately.
-  const onLocalText  = (field) => (e) => onLocalChange(item.item_id, field, e.target.value)
+  //
+  // Quantity gets an extra char-filter so the field accepts only what
+  // parseQty understands (digits, `.`, `+`, `*`, `x`, `X`, whitespace).
+  // The full QWERTY keyboard on mobile makes every non-numeric character
+  // typable; without this filter, paste or stray taps could land letters
+  // / units / currency symbols in the field.
+  const onLocalText  = (field) => (e) => {
+    let v = e.target.value
+    if (field === 'quantity') {
+      v = (v.match(/[\d.+*xX\s]/g) || []).join('')
+    }
+    onLocalChange(item.item_id, field, v)
+  }
   const onCommitText = (field) => (e) => onCommit(item.item_id, field, e.target.value)
   const onDropdown   = (field) => (e) => {
     onLocalChange(item.item_id, field, e.target.value)
@@ -286,20 +298,18 @@ function MarkingItemRow({
     <input type="text" readOnly value={item.category ?? ''}
       placeholder="Marking Type" className={RO} />
   )
-  // type="text" inputMode="tel" — keeps a compact numeric keypad on
-  // iOS / Android while removing the spinner buttons and the wheel-/
-  // arrow-key value-stepping that fire on type=number. The dial pad
-  // also exposes the operators the Qty parser supports:
-  //   * — bottom-left of the keypad → multiplication
-  //   + — long-press 0 on iOS dial pad → addition (cumulative
-  //       block-by-block measurements: "15+20" → 35; "15+20+12" → 47)
-  // See parseQty: accepts x / X / * for product, + for sum, with
-  // standard precedence ("15*10+12" → 162). Decimal point access is
-  // lost on the keypad itself, but Qty values in the field are
-  // whole numbers (LF / EA) so this is a reasonable trade.
+  // type="text" + full QWERTY keyboard (no inputMode override) — gives
+  // crews a familiar layout where every operator the Qty parser
+  // supports is a labelled key on screen: digits, `.`, `+`, `*`, `x`,
+  // `X` (no hidden iOS long-press gestures to discover). type="text"
+  // suppresses the type=number stepper / wheel / arrow-key spinning.
+  // The numeric-only enforcement that used to come from the tel
+  // keypad's limited charset is now done by the per-field filter in
+  // onLocalText above — pasted units / currency / typed letters are
+  // stripped before they hit state.
   const QtyBox = (
     <input
-      type="text" inputMode="tel" placeholder="Qty"
+      type="text" placeholder="Qty"
       value={item.quantity == null ? '' : item.quantity}
       onChange={onLocalText('quantity')}
       onBlur={onCommitText('quantity')}
