@@ -143,6 +143,25 @@ app.get('/api/revenue', async (req, res) => {
 })
 
 /**
+ * GET /api/production?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * Returns aggregated SF / LF / EA totals for the Production dashboard
+ * tab. Same range conventions as /api/revenue.
+ */
+app.get('/api/production', async (req, res) => {
+  try {
+    const { start, end } = req.query
+    const data = await callAppsScript('get_production_data', {
+      start: start ? String(start) : '',
+      end:   end   ? String(end)   : '',
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/production error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/wo-markings/:woId
  * Returns the Marking Items rows pre-populated for this WO (from the
  * scan) plus any completions that have already been written. The Field

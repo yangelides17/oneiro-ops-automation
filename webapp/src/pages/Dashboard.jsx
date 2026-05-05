@@ -6,6 +6,7 @@ import {
 import StatusBadge from '../components/StatusBadge'
 import { opToday } from '../lib/dateOps'
 import RevenueTab from './RevenueTab'
+import ProductionTab from './ProductionTab'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -431,6 +432,7 @@ function WORow({ wo, flagged }) {
 const TABS = [
   { id: 'operations', label: 'Operations' },
   { id: 'revenue',    label: 'Revenue'    },
+  { id: 'production', label: 'Production' },
 ]
 
 function TabStrip({ active, onChange }) {
@@ -455,10 +457,10 @@ function TabStrip({ active, onChange }) {
 
 export default function Dashboard() {
   const [searchParams, setSearchParams] = useSearchParams()
-  // Default tab is "operations" — anything other than the two known
-  // tab IDs collapses back to operations so a typo'd URL doesn't break.
-  const tabParam   = searchParams.get('tab')
-  const activeTab  = tabParam === 'revenue' ? 'revenue' : 'operations'
+  // Default tab is "operations" — anything outside the known tab IDs
+  // collapses back to operations so a typo'd URL doesn't break.
+  const tabParam = searchParams.get('tab')
+  const activeTab = TABS.some(t => t.id === tabParam) ? tabParam : 'operations'
   const setActiveTab = (id) => {
     const next = new URLSearchParams(searchParams)
     if (id === 'operations') next.delete('tab')
@@ -594,7 +596,9 @@ export default function Dashboard() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-black text-navy leading-none">
-            {activeTab === 'revenue' ? 'Revenue Dashboard' : 'Operations Dashboard'}
+            {activeTab === 'revenue'    ? 'Revenue Dashboard'
+              : activeTab === 'production' ? 'Production Dashboard'
+              : 'Operations Dashboard'}
           </h1>
           {activeTab === 'operations' && lastRefresh && (
             <p className="text-slate-400 text-xs mt-1">
@@ -625,6 +629,8 @@ export default function Dashboard() {
 
       {activeTab === 'revenue' ? (
         <RevenueTab />
+      ) : activeTab === 'production' ? (
+        <ProductionTab />
       ) : (
         <OperationsTabContent
           stats={stats}

@@ -2905,6 +2905,8 @@ function doPost(e) {
       return handleGetDashboardData_();
     } else if (action === 'get_revenue_data') {
       return handleGetRevenueData_(body);
+    } else if (action === 'get_production_data') {
+      return handleGetProductionData_(body);
     } else if (action === 'upload_photo') {
       return handleUploadPhoto_(body);
     } else if (action === 'upload_signature') {
@@ -6948,6 +6950,225 @@ function _buildRevenuePayload_(startIso, endIso) {
     by_group:      byGroup,
     top_wos:       topWos,
     needs_pricing: needsPricing,
+  };
+}
+
+
+// ── action: get_production_data ───────────────────────────────
+
+/**
+ * Aggregates Marking Items quantities by unit (SF / LF / EA) for the
+ * Production dashboard tab. Same shape philosophy as
+ * handleGetRevenueData_ but no pricing math — pure quantity rollup.
+ *
+ * Body:
+ *   { start: 'YYYY-MM-DD', end: 'YYYY-MM-DD' }   // both inclusive
+ *
+ * Cache key folds in the rotating cache_token, so Marking Item
+ * mutations (Field Report submits, manual edits, etc) bust every
+ * production cache variant via _invalidateCacheKeys_.
+ */
+function handleGetProductionData_(body) {
+  const d = body.data || {};
+  const start = String(d.start || '').trim();
+  const end   = String(d.end   || '').trim();
+  const today = new Date();
+  const ymd   = (dt) => Utilities.formatDate(dt, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const startEff = /^\d{4}-\d{2}-\d{2}$/.test(start)
+    ? start
+    : ymd(new Date(today.getFullYear(), today.getMonth(), 1));
+  const endEff = /^\d{4}-\d{2}-\d{2}$/.test(end) ? end : ymd(today);
+
+  const token = _getCacheToken_();
+  const key   = 'production_v1_' + token + '_' + startEff + '_' + endEff;
+  const payload = _withScriptCache_(key, 60, () =>
+    _buildProductionPayload_(startEff, endEff)
+  );
+  return jsonResponse_(payload);
+}
+
+function _buildProductionPayload_(startIso, endIso) {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const miSheet = ss.getSheetByName('Marking Items');
+  if (!woSheet || !miSheet) {
+    return {
+      range: { start: startIso, end: endIso },
+      totals: { SF: 0, LF: 0, EA: 0, items: 0 },
+      daily: [], by_contractor: [], by_category: [], top_wos: [],
+    };
+  }
+
+  // ── WO metadata index
+  const woRows = woSheet.getDataRange().getValues();
+  const woById = {};
+  for (let i = 1; i < woRows.length; i++) {
+    const id = String(woRows[i][0] || '').trim();
+    if (!id) continue;
+    woById[id] = {
+      contractor: String(woRows[i][1] || '').trim(),
+      borough:    String(woRows[i][3] || '').trim(),
+      location:   String(woRows[i][5] || '').trim(),
+    };
+  }
+
+  // Helpers
+  const fmt = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    if (!v) return '';
+    const m = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  const blankUnits = () => ({ SF: 0, LF: 0, EA: 0 });
+
+  // ── Walk Marking Items
+  const miData = miSheet.getDataRange().getValues();
+
+  const dailyMap      = {};   // dateIso → { date, SF, LF, EA }
+  const contractorMap = {};   // contractor → { contractor, SF, LF, EA, items }
+  const categoryMap   = {};   // <category|unit> → { category, unit, qty, items }
+  const woMap         = {};   // woId → { wo_id, contractor, location, SF, LF, EA, items }
+
+  let totalSF = 0;
+  let totalLF = 0;
+  let totalEA = 0;
+  let totalItems = 0;
+
+  for (let i = 1; i < miData.length; i++) {
+    const r = miData[i];
+    const status = String(r[12] || '').toLowerCase();
+    if (status !== 'completed') continue;
+    const dateIso = fmt(r[11]);
+    if (!dateIso || dateIso < startIso || dateIso > endIso) continue;
+
+    const woId = String(r[1] || '').trim();
+    const meta = woById[woId];
+    if (!meta) continue;
+
+    const category = String(r[4] || '').trim();
+    const unitRaw  = String(r[9] || '').trim().toUpperCase();
+    const unit     = (unitRaw === 'SF' || unitRaw === 'LF' || unitRaw === 'EA') ? unitRaw : null;
+    if (!unit) continue;   // unrecognized unit — skip rather than mis-bucket
+
+    const qty = Number(r[8]);
+    if (isNaN(qty) || qty <= 0) continue;
+
+    totalItems += 1;
+    if (unit === 'SF') totalSF += qty;
+    else if (unit === 'LF') totalLF += qty;
+    else                   totalEA += qty;
+
+    // daily
+    let day = dailyMap[dateIso];
+    if (!day) {
+      day = { date: dateIso, SF: 0, LF: 0, EA: 0 };
+      dailyMap[dateIso] = day;
+    }
+    day[unit] += qty;
+
+    // contractor
+    const cKey = meta.contractor || 'Unknown';
+    let cBucket = contractorMap[cKey];
+    if (!cBucket) {
+      cBucket = contractorMap[cKey] = Object.assign({ contractor: cKey, items: 0 }, blankUnits());
+    }
+    cBucket[unit] += qty;
+    cBucket.items += 1;
+
+    // category (keyed by category+unit so "Others" entries with mixed
+    // units don't collapse into one inscrutable row)
+    const catKey = category + '|' + unit;
+    let catBucket = categoryMap[catKey];
+    if (!catBucket) {
+      catBucket = categoryMap[catKey] = { category, unit, qty: 0, items: 0 };
+    }
+    catBucket.qty += qty;
+    catBucket.items += 1;
+
+    // wo
+    let wBucket = woMap[woId];
+    if (!wBucket) {
+      wBucket = woMap[woId] = Object.assign({
+        wo_id: woId, contractor: meta.contractor, location: meta.location, items: 0
+      }, blankUnits());
+    }
+    wBucket[unit] += qty;
+    wBucket.items += 1;
+  }
+
+  const daily = Object.keys(dailyMap).sort().map(k => dailyMap[k]);
+
+  // ── Shift metrics (count, % of days, longest streak) ──────────
+  // A "shift" here = a calendar day with at least one completed
+  // Marking Item. Cleaner than reading Daily Sign-In Data because it
+  // captures actual production output (not days where the crew was
+  // dispatched but didn't produce markings, e.g. waterblasting only).
+  const workedDates = new Set(Object.keys(dailyMap));
+  const shiftsCount = workedDates.size;
+
+  // Calendar-day count for the range, inclusive. UTC anchors avoid
+  // DST drift miscounting.
+  const startMs = Date.UTC(
+    Number(startIso.slice(0, 4)),
+    Number(startIso.slice(5, 7)) - 1,
+    Number(startIso.slice(8, 10))
+  );
+  const endMs = Date.UTC(
+    Number(endIso.slice(0, 4)),
+    Number(endIso.slice(5, 7)) - 1,
+    Number(endIso.slice(8, 10))
+  );
+  const daysInRange = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const pctDaysWorked = Math.round((shiftsCount / daysInRange) * 1000) / 10;
+
+  // Longest streak: walk the range day-by-day, counting consecutive
+  // days that appear in workedDates. Reset on any gap.
+  const pad = (n) => String(n).padStart(2, '0');
+  let longestStreak = 0;
+  let currentRun    = 0;
+  for (let ms = startMs; ms <= endMs; ms += 86400000) {
+    const d = new Date(ms);
+    const iso = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+    if (workedDates.has(iso)) {
+      currentRun += 1;
+      if (currentRun > longestStreak) longestStreak = currentRun;
+    } else {
+      currentRun = 0;
+    }
+  }
+
+  // Contractors sorted by total quantity contribution. We sort on a
+  // single combined number so the top-of-list is the biggest producer
+  // even when its work mix is split across units.
+  const contractorScore = (b) => b.SF + b.LF + b.EA;
+  const byContractor = Object.keys(contractorMap)
+    .map(k => contractorMap[k])
+    .sort((a, b) => contractorScore(b) - contractorScore(a));
+
+  const byCategory = Object.keys(categoryMap)
+    .map(k => categoryMap[k])
+    .sort((a, b) => b.qty - a.qty);
+
+  const topWos = Object.keys(woMap)
+    .map(k => woMap[k])
+    .sort((a, b) => (b.SF + b.LF + b.EA) - (a.SF + a.LF + a.EA))
+    .slice(0, 25);
+
+  return {
+    range: { start: startIso, end: endIso },
+    totals: { SF: totalSF, LF: totalLF, EA: totalEA, items: totalItems },
+    shifts: {
+      count:           shiftsCount,
+      days_in_range:   daysInRange,
+      pct_days_worked: pctDaysWorked,
+      longest_streak:  longestStreak,
+    },
+    daily,
+    by_contractor: byContractor,
+    by_category:   byCategory,
+    top_wos:       topWos,
   };
 }
 

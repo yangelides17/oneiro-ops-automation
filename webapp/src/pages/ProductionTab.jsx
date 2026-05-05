@@ -1,0 +1,442 @@
+import { useState, useEffect, useMemo } from 'react'
+import { Link } from 'react-router-dom'
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  CartesianGrid,
+} from 'recharts'
+import { opToday } from '../lib/dateOps'
+
+// ── Date range presets (mirror RevenueTab) ────────────────────
+const PRESETS = [
+  { id: '7d',     label: 'Last 7 days' },
+  { id: '30d',    label: 'Last 30 days' },
+  { id: 'mtd',    label: 'Month to date' },
+  { id: 'last',   label: 'Last month' },
+  { id: 'season', label: 'Season to date' },
+  { id: 'custom', label: 'Custom' },
+]
+
+const isoOf = (d) => {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${dd}`
+}
+
+function rangeForPreset(id, customStart, customEnd) {
+  const today = new Date()
+  if (id === '7d') {
+    const start = new Date(today); start.setDate(today.getDate() - 6)
+    return { start: isoOf(start), end: isoOf(today) }
+  }
+  if (id === '30d') {
+    const start = new Date(today); start.setDate(today.getDate() - 29)
+    return { start: isoOf(start), end: isoOf(today) }
+  }
+  if (id === 'mtd') {
+    const start = new Date(today.getFullYear(), today.getMonth(), 1)
+    return { start: isoOf(start), end: isoOf(today) }
+  }
+  if (id === 'last') {
+    const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+    const lastMonthEnd   = new Date(today.getFullYear(), today.getMonth(),     0)
+    return { start: isoOf(lastMonthStart), end: isoOf(lastMonthEnd) }
+  }
+  if (id === 'season') {
+    // Striping season runs Jan 1 → today for this calendar year. Refine
+    // later if Oneiro starts treating "season" as a different window.
+    const start = new Date(today.getFullYear(), 0, 1)
+    return { start: isoOf(start), end: isoOf(today) }
+  }
+  return { start: customStart || opToday(), end: customEnd || opToday() }
+}
+
+// ── Number / unit formatters ──────────────────────────────────
+const fmtNum = (n) => (Number(n) || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })
+const fmtNumDecimal = (n) => (Number(n) || 0).toLocaleString('en-US', { maximumFractionDigits: 1 })
+
+// ── Fetch ─────────────────────────────────────────────────────
+async function fetchProduction(start, end) {
+  const qs = new URLSearchParams()
+  if (start) qs.set('start', start)
+  if (end)   qs.set('end',   end)
+  const res = await fetch('/api/production?' + qs.toString())
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  const data = await res.json()
+  if (data.error) throw new Error(data.error)
+  return data
+}
+
+// ── Range picker ──────────────────────────────────────────────
+function RangePicker({ preset, onPresetChange, customStart, customEnd, onCustomChange }) {
+  return (
+    <div className="card p-4 space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-semibold text-slate-500">Range</span>
+        {PRESETS.map(p => (
+          <button
+            key={p.id}
+            onClick={() => onPresetChange(p.id)}
+            className={`text-xs px-3 py-1 rounded-full border font-medium transition-all
+              ${preset === p.id
+                ? 'bg-navy text-white border-navy'
+                : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'
+              }`}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {preset === 'custom' && (
+        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
+          <label className="text-xs font-semibold text-slate-500">Start</label>
+          <input
+            type="date"
+            value={customStart}
+            onChange={e => onCustomChange({ start: e.target.value, end: customEnd })}
+            className="field-input text-sm"
+          />
+          <label className="text-xs font-semibold text-slate-500">End</label>
+          <input
+            type="date"
+            value={customEnd}
+            onChange={e => onCustomChange({ start: customStart, end: e.target.value })}
+            className="field-input text-sm"
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── KPI card ──────────────────────────────────────────────────
+function StatCard({ label, value, sub, color }) {
+  return (
+    <div className="card p-4 flex flex-col gap-1">
+      <span className="text-[11px] font-bold uppercase tracking-widest text-slate-500">
+        {label}
+      </span>
+      <span className={`text-3xl font-black leading-none ${color ?? 'text-navy'}`}>
+        {value ?? '—'}
+      </span>
+      {sub && <span className="text-xs text-slate-400">{sub}</span>}
+    </div>
+  )
+}
+
+// ── Daily chart for a single unit ─────────────────────────────
+function UnitDailyChart({ daily, unit, color }) {
+  const data = (daily || []).map(d => ({
+    date: d.date.slice(5),
+    qty:  d[unit] || 0,
+  }))
+  const total = data.reduce((s, r) => s + r.qty, 0)
+  return (
+    <div className="card p-4">
+      <div className="flex items-baseline justify-between mb-1">
+        <p className="section-label">Daily {unit}</p>
+        <span className="text-xs text-slate-500 font-semibold">
+          {fmtNum(total)} {unit}
+        </span>
+      </div>
+      <ResponsiveContainer width="100%" height={180}>
+        <BarChart data={data} barSize={data.length > 31 ? 5 : 12}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+          <YAxis
+            tick={{ fontSize: 10, fill: '#94a3b8' }}
+            axisLine={false}
+            tickLine={false}
+            tickFormatter={fmtNum}
+            width={48}
+          />
+          <Tooltip
+            contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
+            formatter={(v) => [fmtNum(v) + ' ' + unit, unit]}
+            cursor={{ fill: '#f1f5f9' }}
+          />
+          <Bar dataKey="qty" radius={[3, 3, 0, 0]} fill={color} />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Contractor breakdown table ────────────────────────────────
+function ContractorTable({ rows }) {
+  return (
+    <div className="card overflow-hidden">
+      <div className="p-4 border-b border-slate-100">
+        <p className="section-label">Production by Contractor</p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[420px]">
+          <thead>
+            <tr className="border-b border-slate-100 bg-slate-50">
+              {['Contractor', 'SF', 'LF', 'EA', 'Items'].map(h => (
+                <th key={h} className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                                       uppercase tracking-wider text-slate-400">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {(!rows || rows.length === 0) ? (
+              <tr>
+                <td colSpan={5} className="py-8 text-center text-slate-400 text-sm">
+                  No production in this range.
+                </td>
+              </tr>
+            ) : rows.map(r => (
+              <tr key={r.contractor} className="border-b border-slate-100 text-sm hover:bg-slate-50">
+                <td className="py-2.5 px-3 text-slate-700 font-medium">{r.contractor}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(r.SF)}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(r.LF)}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(r.EA)}</td>
+                <td className="py-2.5 px-3 text-slate-500 text-xs">{r.items}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ── By-category breakdown grouped by unit ─────────────────────
+function CategoryBreakdown({ rows }) {
+  const grouped = useMemo(() => {
+    const out = { SF: [], LF: [], EA: [] }
+    ;(rows || []).forEach(r => {
+      if (out[r.unit]) out[r.unit].push(r)
+    })
+    return out
+  }, [rows])
+
+  const sections = [
+    { unit: 'SF', label: 'Square Feet (MMA)' },
+    { unit: 'LF', label: 'Linear Feet (Lines)' },
+    { unit: 'EA', label: 'Each (Messages / Arrows / Symbols)' },
+  ]
+
+  return (
+    <div className="card p-4">
+      <p className="section-label mb-3">By Marking Type</p>
+      <div className="space-y-4">
+        {sections.map(s => {
+          const list = grouped[s.unit] || []
+          const max = list[0]?.qty || 0
+          return (
+            <div key={s.unit}>
+              <p className="text-xs font-semibold text-slate-600 mb-2">{s.label}</p>
+              {list.length === 0 ? (
+                <p className="text-slate-400 text-sm">No {s.unit} markings in this range</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {list.slice(0, 12).map(r => {
+                    const pct = max > 0 ? Math.round((r.qty / max) * 100) : 0
+                    return (
+                      <div key={r.category + '|' + r.unit}>
+                        <div className="flex justify-between text-xs mb-0.5">
+                          <span className="text-slate-700 font-medium truncate max-w-[60%]">
+                            {r.category}
+                          </span>
+                          <span className="text-slate-500 whitespace-nowrap">
+                            {fmtNum(r.qty)} {r.unit} · {r.items} item{r.items === 1 ? '' : 's'}
+                          </span>
+                        </div>
+                        <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-navy rounded-full transition-all duration-700"
+                            style={{ width: pct + '%' }}
+                          />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ── Top WOs table ─────────────────────────────────────────────
+function TopWosTable({ topWos }) {
+  if (!topWos || topWos.length === 0) {
+    return (
+      <div className="card p-4">
+        <p className="section-label">Top WOs</p>
+        <p className="text-slate-400 text-sm mt-2">No production in this range</p>
+      </div>
+    )
+  }
+  return (
+    <div className="card overflow-hidden">
+      <div className="p-4 border-b border-slate-100">
+        <p className="section-label">Top WOs by Production</p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[600px]">
+          <thead>
+            <tr className="border-b border-slate-100 bg-slate-50">
+              {['WO #', 'Contractor', 'Location', 'SF', 'LF', 'EA', 'Items'].map(h => (
+                <th key={h} className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                                       uppercase tracking-wider text-slate-400">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {topWos.map(w => (
+              <tr key={w.wo_id} className="border-b border-slate-100 text-sm hover:bg-slate-50">
+                <td className="py-2.5 px-3 font-mono font-semibold whitespace-nowrap">
+                  <Link to={`/field-report?wo=${encodeURIComponent(w.wo_id)}`} className="text-navy hover:underline">
+                    {w.wo_id}
+                  </Link>
+                </td>
+                <td className="py-2.5 px-3 text-slate-700">{w.contractor || '—'}</td>
+                <td className="py-2.5 px-3 text-slate-600 max-w-[180px] truncate">{w.location || '—'}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(w.SF)}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(w.LF)}</td>
+                <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap">{fmtNum(w.EA)}</td>
+                <td className="py-2.5 px-3 text-slate-500 text-xs">{w.items}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ── Main ──────────────────────────────────────────────────────
+export default function ProductionTab() {
+  const [preset, setPreset]           = useState('30d')
+  const [custom, setCustom]           = useState({ start: '', end: '' })
+  const [data,    setData]            = useState(null)
+  const [loading, setLoading]         = useState(true)
+  const [error,   setError]           = useState(null)
+  const [lastRefresh, setLastRefresh] = useState(null)
+
+  const range = useMemo(
+    () => rangeForPreset(preset, custom.start, custom.end),
+    [preset, custom.start, custom.end]
+  )
+
+  const load = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const d = await fetchProduction(range.start, range.end)
+      setData(d)
+      setLastRefresh(new Date())
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { load() }, [range.start, range.end])
+
+  if (loading && !data) {
+    return (
+      <div className="flex items-center justify-center min-h-[40vh]">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-10 h-10 border-[3px] border-slate-200 border-t-navy
+                          rounded-full animate-spin" />
+          <p className="text-slate-400 text-sm">Loading production…</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error && !data) {
+    return (
+      <div className="flex items-center justify-center min-h-[40vh]">
+        <div className="text-center max-w-sm">
+          <div className="text-4xl mb-4">⚠️</div>
+          <h2 className="text-lg font-bold text-slate-800 mb-2">Failed to load production</h2>
+          <p className="text-slate-500 text-sm mb-4">{error}</p>
+          <button onClick={load} className="btn-outline text-sm px-4 py-2">Try again</button>
+        </div>
+      </div>
+    )
+  }
+
+  const totals       = data?.totals       || { SF: 0, LF: 0, EA: 0, items: 0 }
+  const shifts       = data?.shifts       || { count: 0, days_in_range: 0, pct_days_worked: 0, longest_streak: 0 }
+  const daily        = data?.daily        || []
+  const byContractor = data?.by_contractor|| []
+  const byCategory   = data?.by_category  || []
+  const topWos       = data?.top_wos      || []
+
+  return (
+    <div className="space-y-6">
+      <RangePicker
+        preset={preset}
+        onPresetChange={setPreset}
+        customStart={custom.start}
+        customEnd={custom.end}
+        onCustomChange={setCustom}
+      />
+
+      {lastRefresh && (
+        <p className="text-slate-400 text-xs -mt-3">
+          Range: {range.start} → {range.end} · Updated {lastRefresh.toLocaleTimeString()}
+        </p>
+      )}
+
+      {/* Quantity KPIs */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <StatCard label="Square Feet" value={fmtNum(totals.SF)} sub="MMA work"           color="text-navy" />
+        <StatCard label="Linear Feet" value={fmtNum(totals.LF)} sub="Lines, crosswalks"  color="text-blue-600" />
+        <StatCard label="Each"        value={fmtNum(totals.EA)} sub="Msgs / arrows / symbols" color="text-orange-600" />
+        <StatCard label="Items"       value={fmtNum(totals.items)} sub="completed"       color="text-green-600" />
+      </div>
+
+      {/* Shift KPIs */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <StatCard
+          label="Shifts Worked"
+          value={fmtNum(shifts.count)}
+          sub={`of ${fmtNum(shifts.days_in_range)} days in range`}
+          color="text-navy"
+        />
+        <StatCard
+          label="% Days Worked"
+          value={fmtNumDecimal(shifts.pct_days_worked) + '%'}
+          sub={shifts.pct_days_worked >= 50 ? 'half the days, easy' : 'in this range'}
+          color="text-blue-600"
+        />
+        <StatCard
+          label="Longest Streak"
+          value={fmtNum(shifts.longest_streak) + (shifts.longest_streak === 1 ? ' day' : ' days')}
+          sub="consecutive shifts"
+          color={shifts.longest_streak >= 5 ? 'text-green-600' : 'text-slate-700'}
+        />
+      </div>
+
+      {/* Daily charts — 3-up on desktop, stacked on mobile */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <UnitDailyChart daily={daily} unit="SF" color="#1e40af" />
+        <UnitDailyChart daily={daily} unit="LF" color="#2563eb" />
+        <UnitDailyChart daily={daily} unit="EA" color="#f97316" />
+      </div>
+
+      {/* Breakdown grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <ContractorTable rows={byContractor} />
+        <CategoryBreakdown rows={byCategory} />
+      </div>
+
+      <TopWosTable topWos={topWos} />
+    </div>
+  )
+}
