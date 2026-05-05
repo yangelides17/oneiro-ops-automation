@@ -1565,11 +1565,15 @@ function archiveDocument_(file, docType, woId, ss) {
           getOrCreateSubfolder_(archiveRoot, contractor),
           `${contractNum} - ${getBoroughName_(borough)}`
         );
+        // Master copy at contract level — mirrors Production Logs and
+        // Certified Payroll. Lets the listing handler read Sign-Ins
+        // from a single place instead of de-duping across WO folders.
+        file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Sign-Ins'));
         wos.forEach(wo => {
           const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
           file.makeCopy(cleanName, woFolder);
         });
-        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + master + ${wos.length} WO folder(s)`);
         return { success: true, doc_type: 'Sign-In', wo_ids: wos.map(w => w.id) };
       }
       // Legacy single-WO Sign-In (pre-multi-WO refactor) — keep working.
@@ -4909,6 +4913,102 @@ function backfillDocLifecycleFlags() {
 
 
 /**
+ * One-shot backfill: walks every contractor / contract folder under
+ * Archive, scans the per-WO subfolders for SignIn_* PDFs, and copies
+ * each unique one (by filename) up to a new contract-level
+ * "Sign-Ins/" master folder. Brings existing data into the same
+ * shape that archiveDocument_ now produces going forward.
+ *
+ * Public name (no trailing underscore) so it appears in the editor
+ * function-runner dropdown. Idempotent — the per-filename dedupe
+ * means re-running won't create duplicate masters.
+ */
+function backfillSignInMasters() {
+  const props = PropertiesService.getScriptProperties();
+  const archiveId = props.getProperty('ARCHIVE_ID');
+  if (!archiveId) {
+    Logger.log('❌ backfillSignInMasters: ARCHIVE_ID property not set');
+    return;
+  }
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+
+  let contractorsScanned = 0;
+  let contractsScanned   = 0;
+  let mastersCreated     = 0;
+  let copied             = 0;
+  let skippedExisting    = 0;
+
+  const contractorIt = archiveRoot.getFolders();
+  while (contractorIt.hasNext()) {
+    const contractorFolder = contractorIt.next();
+    contractorsScanned++;
+    const contractIt = contractorFolder.getFolders();
+    while (contractIt.hasNext()) {
+      const contractFolder = contractIt.next();
+      // Skip the Archive Errors folder — never has WO subfolders.
+      if (/Archive Errors/i.test(contractFolder.getName())) continue;
+      contractsScanned++;
+
+      // Build dedupe set from existing master (if any) so re-runs
+      // don't duplicate.
+      let masterFolder = null;
+      const existingIt = contractFolder.getFoldersByName('Sign-Ins');
+      if (existingIt.hasNext()) {
+        masterFolder = existingIt.next();
+      }
+      const existing = new Set();
+      if (masterFolder) {
+        const exFiles = masterFolder.getFiles();
+        while (exFiles.hasNext()) existing.add(exFiles.next().getName());
+      }
+
+      // Walk every WO subfolder of this contract; collect one copy per
+      // unique SignIn_* filename. Skip the master folder itself + any
+      // other non-WO containers (Production Logs, Certified Payroll).
+      const woIt = contractFolder.getFolders();
+      const filesToCopy = {};   // filename → File
+      while (woIt.hasNext()) {
+        const sub = woIt.next();
+        const name = sub.getName();
+        if (name === 'Sign-Ins' || name === 'Production Logs' || name === 'Certified Payroll') continue;
+        const fIt = sub.getFiles();
+        while (fIt.hasNext()) {
+          const f = fIt.next();
+          const fname = f.getName();
+          if (!/^SignIn_/i.test(fname)) continue;
+          if (existing.has(fname)) { skippedExisting++; continue; }
+          if (filesToCopy[fname])  continue;   // dedupe across WO folders
+          filesToCopy[fname] = f;
+        }
+      }
+
+      const filenames = Object.keys(filesToCopy);
+      if (filenames.length === 0) continue;
+
+      if (!masterFolder) {
+        masterFolder = contractFolder.createFolder('Sign-Ins');
+        mastersCreated++;
+      }
+      filenames.forEach(fn => {
+        try {
+          filesToCopy[fn].makeCopy(fn, masterFolder);
+          copied++;
+        } catch (e) {
+          Logger.log('⚠️ backfillSignInMasters: failed to copy ' + fn + ': ' + e.message);
+        }
+      });
+    }
+  }
+
+  Logger.log('✅ backfillSignInMasters: contractors=' + contractorsScanned +
+             ', contracts=' + contractsScanned +
+             ', mastersCreated=' + mastersCreated +
+             ', copied=' + copied +
+             ', skippedExisting=' + skippedExisting);
+}
+
+
+/**
  * DEBUG / one-off: run this manually from the Apps Script editor to add
  * the 3 CFR columns to the WO Tracker immediately, without waiting for
  * a fresh WO scan.
@@ -7381,7 +7481,7 @@ function handleListDocumentsForBatch_(body) {
   const getMasters = (contractor, contractNum, borough) => {
     const k = contractor + '|' + contractNum + '|' + borough;
     if (masterCache[k] !== undefined) return masterCache[k];
-    let prod = null, cp = null;
+    let prod = null, cp = null, signin = null;
     try {
       const cIt = archiveRoot.getFoldersByName(contractor);
       if (cIt.hasNext()) {
@@ -7393,12 +7493,14 @@ function handleListDocumentsForBatch_(body) {
           if (plIt.hasNext()) prod = plIt.next();
           const cpIt = ctFolder.getFoldersByName('Certified Payroll');
           if (cpIt.hasNext()) cp = cpIt.next();
+          const siIt = ctFolder.getFoldersByName('Sign-Ins');
+          if (siIt.hasNext()) signin = siIt.next();
         }
       }
     } catch (e) {
       warnings.push('getMasters failed for ' + k + ': ' + e.message);
     }
-    masterCache[k] = { prod, cp };
+    masterCache[k] = { prod, cp, signin };
     return masterCache[k];
   };
 
@@ -7496,14 +7598,16 @@ function handleListDocumentsForBatch_(body) {
     woGroups[k].push(w);
   });
 
-  const masterDocs = docTypes.filter(t => t === 'Production Log' || t === 'Certified Payroll');
+  const masterDocs = docTypes.filter(t => t === 'Production Log' || t === 'Certified Payroll' || t === 'Sign-In');
   masterDocs.forEach(docType => {
     Object.keys(woGroups).forEach(gk => {
       if (files.length >= MAX_BATCH_FILES_) return;
       const groupWos = woGroups[gk];
       const [contractor, contractNum, borough] = gk.split('|');
       const masters = getMasters(contractor, contractNum, borough);
-      const masterFolder = docType === 'Production Log' ? masters.prod : masters.cp;
+      const masterFolder = docType === 'Production Log' ? masters.prod
+                         : docType === 'Sign-In'        ? masters.signin
+                                                        : masters.cp;
       if (!masterFolder) return;
 
       // Determine which group WOs qualify for this doc type.
@@ -7532,7 +7636,8 @@ function handleListDocumentsForBatch_(body) {
 
         // Resolve covered WOs.
         let coveredWoIds;
-        if (docType === 'Production Log') {
+        if (docType === 'Production Log' || docType === 'Sign-In') {
+          // Both keyed by shift date — same WO group resolves both.
           const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
           const keyMatch = Object.keys(map).find(k => {
             const parts = k.split('|');
@@ -7540,7 +7645,7 @@ function handleListDocumentsForBatch_(body) {
           });
           coveredWoIds = keyMatch ? map[keyMatch].map(x => x.id) : [];
         } else {
-          // Certified Payroll
+          // Certified Payroll — keyed by week
           const wos = getWOsForPayrollWeek_(contractNum, borough, new Date(fileDate + 'T12:00:00'), ss);
           coveredWoIds = wos.map(x => x.id);
         }
@@ -7583,67 +7688,9 @@ function handleListDocumentsForBatch_(body) {
     });
   });
 
-  // ── Sign-In: no master folder; pulled from any one WO folder per
-  //   (contractor, contractNum, borough, date). Walk each WO folder
-  //   in scope, dedupe by filename.
-  if (docTypes.indexOf('Sign-In') !== -1) {
-    const sigSeen = {};   // filename → first chosen file metadata
-    wosInScope.forEach(w => {
-      if (files.length >= MAX_BATCH_FILES_) return;
-      const q = qualifies(w, 'Sign-In');
-      if (!q.include) {
-        if (q.missingReason) {
-          missing.push({ wo_id: w.wo_id, doc_type: 'Sign-In', reason: q.missingReason });
-        }
-        return;
-      }
-      const folder = getWoFolder(w);
-      if (!folder) return;
-      const fIter = folder.getFiles();
-      while (fIter.hasNext()) {
-        const f = fIter.next();
-        const name = f.getName();
-        if (!/^SignIn_/i.test(name)) continue;
-        // dedupe across WO folders — same filename = same logical sheet
-        if (sigSeen[name]) continue;
-
-        const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
-        const fileDate = dm ? dm[1] : '';
-        if (mode === 'date_range') {
-          if (!fileDate || fileDate < dateStart || fileDate > dateEnd) continue;
-        }
-        // Resolve covered WOs by filename pattern (contractNum, borough)
-        const cm = name.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
-        let coveredWoIds = [w.wo_id];
-        if (cm) {
-          const [, fnContractNum, fnBorough, fnDate] = cm;
-          const map = getWOsForDate_(new Date(fnDate + 'T12:00:00'), ss);
-          const keyMatch = Object.keys(map).find(k => {
-            const parts = k.split('|');
-            return parts[0] === w.contractor && parts[1] === fnContractNum && parts[2] === fnBorough;
-          });
-          if (keyMatch) coveredWoIds = map[keyMatch].map(x => x.id);
-        }
-        const allSent = coveredWoIds.every(id => woById[id] && woById[id].sent['Sign-In']);
-
-        sigSeen[name] = true;
-        pushFile({
-          file_id:      f.getId(),
-          filename:     name,
-          mime_type:    f.getMimeType(),
-          size:         f.getSize(),
-          contractor:   w.contractor,
-          contract_num: w.contract_num,
-          borough:      w.borough,
-          doc_type:     'Sign-In',
-          wo_ids:       coveredWoIds,
-          work_date:    fileDate,
-          done:         true,
-          sent:         allSent,
-        });
-      }
-    });
-  }
+  // Sign-In is now handled by the master-doc loop above (it lives in
+  // its own contract-level "Sign-Ins/" master folder, mirroring
+  // Production Logs and Certified Payroll).
 
   // Counts
   const counts = { total: files.length, by_doc_type: {}, by_contractor: {} };
