@@ -1493,12 +1493,24 @@ function handleSetDocsSent_(body) {
  *     ├── PT-XXXXX - [Location] /   ← WO folder (Field Reports, Invoices, Sign-Ins filed directly here)
  *     │     └── Photos/             ← only subfolder inside a WO
  *     ├── Production Logs/          ← master copy; also duplicated into each WO folder
+ *     ├── Sign-Ins/                 ← master copy; also duplicated into each WO folder
  *     └── Certified Payroll/        ← master copy; also duplicated into each WO folder
  *
- * Returns { success: boolean, reason?: string }.  On failure the caller
- * is responsible for preserving the file (moveTo Archive Errors) rather
- * than trashing it, so nothing is ever lost to a bad filename, missing
- * tracker row, or transient Drive error.
+ * Returns one of:
+ *   - On success: { success: true,  doc_type: <one of "Field Report" |
+ *                   "Invoice" | "Production Log" | "Sign-In" |
+ *                   "Certified Payroll">,
+ *                   wo_ids: [<id>, ...] }
+ *     `wo_ids` lists every Work Order this archive operation touched —
+ *     one element for per-WO docs (CFR/Invoice), many for the
+ *     master-copy types (Production Log/Sign-In/CP). The caller in
+ *     _processApprovedDocumentsImpl_ uses these to flip the matching
+ *     "<DocType> Done?" flag on each WO Tracker row.
+ *   - On failure: { success: false, reason: <string> }
+ *     The caller is responsible for preserving the file (moveTo
+ *     Archive Errors) rather than trashing it, so nothing is ever
+ *     lost to a bad filename, missing tracker row, or transient
+ *     Drive error.
  */
 function archiveDocument_(file, docType, woId, ss) {
   try {
