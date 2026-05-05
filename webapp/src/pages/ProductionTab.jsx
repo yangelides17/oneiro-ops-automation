@@ -55,6 +55,16 @@ function rangeForPreset(id, customStart, customEnd) {
 const fmtNum = (n) => (Number(n) || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })
 const fmtNumDecimal = (n) => (Number(n) || 0).toLocaleString('en-US', { maximumFractionDigits: 1 })
 
+// Per-unit display metadata used across the tab. The user-facing
+// title is the work category; the unit code is treated as a
+// subheader.  Using a single map keeps tab labels in sync — change
+// here and every chart / table picks it up.
+const UNIT_META = {
+  SF: { title: 'MMA Work',                 short: 'MMA Work' },
+  LF: { title: 'Lines and Crosswalks',     short: 'Lines & Xwalks' },
+  EA: { title: 'Msgs, Arrows and Symbols', short: 'Msgs / Arrows / Symbols' },
+}
+
 // ── Fetch ─────────────────────────────────────────────────────
 async function fetchProduction(start, end) {
   const qs = new URLSearchParams()
@@ -131,11 +141,17 @@ function UnitDailyChart({ daily, unit, color }) {
     qty:  d[unit] || 0,
   }))
   const total = data.reduce((s, r) => s + r.qty, 0)
+  const meta = UNIT_META[unit] || { title: unit, short: unit }
   return (
     <div className="card p-4">
-      <div className="flex items-baseline justify-between mb-1">
-        <p className="section-label">Daily {unit}</p>
-        <span className="text-xs text-slate-500 font-semibold">
+      <div className="flex items-start justify-between mb-1 gap-2">
+        <div>
+          <p className="section-label leading-tight">{meta.title}</p>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-0.5">
+            Daily · {unit}
+          </p>
+        </div>
+        <span className="text-xs text-slate-500 font-semibold whitespace-nowrap">
           {fmtNum(total)} {unit}
         </span>
       </div>
@@ -163,6 +179,19 @@ function UnitDailyChart({ daily, unit, color }) {
 }
 
 // ── Contractor breakdown table ────────────────────────────────
+// Two-line column headers — work category as the primary label, unit
+// code as the subhead. Matches the tab-wide convention.
+function UnitTh({ unit }) {
+  const meta = UNIT_META[unit] || { short: unit }
+  return (
+    <th className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                   uppercase tracking-wider text-slate-500">
+      <div className="leading-tight">{meta.short}</div>
+      <div className="text-[9px] text-slate-400 font-bold mt-0.5">{unit}</div>
+    </th>
+  )
+}
+
 function ContractorTable({ rows }) {
   return (
     <div className="card overflow-hidden">
@@ -170,15 +199,20 @@ function ContractorTable({ rows }) {
         <p className="section-label">Production by Contractor</p>
       </div>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[420px]">
+        <table className="w-full min-w-[460px]">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50">
-              {['Contractor', 'SF', 'LF', 'EA', 'Items'].map(h => (
-                <th key={h} className="py-2.5 px-3 text-left text-[10px] font-extrabold
-                                       uppercase tracking-wider text-slate-400">
-                  {h}
-                </th>
-              ))}
+              <th className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                             uppercase tracking-wider text-slate-400">
+                Contractor
+              </th>
+              <UnitTh unit="SF" />
+              <UnitTh unit="LF" />
+              <UnitTh unit="EA" />
+              <th className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                             uppercase tracking-wider text-slate-400">
+                Items
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -214,24 +248,28 @@ function CategoryBreakdown({ rows }) {
     return out
   }, [rows])
 
-  const sections = [
-    { unit: 'SF', label: 'Square Feet (MMA)' },
-    { unit: 'LF', label: 'Linear Feet (Lines)' },
-    { unit: 'EA', label: 'Each (Messages / Arrows / Symbols)' },
-  ]
+  const sections = ['SF', 'LF', 'EA']
 
   return (
     <div className="card p-4">
       <p className="section-label mb-3">By Marking Type</p>
       <div className="space-y-4">
-        {sections.map(s => {
-          const list = grouped[s.unit] || []
-          const max = list[0]?.qty || 0
+        {sections.map(unit => {
+          const list = grouped[unit] || []
+          const max  = list[0]?.qty || 0
+          const meta = UNIT_META[unit] || { title: unit }
           return (
-            <div key={s.unit}>
-              <p className="text-xs font-semibold text-slate-600 mb-2">{s.label}</p>
+            <div key={unit}>
+              <div className="mb-2">
+                <p className="text-xs font-semibold text-slate-700 leading-tight">
+                  {meta.title}
+                </p>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-0.5">
+                  {unit}
+                </p>
+              </div>
               {list.length === 0 ? (
-                <p className="text-slate-400 text-sm">No {s.unit} markings in this range</p>
+                <p className="text-slate-400 text-sm">No {unit} markings in this range</p>
               ) : (
                 <div className="space-y-1.5">
                   {list.slice(0, 12).map(r => {
@@ -281,15 +319,22 @@ function TopWosTable({ topWos }) {
         <p className="section-label">Top WOs by Production</p>
       </div>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[600px]">
+        <table className="w-full min-w-[640px]">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50">
-              {['WO #', 'Contractor', 'Location', 'SF', 'LF', 'EA', 'Items'].map(h => (
+              {['WO #', 'Contractor', 'Location'].map(h => (
                 <th key={h} className="py-2.5 px-3 text-left text-[10px] font-extrabold
                                        uppercase tracking-wider text-slate-400">
                   {h}
                 </th>
               ))}
+              <UnitTh unit="SF" />
+              <UnitTh unit="LF" />
+              <UnitTh unit="EA" />
+              <th className="py-2.5 px-3 text-left text-[10px] font-extrabold
+                             uppercase tracking-wider text-slate-400">
+                Items
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -393,12 +438,12 @@ export default function ProductionTab() {
         </p>
       )}
 
-      {/* Quantity KPIs */}
+      {/* Quantity KPIs — title is the work category, unit (SF/LF/EA) is the subhead */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="Square Feet" value={fmtNum(totals.SF)} sub="MMA work"           color="text-navy" />
-        <StatCard label="Linear Feet" value={fmtNum(totals.LF)} sub="Lines, crosswalks"  color="text-blue-600" />
-        <StatCard label="Each"        value={fmtNum(totals.EA)} sub="Msgs / arrows / symbols" color="text-orange-600" />
-        <StatCard label="Items"       value={fmtNum(totals.items)} sub="completed"       color="text-green-600" />
+        <StatCard label={UNIT_META.SF.title} value={fmtNum(totals.SF)} sub="SF" color="text-navy" />
+        <StatCard label={UNIT_META.LF.title} value={fmtNum(totals.LF)} sub="LF" color="text-blue-600" />
+        <StatCard label={UNIT_META.EA.title} value={fmtNum(totals.EA)} sub="EA" color="text-orange-600" />
+        <StatCard label="Items"              value={fmtNum(totals.items)} sub="completed" color="text-green-600" />
       </div>
 
       {/* Shift KPIs */}
