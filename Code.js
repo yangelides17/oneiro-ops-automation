@@ -4616,15 +4616,18 @@ function ensureWoTrackerCFRCols_(woSheet) { return ensureWoTrackerExtraCols_(woS
  * it's currently empty. Run once from the Apps Script editor after
  * deploying the col-43 schema change. Subsequent archiving for new
  * WOs writes the URL inline in getWOFolder_.
+ *
+ * No trailing underscore on the name so the Apps Script editor
+ * shows it in the function-runner dropdown.
  */
-function backfillArchiveFolderUrls_() {
+function backfillArchiveFolderUrls() {
   const ss        = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet   = ss.getSheetByName('Work Order Tracker');
   ensureWoTrackerExtraCols_(woSheet);
 
   const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
   if (!archiveId) {
-    Logger.log('❌ backfillArchiveFolderUrls_: ARCHIVE_ID property not set');
+    Logger.log('❌ backfillArchiveFolderUrls: ARCHIVE_ID property not set');
     return;
   }
   const archiveRoot = DriveApp.getFolderById(archiveId);
@@ -4646,7 +4649,7 @@ function backfillArchiveFolderUrls_() {
       missing++;
     }
   }
-  Logger.log('✅ backfillArchiveFolderUrls_: filled=' + filled +
+  Logger.log('✅ backfillArchiveFolderUrls: filled=' + filled +
              ', missing=' + missing + ', alreadyHad=' + already);
 }
 
