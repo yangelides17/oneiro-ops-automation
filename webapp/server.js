@@ -1314,39 +1314,112 @@ function buildBatchManifest(filters, listing) {
   lines.push(`Total: ${files.length} file${files.length === 1 ? '' : 's'} across ${allWos.size} work order${allWos.size === 1 ? '' : 's'}`)
   lines.push('')
 
+  // Natural-sort comparator for WO numbers like "RM-43101", "PT-12345":
+  // prefix alphabetical, then numeric portion ascending.
+  const woCompare = (a, b) => {
+    const aa = String(a || ''); const bb = String(b || '')
+    const ap = aa.split('-')[0]; const bp = bb.split('-')[0]
+    if (ap !== bp) return ap.localeCompare(bp)
+    const an = parseInt(aa.split('-')[1] || '0', 10)
+    const bn = parseInt(bb.split('-')[1] || '0', 10)
+    if (an !== bn) return an - bn
+    return aa.localeCompare(bb)
+  }
+  const dateCompare = (a, b) => String(a || '').localeCompare(String(b || ''))
+
   const sectionRule = '─'.repeat(40)
-  const sections = [
-    { dt: 'CFR',               heading: 'Contractor Field Reports' },
-    { dt: 'Production Log',    heading: 'Production Logs' },
-    { dt: 'Sign-In',           heading: 'Sign-In Sheets' },
-    { dt: 'Certified Payroll', heading: 'Certified Payroll' },
-    { dt: 'Invoice',           heading: 'Invoices' },
-  ]
-  sections.forEach(s => {
-    const items = files.filter(f => f.doc_type === s.dt)
-    if (items.length === 0) return
+  const bullet      = '  - '
+
+  // Each section: a labeled header line ("X for:") followed by a
+  // bulleted list. Per-WO docs (CFR, Invoice) sort by WO ascending;
+  // master-copy docs (Production Log, Sign-In, CP) sort by date.
+
+  // ── Contractor Field Reports
+  const cfrFiles = files.filter(f => f.doc_type === 'CFR')
+    .sort((a, b) => woCompare((a.wo_ids || [])[0], (b.wo_ids || [])[0]))
+  if (cfrFiles.length) {
     lines.push(sectionRule)
-    lines.push(`${s.heading} (${items.length})`)
+    lines.push(`Contractor Field Reports for: (${cfrFiles.length})`)
     lines.push(sectionRule)
-    items.forEach(f => {
-      const wos = (f.wo_ids || []).join(', ')
-      const dateNote = f.work_date ? ` — ${f.work_date}` : ''
-      if (s.dt === 'CFR' || s.dt === 'Invoice') {
-        lines.push(`  ${wos}${dateNote} — ${f.filename}`)
-      } else {
-        // Master-copy docs cover multiple WOs
-        lines.push(`  ${f.work_date || '?'} (covers ${wos})${dateNote && wos ? '' : ''} — ${f.filename}`)
-      }
+    cfrFiles.forEach(f => {
+      const woId = (f.wo_ids || [])[0] || '?'
+      const loc  = f.location || ''
+      const date = f.work_date || '?'
+      const locPart = loc ? ` - ${loc}` : ''
+      lines.push(`${bullet}${woId}${locPart} (${date})`)
     })
     lines.push('')
-  })
+  }
+
+  // ── Production Logs
+  const plFiles = files.filter(f => f.doc_type === 'Production Log')
+    .sort((a, b) => dateCompare(a.work_date, b.work_date))
+  if (plFiles.length) {
+    lines.push(sectionRule)
+    lines.push(`Production Logs for: (${plFiles.length})`)
+    lines.push(sectionRule)
+    plFiles.forEach(f => {
+      lines.push(`${bullet}${f.work_date || '?'}`)
+    })
+    lines.push('')
+  }
+
+  // ── Invoices
+  const invFiles = files.filter(f => f.doc_type === 'Invoice')
+    .sort((a, b) => woCompare((a.wo_ids || [])[0], (b.wo_ids || [])[0]))
+  if (invFiles.length) {
+    lines.push(sectionRule)
+    lines.push(`Invoices for: (${invFiles.length})`)
+    lines.push(sectionRule)
+    invFiles.forEach(f => {
+      const woId = (f.wo_ids || [])[0] || '?'
+      const loc  = f.location || ''
+      const locPart = loc ? ` - ${loc}` : ''
+      lines.push(`${bullet}${woId}${locPart}`)
+    })
+    lines.push('')
+  }
+
+  // ── Certified Payroll
+  const cpFiles = files.filter(f => f.doc_type === 'Certified Payroll')
+    .sort((a, b) => dateCompare(a.work_date, b.work_date))
+  if (cpFiles.length) {
+    lines.push(sectionRule)
+    lines.push(`Certified Payroll for Week(s) of: (${cpFiles.length})`)
+    lines.push(sectionRule)
+    cpFiles.forEach(f => {
+      lines.push(`${bullet}${f.work_date || '?'}`)
+    })
+    lines.push('')
+  }
+
+  // ── Sign-In Sheets
+  const siFiles = files.filter(f => f.doc_type === 'Sign-In')
+    .sort((a, b) => dateCompare(a.work_date, b.work_date)
+                 || String(a.contract_num || '').localeCompare(String(b.contract_num || ''))
+                 || String(a.borough      || '').localeCompare(String(b.borough      || '')))
+  if (siFiles.length) {
+    lines.push(sectionRule)
+    lines.push(`Sign in Sheets for: (${siFiles.length})`)
+    lines.push(sectionRule)
+    siFiles.forEach(f => {
+      const date     = f.work_date    || '?'
+      const contract = f.contract_num || '?'
+      const borough  = f.borough      || '?'
+      lines.push(`${bullet}${date} - ${contract}, ${borough}`)
+    })
+    lines.push('')
+  }
 
   if (missing.length) {
     lines.push(sectionRule)
     lines.push(`NOT INCLUDED — requested but not yet generated/approved (${missing.length})`)
     lines.push(sectionRule)
-    missing.forEach(m => {
-      lines.push(`  ${m.wo_id} — ${m.doc_type} — ${m.reason}`)
+    const sortedMissing = missing.slice().sort((a, b) =>
+      woCompare(a.wo_id, b.wo_id) || String(a.doc_type).localeCompare(String(b.doc_type))
+    )
+    sortedMissing.forEach(m => {
+      lines.push(`${bullet}${m.wo_id} — ${m.doc_type} — ${m.reason}`)
     })
     lines.push('')
   }

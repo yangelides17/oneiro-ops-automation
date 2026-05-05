@@ -1458,12 +1458,34 @@ function handleSetDocsSent_(body) {
 
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
 
+  // doc_type values from the listing handler / webapp use friendly names
+  // (CFR, Production Log, Sign-In, Certified Payroll, Invoice). The
+  // column maps DOC_TYPE_DONE_COL_ / DOC_TYPE_SENT_COL_ key on
+  // archiveDocument_'s internal names — only CFR ≠ Field Report.
+  // Without this translation, set_docs_sent silently skipped every
+  // CFR row (the helper logs "unknown doc_type" but the caller doesn't
+  // see it), so the batch download's mark-sent step did nothing for
+  // CFRs. Accept either friendly or internal here so manual flips
+  // (Phase 5) can use whichever is convenient.
+  const toInternal = {
+    'CFR':               'Field Report',
+    'Field Report':      'Field Report',
+    'Production Log':    'Production Log',
+    'Sign-In':           'Sign-In',
+    'Certified Payroll': 'Certified Payroll',
+    'Invoice':           'Invoice',
+  };
+
   // Group woIds by (doc_type, done?, sent?) so each unique flag combo
   // is one batch write call. Most calls will collapse to one bucket.
   const buckets = {};
   updates.forEach(u => {
-    const docType = String(u.doc_type || '').trim();
-    if (!docType) return;
+    const raw = String(u.doc_type || '').trim();
+    const docType = toInternal[raw];
+    if (!docType) {
+      Logger.log('⚠️ handleSetDocsSent_: skipping unknown doc_type "' + raw + '"');
+      return;
+    }
     const woId = String(u.wo_id || '').trim();
     if (!woId) return;
     const doneKey = (u.done === true) ? 'Y' : (u.done === false ? 'N' : '_');
@@ -7610,6 +7632,7 @@ function handleListDocumentsForBatch_(body) {
         contractor:   w.contractor,
         contract_num: w.contract_num,
         borough:      w.borough,
+        location:     w.location,
         doc_type:     'CFR',
         wo_ids:       [w.wo_id],
         work_date:    w.work_end,
@@ -7652,6 +7675,7 @@ function handleListDocumentsForBatch_(body) {
           contractor:   w.contractor,
           contract_num: w.contract_num,
           borough:      w.borough,
+          location:     w.location,
           doc_type:     'Invoice',
           wo_ids:       [w.wo_id],
           work_date:    w.work_end,
