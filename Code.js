@@ -7104,6 +7104,20 @@ function _buildDashboardPayload_() {
         const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
         if (folder) folderUrl = folder.getUrl();
       }
+      // Per-doc-type lifecycle flags. Reads come through the
+      // DOC_TYPE_DONE_COL_ / DOC_TYPE_SENT_COL_ maps so column
+      // positions stay abstracted. Returned as a nested `docs` object
+      // for the React DocStatusChips component; legacy flat keys
+      // (prod_log / field_report / invoice_sent) kept for back-compat
+      // with existing dashboard reads — drop in a follow-up.
+      const yes = (col) => String(r[col] || '').toLowerCase() === 'yes';
+      const docs = {
+        cfr:               { done: yes(DOC_TYPE_DONE_COL_['Field Report']),      sent: yes(DOC_TYPE_SENT_COL_['Field Report']) },
+        production_log:    { done: yes(DOC_TYPE_DONE_COL_['Production Log']),    sent: yes(DOC_TYPE_SENT_COL_['Production Log']) },
+        signin:            { done: yes(DOC_TYPE_DONE_COL_['Sign-In']),           sent: yes(DOC_TYPE_SENT_COL_['Sign-In']) },
+        certified_payroll: { done: yes(DOC_TYPE_DONE_COL_['Certified Payroll']), sent: yes(DOC_TYPE_SENT_COL_['Certified Payroll']) },
+        invoice:           { done: yes(DOC_TYPE_DONE_COL_['Invoice']),           sent: yes(DOC_TYPE_SENT_COL_['Invoice']) },
+      };
       return {
         id:                  woId,
         contractor:          String(r[1]),
@@ -7129,6 +7143,7 @@ function _buildDashboardPayload_() {
         paint:               String(r[21] || ''),
         issues:              String(r[22] || ''),
         photos:              String(r[23] || ''),
+        // Legacy flat keys — kept for one release, drop in follow-up.
         prod_log:            String(r[24] || ''),
         field_report:        String(r[25] || ''),
         invoice_sent:        String(r[29] || ''),
@@ -7136,6 +7151,7 @@ function _buildDashboardPayload_() {
         markings_total:      counts.total,
         markings_completed:  counts.completed,
         folder_url:          folderUrl,
+        docs,
       };
     });
 

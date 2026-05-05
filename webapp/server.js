@@ -1091,6 +1091,24 @@ app.post('/api/upload-signature', async (req, res) => {
 
 
 /**
+ * POST /api/documents/flags
+ * Manual Done/Sent toggles from the DocStatusChips component on the
+ * WO Tracker tab. Body matches set_docs_sent verbatim:
+ *   { updates: [{ wo_id, doc_type, done?, sent? }] }
+ * Apps Script accepts both friendly (CFR) and internal (Field Report)
+ * doc_type names and bumps the dashboard cache after writes.
+ */
+app.post('/api/documents/flags', async (req, res) => {
+  try {
+    const data = await callAppsScript('set_docs_sent', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/documents/flags error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/documents/list-batch
  * Returns metadata for documents matching the given filters — used by
  * the DownloadDocumentsModal's preview step before the user commits to

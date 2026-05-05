@@ -8,6 +8,7 @@ import { opToday } from '../lib/dateOps'
 import RevenueTab from './RevenueTab'
 import ProductionTab from './ProductionTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
+import DocStatusChips from '../components/DocStatusChips'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -345,7 +346,7 @@ function FilterBar({ label, options, value, onChange }) {
 }
 
 // ── WO Table row ──────────────────────────────────────────────
-function WORow({ wo, flagged }) {
+function WORow({ wo, flagged, onDocsChange }) {
   const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
     && wo.status.toLowerCase() !== 'completed'
 
@@ -408,6 +409,13 @@ function WORow({ wo, flagged }) {
             </span>
           </div>
         )}
+      </td>
+      <td className="py-2.5 px-3">
+        <DocStatusChips
+          woId={wo.id}
+          docs={wo.docs}
+          onChange={onDocsChange}
+        />
       </td>
       <td className="py-2.5 px-3">
         {wo.folder_url ? (
@@ -496,6 +504,55 @@ export default function Dashboard() {
   }
 
   useEffect(() => { load() }, [])
+
+  // Doc-flag toggle handler — used by the DocStatusChips popover on
+  // each WO row. Optimistically updates the WO's docs object in
+  // local state, fires the network call, returns true on success so
+  // the chip component can keep its optimistic update (or revert).
+  // The Apps Script set_docs_sent action accepts both 'CFR' and
+  // 'Field Report' as friendly names; we pass whichever the chip
+  // sends through.
+  const onDocsChange = async (woId, friendlyDocType, partial) => {
+    // Map friendly doc_type → docs object key for the local update.
+    const docKey = ({
+      'CFR':               'cfr',
+      'Field Report':      'cfr',
+      'Production Log':    'production_log',
+      'Sign-In':           'signin',
+      'Certified Payroll': 'certified_payroll',
+      'Invoice':           'invoice',
+    })[friendlyDocType]
+
+    if (docKey) {
+      setData(prev => {
+        if (!prev || !Array.isArray(prev.wos)) return prev
+        const next = {
+          ...prev,
+          wos: prev.wos.map(w => w.id === woId
+            ? { ...w, docs: { ...w.docs, [docKey]: { ...w.docs?.[docKey], ...partial } } }
+            : w
+          ),
+        }
+        return next
+      })
+    }
+    try {
+      const res = await fetch('/api/documents/flags', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ updates: [{ wo_id: woId, doc_type: friendlyDocType, ...partial }] }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok || body.error) {
+        console.warn('onDocsChange failed:', body.error || `HTTP ${res.status}`)
+        return false
+      }
+      return true
+    } catch (e) {
+      console.warn('onDocsChange threw:', e.message)
+      return false
+    }
+  }
 
   // "Completed Today" is a pseudo-status — the pill adds one extra
   // filter beyond the real WO Tracker statuses (Received / Dispatched /
@@ -661,6 +718,7 @@ export default function Dashboard() {
           boroughs={boroughs}
           filteredWOs={filteredWOs}
           completedTodayLabel={COMPLETED_TODAY}
+          onDocsChange={onDocsChange}
         />
       )}
 
@@ -687,6 +745,7 @@ function OperationsTabContent({
   contractors, boroughs,
   filteredWOs,
   completedTodayLabel,
+  onDocsChange,
 }) {
   return (
     <>
@@ -840,10 +899,10 @@ function OperationsTabContent({
 
         {/* Table — horizontally scrollable on mobile */}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[700px]">
+          <table className="w-full min-w-[820px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
-                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Drive'].map(h => (
+                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Drive'].map(h => (
                   <th
                     key={h}
                     className="py-2.5 px-3 text-left text-[10px] font-extrabold
@@ -857,7 +916,7 @@ function OperationsTabContent({
             <tbody>
               {filteredWOs.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="py-12 text-center text-slate-400 text-sm">
+                  <td colSpan={10} className="py-12 text-center text-slate-400 text-sm">
                     No work orders match your filters.
                   </td>
                 </tr>
@@ -867,6 +926,7 @@ function OperationsTabContent({
                     key={wo.id}
                     wo={wo}
                     flagged={attention.includes(wo.id)}
+                    onDocsChange={onDocsChange}
                   />
                 ))
               )}
