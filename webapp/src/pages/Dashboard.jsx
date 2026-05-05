@@ -1,10 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from 'recharts'
 import StatusBadge from '../components/StatusBadge'
 import { opToday } from '../lib/dateOps'
+import RevenueTab from './RevenueTab'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -427,7 +428,44 @@ function WORow({ wo, flagged }) {
 }
 
 // ── Main ──────────────────────────────────────────────────────
+const TABS = [
+  { id: 'operations', label: 'Operations' },
+  { id: 'revenue',    label: 'Revenue'    },
+]
+
+function TabStrip({ active, onChange }) {
+  return (
+    <div className="flex items-center gap-1 border-b border-slate-200">
+      {TABS.map(t => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          className={`text-sm font-semibold px-4 py-2 -mb-px border-b-2 transition-colors
+            ${active === t.id
+              ? 'border-navy text-navy'
+              : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export default function Dashboard() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  // Default tab is "operations" — anything other than the two known
+  // tab IDs collapses back to operations so a typo'd URL doesn't break.
+  const tabParam   = searchParams.get('tab')
+  const activeTab  = tabParam === 'revenue' ? 'revenue' : 'operations'
+  const setActiveTab = (id) => {
+    const next = new URLSearchParams(searchParams)
+    if (id === 'operations') next.delete('tab')
+    else next.set('tab', id)
+    setSearchParams(next, { replace: true })
+  }
+
   const [data,       setData]       = useState(null)
   const [loading,    setLoading]    = useState(true)
   const [error,      setError]      = useState(null)
@@ -555,8 +593,10 @@ export default function Dashboard() {
       {/* ── Page header ──────────────────────────────── */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-black text-navy leading-none">Operations Dashboard</h1>
-          {lastRefresh && (
+          <h1 className="text-2xl font-black text-navy leading-none">
+            {activeTab === 'revenue' ? 'Revenue Dashboard' : 'Operations Dashboard'}
+          </h1>
+          {activeTab === 'operations' && lastRefresh && (
             <p className="text-slate-400 text-xs mt-1">
               Updated {lastRefresh.toLocaleTimeString()}
             </p>
@@ -564,20 +604,67 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2">
           <ToolsMenu />
-          <button
-            onClick={load}
-            disabled={loading}
-            className="btn-ghost flex items-center gap-1.5"
-          >
-            <span className={loading ? 'animate-spin inline-block' : ''}>↻</span>
-            Refresh
-          </button>
+          {activeTab === 'operations' && (
+            <button
+              onClick={load}
+              disabled={loading}
+              className="btn-ghost flex items-center gap-1.5"
+            >
+              <span className={loading ? 'animate-spin inline-block' : ''}>↻</span>
+              Refresh
+            </button>
+          )}
           <Link to="/field-report" className="btn-primary text-sm px-4 py-2">
             + Field Report
           </Link>
         </div>
       </div>
 
+      {/* ── Tab strip ────────────────────────────────── */}
+      <TabStrip active={activeTab} onChange={setActiveTab} />
+
+      {activeTab === 'revenue' ? (
+        <RevenueTab />
+      ) : (
+        <OperationsTabContent
+          stats={stats}
+          attention={attention}
+          chartData={chartData}
+          data={data}
+          search={search}
+          setSearch={setSearch}
+          statusFilt={statusFilt}
+          setStatusFilt={setStatusFilt}
+          contFilt={contFilt}
+          setContFilt={setContFilt}
+          boroughFilt={boroughFilt}
+          setBoroughFilt={setBoroughFilt}
+          contractors={contractors}
+          boroughs={boroughs}
+          filteredWOs={filteredWOs}
+          completedTodayLabel={COMPLETED_TODAY}
+        />
+      )}
+    </div>
+  )
+}
+
+// ── Operations tab body ───────────────────────────────────────
+// Extracted from Dashboard's render so the Revenue tab can swap in
+// without re-rendering all the operations chrome. Pure presentation
+// — every piece of state still lives in Dashboard().
+function OperationsTabContent({
+  stats, attention, chartData, data,
+  search, setSearch,
+  statusFilt, setStatusFilt,
+  contFilt, setContFilt,
+  boroughFilt, setBoroughFilt,
+  contractors, boroughs,
+  filteredWOs,
+  completedTodayLabel,
+}) {
+  return (
+    <>
       {/* ── Stat cards ───────────────────────────────── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <StatCard
@@ -703,7 +790,7 @@ export default function Dashboard() {
           <div className="space-y-2">
             <FilterBar
               label="Status"
-              options={['Received', 'Dispatched', 'In Progress', 'Completed', COMPLETED_TODAY]}
+              options={['Received', 'Dispatched', 'In Progress', 'Completed', completedTodayLabel]}
               value={statusFilt}
               onChange={setStatusFilt}
             />
@@ -762,7 +849,6 @@ export default function Dashboard() {
           </table>
         </div>
       </div>
-
-    </div>
+    </>
   )
 }

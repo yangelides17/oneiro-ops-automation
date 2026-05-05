@@ -314,7 +314,7 @@ function setupMarkingItems() {
     // Page 2 — bike lane
     'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
     // MMA
-    'Bike Lane', 'Pedestrian Space', 'Bus Lane', 'Ped Stop',
+    'Bike Lane', 'Pedestrian Space', 'Bus Lane',
   ];
 
   // Column indices (1-based) for the 15-col schema:
@@ -397,6 +397,55 @@ function setupMarkingItems() {
   } catch (_) {
     // No UI context (e.g. running from script editor without active sheet) — skip alert.
   }
+}
+
+
+/**
+ * Idempotently creates the Contract Pricing sheet that the Revenue
+ * dashboard + future invoice generator both read from. Keyed on
+ * (Prime Contractor, Contract #, Borough) with an Effective Date
+ * column so contract amendments don't lose history.
+ *
+ * Schema (1-indexed cols):
+ *   A Prime Contractor   F 12" Line $/LF   (covers HVX Crosswalk + Stop Line —
+ *   B Contract #                            wording matches contractor expectations)
+ *   C Borough            G Preformed L&S $/Unit
+ *   D Effective Date     H Extruded L&S $/Unit
+ *   E 4" Line $/LF       I Color Surface $/SF
+ *                        J Notes
+ *
+ * Effective Date semantics: lookup picks the most recent row with
+ * Effective Date <= item's Date Completed. A blank Effective Date is
+ * treated as "effective forever" — only used when no dated row matches.
+ */
+function setupContractPricing() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let sheet = ss.getSheetByName('Contract Pricing');
+  const createdNew = !sheet;
+  if (createdNew) sheet = ss.insertSheet('Contract Pricing');
+
+  const headers = [
+    'Prime Contractor', 'Contract #', 'Borough', 'Effective Date',
+    '4" Line $/LF', '12" Line $/LF', 'Preformed L&S $/Unit',
+    'Extruded L&S $/Unit', 'Color Surface $/SF', 'Notes'
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  // Date validator on col D (Effective Date). Allow blank.
+  const dateRule = SpreadsheetApp.newDataValidation()
+    .requireDate()
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(2, 4, 999, 1).setDataValidation(dateRule);
+
+  // A2 is intentionally left blank for the user's first contract row;
+  // documenting the blank-date rule lives in the Notes col instead so
+  // it doesn't conflict with row data.
+  Logger.log(createdNew
+    ? '✅ Contract Pricing sheet created'
+    : '↻ Contract Pricing schema reconciled');
 }
 
 
@@ -1285,6 +1334,14 @@ function _processApprovedDocumentsImpl_() {
     }
   }
 
+  // Archiving updates "Prod Log Done" / "Field Report Done" flags on
+  // the WO Tracker (the dashboard surfaces these). Invalidate the
+  // dashboard cache so the next /api/dashboard rebuilds and reflects
+  // the new flag state instead of serving up to 60s of stale data.
+  if (archivedCount > 0) {
+    _invalidateCacheKeys_(['dashboard_v1']);
+  }
+
   return { archived: archivedCount, errored: erroredCount };
 }
 
@@ -1786,9 +1843,13 @@ function handleListMetroCompletedDocs_(body) {
 
 /** Get or create the WO-level subfolder: Archive/Contractor/Contract-Borough/WO#-Location */
 function getWOFolder_(archiveRoot, woId, ss) {
-  const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
-  const woRow = woData.find(r => r[0] === woId);
-  if (!woRow) return null;
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData  = woSheet.getDataRange().getValues();
+  // 0-based row index (in `woData`) of the matching WO; the actual
+  // sheet row is `idx + 1` because `woData` includes the header at [0].
+  const idx = woData.findIndex(r => r[0] === woId);
+  if (idx < 1) return null;
+  const woRow       = woData[idx];
   const contractor  = woRow[1] || 'General';
   const contractNum = String(woRow[2]).split('/')[0];
   const borough     = woRow[3];
@@ -1797,7 +1858,22 @@ function getWOFolder_(archiveRoot, woId, ss) {
     getOrCreateSubfolder_(archiveRoot, contractor),
     `${contractNum} - ${getBoroughName_(borough)}`
   );
-  return getOrCreateSubfolder_(contractFolder, `${woId} - ${location}`);
+  const woFolder = getOrCreateSubfolder_(contractFolder, `${woId} - ${location}`);
+
+  // Persist the URL on the WO row (col 43 / 0-idx 42) the first time
+  // we resolve it. Subsequent dashboard refreshes read it from the sheet
+  // instead of walking Drive — see handleGetDashboardData_. Wrapped in
+  // try/catch because URL persistence must never break archiving.
+  try {
+    if (!woRow[42]) {
+      ensureWoTrackerExtraCols_(woSheet);
+      woSheet.getRange(idx + 1, 43).setValue(woFolder.getUrl());
+    }
+  } catch (e) {
+    Logger.log('⚠️ getWOFolder_: failed to persist Archive Folder URL for ' + woId + ': ' + e.message);
+  }
+
+  return woFolder;
 }
 
 /**
@@ -2827,6 +2903,8 @@ function doPost(e) {
       return handleFinalizeFieldReportDocs_(body);
     } else if (action === 'get_dashboard_data') {
       return handleGetDashboardData_();
+    } else if (action === 'get_revenue_data') {
+      return handleGetRevenueData_(body);
     } else if (action === 'upload_photo') {
       return handleUploadPhoto_(body);
     } else if (action === 'upload_signature') {
@@ -3466,6 +3544,94 @@ function handleApproveSignInWithBytes_(body) {
   } catch (err) {
     return jsonResponse_({ error: String(err) }, 500);
   }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// SCRIPT CACHE HELPERS — used by dashboard + revenue endpoints
+// ═══════════════════════════════════════════════════════════════
+//
+// Apps Script CacheService gives us a 6-hour, 100KB-per-key, in-memory
+// cache shared across executions. The dashboard handler does heavy
+// per-request work (sheet reads + Drive walks for any WO whose
+// Archive Folder URL hasn't been backfilled yet); caching its JSON
+// payload for 60 seconds turns most refreshes into ~50ms hits.
+//
+// Cache invalidation: WO/Marking-Item mutators call
+// _invalidateCacheKeys_(['dashboard_v1']) after writing. That also
+// bumps a global token used by parameterized cache keys (revenue,
+// which keys per date range), so we don't have to enumerate variants.
+
+/**
+ * Wrap a producer function with CacheService. Returns the cached value
+ * on hit, runs `fn()` and caches the JSON-stringified result on miss.
+ * Falls through to `fn()` directly if the result exceeds the 100KB
+ * per-entry cap (logs a warning rather than throwing).
+ */
+function _withScriptCache_(key, ttlSec, fn) {
+  const cache = CacheService.getScriptCache();
+  try {
+    const hit = cache.get(key);
+    if (hit) {
+      try { return JSON.parse(hit); }
+      catch (e) { /* corrupt entry — fall through to recompute */ }
+    }
+  } catch (e) {
+    // CacheService can throw on rare backend failures — never let it
+    // break the calling handler.
+    Logger.log('⚠️ _withScriptCache_ get failed for ' + key + ': ' + e.message);
+  }
+
+  const value = fn();
+  try {
+    const payload = JSON.stringify(value);
+    if (payload.length <= 100 * 1024) {
+      cache.put(key, payload, ttlSec);
+    } else {
+      Logger.log('⚠️ _withScriptCache_ skip put for ' + key +
+                 ' (size=' + payload.length + ' bytes exceeds 100KB cap)');
+    }
+  } catch (e) {
+    Logger.log('⚠️ _withScriptCache_ put failed for ' + key + ': ' + e.message);
+  }
+  return value;
+}
+
+/**
+ * Invalidate the given cache keys AND bump the global cache token used
+ * by parameterized cache keys (revenue endpoint keys per date range).
+ * Bumping the token instead of enumerating variants means we never
+ * have to keep an exhaustive list of revenue cache keys to evict.
+ */
+function _invalidateCacheKeys_(keys) {
+  const cache = CacheService.getScriptCache();
+  try {
+    if (Array.isArray(keys) && keys.length) cache.removeAll(keys);
+  } catch (e) {
+    Logger.log('⚠️ _invalidateCacheKeys_ removeAll failed: ' + e.message);
+  }
+  try {
+    // Token is a monotonic value; any cached payload keyed with the
+    // previous token instantly becomes unreachable.
+    cache.put('cache_token', String(Date.now()), 21600);
+  } catch (e) {
+    Logger.log('⚠️ _invalidateCacheKeys_ token bump failed: ' + e.message);
+  }
+}
+
+/**
+ * Read the current cache token (used when constructing parameterized
+ * cache keys). Initializes lazily so the first reader doesn't see null.
+ */
+function _getCacheToken_() {
+  const cache = CacheService.getScriptCache();
+  let t = null;
+  try { t = cache.get('cache_token'); } catch (e) { /* fall through */ }
+  if (!t) {
+    t = String(Date.now());
+    try { cache.put('cache_token', t, 21600); } catch (e) { /* best effort */ }
+  }
+  return t;
 }
 
 
@@ -4282,6 +4448,7 @@ function handleWriteWO_(body) {
     actionNote
   ]);
 
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({ success: true, work_order_id: d.work_order_id });
 }
 
@@ -4403,13 +4570,16 @@ function retryArchiveStuckWO(woId) {
 
 /**
  * Idempotently ensures the WO Tracker has every extra column we've
- * added over time: the 3 CFR cols (Date Entered, School, Prep By) and
- * the 2 scan-tracking cols (Scan File ID, Combined Scan File ID).
+ * added over time: the 3 CFR cols (Date Entered, School, Prep By),
+ * the 3 scan-tracking cols, and the persisted Archive Folder URL
+ * that lets the dashboard skip per-WO Drive walks.
  * Safe to call on every scan intake — only writes headers that are
  * actually missing.
  *
  * Column layout (1-indexed): 36 = Date Entered, 37 = School,
- *   38 = Prep By, 39 = Scan File ID, 40 = Combined Scan File ID.
+ *   38 = Prep By, 39 = Scan File ID, 40 = Combined Scan File ID,
+ *   41 = Scan Upload Timestamp, 42 = Original Filename,
+ *   43 = Archive Folder URL.
  */
 function ensureWoTrackerExtraCols_(woSheet) {
   const EXTRA_HEADERS = [
@@ -4420,6 +4590,7 @@ function ensureWoTrackerExtraCols_(woSheet) {
     'Combined Scan File ID',   // col 40 / 0-idx 39
     'Scan Upload Timestamp',   // col 41 / 0-idx 40 — for "today's uploads" query
     'Original Filename',       // col 42 / 0-idx 41 — filename the user picked in the webapp
+    'Archive Folder URL',      // col 43 / 0-idx 42 — written once by getWOFolder_; read by dashboard
   ];
   const START_COL = 36;
   const N = EXTRA_HEADERS.length;
@@ -4438,6 +4609,46 @@ function ensureWoTrackerExtraCols_(woSheet) {
  * Keep both names live so we don't break any callers during rollout.
  */
 function ensureWoTrackerCFRCols_(woSheet) { return ensureWoTrackerExtraCols_(woSheet); }
+
+/**
+ * One-time backfill: walks Drive (read-only, via findWOFolder_) to
+ * populate WO Tracker col 43 (Archive Folder URL) for any row where
+ * it's currently empty. Run once from the Apps Script editor after
+ * deploying the col-43 schema change. Subsequent archiving for new
+ * WOs writes the URL inline in getWOFolder_.
+ */
+function backfillArchiveFolderUrls_() {
+  const ss        = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet   = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerExtraCols_(woSheet);
+
+  const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
+  if (!archiveId) {
+    Logger.log('❌ backfillArchiveFolderUrls_: ARCHIVE_ID property not set');
+    return;
+  }
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+
+  const data = woSheet.getDataRange().getValues();
+  let filled  = 0;
+  let missing = 0;
+  let already = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row  = data[i];
+    const woId = String(row[0] || '').trim();
+    if (!woId) continue;
+    if (row[42]) { already++; continue; }
+    const folder = findWOFolder_(archiveRoot, woId, ss, data);
+    if (folder) {
+      woSheet.getRange(i + 1, 43).setValue(folder.getUrl());
+      filled++;
+    } else {
+      missing++;
+    }
+  }
+  Logger.log('✅ backfillArchiveFolderUrls_: filled=' + filled +
+             ', missing=' + missing + ', alreadyHad=' + already);
+}
 
 
 /**
@@ -4539,6 +4750,7 @@ function handleSetWaterblastConfirmed_(body) {
     ]);
   }
 
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({
     success: true,
     wo_id: woId,
@@ -4745,13 +4957,289 @@ const CATEGORY_UNITS_ = {
   'Shark Teeth 24x36':   'EA',
   'Bike Lane Arrow':     'EA',
   'Bike Lane Symbol':    'EA',
-  'Bike Lane Green Bar': 'EA',
-  'Ped Stop':            'EA',
+  'Bike Lane Green Bar': 'SF',
   // "Others" is intentionally variable (user picks).
 };
 
 function unitForCategory_(category) {
   return CATEGORY_UNITS_[String(category || '').trim()] || '';
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// PRICING ENGINE — Marking Type → revenue
+// ═══════════════════════════════════════════════════════════════
+//
+// Lookup tables here are the single source of truth for pricing
+// math. Mirror the SAME data (without the helpers) in
+// webapp/src/lib/pricing.js so the React side can reference group
+// names, unit counts, etc. for display purposes — but actual revenue
+// math always runs server-side off these tables.
+//
+// Pricing groups:
+//   line4         — base $/LF rate; multiplied by LINE_WIDTH_MULTIPLIER
+//                   for non-4" widths and double-yellow.
+//   line12        — flat $/LF; reserved for HVX Crosswalk + Stop Line
+//                   (typically a bulk-discounted rate).
+//   preformed     — $/Unit × PREFORMED_UNIT_COUNT (preformed thermo).
+//   extruded      — $/Unit × EXTRUDED_UNIT_COUNT (standard contractor
+//                   unit-count table — same across all contractors).
+//   color_surface — flat $/SF for green/red surface treatments.
+//   unpriced      — categories that always require manual pricing
+//                   (Custom Msg, Others, parent categories like
+//                   "Messages"/"Arrows" that should never carry a
+//                   quantity in the first place).
+
+const PRICING_GROUP_BY_CATEGORY_ = Object.freeze({
+  // line4 (multiplied by width ratio)
+  '4" Line':            'line4',
+  '6" Line':            'line4',
+  '8" Line':            'line4',
+  '12" Line':           'line4',
+  '16" Line':           'line4',
+  '24" Line':           'line4',
+  'Lane Lines':         'line4',
+  'Double Yellow Line': 'line4',
+
+  // line12 (Crosswalk + Stop Line bulk rate)
+  'HVX Crosswalk':      'line12',
+  'Stop Line':          'line12',
+
+  // preformed thermoplastic
+  'Bike Lane Symbol':   'preformed',
+
+  // extruded thermoplastic — priced by unit count
+  'Stop Msg':            'extruded',
+  'Only Msg':            'extruded',
+  'Bus Msg':             'extruded',
+  'Bump Msg':            'extruded',
+  '20 MPH Msg':          'extruded',
+  'Railroad (RR)':       'extruded',
+  'Railroad (X)':        'extruded',
+  'L/R Arrow':           'extruded',
+  'Straight Arrow':      'extruded',
+  'Combination Arrow':   'extruded',
+  'Speed Hump Markings': 'extruded',
+  'Shark Teeth 12x18':   'extruded',
+  'Shark Teeth 24x36':   'extruded',
+  'Bike Lane Arrow':     'extruded',
+
+  // color surface treatment ($/SF)
+  'Bike Lane':           'color_surface',
+  'Bus Lane':            'color_surface',
+  'Pedestrian Space':    'color_surface',
+  'Bike Lane Green Bar': 'color_surface',
+
+  // always unpriced — flagged in Needs Pricing bucket
+  'Custom Msg':          'unpriced',
+  'Others':              'unpriced',
+  'Solid Lines':         'unpriced',
+  'Gores':               'unpriced',
+  'Messages':            'unpriced',
+  'Arrows':              'unpriced',
+  'Rail Road X/Diamond': 'unpriced',
+});
+
+// Standard width ratios — line width / 4. Set in stone across
+// contractors per the user's pricing convention.
+const LINE_WIDTH_MULTIPLIER_ = Object.freeze({
+  '4" Line':            1.0,
+  '6" Line':            1.5,
+  '8" Line':            2.0,
+  '12" Line':           3.0,
+  '16" Line':           4.0,
+  '24" Line':           6.0,
+  'Lane Lines':         1.0,
+  'Double Yellow Line': 2.0,
+});
+
+// Standard NYC DOT thermo unit table. `null` = unit count not yet
+// known — items will surface in the Needs Pricing bucket with
+// reason='no_unit_count' until the table arrives. Stop Msg is the
+// only confirmed value as of 2026-05-04.
+const EXTRUDED_UNIT_COUNT_ = Object.freeze({
+  'Stop Msg':            1.35,
+  'Only Msg':            null,
+  'Bus Msg':             null,
+  'Bump Msg':            null,
+  '20 MPH Msg':          null,
+  'Railroad (RR)':       null,
+  'Railroad (X)':        null,
+  'L/R Arrow':           null,
+  'Straight Arrow':      null,
+  'Combination Arrow':   null,
+  'Speed Hump Markings': null,
+  'Shark Teeth 12x18':   null,
+  'Shark Teeth 24x36':   null,
+  'Bike Lane Arrow':     null,
+});
+
+const PREFORMED_UNIT_COUNT_ = Object.freeze({
+  'Bike Lane Symbol': 1.0,
+});
+
+/**
+ * Read the Contract Pricing sheet once and return parsed rate rows.
+ * Each row has its rate fields coerced to Numbers (or null when blank
+ * — distinguishes "no rate set" from "rate set to 0"). Effective Date
+ * is normalized to a Date instance or null.
+ */
+function _loadContractPricing_(ss) {
+  const sheet = ss.getSheetByName('Contract Pricing');
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const contractor  = String(r[0] || '').trim();
+    const contractNum = String(r[1] || '').trim();
+    const borough     = String(r[2] || '').trim();
+    if (!contractor || !contractNum || !borough) continue;
+    const effRaw = r[3];
+    let effDate = null;
+    if (effRaw instanceof Date && !isNaN(effRaw.getTime())) effDate = effRaw;
+    else if (typeof effRaw === 'string' && effRaw.trim()) {
+      const d = new Date(effRaw);
+      if (!isNaN(d.getTime())) effDate = d;
+    }
+    const num = (v) => {
+      if (v === '' || v == null) return null;
+      const n = Number(v);
+      return isNaN(n) ? null : n;
+    };
+    rows.push({
+      contractor,
+      contract_num: contractNum.split('/')[0].trim(),
+      borough,
+      effective_date: effDate,
+      rates: {
+        line4:         num(r[4]),
+        line12:        num(r[5]),
+        preformed:     num(r[6]),
+        extruded:      num(r[7]),
+        color_surface: num(r[8]),
+      },
+      notes: String(r[9] || '').trim(),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Pick the rate row that applies to a given (contractor, contract,
+ * borough) on the supplied date. Dated rows beat blank-date rows when
+ * both could match. Returns null when nothing applies — caller should
+ * surface a `no_rate` reason in that case.
+ */
+function _resolveRateRow_(rates, contractor, contractNum, borough, dateIso) {
+  if (!Array.isArray(rates) || rates.length === 0) return null;
+  const cn = String(contractNum || '').split('/')[0].trim();
+  const itemDate = (() => {
+    if (!dateIso) return null;
+    const d = new Date(dateIso);
+    return isNaN(d.getTime()) ? null : d;
+  })();
+
+  const candidates = rates.filter(r =>
+    r.contractor === contractor &&
+    r.contract_num === cn &&
+    r.borough === borough
+  );
+  if (candidates.length === 0) return null;
+
+  // Dated candidates whose Effective Date <= item date.
+  const dated = candidates.filter(r => r.effective_date != null);
+  const datedApplicable = (itemDate
+    ? dated.filter(r => r.effective_date.getTime() <= itemDate.getTime())
+    : dated.slice()
+  ).sort((a, b) => b.effective_date.getTime() - a.effective_date.getTime());
+  if (datedApplicable.length > 0) return datedApplicable[0];
+
+  // Fall back to a blank-date row (effective forever).
+  const blank = candidates.find(r => r.effective_date == null);
+  return blank || null;
+}
+
+/**
+ * Compute revenue for one Marking Item. Returns
+ *   { revenue: <number>, group: <string>, reason: <string|null> }
+ *
+ * `reason` semantics (precedence):
+ *   'unit_migration'    — Bike Lane Green Bar entered as EA (legacy);
+ *                         needs manual re-entry as SF before pricing.
+ *   'unpriced_category' — category is in the always-manual bucket
+ *                         (Custom Msg / Others / parent categories).
+ *   'no_rate'           — no Contract Pricing row matches.
+ *   'no_unit_count'     — extruded category whose unit count isn't
+ *                         in the table yet.
+ *   null                — priced cleanly. revenue is the dollar value.
+ *
+ * `item` shape: { category, quantity, unit, ... } from Marking Items.
+ * `woMeta` shape: { contractor, contract_num, borough }.
+ */
+function priceMarkingItem_(item, woMeta, rates) {
+  const cat = String(item.category || '').trim();
+  const qty = Number(item.quantity);
+  if (!cat || isNaN(qty) || qty <= 0) {
+    return { revenue: 0, group: 'unpriced', reason: 'unpriced_category' };
+  }
+
+  // Bike Lane Green Bar legacy unit migration: anything still entered
+  // as EA can't be priced as a $/SF surface treatment. Flag it instead
+  // of producing a wrong number.
+  if (cat === 'Bike Lane Green Bar' && String(item.unit || '').toUpperCase() === 'EA') {
+    return { revenue: 0, group: 'color_surface', reason: 'unit_migration' };
+  }
+
+  const group = PRICING_GROUP_BY_CATEGORY_[cat] || 'unpriced';
+  if (group === 'unpriced') {
+    return { revenue: 0, group, reason: 'unpriced_category' };
+  }
+
+  const rateRow = _resolveRateRow_(
+    rates,
+    woMeta.contractor,
+    woMeta.contract_num,
+    woMeta.borough,
+    item.date_completed
+  );
+  if (!rateRow) return { revenue: 0, group, reason: 'no_rate' };
+
+  switch (group) {
+    case 'line4': {
+      const base = rateRow.rates.line4;
+      if (base == null) return { revenue: 0, group, reason: 'no_rate' };
+      const mult = LINE_WIDTH_MULTIPLIER_[cat];
+      if (mult == null) return { revenue: 0, group, reason: 'no_unit_count' };
+      return { revenue: qty * base * mult, group, reason: null };
+    }
+    case 'line12': {
+      const base = rateRow.rates.line12;
+      if (base == null) return { revenue: 0, group, reason: 'no_rate' };
+      return { revenue: qty * base, group, reason: null };
+    }
+    case 'preformed': {
+      const base  = rateRow.rates.preformed;
+      const units = PREFORMED_UNIT_COUNT_[cat];
+      if (base == null) return { revenue: 0, group, reason: 'no_rate' };
+      if (units == null) return { revenue: 0, group, reason: 'no_unit_count' };
+      return { revenue: qty * base * units, group, reason: null };
+    }
+    case 'extruded': {
+      const base  = rateRow.rates.extruded;
+      const units = EXTRUDED_UNIT_COUNT_[cat];
+      if (base == null) return { revenue: 0, group, reason: 'no_rate' };
+      if (units == null) return { revenue: 0, group, reason: 'no_unit_count' };
+      return { revenue: qty * base * units, group, reason: null };
+    }
+    case 'color_surface': {
+      const base = rateRow.rates.color_surface;
+      if (base == null) return { revenue: 0, group, reason: 'no_rate' };
+      return { revenue: qty * base, group, reason: null };
+    }
+    default:
+      return { revenue: 0, group: 'unpriced', reason: 'unpriced_category' };
+  }
 }
 
 
@@ -5276,6 +5764,7 @@ function handleCreateMarkingItem_(body) {
   SpreadsheetApp.flush();
 
   const item = readMarkingItemById_(sheet, newId);
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({ item });
 }
 
@@ -5400,6 +5889,7 @@ function handleUpdateMarkingItem_(body) {
 
   SpreadsheetApp.flush();
   const item = readMarkingItemById_(sheet, itemId);
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({ item });
 }
 
@@ -5440,6 +5930,7 @@ function handleDeleteMarkingItems_(body) {
   rowNums.forEach(r => sheet.deleteRow(r));
   SpreadsheetApp.flush();
 
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({ deleted });
 }
 
@@ -5815,6 +6306,7 @@ function handleSubmitFieldReport_(body) {
     'Automation Log'
   );
 
+  _invalidateCacheKeys_(['dashboard_v1']);
   return jsonResponse_({ success: true, wo_id: d.wo_id, status: newStatus });
 
   } catch (err) {
@@ -6146,8 +6638,18 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
 /**
  * Returns all WO Tracker rows + summary stats for the React dashboard.
  * Called by the Express backend (/api/dashboard) which proxies here.
+ *
+ * Wrapped in _withScriptCache_ (60s TTL) — full rebuild reads two
+ * sheets and only walks Drive for WOs whose Archive Folder URL hasn't
+ * been backfilled yet. Mutating handlers call _invalidateCacheKeys_
+ * to bust the cache on writes.
  */
 function handleGetDashboardData_() {
+  const payload = _withScriptCache_('dashboard_v1', 60, _buildDashboardPayload_);
+  return jsonResponse_(payload);
+}
+
+function _buildDashboardPayload_() {
   const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
   const allRows = woSheet.getDataRange().getValues();
@@ -6167,9 +6669,12 @@ function handleGetDashboardData_() {
     });
   }
 
-  // ── Drive folder URLs: resolve once per WO via the read-only lookup.
-  // findWOFolder_ caches the WO Tracker rows so we don't re-fetch the
-  // sheet for each call.
+  // ── Drive folder URLs: prefer the persisted Archive Folder URL on
+  // col 43; fall back to a read-only Drive walk only when the cell is
+  // empty (newly-created WOs that haven't archived a doc yet, or
+  // pre-backfill rows). The walk path is the ~150ms-per-WO cost we're
+  // designing this whole change to avoid; getWOFolder_ writes the URL
+  // back the first time it's resolved so subsequent refreshes stay fast.
   const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
   const archiveRoot = archiveId ? DriveApp.getFolderById(archiveId) : null;
 
@@ -6188,8 +6693,8 @@ function handleGetDashboardData_() {
       const workType  = String(r[10] || '');
       const isMMA     = workType.toUpperCase() === 'MMA';
       const counts    = miCounts[woId] || { total: 0, completed: 0 };
-      let folderUrl = null;
-      if (archiveRoot) {
+      let folderUrl = String(r[42] || '').trim() || null;
+      if (!folderUrl && archiveRoot) {
         const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
         if (folder) folderUrl = folder.getUrl();
       }
@@ -6255,7 +6760,192 @@ function handleGetDashboardData_() {
     )
   ).map(w => w.id);
 
-  return jsonResponse_({ wos, stats, byContractor, attention });
+  return { wos, stats, byContractor, attention };
+}
+
+
+// ── action: get_revenue_data ──────────────────────────────────
+
+/**
+ * Aggregates priced Marking Items into the Revenue dashboard payload.
+ * Body:
+ *   { start: 'YYYY-MM-DD', end: 'YYYY-MM-DD' }   // both inclusive
+ *
+ * Cache key folds in the rotating cache_token, so any WO/Marking-Item
+ * mutation that calls _invalidateCacheKeys_ instantly invalidates
+ * every revenue cache variant — no need to enumerate date-range keys.
+ */
+function handleGetRevenueData_(body) {
+  const d = body.data || {};
+  const start = String(d.start || '').trim();
+  const end   = String(d.end   || '').trim();
+  // Default to month-to-date when called without an explicit range.
+  const today = new Date();
+  const ymd   = (dt) => Utilities.formatDate(dt, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const startEff = /^\d{4}-\d{2}-\d{2}$/.test(start)
+    ? start
+    : ymd(new Date(today.getFullYear(), today.getMonth(), 1));
+  const endEff = /^\d{4}-\d{2}-\d{2}$/.test(end) ? end : ymd(today);
+
+  const token = _getCacheToken_();
+  const key   = 'revenue_v1_' + token + '_' + startEff + '_' + endEff;
+  const payload = _withScriptCache_(key, 60, () =>
+    _buildRevenuePayload_(startEff, endEff)
+  );
+  return jsonResponse_(payload);
+}
+
+function _buildRevenuePayload_(startIso, endIso) {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const miSheet = ss.getSheetByName('Marking Items');
+  if (!woSheet || !miSheet) {
+    return {
+      range: { start: startIso, end: endIso },
+      totals: { revenue: 0, items: 0, unpriced_items: 0 },
+      daily: [], by_contractor: [], by_group: [], top_wos: [], needs_pricing: [],
+    };
+  }
+
+  // ── WO metadata index (woId → { contractor, contract_num, borough, location })
+  const woRows = woSheet.getDataRange().getValues();
+  const woById = {};
+  for (let i = 1; i < woRows.length; i++) {
+    const id = String(woRows[i][0] || '').trim();
+    if (!id) continue;
+    woById[id] = {
+      contractor:   String(woRows[i][1] || '').trim(),
+      contract_num: String(woRows[i][2] || '').split('/')[0].trim(),
+      borough:      String(woRows[i][3] || '').trim(),
+      location:     String(woRows[i][5] || '').trim(),
+    };
+  }
+
+  const rates = _loadContractPricing_(ss);
+
+  // Format any Date / string Date Completed cell to YYYY-MM-DD in local tz.
+  const fmt = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    if (!v) return '';
+    const m = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+
+  // ── Walk Marking Items, score each completed-in-range row.
+  const miData = miSheet.getDataRange().getValues();
+  const allGroups = ['line4', 'line12', 'preformed', 'extruded', 'color_surface'];
+
+  const dailyMap        = {};   // dateIso → { revenue, by_group: { ... } }
+  const contractorMap   = {};   // contractor → { revenue, items }
+  const groupMap        = {};   // group → { revenue, items }
+  const woMap           = {};   // woId → { contractor, location, revenue, items }
+  const needsPricing    = [];
+
+  let totalRevenue   = 0;
+  let totalItems     = 0;
+  let unpricedCount  = 0;
+
+  for (let i = 1; i < miData.length; i++) {
+    const r = miData[i];
+    const status = String(r[12] || '').toLowerCase();
+    if (status !== 'completed') continue;
+    const dateIso = fmt(r[11]);
+    if (!dateIso || dateIso < startIso || dateIso > endIso) continue;
+
+    const woId = String(r[1] || '').trim();
+    const meta = woById[woId];
+    if (!meta) continue;   // orphaned item — skip silently
+
+    const item = {
+      item_id:        String(r[0] || '').trim(),
+      category:       String(r[4] || '').trim(),
+      quantity:       r[8],
+      unit:           String(r[9] || '').trim(),
+      date_completed: dateIso,
+    };
+
+    const result = priceMarkingItem_(item, meta, rates);
+    totalItems += 1;
+
+    if (result.reason !== null) {
+      unpricedCount += 1;
+      needsPricing.push({
+        wo_id:    woId,
+        item_id:  item.item_id,
+        category: item.category,
+        qty:      Number(item.quantity) || 0,
+        unit:     item.unit,
+        reason:   result.reason,
+      });
+      continue;
+    }
+
+    const rev = Number(result.revenue) || 0;
+    totalRevenue += rev;
+
+    // daily
+    let day = dailyMap[dateIso];
+    if (!day) {
+      day = { date: dateIso, revenue: 0, by_group: {} };
+      allGroups.forEach(g => { day.by_group[g] = 0; });
+      dailyMap[dateIso] = day;
+    }
+    day.revenue += rev;
+    day.by_group[result.group] = (day.by_group[result.group] || 0) + rev;
+
+    // contractor
+    const cKey = meta.contractor || 'Unknown';
+    let cBucket = contractorMap[cKey];
+    if (!cBucket) cBucket = contractorMap[cKey] = { contractor: cKey, revenue: 0, items: 0 };
+    cBucket.revenue += rev;
+    cBucket.items   += 1;
+
+    // group
+    let gBucket = groupMap[result.group];
+    if (!gBucket) gBucket = groupMap[result.group] = { group: result.group, revenue: 0, items: 0 };
+    gBucket.revenue += rev;
+    gBucket.items   += 1;
+
+    // wo
+    let wBucket = woMap[woId];
+    if (!wBucket) {
+      wBucket = woMap[woId] = {
+        wo_id:      woId,
+        contractor: meta.contractor,
+        location:   meta.location,
+        revenue:    0,
+        items:      0,
+      };
+    }
+    wBucket.revenue += rev;
+    wBucket.items   += 1;
+  }
+
+  const daily = Object.keys(dailyMap).sort().map(k => dailyMap[k]);
+  const byContractor = Object.keys(contractorMap)
+    .map(k => contractorMap[k])
+    .sort((a, b) => b.revenue - a.revenue);
+  const byGroup = allGroups.map(g => groupMap[g] || { group: g, revenue: 0, items: 0 });
+  const topWos = Object.keys(woMap)
+    .map(k => woMap[k])
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 25);
+
+  return {
+    range: { start: startIso, end: endIso },
+    totals: {
+      revenue:        totalRevenue,
+      items:          totalItems,
+      unpriced_items: unpricedCount,
+    },
+    daily,
+    by_contractor: byContractor,
+    by_group:      byGroup,
+    top_wos:       topWos,
+    needs_pricing: needsPricing,
+  };
 }
 
 

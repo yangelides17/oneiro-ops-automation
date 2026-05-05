@@ -23,8 +23,6 @@ export const MARKING_CATEGORIES = [
   'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
   // MMA
   'Bike Lane', 'Pedestrian Space', 'Bus Lane',
-  // Thermo, count-based
-  'Ped Stop',
 ]
 
 // Categories rendered with the grid layout: Type | Intersection | Direction | Qty | Unit
@@ -32,7 +30,6 @@ export const GRID_CATEGORIES = new Set(['HVX Crosswalk', 'Stop Msg', 'Stop Line'
 
 // Categories rendered with the MMA layout: Type | Color/Material | Qty | Unit
 // (and require a Color/Material value to be considered Completable).
-// Ped Stop is intentionally Thermo — count markings, no color field.
 export const MMA_CATEGORIES = new Set(['Bike Lane', 'Bus Lane', 'Pedestrian Space'])
 
 // Fixed unit per Marking Type. Categories omitted from the map are
@@ -78,8 +75,7 @@ export const CATEGORY_UNITS = {
   'Shark Teeth 24x36':   'EA',
   'Bike Lane Arrow':     'EA',
   'Bike Lane Symbol':    'EA',
-  'Bike Lane Green Bar': 'EA',
-  'Ped Stop':            'EA',
+  'Bike Lane Green Bar': 'SF',
 
   // "Others" is intentionally absent — variable unit.
 }

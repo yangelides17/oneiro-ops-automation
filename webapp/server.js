@@ -124,6 +124,25 @@ app.get('/api/dashboard', async (_req, res) => {
 })
 
 /**
+ * GET /api/revenue?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * Returns aggregated revenue for the Revenue dashboard tab. Both
+ * dates inclusive; either can be omitted (server defaults to MTD).
+ */
+app.get('/api/revenue', async (req, res) => {
+  try {
+    const { start, end } = req.query
+    const data = await callAppsScript('get_revenue_data', {
+      start: start ? String(start) : '',
+      end:   end   ? String(end)   : '',
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/revenue error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/wo-markings/:woId
  * Returns the Marking Items rows pre-populated for this WO (from the
  * scan) plus any completions that have already been written. The Field
