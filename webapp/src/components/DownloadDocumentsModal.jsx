@@ -45,11 +45,11 @@ const fmtBytes = (n) => {
 export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   const [step,    setStep]    = useState(1)
   const [mode,    setMode]    = useState('unsent')
-  // Filters — Unsent defaults to "nothing selected" so the admin
-  // explicitly picks what they're chasing down. WO Numbers and Date
-  // Range default to "everything" so picking those modes pulls all
-  // doc types for the chosen WOs/dates without extra clicks. The
-  // useEffect below resets selections when mode changes.
+  // Filters always start empty across every mode — the admin
+  // explicitly picks what's in the batch. Step 2 disables the
+  // "Preview" button until at least one contractor and one doc type
+  // is checked, so empty defaults can't accidentally fan out to a
+  // huge zip.
   const [selectedContractors, setSelectedContractors] = useState([])
   const [selectedDocTypes,    setSelectedDocTypes]    = useState([])
   const [woInput,             setWoInput]             = useState('')
@@ -77,18 +77,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
 
-  // Apply the per-mode default whenever mode changes (or the
-  // contractors prop arrives from the parent fetch). Unsent =
-  // explicit picking; other modes = pre-checked everything.
+  // Reset filters to empty whenever the mode changes — keeps the
+  // selections explicit per batch instead of carrying over from a
+  // prior mode the admin may have abandoned.
   useEffect(() => {
-    if (mode === 'unsent') {
-      setSelectedContractors([])
-      setSelectedDocTypes([])
-    } else {
-      setSelectedContractors(contractors.slice())
-      setSelectedDocTypes(DOC_TYPES.slice())
-    }
-  }, [mode, contractors.length])
+    setSelectedContractors([])
+    setSelectedDocTypes([])
+  }, [mode])
 
   // ── Filter payload built from current state ───────────────────
   const filters = useMemo(() => {
