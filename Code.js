@@ -1257,36 +1257,16 @@ function _processApprovedDocumentsImpl_() {
       }
     }
     
-    // Look up who to send this to
-    const recipients = getRecipientsForDoc_(docType, woId, ss);
-    
-    if (recipients.length > 0) {
-      // Email the document
-      const blob = file.getBlob();
-      recipients.forEach(recipient => {
-        MailApp.sendEmail({
-          to: recipient.email,
-          subject: `Oneiro Collection — ${docType}: ${woId || fileName}`,
-          htmlBody: `
-            <p>Hi ${recipient.name},</p>
-            <p>Please find attached the ${docType.toLowerCase()} ${woId ? 'for ' + woId : ''} from Oneiro Collection LLC.</p>
-            <p>Best regards,<br>Oneiro Operations</p>
-          `,
-          attachments: [blob]
-        });
-      });
-      
-      Logger.log(`📨 Sent ${docType} to ${recipients.map(r => r.email).join(', ')}`);
-    }
-    
+    // Per-doc emailing has been retired in favor of the batch
+    // Download Documents flow on the dashboard. The cron is now a
+    // pure archival pipeline. getRecipientsForDoc_ stays in the file
+    // for future automation iterations but is no longer called here.
+    //
     // Archive the file.  archiveDocument_ never throws — it returns a
     // result so we can branch on failure and preserve the file rather
     // than trashing it into the void.
     const archiveResult = archiveDocument_(file, docType, woId, ss);
 
-    const recipientList = recipients.length > 0
-      ? recipients.map(r => `${r.name} <${r.email}>`).join('; ')
-      : 'No recipients (archive only)';
     const logSheet = ss.getSheetByName('Automation Log');
 
     if (archiveResult.success) {
@@ -1296,10 +1276,16 @@ function _processApprovedDocumentsImpl_() {
           ? `Archived to WO folder: ${woId}`
           : `Archived (doc type: ${docType})`;
 
+      // Flip the matching Done? flag(s) on the WO Tracker. archiveDocument_
+      // returns the doc_type and the list of WOs the archive operation
+      // covered (multiple for Production Log / Sign-In / CP, one for
+      // CFR / Invoice). The helper is a no-op for unknown doc types.
+      _setDocLifecycleFlags_(ss, archiveResult.wo_ids || [], archiveResult.doc_type, { done: true });
+
       logSheet.appendRow([
         new Date(), 'Approve & Send', 'File moved to Approved Docs folder',
         fileName,
-        `Emailed to: ${recipientList} | ${archiveNote}`,
+        `${archiveNote} | Done flag set on ${(archiveResult.wo_ids || []).length} WO(s) — Sent flag is set on batch download`,
         'Completed', '', 'No'
       ]);
 
@@ -1327,17 +1313,17 @@ function _processApprovedDocumentsImpl_() {
       logSheet.appendRow([
         new Date(), 'Approve & Send', 'Archive failed — moved to Archive Errors',
         fileName,
-        `Reason: ${archiveResult.reason} | Emailed to: ${recipientList}`,
+        `Reason: ${archiveResult.reason}`,
         'Error', '', 'Yes'
       ]);
       erroredCount += 1;
     }
   }
 
-  // Archiving updates "Prod Log Done" / "Field Report Done" flags on
-  // the WO Tracker (the dashboard surfaces these). Invalidate the
-  // dashboard cache so the next /api/dashboard rebuilds and reflects
-  // the new flag state instead of serving up to 60s of stale data.
+  // Archive flips Done flags on the WO Tracker (the dashboard surfaces
+  // these). Invalidate the dashboard cache so the next /api/dashboard
+  // rebuilds and reflects the new flag state instead of serving up to
+  // 60s of stale data.
   if (archivedCount > 0) {
     _invalidateCacheKeys_(['dashboard_v1']);
   }
@@ -1384,6 +1370,122 @@ function getRecipientsForDoc_(docType, woId, ss) {
   return recipients;
 }
 
+// ── Doc lifecycle column maps ─────────────────────────────────
+// Single source of truth for which WO Tracker column tracks each
+// doc type's Done/Sent state. Used by _setDocLifecycleFlags_ +
+// list_documents_for_batch + set_docs_sent.
+//
+// Doc-type strings match the values archiveDocument_ returns.
+// 0-idx column numbers (sheet col = idx+1).
+const DOC_TYPE_DONE_COL_ = Object.freeze({
+  'Field Report':      25,   // existing — Field Report Done?
+  'Production Log':    24,   // existing — Production Log Done?
+  'Sign-In':           46,   // new
+  'Certified Payroll': 48,   // new
+  'Invoice':           50,   // new
+});
+const DOC_TYPE_SENT_COL_ = Object.freeze({
+  'Field Report':      44,   // new — CFR Sent?
+  'Production Log':    45,   // new — Prod Log Sent?
+  'Sign-In':           47,   // new
+  'Certified Payroll': 49,   // new
+  'Invoice':           29,   // existing — Invoice Sent?
+});
+
+/**
+ * Bulk-flip Done? and/or Sent? flags on the WO Tracker for a list of
+ * WO ids and one doc type. `flags` is `{done?: boolean, sent?: boolean}`;
+ * pass true to write 'Yes', false to write 'No', omit to leave alone.
+ *
+ * Idempotent. Doesn't read the row first — just writes. Safe to call
+ * with an empty woIds array (no-op).
+ *
+ * Single sheet read of all rows up front so we can map woId → row
+ * number once without N round-trips.
+ */
+function _setDocLifecycleFlags_(ss, woIds, docType, flags) {
+  if (!Array.isArray(woIds) || woIds.length === 0) return;
+  if (!flags || (flags.done == null && flags.sent == null)) return;
+
+  const doneCol = DOC_TYPE_DONE_COL_[docType];
+  const sentCol = DOC_TYPE_SENT_COL_[docType];
+  if (doneCol == null && sentCol == null) {
+    Logger.log('⚠️ _setDocLifecycleFlags_: unknown doc_type "' + docType + '" — skipping');
+    return;
+  }
+
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) return;
+  ensureWoTrackerExtraCols_(woSheet);
+
+  const data = woSheet.getDataRange().getValues();
+  const rowByWoId = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][0] || '').trim();
+    if (id) rowByWoId[id] = i + 1;   // 1-indexed sheet row
+  }
+
+  const doneVal = flags.done == null ? null : (flags.done ? 'Yes' : 'No');
+  const sentVal = flags.sent == null ? null : (flags.sent ? 'Yes' : 'No');
+
+  woIds.forEach(woId => {
+    const row = rowByWoId[String(woId).trim()];
+    if (!row) return;
+    if (doneVal != null && doneCol != null) {
+      woSheet.getRange(row, doneCol + 1).setValue(doneVal);
+    }
+    if (sentVal != null && sentCol != null) {
+      woSheet.getRange(row, sentCol + 1).setValue(sentVal);
+    }
+  });
+}
+
+// ── action: set_docs_sent ─────────────────────────────────────
+//
+// Bulk-flip Done? and/or Sent? flags on the WO Tracker. Used by the
+// batch download endpoint after a successful zip stream, and by the
+// dashboard's manual toggle UI.
+//
+// Body shape:
+//   { updates: [{ wo_id, doc_type, sent?: bool, done?: bool }, ...] }
+//
+// Groups updates by (doc_type, flag combination) to minimize sheet
+// writes. Returns counts per flag for caller telemetry.
+function handleSetDocsSent_(body) {
+  const d = body.data || {};
+  const updates = Array.isArray(d.updates) ? d.updates : [];
+  if (updates.length === 0) return jsonResponse_({ updated: 0 });
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Group woIds by (doc_type, done?, sent?) so each unique flag combo
+  // is one batch write call. Most calls will collapse to one bucket.
+  const buckets = {};
+  updates.forEach(u => {
+    const docType = String(u.doc_type || '').trim();
+    if (!docType) return;
+    const woId = String(u.wo_id || '').trim();
+    if (!woId) return;
+    const doneKey = (u.done === true) ? 'Y' : (u.done === false ? 'N' : '_');
+    const sentKey = (u.sent === true) ? 'Y' : (u.sent === false ? 'N' : '_');
+    if (doneKey === '_' && sentKey === '_') return;
+    const k = docType + '|' + doneKey + '|' + sentKey;
+    if (!buckets[k]) buckets[k] = { docType, flags: {}, woIds: [] };
+    if (doneKey !== '_') buckets[k].flags.done = (doneKey === 'Y');
+    if (sentKey !== '_') buckets[k].flags.sent = (sentKey === 'Y');
+    buckets[k].woIds.push(woId);
+  });
+
+  let total = 0;
+  Object.values(buckets).forEach(b => {
+    _setDocLifecycleFlags_(ss, b.woIds, b.docType, b.flags);
+    total += b.woIds.length;
+  });
+
+  if (total > 0) _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({ updated: total });
+}
+
 /**
  * Archive a document using the correct folder structure:
  *
@@ -1423,7 +1525,7 @@ function archiveDocument_(file, docType, woId, ss) {
       }
       _replaceArchivedWODoc_(woFolder, file, woId);
       Logger.log(`📁 Archived merged CFR → WO folder ${woId} (replaced prior WO doc)`);
-      return { success: true };
+      return { success: true, doc_type: 'Field Report', wo_ids: [woId] };
 
     } else if (docType === 'Invoice') {
       // Invoice files alongside the WO doc — no replacement.
@@ -1436,7 +1538,7 @@ function archiveDocument_(file, docType, woId, ss) {
       }
       file.makeCopy(cleanName, woFolder);
       Logger.log(`📁 Archived Invoice: ${cleanName} → WO folder ${woId}`);
-      return { success: true };
+      return { success: true, doc_type: 'Invoice', wo_ids: [woId] };
 
     } else if (docType === 'Sign-In') {
       // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
@@ -1468,7 +1570,7 @@ function archiveDocument_(file, docType, woId, ss) {
           file.makeCopy(cleanName, woFolder);
         });
         Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
-        return { success: true };
+        return { success: true, doc_type: 'Sign-In', wo_ids: wos.map(w => w.id) };
       }
       // Legacy single-WO Sign-In (pre-multi-WO refactor) — keep working.
       if (!woId) {
@@ -1480,7 +1582,7 @@ function archiveDocument_(file, docType, woId, ss) {
       }
       file.makeCopy(cleanName, woFolder);
       Logger.log(`📁 Archived Sign-In (legacy): ${cleanName} → WO folder ${woId}`);
-      return { success: true };
+      return { success: true, doc_type: 'Sign-In', wo_ids: [woId] };
 
     } else if (docType === 'Production Log') {
       // Filename patterns:
@@ -1518,6 +1620,7 @@ function archiveDocument_(file, docType, woId, ss) {
           reason: `No WOs in Daily Sign-In Data for contractor "${contractorTarget}" on ${dateMatch[1]}` };
       }
 
+      const allCoveredWoIds = [];
       matchingEntries.forEach(([key, wos]) => {
         const [contractor, contractNum, borough] = key.split('|');
         const contractFolder = getOrCreateSubfolder_(
@@ -1530,10 +1633,11 @@ function archiveDocument_(file, docType, woId, ss) {
         wos.forEach(wo => {
           const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
           file.makeCopy(cleanName, woFolder);
+          allCoveredWoIds.push(wo.id);
         });
         Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
       });
-      return { success: true };
+      return { success: true, doc_type: 'Production Log', wo_ids: allCoveredWoIds };
 
     } else if (docType === 'Certified Payroll') {
       // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD.txt
@@ -1572,7 +1676,7 @@ function archiveDocument_(file, docType, woId, ss) {
         file.makeCopy(cleanName, woFolder);
       });
       Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
-      return { success: true };
+      return { success: true, doc_type: 'Certified Payroll', wo_ids: wos.map(w => w.id) };
 
     } else {
       return { success: false, reason: `Unknown docType '${docType}' — no archive path defined` };
@@ -2961,6 +3065,10 @@ function doPost(e) {
       return handleLookupArchivedWOPdf_(body);
     } else if (action === 'list_metro_completed_docs') {
       return handleListMetroCompletedDocs_(body);
+    } else if (action === 'set_docs_sent') {
+      return handleSetDocsSent_(body);
+    } else if (action === 'list_documents_for_batch') {
+      return handleListDocumentsForBatch_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -4593,6 +4701,18 @@ function ensureWoTrackerExtraCols_(woSheet) {
     'Scan Upload Timestamp',   // col 41 / 0-idx 40 — for "today's uploads" query
     'Original Filename',       // col 42 / 0-idx 41 — filename the user picked in the webapp
     'Archive Folder URL',      // col 43 / 0-idx 42 — written once by getWOFolder_; read by dashboard
+    // Per-doc-type lifecycle flags. Each doc has a Done? (= archived in
+    // Drive) and Sent? (= delivered to prime contractor). Existing legacy
+    // Done? columns at 0-idx 24 (Production Log) and 25 (Field Report)
+    // stay where they are; existing Invoice Sent? at 0-idx 29 is also
+    // kept. The new columns below fill in the missing pairs.
+    'CFR Sent?',               // col 45 / 0-idx 44 — pairs with col 26/0-idx 25 Field Report Done?
+    'Prod Log Sent?',          // col 46 / 0-idx 45 — pairs with col 25/0-idx 24 Production Log Done?
+    'Sign-In Done?',           // col 47 / 0-idx 46
+    'Sign-In Sent?',           // col 48 / 0-idx 47
+    'CP Done?',                // col 49 / 0-idx 48 — Certified Payroll
+    'CP Sent?',                // col 50 / 0-idx 49
+    'Invoice Done?',           // col 51 / 0-idx 50 — pairs with col 30/0-idx 29 Invoice Sent?
   ];
   const START_COL = 36;
   const N = EXTRA_HEADERS.length;
@@ -4611,6 +4731,30 @@ function ensureWoTrackerExtraCols_(woSheet) {
  * Keep both names live so we don't break any callers during rollout.
  */
 function ensureWoTrackerCFRCols_(woSheet) { return ensureWoTrackerExtraCols_(woSheet); }
+
+/**
+ * One-shot bootstrap that extends the WO Tracker with the new doc
+ * lifecycle columns (CFR/Prod Log/Sign-In/CP/Invoice — Done? + Sent?).
+ * Run once from the Apps Script editor after deploying.
+ *
+ * Public name (no trailing underscore) so it appears in the editor's
+ * function-runner dropdown. Idempotent — safe to re-run; it only writes
+ * headers that aren't already present.
+ *
+ * Avoid using setupAutomation for this — that function reinstalls
+ * triggers and creates folder structure, both of which are out of
+ * scope for a column rename / add.
+ */
+function setupDocLifecycleColumns() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) {
+    Logger.log('❌ setupDocLifecycleColumns: Work Order Tracker sheet not found');
+    return;
+  }
+  ensureWoTrackerExtraCols_(woSheet);
+  Logger.log('✅ setupDocLifecycleColumns: WO Tracker schema reconciled with Done/Sent columns');
+}
 
 /**
  * One-time backfill: walks Drive (read-only, via findWOFolder_) to
@@ -4653,6 +4797,114 @@ function backfillArchiveFolderUrls() {
   }
   Logger.log('✅ backfillArchiveFolderUrls: filled=' + filled +
              ', missing=' + missing + ', alreadyHad=' + already);
+}
+
+
+/**
+ * One-shot backfill: walks each WO's archive folder and writes
+ * Done='Yes' on every doc-type lifecycle column whose corresponding
+ * file already exists in Drive. Run once after deploying the new
+ * Done/Sent schema.
+ *
+ * Detects each doc by filename prefix inside the WO folder (CFR_,
+ * Invoice_, SignIn_) and inside the contract-level master subfolders
+ * (Production Logs/, Certified Payroll/). Sent flags are NOT touched
+ * — there's no reliable way to recover past send history; admin can
+ * use the Download Documents modal to mark the unsent backlog.
+ *
+ * Public name (no trailing underscore) so it appears in the editor's
+ * function-runner dropdown.
+ */
+function backfillDocLifecycleFlags() {
+  const ss        = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet   = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) {
+    Logger.log('❌ backfillDocLifecycleFlags: Work Order Tracker not found');
+    return;
+  }
+  ensureWoTrackerExtraCols_(woSheet);
+
+  const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
+  if (!archiveId) {
+    Logger.log('❌ backfillDocLifecycleFlags: ARCHIVE_ID property not set');
+    return;
+  }
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+
+  // Cache contract-level master files (Production Logs / CP) so we
+  // don't re-walk those folders for every WO. Keyed by
+  // <contractor>|<contractNum>|<borough>.
+  const masterCache = {};
+  const getMaster = (contractor, contractNum, borough) => {
+    const k = contractor + '|' + contractNum + '|' + borough;
+    if (masterCache[k] != null) return masterCache[k];
+    let prod = false, cp = false;
+    try {
+      const cIt = archiveRoot.getFoldersByName(contractor);
+      if (!cIt.hasNext()) return (masterCache[k] = { prod: false, cp: false });
+      const cFolder = cIt.next();
+      const cnIt = cFolder.getFoldersByName(`${contractNum} - ${getBoroughName_(borough)}`);
+      if (!cnIt.hasNext()) return (masterCache[k] = { prod: false, cp: false });
+      const ctFolder = cnIt.next();
+      const plIt = ctFolder.getFoldersByName('Production Logs');
+      if (plIt.hasNext()) {
+        const f = plIt.next().getFiles();
+        if (f.hasNext()) prod = true;
+      }
+      const cpIt = ctFolder.getFoldersByName('Certified Payroll');
+      if (cpIt.hasNext()) {
+        const f = cpIt.next().getFiles();
+        if (f.hasNext()) cp = true;
+      }
+    } catch (e) {
+      Logger.log('⚠️ getMaster failed for ' + k + ': ' + e.message);
+    }
+    masterCache[k] = { prod, cp };
+    return masterCache[k];
+  };
+
+  const data = woSheet.getDataRange().getValues();
+  let touched = 0, scanned = 0, skipped = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const woId = String(row[0] || '').trim();
+    if (!woId) continue;
+    scanned++;
+
+    const contractor  = String(row[1] || '').trim();
+    const contractNum = String(row[2] || '').split('/')[0].trim();
+    const borough     = String(row[3] || '').trim();
+    if (!contractor || !contractNum || !borough) { skipped++; continue; }
+
+    const folder = findWOFolder_(archiveRoot, woId, ss, data);
+    if (!folder) { skipped++; continue; }
+
+    // Detect per-WO docs by filename prefix in this WO's folder.
+    let cfrFound = false;
+    let invFound = false;
+    let signInFound = false;
+    const files = folder.getFiles();
+    while (files.hasNext()) {
+      const name = files.next().getName();
+      if (/^CFR_/i.test(name) || /Field_Report/i.test(name)) cfrFound = true;
+      else if (/^Invoice_/i.test(name)) invFound = true;
+      else if (/^SignIn_/i.test(name) || /Sign[-_]In/i.test(name)) signInFound = true;
+    }
+    const masters = getMaster(contractor, contractNum, borough);
+
+    const sheetRow = i + 1;
+    const set = (col, val) => woSheet.getRange(sheetRow, col + 1).setValue(val);
+    if (cfrFound)              set(DOC_TYPE_DONE_COL_['Field Report'],      'Yes');
+    if (invFound)              set(DOC_TYPE_DONE_COL_['Invoice'],           'Yes');
+    if (signInFound)           set(DOC_TYPE_DONE_COL_['Sign-In'],           'Yes');
+    if (masters.prod)          set(DOC_TYPE_DONE_COL_['Production Log'],    'Yes');
+    if (masters.cp)            set(DOC_TYPE_DONE_COL_['Certified Payroll'], 'Yes');
+    if (cfrFound || invFound || signInFound || masters.prod || masters.cp) touched++;
+  }
+
+  _invalidateCacheKeys_(['dashboard_v1']);
+  Logger.log('✅ backfillDocLifecycleFlags: scanned=' + scanned +
+             ', touched=' + touched + ', skipped=' + skipped);
 }
 
 
@@ -6951,6 +7203,462 @@ function _buildRevenuePayload_(startIso, endIso) {
     top_wos:       topWos,
     needs_pricing: needsPricing,
   };
+}
+
+
+// ── action: list_documents_for_batch ──────────────────────────
+//
+// Returns the metadata for every archived doc that matches the
+// caller's filters. The Express batch-download endpoint takes this
+// list, fetches each file's bytes via get_drive_file_bytes, and
+// streams them into a zip. No bytes are returned here.
+//
+// Body shape:
+//   {
+//     mode: 'unsent' | 'wo_numbers' | 'date_range',
+//     contractors: ['Metro Express', ...],     // empty/missing = all
+//     doc_types:   ['CFR','Production Log','Sign-In','Certified Payroll','Invoice'],
+//     wo_ids:      ['RM-43101', ...],          // mode=wo_numbers
+//     date_start:  'YYYY-MM-DD',               // mode=date_range
+//     date_end:    'YYYY-MM-DD',
+//   }
+//
+// Returns:
+//   {
+//     files: [{
+//       file_id, filename, mime_type, size,
+//       contractor, contract_num, borough,
+//       doc_type, wo_ids: [...], work_date: 'YYYY-MM-DD',
+//       done: bool, sent: bool,
+//     }],
+//     counts:    { total, by_doc_type: {...}, by_contractor: {...} },
+//     missing:   [{ wo_id, doc_type, reason }],
+//     warnings:  [strings],
+//     truncated: bool,
+//   }
+//
+// User-facing doc_type values are CFR / Production Log / Sign-In /
+// Certified Payroll / Invoice. Internally we translate "CFR" → the
+// "Field Report" key used by archiveDocument_ + the lifecycle column
+// maps so we don't have to rename those.
+const _DOC_TYPE_FRIENDLY_TO_INTERNAL_ = Object.freeze({
+  'CFR':               'Field Report',
+  'Production Log':    'Production Log',
+  'Sign-In':           'Sign-In',
+  'Certified Payroll': 'Certified Payroll',
+  'Invoice':           'Invoice',
+});
+const _DOC_TYPE_INTERNAL_TO_FRIENDLY_ = Object.freeze({
+  'Field Report':      'CFR',
+  'Production Log':    'Production Log',
+  'Sign-In':           'Sign-In',
+  'Certified Payroll': 'Certified Payroll',
+  'Invoice':           'Invoice',
+});
+
+const MAX_BATCH_FILES_ = 500;
+
+function handleListDocumentsForBatch_(body) {
+  const d = body.data || {};
+  const mode = String(d.mode || '').trim();
+  const validModes = { unsent: 1, wo_numbers: 1, date_range: 1 };
+  if (!validModes[mode]) {
+    return jsonResponse_({ error: 'mode must be one of unsent | wo_numbers | date_range' }, 400);
+  }
+
+  const contractorsFilter = Array.isArray(d.contractors)
+    ? d.contractors.map(s => String(s).trim()).filter(Boolean)
+    : [];
+  const docTypesFriendly = Array.isArray(d.doc_types) && d.doc_types.length
+    ? d.doc_types.map(s => String(s).trim())
+    : Object.keys(_DOC_TYPE_FRIENDLY_TO_INTERNAL_);
+  const docTypes = docTypesFriendly
+    .map(f => _DOC_TYPE_FRIENDLY_TO_INTERNAL_[f])
+    .filter(Boolean);
+  if (docTypes.length === 0) {
+    return jsonResponse_({ error: 'doc_types had no recognized values' }, 400);
+  }
+
+  const woIdsFilter = Array.isArray(d.wo_ids)
+    ? d.wo_ids.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+    : [];
+  const dateStart = String(d.date_start || '').trim();
+  const dateEnd   = String(d.date_end   || '').trim();
+  if (mode === 'wo_numbers' && woIdsFilter.length === 0) {
+    return jsonResponse_({ error: 'wo_numbers mode requires wo_ids' }, 400);
+  }
+  if (mode === 'date_range' && (!/^\d{4}-\d{2}-\d{2}$/.test(dateStart) ||
+                                !/^\d{4}-\d{2}-\d{2}$/.test(dateEnd))) {
+    return jsonResponse_({ error: 'date_range mode requires date_start + date_end (YYYY-MM-DD)' }, 400);
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) return jsonResponse_({ error: 'Work Order Tracker not found' }, 500);
+  ensureWoTrackerExtraCols_(woSheet);
+
+  const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
+  if (!archiveId) return jsonResponse_({ error: 'ARCHIVE_ID property not set' }, 500);
+  const archiveRoot = DriveApp.getFolderById(archiveId);
+
+  const data = woSheet.getDataRange().getValues();
+
+  // Date helper — match the same fmtDate used by other handlers.
+  const fmtDate = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    if (!v) return '';
+    const m = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+
+  // Build a parallel array of WO row metadata that we'll filter against.
+  const allWos = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const woId = String(row[0] || '').trim();
+    if (!woId) continue;
+    allWos.push({
+      wo_id:        woId,
+      contractor:   String(row[1] || '').trim(),
+      contract_num: String(row[2] || '').split('/')[0].trim(),
+      borough:      String(row[3] || '').trim(),
+      location:     String(row[5] || '').trim(),
+      work_end:     fmtDate(row[18]),
+      // Per-doc Done/Sent flags
+      done: {
+        'Field Report':      String(row[DOC_TYPE_DONE_COL_['Field Report']]      || '').toLowerCase() === 'yes',
+        'Production Log':    String(row[DOC_TYPE_DONE_COL_['Production Log']]    || '').toLowerCase() === 'yes',
+        'Sign-In':           String(row[DOC_TYPE_DONE_COL_['Sign-In']]           || '').toLowerCase() === 'yes',
+        'Certified Payroll': String(row[DOC_TYPE_DONE_COL_['Certified Payroll']] || '').toLowerCase() === 'yes',
+        'Invoice':           String(row[DOC_TYPE_DONE_COL_['Invoice']]           || '').toLowerCase() === 'yes',
+      },
+      sent: {
+        'Field Report':      String(row[DOC_TYPE_SENT_COL_['Field Report']]      || '').toLowerCase() === 'yes',
+        'Production Log':    String(row[DOC_TYPE_SENT_COL_['Production Log']]    || '').toLowerCase() === 'yes',
+        'Sign-In':           String(row[DOC_TYPE_SENT_COL_['Sign-In']]           || '').toLowerCase() === 'yes',
+        'Certified Payroll': String(row[DOC_TYPE_SENT_COL_['Certified Payroll']] || '').toLowerCase() === 'yes',
+        'Invoice':           String(row[DOC_TYPE_SENT_COL_['Invoice']]           || '').toLowerCase() === 'yes',
+      },
+    });
+  }
+  const woById = {};
+  allWos.forEach(w => { woById[w.wo_id] = w; });
+
+  // Mode-specific WO scope.
+  let wosInScope;
+  if (mode === 'wo_numbers') {
+    wosInScope = woIdsFilter.map(id => woById[id]).filter(Boolean);
+  } else if (mode === 'date_range') {
+    wosInScope = allWos.filter(w => w.work_end >= dateStart && w.work_end <= dateEnd && w.work_end);
+  } else {
+    // unsent — every WO is potentially in scope; per-doc filtering happens below.
+    wosInScope = allWos.slice();
+  }
+  if (contractorsFilter.length) {
+    wosInScope = wosInScope.filter(w => contractorsFilter.indexOf(w.contractor) !== -1);
+  }
+
+  const warnings = [];
+  if (mode === 'wo_numbers') {
+    woIdsFilter.forEach(id => {
+      if (!woById[id]) warnings.push('WO not found in tracker: ' + id);
+    });
+  }
+
+  // Master-copy folder cache, contractor folder cache, WO folder cache —
+  // each Drive walk is the slowest part of this handler so we memoize.
+  const wofolderCache = {};
+  const masterCache = {};   // key contractor|contractNum|borough → { prodFolder, cpFolder }
+  const getWoFolder = (w) => {
+    const k = w.wo_id;
+    if (wofolderCache[k] !== undefined) return wofolderCache[k];
+    const f = findWOFolder_(archiveRoot, k, ss, data);
+    wofolderCache[k] = f || null;
+    return wofolderCache[k];
+  };
+  const getMasters = (contractor, contractNum, borough) => {
+    const k = contractor + '|' + contractNum + '|' + borough;
+    if (masterCache[k] !== undefined) return masterCache[k];
+    let prod = null, cp = null;
+    try {
+      const cIt = archiveRoot.getFoldersByName(contractor);
+      if (cIt.hasNext()) {
+        const cFolder = cIt.next();
+        const cnIt = cFolder.getFoldersByName(`${contractNum} - ${getBoroughName_(borough)}`);
+        if (cnIt.hasNext()) {
+          const ctFolder = cnIt.next();
+          const plIt = ctFolder.getFoldersByName('Production Logs');
+          if (plIt.hasNext()) prod = plIt.next();
+          const cpIt = ctFolder.getFoldersByName('Certified Payroll');
+          if (cpIt.hasNext()) cp = cpIt.next();
+        }
+      }
+    } catch (e) {
+      warnings.push('getMasters failed for ' + k + ': ' + e.message);
+    }
+    masterCache[k] = { prod, cp };
+    return masterCache[k];
+  };
+
+  // Output buckets
+  const files = [];
+  const missing = [];
+  const seenFileIds = new Set();
+  const pushFile = (f) => {
+    if (seenFileIds.has(f.file_id)) return;
+    seenFileIds.add(f.file_id);
+    files.push(f);
+  };
+
+  // Helper: determine if the WO row qualifies for the requested doc
+  // type given the mode. Returns { include, missingReason? }.
+  const qualifies = (w, internalType) => {
+    if (mode === 'unsent') {
+      if (!w.done[internalType])  return { include: false };               // never generated
+      if (w.sent[internalType])   return { include: false };               // already sent
+      return { include: true };
+    }
+    if (mode === 'wo_numbers') {
+      if (!w.done[internalType]) {
+        return { include: false, missingReason: internalType + ' Done? = No' };
+      }
+      return { include: true };
+    }
+    // date_range
+    if (!w.done[internalType]) {
+      return { include: false, missingReason: internalType + ' Done? = No' };
+    }
+    return { include: true };
+  };
+
+  // ── Per-WO docs: CFR + Invoice
+  const perWoDocs = docTypes.filter(t => t === 'Field Report' || t === 'Invoice');
+  perWoDocs.forEach(docType => {
+    const filenamePrefix = docType === 'Field Report' ? /^(CFR_|Contractor_Field_Report_)/i : /^Invoice_/i;
+    wosInScope.forEach(w => {
+      if (files.length >= MAX_BATCH_FILES_) return;
+      const q = qualifies(w, docType);
+      if (!q.include) {
+        if (q.missingReason) {
+          missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: q.missingReason });
+        }
+        return;
+      }
+      const folder = getWoFolder(w);
+      if (!folder) {
+        missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: 'archive folder not found' });
+        return;
+      }
+      const fIter = folder.getFiles();
+      let foundAny = false;
+      while (fIter.hasNext()) {
+        const f = fIter.next();
+        const name = f.getName();
+        if (!filenamePrefix.test(name)) continue;
+        // CFR pdfs may live alongside an older legacy WO doc. Restrict
+        // to the WO's own id in the filename to avoid grabbing the
+        // wrong one.
+        if (name.toUpperCase().indexOf(w.wo_id.toUpperCase()) === -1) continue;
+        pushFile({
+          file_id:      f.getId(),
+          filename:     name,
+          mime_type:    f.getMimeType(),
+          size:         f.getSize(),
+          contractor:   w.contractor,
+          contract_num: w.contract_num,
+          borough:      w.borough,
+          doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
+          wo_ids:       [w.wo_id],
+          work_date:    w.work_end,
+          done:         true,
+          sent:         w.sent[docType],
+        });
+        foundAny = true;
+      }
+      if (!foundAny) {
+        missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: 'Done? = Yes but no matching file in WO folder' });
+      }
+    });
+  });
+
+  // ── Master-copy docs: Production Log + Certified Payroll
+  // Walk each contract's master subfolder once; filter by date range
+  // (date_range mode) or include all (other modes filtered by WO).
+  // For each file, resolve the WOs it covers via getWOsForDate_ /
+  // getWOsForPayrollWeek_ so the manifest can list them.
+  const groupKey = (w) => w.contractor + '|' + w.contract_num + '|' + w.borough;
+  const woGroups = {};   // group key → array of WO rows
+  wosInScope.forEach(w => {
+    const k = groupKey(w);
+    if (!woGroups[k]) woGroups[k] = [];
+    woGroups[k].push(w);
+  });
+
+  const masterDocs = docTypes.filter(t => t === 'Production Log' || t === 'Certified Payroll');
+  masterDocs.forEach(docType => {
+    Object.keys(woGroups).forEach(gk => {
+      if (files.length >= MAX_BATCH_FILES_) return;
+      const groupWos = woGroups[gk];
+      const [contractor, contractNum, borough] = gk.split('|');
+      const masters = getMasters(contractor, contractNum, borough);
+      const masterFolder = docType === 'Production Log' ? masters.prod : masters.cp;
+      if (!masterFolder) return;
+
+      // Determine which group WOs qualify for this doc type.
+      const qualifyingWos = groupWos.filter(w => {
+        const q = qualifies(w, docType);
+        if (!q.include && q.missingReason) {
+          missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: q.missingReason });
+        }
+        return q.include;
+      });
+      if (qualifyingWos.length === 0) return;
+
+      const fIter = masterFolder.getFiles();
+      while (fIter.hasNext()) {
+        if (files.length >= MAX_BATCH_FILES_) break;
+        const f = fIter.next();
+        const name = f.getName();
+        const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
+        if (!dm) continue;
+        const fileDate = dm[1];
+
+        // Apply date_range filter
+        if (mode === 'date_range') {
+          if (fileDate < dateStart || fileDate > dateEnd) continue;
+        }
+
+        // Resolve covered WOs.
+        let coveredWoIds;
+        if (docType === 'Production Log') {
+          const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
+          const keyMatch = Object.keys(map).find(k => {
+            const parts = k.split('|');
+            return parts[0] === contractor && parts[1] === contractNum && parts[2] === borough;
+          });
+          coveredWoIds = keyMatch ? map[keyMatch].map(x => x.id) : [];
+        } else {
+          // Certified Payroll
+          const wos = getWOsForPayrollWeek_(contractNum, borough, new Date(fileDate + 'T12:00:00'), ss);
+          coveredWoIds = wos.map(x => x.id);
+        }
+        if (coveredWoIds.length === 0) continue;
+
+        // For modes that filter by WO scope (wo_numbers / date_range
+        // intersected with scope), check that at least one covered WO
+        // overlaps with our qualifyingWos. Otherwise this master file
+        // belongs to a WO outside the scope.
+        const inScopeIds = new Set(qualifyingWos.map(w => w.wo_id));
+        const overlaps = coveredWoIds.some(id => inScopeIds.has(id));
+        if (!overlaps && (mode === 'wo_numbers' || mode === 'date_range')) continue;
+        // unsent mode: include if any covered WO has Done?=Yes & Sent?!=Yes
+        if (mode === 'unsent') {
+          const anyUnsent = coveredWoIds.some(id => {
+            const w = woById[id];
+            return w && w.done[docType] && !w.sent[docType];
+          });
+          if (!anyUnsent) continue;
+        }
+
+        // Sent? state for this batch entry — true if EVERY covered WO is sent
+        const allSent = coveredWoIds.every(id => woById[id] && woById[id].sent[docType]);
+
+        pushFile({
+          file_id:      f.getId(),
+          filename:     name,
+          mime_type:    f.getMimeType(),
+          size:         f.getSize(),
+          contractor,
+          contract_num: contractNum,
+          borough,
+          doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
+          wo_ids:       coveredWoIds,
+          work_date:    fileDate,
+          done:         true,
+          sent:         allSent,
+        });
+      }
+    });
+  });
+
+  // ── Sign-In: no master folder; pulled from any one WO folder per
+  //   (contractor, contractNum, borough, date). Walk each WO folder
+  //   in scope, dedupe by filename.
+  if (docTypes.indexOf('Sign-In') !== -1) {
+    const sigSeen = {};   // filename → first chosen file metadata
+    wosInScope.forEach(w => {
+      if (files.length >= MAX_BATCH_FILES_) return;
+      const q = qualifies(w, 'Sign-In');
+      if (!q.include) {
+        if (q.missingReason) {
+          missing.push({ wo_id: w.wo_id, doc_type: 'Sign-In', reason: q.missingReason });
+        }
+        return;
+      }
+      const folder = getWoFolder(w);
+      if (!folder) return;
+      const fIter = folder.getFiles();
+      while (fIter.hasNext()) {
+        const f = fIter.next();
+        const name = f.getName();
+        if (!/^SignIn_/i.test(name)) continue;
+        // dedupe across WO folders — same filename = same logical sheet
+        if (sigSeen[name]) continue;
+
+        const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
+        const fileDate = dm ? dm[1] : '';
+        if (mode === 'date_range') {
+          if (!fileDate || fileDate < dateStart || fileDate > dateEnd) continue;
+        }
+        // Resolve covered WOs by filename pattern (contractNum, borough)
+        const cm = name.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
+        let coveredWoIds = [w.wo_id];
+        if (cm) {
+          const [, fnContractNum, fnBorough, fnDate] = cm;
+          const map = getWOsForDate_(new Date(fnDate + 'T12:00:00'), ss);
+          const keyMatch = Object.keys(map).find(k => {
+            const parts = k.split('|');
+            return parts[0] === w.contractor && parts[1] === fnContractNum && parts[2] === fnBorough;
+          });
+          if (keyMatch) coveredWoIds = map[keyMatch].map(x => x.id);
+        }
+        const allSent = coveredWoIds.every(id => woById[id] && woById[id].sent['Sign-In']);
+
+        sigSeen[name] = true;
+        pushFile({
+          file_id:      f.getId(),
+          filename:     name,
+          mime_type:    f.getMimeType(),
+          size:         f.getSize(),
+          contractor:   w.contractor,
+          contract_num: w.contract_num,
+          borough:      w.borough,
+          doc_type:     'Sign-In',
+          wo_ids:       coveredWoIds,
+          work_date:    fileDate,
+          done:         true,
+          sent:         allSent,
+        });
+      }
+    });
+  }
+
+  // Counts
+  const counts = { total: files.length, by_doc_type: {}, by_contractor: {} };
+  files.forEach(f => {
+    counts.by_doc_type[f.doc_type]    = (counts.by_doc_type[f.doc_type]    || 0) + 1;
+    counts.by_contractor[f.contractor]= (counts.by_contractor[f.contractor]|| 0) + 1;
+  });
+
+  return jsonResponse_({
+    files,
+    counts,
+    missing,
+    warnings,
+    truncated: files.length >= MAX_BATCH_FILES_,
+  });
 }
 
 

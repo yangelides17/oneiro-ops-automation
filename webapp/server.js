@@ -18,6 +18,7 @@ import express  from 'express'
 import cors     from 'cors'
 import path     from 'path'
 import multer   from 'multer'
+import archiver from 'archiver'
 import { fileURLToPath } from 'url'
 import 'dotenv/config'
 
@@ -1087,6 +1088,243 @@ app.post('/api/upload-signature', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
+
+/**
+ * POST /api/documents/list-batch
+ * Returns metadata for documents matching the given filters — used by
+ * the DownloadDocumentsModal's preview step before the user commits to
+ * the actual zip download. No file bytes returned. Body shape matches
+ * the Apps Script list_documents_for_batch action.
+ */
+app.post('/api/documents/list-batch', async (req, res) => {
+  try {
+    const data = await callAppsScript('list_documents_for_batch', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/documents/list-batch error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/documents/batch-download
+ * Streams a zip of every doc matching the filters to the client.
+ * Body: { ...filters, mark_sent: bool }.
+ *
+ * Flow:
+ *   1. Call Apps Script for the list of files.
+ *   2. archiver streams the zip to res; MANIFEST.txt at the root.
+ *   3. Each file's bytes fetched via Apps Script get_drive_file_bytes.
+ *   4. On client abort (req.aborted / req.close), stop the file loop
+ *      and skip mark_sent.
+ *   5. On success and mark_sent=true, fire-and-forget set_docs_sent
+ *      to flip Sent flags for every (wo_id, doc_type) covered.
+ */
+app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async (req, res) => {
+  const filters  = req.body || {}
+  const markSent = !!filters.mark_sent
+
+  let cancelled = false
+  const onCancel = () => { cancelled = true }
+  req.on('aborted', onCancel)
+  req.on('close',   () => { if (!res.writableEnded) cancelled = true })
+
+  try {
+    // Resolve the file list first (small JSON payload).
+    const listing = await callAppsScript('list_documents_for_batch', filters)
+    const files = Array.isArray(listing.files) ? listing.files : []
+    if (files.length === 0) {
+      return res.status(400).json({
+        error:    'No documents matched the requested filters.',
+        missing:  listing.missing  || [],
+        warnings: listing.warnings || [],
+      })
+    }
+
+    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="oneiro-docs-${ts}.zip"`)
+    res.setHeader('Cache-Control', 'no-store')
+
+    const archive = archiver('zip', { zlib: { level: 9 } })
+    archive.on('warning', (e) => console.warn('archiver warning:', e.message))
+    archive.on('error',   (e) => {
+      console.error('archiver error:', e.message)
+      try { res.end() } catch (_) {}
+    })
+    archive.pipe(res)
+
+    // Build & append manifest first so it lives at the zip root.
+    const manifest = buildBatchManifest(filters, listing)
+    archive.append(manifest, { name: 'MANIFEST.txt' })
+
+    // Determine zip-path layout: contractor folders only when more
+    // than one contractor is present in the result set.
+    const contractorsInBatch = new Set(files.map(f => f.contractor || 'Unknown'))
+    const includeContractorFolder = contractorsInBatch.size > 1
+
+    // Track filename collisions inside each (contractor)/(doc-type)
+    // path; on collision prefix with the WO id.
+    const docTypeFolder = (dt) => ({
+      'CFR':               'Contractor Field Reports',
+      'Production Log':    'Production Logs',
+      'Sign-In':           'Sign-In Sheets',
+      'Certified Payroll': 'Certified Payroll',
+      'Invoice':           'Invoices',
+    })[dt] || dt
+    const usedPaths = new Set()
+    const zipPathFor = (file) => {
+      const folder = (includeContractorFolder ? `${file.contractor}/` : '') + docTypeFolder(file.doc_type)
+      let candidate = `${folder}/${file.filename}`
+      if (!usedPaths.has(candidate)) {
+        usedPaths.add(candidate)
+        return candidate
+      }
+      // Collision — prefix with WO id (or first wo id for multi-WO files)
+      const prefix = (file.wo_ids && file.wo_ids[0]) || 'unknown-wo'
+      candidate = `${folder}/${prefix}_${file.filename}`
+      let i = 2
+      while (usedPaths.has(candidate)) {
+        candidate = `${folder}/${prefix}_${i}_${file.filename}`
+        i++
+      }
+      usedPaths.add(candidate)
+      return candidate
+    }
+
+    for (const file of files) {
+      if (cancelled) break
+      try {
+        const fetched = await callAppsScript('get_drive_file_bytes', { file_id: file.file_id })
+        if (!fetched || !fetched.data) {
+          console.warn(`batch-download: get_drive_file_bytes returned no bytes for ${file.filename}`)
+          continue
+        }
+        const buf = Buffer.from(fetched.data, 'base64')
+        archive.append(buf, { name: zipPathFor(file) })
+      } catch (e) {
+        console.warn(`batch-download: failed to fetch ${file.filename}: ${e.message}`)
+        // Continue with the other files rather than aborting the whole zip.
+      }
+    }
+
+    if (cancelled) {
+      // Client gave up — finalize the partial zip cleanly so we don't
+      // leak a stuck stream, but don't mark sent.
+      try { archive.abort() } catch (_) {}
+      try { res.end() }       catch (_) {}
+      return
+    }
+
+    archive.finalize()
+
+    // Wait for the response stream to close before flipping Sent flags.
+    res.on('finish', () => {
+      if (cancelled || !markSent) return
+      // Build the per-(wo_id, doc_type) updates list.
+      const updates = []
+      const seen = new Set()
+      files.forEach(f => {
+        const ids = f.wo_ids || []
+        ids.forEach(woId => {
+          const k = woId + '|' + f.doc_type
+          if (seen.has(k)) return
+          seen.add(k)
+          updates.push({ wo_id: woId, doc_type: f.doc_type, sent: true })
+        })
+      })
+      callAppsScript('set_docs_sent', { updates }).catch(e => {
+        console.warn('batch-download: set_docs_sent failed:', e.message)
+      })
+    })
+  } catch (err) {
+    console.error('POST /api/documents/batch-download error:', err.message)
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message })
+    } else {
+      try { res.end() } catch (_) {}
+    }
+  }
+})
+
+/**
+ * Build the human-readable MANIFEST.txt content for a doc batch.
+ * Plain text, monospace-friendly so it renders well in any reader
+ * the prime contractor opens it with.
+ */
+function buildBatchManifest(filters, listing) {
+  const lines = []
+  const files   = listing.files   || []
+  const missing = listing.missing || []
+  const counts  = listing.counts  || {}
+
+  const now = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date())
+
+  lines.push('ONEIRO COLLECTION LLC — Document Delivery')
+  lines.push('Generated: ' + now + ' ET')
+  lines.push('Mode: ' + (filters.mode || 'unspecified'))
+  const detail = []
+  if (filters.contractors && filters.contractors.length) detail.push('contractors=[' + filters.contractors.join(', ') + ']')
+  if (filters.doc_types   && filters.doc_types.length)   detail.push('doc_types=['   + filters.doc_types.join(', ')   + ']')
+  if (filters.mode === 'date_range') detail.push(`dates=[${filters.date_start} → ${filters.date_end}]`)
+  if (filters.mode === 'wo_numbers') detail.push('wos=[' + (filters.wo_ids || []).join(', ') + ']')
+  if (detail.length) lines.push('Filters: ' + detail.join('  '))
+
+  // Distinct WO count across the batch
+  const allWos = new Set()
+  files.forEach(f => (f.wo_ids || []).forEach(id => allWos.add(id)))
+  lines.push(`Total: ${files.length} file${files.length === 1 ? '' : 's'} across ${allWos.size} work order${allWos.size === 1 ? '' : 's'}`)
+  lines.push('')
+
+  const sectionRule = '─'.repeat(40)
+  const sections = [
+    { dt: 'CFR',               heading: 'Contractor Field Reports' },
+    { dt: 'Production Log',    heading: 'Production Logs' },
+    { dt: 'Sign-In',           heading: 'Sign-In Sheets' },
+    { dt: 'Certified Payroll', heading: 'Certified Payroll' },
+    { dt: 'Invoice',           heading: 'Invoices' },
+  ]
+  sections.forEach(s => {
+    const items = files.filter(f => f.doc_type === s.dt)
+    if (items.length === 0) return
+    lines.push(sectionRule)
+    lines.push(`${s.heading} (${items.length})`)
+    lines.push(sectionRule)
+    items.forEach(f => {
+      const wos = (f.wo_ids || []).join(', ')
+      const dateNote = f.work_date ? ` — ${f.work_date}` : ''
+      if (s.dt === 'CFR' || s.dt === 'Invoice') {
+        lines.push(`  ${wos}${dateNote} — ${f.filename}`)
+      } else {
+        // Master-copy docs cover multiple WOs
+        lines.push(`  ${f.work_date || '?'} (covers ${wos})${dateNote && wos ? '' : ''} — ${f.filename}`)
+      }
+    })
+    lines.push('')
+  })
+
+  if (missing.length) {
+    lines.push(sectionRule)
+    lines.push(`NOT INCLUDED — requested but not yet generated/approved (${missing.length})`)
+    lines.push(sectionRule)
+    missing.forEach(m => {
+      lines.push(`  ${m.wo_id} — ${m.doc_type} — ${m.reason}`)
+    })
+    lines.push('')
+  }
+
+  if (listing.truncated) {
+    lines.push('NOTE: Result truncated at the server limit. Narrow the filters and re-run for the rest.')
+    lines.push('')
+  }
+
+  return lines.join('\n')
+}
 
 
 // ── Static file serving (production only) ────────────────────

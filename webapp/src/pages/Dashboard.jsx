@@ -7,6 +7,7 @@ import StatusBadge from '../components/StatusBadge'
 import { opToday } from '../lib/dateOps'
 import RevenueTab from './RevenueTab'
 import ProductionTab from './ProductionTab'
+import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -478,6 +479,7 @@ export default function Dashboard() {
   const [boroughFilt,setBoroughFilt]= useState(ALL)
   const [search,     setSearch]     = useState('')
   const [lastRefresh,setLastRefresh]= useState(null)
+  const [showDownloadModal, setShowDownloadModal] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -610,6 +612,14 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2">
           <ToolsMenu />
+          <button
+            onClick={() => setShowDownloadModal(true)}
+            className="btn-ghost flex items-center gap-1.5"
+            title="Download a zip of archived docs filtered by mode/contractor/doc-type"
+          >
+            <span>📦</span>
+            Documents
+          </button>
           {activeTab === 'operations' && (
             <button
               onClick={load}
@@ -651,6 +661,13 @@ export default function Dashboard() {
           boroughs={boroughs}
           filteredWOs={filteredWOs}
           completedTodayLabel={COMPLETED_TODAY}
+        />
+      )}
+
+      {showDownloadModal && (
+        <DownloadDocumentsModal
+          contractors={contractors}
+          onClose={() => setShowDownloadModal(false)}
         />
       )}
     </div>
