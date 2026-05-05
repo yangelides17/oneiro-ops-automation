@@ -45,9 +45,13 @@ const fmtBytes = (n) => {
 export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   const [step,    setStep]    = useState(1)
   const [mode,    setMode]    = useState('unsent')
-  // Filters
-  const [selectedContractors, setSelectedContractors] = useState(() => contractors.slice())
-  const [selectedDocTypes,    setSelectedDocTypes]    = useState(DOC_TYPES.slice())
+  // Filters — Unsent defaults to "nothing selected" so the admin
+  // explicitly picks what they're chasing down. WO Numbers and Date
+  // Range default to "everything" so picking those modes pulls all
+  // doc types for the chosen WOs/dates without extra clicks. The
+  // useEffect below resets selections when mode changes.
+  const [selectedContractors, setSelectedContractors] = useState([])
+  const [selectedDocTypes,    setSelectedDocTypes]    = useState([])
   const [woInput,             setWoInput]             = useState('')
   const [dateStart, setDateStart] = useState(() => {
     const d = new Date(); d.setDate(d.getDate() - 6); return isoOf(d)
@@ -73,10 +77,18 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
 
-  // Reset selectedContractors when contractors prop changes (parent fetch)
+  // Apply the per-mode default whenever mode changes (or the
+  // contractors prop arrives from the parent fetch). Unsent =
+  // explicit picking; other modes = pre-checked everything.
   useEffect(() => {
-    setSelectedContractors(contractors.slice())
-  }, [contractors.length])
+    if (mode === 'unsent') {
+      setSelectedContractors([])
+      setSelectedDocTypes([])
+    } else {
+      setSelectedContractors(contractors.slice())
+      setSelectedDocTypes(DOC_TYPES.slice())
+    }
+  }, [mode, contractors.length])
 
   // ── Filter payload built from current state ───────────────────
   const filters = useMemo(() => {

@@ -4895,16 +4895,31 @@ function backfillDocLifecycleFlags() {
     const folder = findWOFolder_(archiveRoot, woId, ss, data);
     if (!folder) { skipped++; continue; }
 
-    // Detect per-WO docs by filename prefix in this WO's folder.
+    // Detect per-WO docs in this WO's folder.
+    //   - CFR: archived as the merged WO doc named `WO_<wo_id>.pdf`
+    //     (or, for legacy folders that haven't had a CFR merged yet,
+    //     ANY non-aux PDF — original scan). Mirrors the precedence in
+    //     lookup_archived_wo_pdf.
+    //   - Invoice: filename starts with Invoice_.
+    //   - Sign-In: filename starts with SignIn_.
+    const canonical = `WO_${woId}.pdf`;
     let cfrFound = false;
     let invFound = false;
     let signInFound = false;
     const files = folder.getFiles();
     while (files.hasNext()) {
-      const name = files.next().getName();
-      if (/^CFR_/i.test(name) || /Field_Report/i.test(name)) cfrFound = true;
-      else if (/^Invoice_/i.test(name)) invFound = true;
-      else if (/^SignIn_/i.test(name) || /Sign[-_]In/i.test(name)) signInFound = true;
+      const f = files.next();
+      const name = f.getName();
+      if (name === canonical) {
+        cfrFound = true;
+      } else if (/^Invoice_/i.test(name)) {
+        invFound = true;
+      } else if (/^SignIn_/i.test(name)) {
+        signInFound = true;
+      } else if (f.getMimeType() === 'application/pdf' && !_isAuxDocName_(name)) {
+        // Non-aux PDF = legacy WO doc (pre-merged-CFR) — counts as CFR.
+        cfrFound = true;
+      }
     }
     const masters = getMaster(contractor, contractNum, borough);
 
@@ -7547,33 +7562,87 @@ function handleListDocumentsForBatch_(body) {
     return { include: true };
   };
 
-  // ── Per-WO docs: CFR + Invoice
-  const perWoDocs = docTypes.filter(t => t === 'Field Report' || t === 'Invoice');
-  perWoDocs.forEach(docType => {
-    const filenamePrefix = docType === 'Field Report' ? /^(CFR_|Contractor_Field_Report_)/i : /^Invoice_/i;
+  // ── CFR (Field Report) — archived as the merged WO doc.
+  //
+  // archiveDocument_ runs _replaceArchivedWODoc_ on Field Report files,
+  // which renames the file to canonical `WO_<wo_id>.pdf` and trashes
+  // any prior WO doc. So the file in the WO folder is NOT named CFR_*.
+  // Match precedence mirrors lookup_archived_wo_pdf (Code.js:1818):
+  //   1. Canonical `WO_<wo_id>.pdf`.
+  //   2. Any non-aux PDF (the original scan, before its first CFR was
+  //      merged) as a legacy fallback.
+  if (docTypes.indexOf('Field Report') !== -1) {
     wosInScope.forEach(w => {
       if (files.length >= MAX_BATCH_FILES_) return;
-      const q = qualifies(w, docType);
+      const q = qualifies(w, 'Field Report');
       if (!q.include) {
         if (q.missingReason) {
-          missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: q.missingReason });
+          missing.push({ wo_id: w.wo_id, doc_type: 'CFR', reason: q.missingReason });
         }
         return;
       }
       const folder = getWoFolder(w);
       if (!folder) {
-        missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: 'archive folder not found' });
+        missing.push({ wo_id: w.wo_id, doc_type: 'CFR', reason: 'archive folder not found' });
         return;
       }
+      const canonical = `WO_${w.wo_id}.pdf`;
+      let canonicalHit = null;
+      let fallbackHit  = null;
       const fIter = folder.getFiles();
+      while (fIter.hasNext()) {
+        const f = fIter.next();
+        if (f.getMimeType() !== 'application/pdf') continue;
+        const name = f.getName();
+        if (name === canonical) { canonicalHit = f; break; }
+        if (!_isAuxDocName_(name) && !fallbackHit) fallbackHit = f;
+      }
+      const target = canonicalHit || fallbackHit;
+      if (!target) {
+        missing.push({ wo_id: w.wo_id, doc_type: 'CFR', reason: 'Done? = Yes but no merged WO doc found in folder' });
+        return;
+      }
+      pushFile({
+        file_id:      target.getId(),
+        filename:     target.getName(),
+        mime_type:    target.getMimeType(),
+        size:         target.getSize(),
+        contractor:   w.contractor,
+        contract_num: w.contract_num,
+        borough:      w.borough,
+        doc_type:     'CFR',
+        wo_ids:       [w.wo_id],
+        work_date:    w.work_end,
+        done:         true,
+        sent:         w.sent['Field Report'],
+      });
+    });
+  }
+
+  // ── Invoice — Invoice_<num>_<wo_id>.<ext> in the WO folder.
+  if (docTypes.indexOf('Invoice') !== -1) {
+    wosInScope.forEach(w => {
+      if (files.length >= MAX_BATCH_FILES_) return;
+      const q = qualifies(w, 'Invoice');
+      if (!q.include) {
+        if (q.missingReason) {
+          missing.push({ wo_id: w.wo_id, doc_type: 'Invoice', reason: q.missingReason });
+        }
+        return;
+      }
+      const folder = getWoFolder(w);
+      if (!folder) {
+        missing.push({ wo_id: w.wo_id, doc_type: 'Invoice', reason: 'archive folder not found' });
+        return;
+      }
       let foundAny = false;
+      const fIter = folder.getFiles();
       while (fIter.hasNext()) {
         const f = fIter.next();
         const name = f.getName();
-        if (!filenamePrefix.test(name)) continue;
-        // CFR pdfs may live alongside an older legacy WO doc. Restrict
-        // to the WO's own id in the filename to avoid grabbing the
-        // wrong one.
+        if (!/^Invoice_/i.test(name)) continue;
+        // Restrict to invoices that mention this WO id, so we don't
+        // grab a sibling WO's invoice if more than one was filed.
         if (name.toUpperCase().indexOf(w.wo_id.toUpperCase()) === -1) continue;
         pushFile({
           file_id:      f.getId(),
@@ -7583,19 +7652,19 @@ function handleListDocumentsForBatch_(body) {
           contractor:   w.contractor,
           contract_num: w.contract_num,
           borough:      w.borough,
-          doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
+          doc_type:     'Invoice',
           wo_ids:       [w.wo_id],
           work_date:    w.work_end,
           done:         true,
-          sent:         w.sent[docType],
+          sent:         w.sent['Invoice'],
         });
         foundAny = true;
       }
       if (!foundAny) {
-        missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: 'Done? = Yes but no matching file in WO folder' });
+        missing.push({ wo_id: w.wo_id, doc_type: 'Invoice', reason: 'Done? = Yes but no Invoice_*.pdf found in folder' });
       }
     });
-  });
+  }
 
   // ── Master-copy docs: Production Log + Certified Payroll
   // Walk each contract's master subfolder once; filter by date range
@@ -7622,6 +7691,12 @@ function handleListDocumentsForBatch_(body) {
                                                         : masters.cp;
       if (!masterFolder) return;
 
+      // Filename prefix per doc type — guards against accidentally
+      // picking up unrelated PDFs that happened to land in the master.
+      const masterPrefix = docType === 'Production Log' ? /^Production_Log_/i
+                         : docType === 'Sign-In'        ? /^SignIn_/i
+                                                        : /^Certified_Payroll_/i;
+
       // Determine which group WOs qualify for this doc type.
       const qualifyingWos = groupWos.filter(w => {
         const q = qualifies(w, docType);
@@ -7637,6 +7712,7 @@ function handleListDocumentsForBatch_(body) {
         if (files.length >= MAX_BATCH_FILES_) break;
         const f = fIter.next();
         const name = f.getName();
+        if (!masterPrefix.test(name)) continue;
         const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
         if (!dm) continue;
         const fileDate = dm[1];
