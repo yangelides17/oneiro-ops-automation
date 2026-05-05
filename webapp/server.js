@@ -1238,7 +1238,8 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           continue
         }
         const buf = Buffer.from(fetched.data, 'base64')
-        archive.append(buf, { name: zipPathFor(file) })
+        const flat = await flattenPdfForDelivery(buf, file.filename)
+        archive.append(flat, { name: zipPathFor(file) })
         appended++
       } catch (e) {
         failed++
@@ -1298,6 +1299,52 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     // forcing res.end() (which used to truncate good data in flight).
   }
 })
+
+/**
+ * Flatten a single PDF for inclusion in the delivery zip.
+ *
+ * Why: every CFR (and other doc-type) coming out of the worker uses
+ * the same AcroForm field names from a shared template (Hours,
+ * Quantity_1, Date, etc). When the admin combines individual zip
+ * PDFs via macOS's Create PDF Quick Action, the merged document has
+ * a single AcroForm tree with collisions — Acrobat shows only the
+ * first PDF's filled values, the rest appear blank. Flattening
+ * removes the AcroForm so combine tools can't get confused.
+ *
+ * Why pdf-lib's flatten with `updateFieldAppearances: false` works
+ * for us (and the saved-memory warning about pdf-lib flatten doesn't
+ * apply here): the option skips the regenerate-/AP-with-pdf-lib-fonts
+ * step (PDFForm.js:449). The flatten body then just walks each
+ * widget, takes its EXISTING /AP/N XObject ref, and emits a /Do
+ * operator on the page at the widget's /Rect — preserving the exact
+ * PyMuPDF-rendered visual byte-for-byte.
+ *
+ * Drive originals stay editable; only the zip-bound copy is flat.
+ *
+ * Falls back to the original buffer on:
+ *   - non-PDF inputs (Invoice_*.txt artifacts, magic-byte check)
+ *   - PDFs with no form fields (nothing to do)
+ *   - pdf-lib parse / flatten errors (defensive)
+ */
+async function flattenPdfForDelivery(buf, filename) {
+  if (!buf || buf.length < 5 || buf.slice(0, 5).toString() !== '%PDF-') {
+    return buf
+  }
+  try {
+    const { PDFDocument } = await import('pdf-lib')
+    const doc = await PDFDocument.load(buf, { updateMetadata: false })
+    const form = doc.getForm()
+    if (form.getFields().length === 0) return buf
+    // BOTH calls need updateFieldAppearances:false. The save default
+    // also re-runs updateFieldAppearances if a form was accessed, so
+    // forgetting either flag undoes everything we're trying to avoid.
+    form.flatten({ updateFieldAppearances: false })
+    return Buffer.from(await doc.save({ updateFieldAppearances: false }))
+  } catch (e) {
+    console.warn(`flatten failed for ${filename}, sending original: ${e.message}`)
+    return buf
+  }
+}
 
 /**
  * Build the human-readable MANIFEST.txt content for a doc batch.
