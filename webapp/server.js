@@ -1125,10 +1125,20 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
   const filters  = req.body || {}
   const markSent = !!filters.mark_sent
 
+  // Cancel detection: listen on RES (not req). req.close fires when the
+  // incoming request stream ends, which for a POST happens once express
+  // has parsed the body — that's BEFORE our handler runs. Using req
+  // produced spurious "cancelled" flags that broke the zip stream and
+  // skipped the post-finish set_docs_sent call. res.on('close') fires
+  // when the response stream closes; combined with !res.writableEnded
+  // it's the canonical "client disconnected mid-stream" signal.
   let cancelled = false
-  const onCancel = () => { cancelled = true }
-  req.on('aborted', onCancel)
-  req.on('close',   () => { if (!res.writableEnded) cancelled = true })
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      console.warn('batch-download: response closed before writableEnded — cancelled')
+      cancelled = true
+    }
+  })
 
   try {
     // Resolve the file list first (small JSON payload).
@@ -1141,17 +1151,22 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
         warnings: listing.warnings || [],
       })
     }
+    console.log(`batch-download: starting zip with ${files.length} files`)
 
     const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
     res.setHeader('Content-Type', 'application/zip')
     res.setHeader('Content-Disposition', `attachment; filename="oneiro-docs-${ts}.zip"`)
     res.setHeader('Cache-Control', 'no-store')
+    res.flushHeaders()
 
     const archive = archiver('zip', { zlib: { level: 9 } })
     archive.on('warning', (e) => console.warn('archiver warning:', e.message))
-    archive.on('error',   (e) => {
-      console.error('archiver error:', e.message)
-      try { res.end() } catch (_) {}
+    // Don't call res.end() in the error handler — archiver's pipe will
+    // unpipe and let the response surface the error naturally. Manually
+    // ending the response here used to truncate the stream while bytes
+    // were still in flight.
+    archive.on('error', (e) => {
+      console.error('archiver error:', e && e.stack || e.message)
     })
     archive.pipe(res)
 
@@ -1193,33 +1208,49 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       return candidate
     }
 
+    let appended = 0
+    let failed   = 0
     for (const file of files) {
       if (cancelled) break
       try {
         const fetched = await callAppsScript('get_drive_file_bytes', { file_id: file.file_id })
         if (!fetched || !fetched.data) {
           console.warn(`batch-download: get_drive_file_bytes returned no bytes for ${file.filename}`)
+          failed++
           continue
         }
         const buf = Buffer.from(fetched.data, 'base64')
         archive.append(buf, { name: zipPathFor(file) })
+        appended++
       } catch (e) {
+        failed++
         console.warn(`batch-download: failed to fetch ${file.filename}: ${e.message}`)
         // Continue with the other files rather than aborting the whole zip.
       }
     }
+    console.log(`batch-download: appended=${appended} failed=${failed} cancelled=${cancelled}`)
 
     if (cancelled) {
-      // Client gave up — finalize the partial zip cleanly so we don't
-      // leak a stuck stream, but don't mark sent.
+      // Client gave up — abort the archive (which destroys the underlying
+      // stream including the response) and skip set_docs_sent.
       try { archive.abort() } catch (_) {}
-      try { res.end() }       catch (_) {}
       return
     }
 
-    archive.finalize()
+    // finalize() returns a Promise in archiver v5+. Awaiting it lets us
+    // catch finalization errors and confirm bytes flushed before we
+    // schedule the set_docs_sent call.
+    try {
+      await archive.finalize()
+      console.log('batch-download: archive finalized')
+    } catch (e) {
+      console.error('batch-download: archive.finalize() threw:', e && e.stack || e.message)
+      return
+    }
 
-    // Wait for the response stream to close before flipping Sent flags.
+    // Wait for the response stream to fully drain before flipping Sent
+    // flags. res.on('finish') is the right signal — it fires after the
+    // last byte was written to the socket.
     res.on('finish', () => {
       if (cancelled || !markSent) return
       // Build the per-(wo_id, doc_type) updates list.
@@ -1234,17 +1265,19 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           updates.push({ wo_id: woId, doc_type: f.doc_type, sent: true })
         })
       })
+      console.log(`batch-download: marking ${updates.length} (wo_id, doc_type) tuples as sent`)
       callAppsScript('set_docs_sent', { updates }).catch(e => {
         console.warn('batch-download: set_docs_sent failed:', e.message)
       })
     })
   } catch (err) {
-    console.error('POST /api/documents/batch-download error:', err.message)
+    console.error('POST /api/documents/batch-download error:', err && err.stack || err.message)
     if (!res.headersSent) {
       res.status(500).json({ error: err.message })
-    } else {
-      try { res.end() } catch (_) {}
     }
+    // If headers already went out, the partial zip the browser has is
+    // unrecoverable — let the response close naturally rather than
+    // forcing res.end() (which used to truncate good data in flight).
   }
 })
 
