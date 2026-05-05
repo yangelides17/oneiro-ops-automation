@@ -429,10 +429,12 @@ function WORow({ wo, flagged }) {
 }
 
 // ── Main ──────────────────────────────────────────────────────
+// Tab id 'operations' is kept internally for back-compat with any
+// existing `?tab=operations` URLs; the user-facing label is WO Tracker.
 const TABS = [
-  { id: 'operations', label: 'Operations' },
-  { id: 'revenue',    label: 'Revenue'    },
+  { id: 'operations', label: 'WO Tracker' },
   { id: 'production', label: 'Production' },
+  { id: 'revenue',    label: 'Revenue'    },
 ]
 
 function TabStrip({ active, onChange }) {
@@ -598,7 +600,7 @@ export default function Dashboard() {
           <h1 className="text-2xl font-black text-navy leading-none">
             {activeTab === 'revenue'    ? 'Revenue Dashboard'
               : activeTab === 'production' ? 'Production Dashboard'
-              : 'Operations Dashboard'}
+              : 'Work Order Tracker'}
           </h1>
           {activeTab === 'operations' && lastRefresh && (
             <p className="text-slate-400 text-xs mt-1">
