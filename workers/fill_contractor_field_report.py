@@ -338,8 +338,29 @@ def merge_cfr_into_wo(wo_pdf_bytes: bytes,
     """
     wo_reader  = PdfReader(BytesIO(wo_pdf_bytes))
     cfr_reader = PdfReader(cfr_pdf_path)
-    cfr_page   = cfr_reader.pages[0]
-    writer     = PdfWriter()
+
+    # Build the writer by appending the CFR reader first — `append`
+    # carries the catalog including /AcroForm, /AcroForm/DR, and the
+    # full field tree (with /AP streams already PyMuPDF-regenerated).
+    # Then we reset writer.pages[] and re-insert pages in the right
+    # order, treating the cloned CFR page as a normal page reference.
+    #
+    # Why not the previous `PdfWriter()` + per-page `add_page(...)`
+    # pattern: that produces a merged doc whose pages have widget
+    # annotations with /T names and /AP, but NO catalog /AcroForm
+    # tying them together. Acrobat is lenient enough to render and
+    # edit those orphan widgets, but pdf-lib (used by the webapp's
+    # batch-download prep step) walks /AcroForm/Fields and finds
+    # nothing — so renaming + read-only never gets applied to CFRs,
+    # leaving them editable and collision-prone on combine.
+    #
+    # Mirrors the pattern at fill_production_log.py:440-441.
+    writer = PdfWriter()
+    writer.append(cfr_reader)
+    # The append placed the CFR's single page at index 0; capture the
+    # writer-cloned reference so we can position it correctly below.
+    cfr_page = writer.pages[0]
+    del writer.pages[0]
 
     cfr_idx = next((i for i, t in enumerate(page_types) if t == 'CFR'), None)
 
