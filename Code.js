@@ -1476,6 +1476,13 @@ function handleSetDocsSent_(body) {
     'Invoice':           'Invoice',
   };
 
+  // PL / SI / CP storage moved to the Doc Lifecycle Log (per-doc rows
+  // keyed by Doc ID). Per-WO updates for those types no longer make
+  // sense — caller should route to set_doc_status with a doc_id. Skip
+  // them here with a warning so a stale caller doesn't silently flip
+  // unrelated rows.
+  const PER_DOC_TYPES = { 'Production Log': 1, 'Sign-In': 1, 'Certified Payroll': 1 };
+
   // Group woIds by (doc_type, done?, sent?) so each unique flag combo
   // is one batch write call. Most calls will collapse to one bucket.
   const buckets = {};
@@ -1484,6 +1491,10 @@ function handleSetDocsSent_(body) {
     const docType = toInternal[raw];
     if (!docType) {
       Logger.log('⚠️ handleSetDocsSent_: skipping unknown doc_type "' + raw + '"');
+      return;
+    }
+    if (PER_DOC_TYPES[docType]) {
+      Logger.log('⚠️ handleSetDocsSent_: per-WO update for "' + docType + '" ignored — use set_doc_status with doc_id instead');
       return;
     }
     const woId = String(u.wo_id || '').trim();
@@ -1502,6 +1513,39 @@ function handleSetDocsSent_(body) {
   Object.values(buckets).forEach(b => {
     _setDocLifecycleFlags_(ss, b.woIds, b.docType, b.flags);
     total += b.woIds.length;
+  });
+
+  if (total > 0) _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({ updated: total });
+}
+
+// ── action: set_doc_status ────────────────────────────────────
+//
+// Per-doc lifecycle update for time-anchored docs (PL / SI / CP) that
+// live in the Doc Lifecycle Log. Body shape:
+//
+//   { updates: [{ doc_id, done?, sent? }, ...] }
+//
+// Each update target is a single row in the Log (1-to-1 with Doc ID).
+// Returns count of rows touched.
+function handleSetDocStatus_(body) {
+  const d = body.data || {};
+  const updates = Array.isArray(d.updates) ? d.updates : [];
+  if (updates.length === 0) return jsonResponse_({ updated: 0 });
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let total = 0;
+  updates.forEach(u => {
+    const docId = String(u.doc_id || '').trim();
+    if (!docId) return;
+    const flags = {};
+    if (u.done === true)  flags.done = true;
+    if (u.done === false) flags.done = false;
+    if (u.sent === true)  flags.sent = true;
+    if (u.sent === false) flags.sent = false;
+    if (flags.done == null && flags.sent == null) return;
+    _setDocLifecycleStatus_(ss, docId, flags);
+    total++;
   });
 
   if (total > 0) _invalidateCacheKeys_(['dashboard_v1']);
@@ -1602,12 +1646,32 @@ function archiveDocument_(file, docType, woId, ss) {
         // Master copy at contract level — mirrors Production Logs and
         // Certified Payroll. Lets the listing handler read Sign-Ins
         // from a single place instead of de-duping across WO folders.
-        file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Sign-Ins'));
+        const masterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Sign-Ins'));
         wos.forEach(wo => {
           const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
           file.makeCopy(cleanName, woFolder);
         });
         Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + master + ${wos.length} WO folder(s)`);
+
+        // Doc Lifecycle Log: upsert SI row with done=true. Sent stays
+        // blank — Sign-Ins ride out with the Certified Payroll, and we
+        // don't track SI Sent independently.
+        try {
+          _upsertDocLifecycleRow_(ss, {
+            doc_id:       _docLifecycleId_('Sign-In', dateStr, contractNum, borough),
+            doc_type:     'Sign-In',
+            anchor:       dateStr,
+            contractor:   contractor,
+            contract_num: contractNum,
+            borough:      borough,
+            wo_ids:       wos.map(w => w.id),
+            done:         true,
+            file_id:      masterCopy.getId(),
+          });
+        } catch (e) {
+          Logger.log('⚠️ archiveDocument_ Sign-In: Doc Lifecycle Log upsert failed: ' + e.message);
+        }
+
         return { success: true, doc_type: 'Sign-In', wo_ids: wos.map(w => w.id) };
       }
       // Legacy single-WO Sign-In (pre-multi-WO refactor) — keep working.
@@ -1659,6 +1723,7 @@ function archiveDocument_(file, docType, woId, ss) {
       }
 
       const allCoveredWoIds = [];
+      const plAnchorIso = dateMatch[1];
       matchingEntries.forEach(([key, wos]) => {
         const [contractor, contractNum, borough] = key.split('|');
         const contractFolder = getOrCreateSubfolder_(
@@ -1666,7 +1731,7 @@ function archiveDocument_(file, docType, woId, ss) {
           `${contractNum} - ${getBoroughName_(borough)}`
         );
         // Master copy at contract level
-        file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Production Logs'));
+        const masterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Production Logs'));
         // Duplicate into each WO folder covered by this log
         wos.forEach(wo => {
           const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
@@ -1674,6 +1739,23 @@ function archiveDocument_(file, docType, woId, ss) {
           allCoveredWoIds.push(wo.id);
         });
         Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+
+        // Doc Lifecycle Log: one row per (date, contract, borough).
+        try {
+          _upsertDocLifecycleRow_(ss, {
+            doc_id:       _docLifecycleId_('Production Log', plAnchorIso, contractNum, borough),
+            doc_type:     'Production Log',
+            anchor:       plAnchorIso,
+            contractor:   contractor,
+            contract_num: contractNum,
+            borough:      borough,
+            wo_ids:       wos.map(w => w.id),
+            done:         true,
+            file_id:      masterCopy.getId(),
+          });
+        } catch (e) {
+          Logger.log('⚠️ archiveDocument_ Prod Log: Doc Lifecycle Log upsert failed: ' + e.message);
+        }
       });
       return { success: true, doc_type: 'Production Log', wo_ids: allCoveredWoIds };
 
@@ -1707,13 +1789,31 @@ function archiveDocument_(file, docType, woId, ss) {
         `${contractNum} - ${getBoroughName_(borough)}`
       );
       // Master copy at contract level
-      file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
+      const cpMasterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
       // Duplicate into each WO folder worked during that payroll week for this contract
       wos.forEach(wo => {
         const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
         file.makeCopy(cleanName, woFolder);
       });
       Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+
+      // Doc Lifecycle Log: one row per (week, contract, borough).
+      try {
+        _upsertDocLifecycleRow_(ss, {
+          doc_id:       _docLifecycleId_('Certified Payroll', weekStartStr, contractNum, borough),
+          doc_type:     'Certified Payroll',
+          anchor:       weekStartStr,
+          contractor:   contractor,
+          contract_num: contractNum,
+          borough:      borough,
+          wo_ids:       wos.map(w => w.id),
+          done:         true,
+          file_id:      cpMasterCopy.getId(),
+        });
+      } catch (e) {
+        Logger.log('⚠️ archiveDocument_ CP: Doc Lifecycle Log upsert failed: ' + e.message);
+      }
+
       return { success: true, doc_type: 'Certified Payroll', wo_ids: wos.map(w => w.id) };
 
     } else {
@@ -3105,6 +3205,10 @@ function doPost(e) {
       return handleListMetroCompletedDocs_(body);
     } else if (action === 'set_docs_sent') {
       return handleSetDocsSent_(body);
+    } else if (action === 'set_doc_status') {
+      return handleSetDocStatus_(body);
+    } else if (action === 'get_doc_status_calendar') {
+      return handleGetDocStatusCalendar_(body);
     } else if (action === 'list_documents_for_batch') {
       return handleListDocumentsForBatch_(body);
     } else {
@@ -4792,6 +4896,424 @@ function setupDocLifecycleColumns() {
   }
   ensureWoTrackerExtraCols_(woSheet);
   Logger.log('✅ setupDocLifecycleColumns: WO Tracker schema reconciled with Done/Sent columns');
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// DOC LIFECYCLE LOG — per-doc tracking for time-anchored docs
+// ═══════════════════════════════════════════════════════════════
+//
+// Production Logs, Sign-Ins, and Certified Payrolls don't fit a
+// per-WO storage shape — a WO that worked 3 days has 3 PLs, not 1.
+// The legacy WO Tracker columns can only track "at least one of these
+// is done"; once flipped from one occurrence's archive, subsequent
+// occurrences are invisible to the data model.
+//
+// The Doc Lifecycle Log holds one row per actual doc instance, keyed
+// by a synthetic Doc ID:  <DOCTYPE>_<ANCHOR>_<CONTRACTNUM>_<BOROUGH>
+//   PL_2026-04-13_84125MBTP701_BK
+//   SI_2026-04-13_84125MBTP701_BK
+//   CP_2026-04-12_84125MBTP701_BK   (week-start anchor)
+//
+// CFR + Invoice stay on the WO Tracker (their data shape is genuinely
+// per-WO).
+
+const DOC_LIFECYCLE_LOG_SHEET_ = 'Doc Lifecycle Log';
+const DOC_LIFECYCLE_HEADERS_ = [
+  'Doc ID',           // 0  primary key (synthetic)
+  'Doc Type',         // 1  Production Log | Sign-In | Certified Payroll
+  'Anchor Date',      // 2  YYYY-MM-DD (work date for PL/SI; week-start for CP)
+  'Prime Contractor', // 3
+  'Contract #',       // 4
+  'Borough',          // 5  M / BX / BK / QU / SI
+  'WO IDs',           // 6  comma-separated
+  'Done',             // 7  Yes / blank
+  'Sent',             // 8  Yes / blank (always blank for SI; not tracked)
+  'Drive File ID',    // 9  set by archiveDocument_
+  'Done At',          // 10 timestamp
+  'Sent At',          // 11 timestamp
+  'Notes',            // 12 free-form
+];
+
+/**
+ * Idempotently create the Doc Lifecycle Log sheet. Public name (no
+ * underscore) so it appears in the Apps Script editor dropdown — the
+ * admin runs this once after deploying.
+ */
+function setupDocLifecycleLog() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  const createdNew = !sheet;
+  if (createdNew) sheet = ss.insertSheet(DOC_LIFECYCLE_LOG_SHEET_);
+
+  sheet.getRange(1, 1, 1, DOC_LIFECYCLE_HEADERS_.length).setValues([DOC_LIFECYCLE_HEADERS_]);
+  sheet.getRange(1, 1, 1, DOC_LIFECYCLE_HEADERS_.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  // Done / Sent dropdown validators on rows 2+ for visual cue.
+  const yesNo = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Yes'], true)   // blank also valid; Yes is the only filled value
+    .setAllowInvalid(true)
+    .build();
+  sheet.getRange(2, 8, 9999, 1).setDataValidation(yesNo);   // Done
+  sheet.getRange(2, 9, 9999, 1).setDataValidation(yesNo);   // Sent
+
+  Logger.log(createdNew
+    ? '✅ setupDocLifecycleLog: created sheet "' + DOC_LIFECYCLE_LOG_SHEET_ + '"'
+    : '↻ setupDocLifecycleLog: sheet already exists; headers reconciled');
+}
+
+/**
+ * Build the synthetic Doc ID from natural identifiers. Deterministic
+ * — used both at archive time (upsert) and at backfill time, so the
+ * same logical doc always resolves to the same key.
+ *
+ *   PL_2026-04-13_84125MBTP701_BK
+ *   SI_2026-04-13_84125MBTP701_BK
+ *   CP_2026-04-12_84125MBTP701_BK
+ *
+ * docType maps:
+ *   'Production Log'    → PL
+ *   'Sign-In'           → SI
+ *   'Certified Payroll' → CP
+ */
+const _DOC_TYPE_PREFIX_ = Object.freeze({
+  'Production Log':    'PL',
+  'Sign-In':           'SI',
+  'Certified Payroll': 'CP',
+});
+function _docLifecycleId_(docType, anchorIso, contractNum, borough) {
+  const prefix = _DOC_TYPE_PREFIX_[docType];
+  if (!prefix) return '';
+  // Strip any '/EXT' suffix from contract number (matches the rest of
+  // the codebase — see split('/')[0] in archiveDocument_ etc.).
+  const cn = String(contractNum || '').split('/')[0].trim();
+  return prefix + '_' + String(anchorIso).trim() + '_' + cn + '_' + String(borough).trim();
+}
+
+/**
+ * Read the entire Doc Lifecycle Log into an array of objects keyed by
+ * Doc ID. Single sheet read; callers can pass the result to multiple
+ * helpers without re-fetching.
+ */
+function _readDocLifecycle_(ss) {
+  const sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!sheet) return { rows: [], byId: {} };
+  const data = sheet.getDataRange().getValues();
+  const rows = [];
+  const byId = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const id = String(r[0] || '').trim();
+    if (!id) continue;
+    const obj = {
+      sheet_row:    i + 1,           // 1-indexed
+      doc_id:       id,
+      doc_type:     String(r[1] || '').trim(),
+      anchor:       (r[2] instanceof Date)
+                      ? Utilities.formatDate(r[2], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+                      : String(r[2] || '').trim(),
+      contractor:   String(r[3] || '').trim(),
+      contract_num: String(r[4] || '').trim(),
+      borough:      String(r[5] || '').trim(),
+      wo_ids:       String(r[6] || '').split(',').map(s => s.trim()).filter(Boolean),
+      done:         String(r[7] || '').toLowerCase() === 'yes',
+      sent:         String(r[8] || '').toLowerCase() === 'yes',
+      file_id:      String(r[9] || '').trim(),
+      done_at:      r[10] || '',
+      sent_at:      r[11] || '',
+      notes:        String(r[12] || '').trim(),
+    };
+    rows.push(obj);
+    byId[id] = obj;
+  }
+  return { rows, byId };
+}
+
+/**
+ * Insert or update a row in the Doc Lifecycle Log. Doc ID is the
+ * primary key. If the row exists, mutates the supplied fields and
+ * stamps Done At / Sent At when those flags first flip blank → Yes.
+ *
+ * Idempotent: re-archiving a doc that's already in the log just
+ * updates the Drive File ID + done timestamp without duplicating.
+ */
+function _upsertDocLifecycleRow_(ss, payload) {
+  const sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!sheet) {
+    Logger.log('⚠️ _upsertDocLifecycleRow_: Doc Lifecycle Log not found — run setupDocLifecycleLog');
+    return;
+  }
+  const docId = String(payload.doc_id || '').trim();
+  if (!docId) return;
+
+  const data = sheet.getDataRange().getValues();
+  let foundRow = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === docId) { foundRow = i + 1; break; }
+  }
+
+  const now = new Date();
+  const woIdsCsv = Array.isArray(payload.wo_ids)
+    ? payload.wo_ids.filter(Boolean).join(', ')
+    : (payload.wo_ids || '');
+
+  if (foundRow === 0) {
+    // Insert
+    const row = [
+      docId,
+      payload.doc_type || '',
+      payload.anchor   || '',
+      payload.contractor   || '',
+      payload.contract_num || '',
+      payload.borough      || '',
+      woIdsCsv,
+      payload.done ? 'Yes' : '',
+      payload.sent ? 'Yes' : '',
+      payload.file_id || '',
+      payload.done ? now : '',
+      payload.sent ? now : '',
+      payload.notes || '',
+    ];
+    sheet.appendRow(row);
+    return;
+  }
+
+  // Update existing row in place. Only mutate explicitly-supplied fields.
+  const r = data[foundRow - 1];
+  const updates = [];
+  if (payload.doc_type   !== undefined) updates.push({ col: 2,  val: payload.doc_type });
+  if (payload.anchor     !== undefined) updates.push({ col: 3,  val: payload.anchor });
+  if (payload.contractor !== undefined) updates.push({ col: 4,  val: payload.contractor });
+  if (payload.contract_num !== undefined) updates.push({ col: 5, val: String(payload.contract_num).split('/')[0].trim() });
+  if (payload.borough    !== undefined) updates.push({ col: 6,  val: payload.borough });
+  if (payload.wo_ids     !== undefined) updates.push({ col: 7,  val: woIdsCsv });
+  if (payload.done === true) {
+    updates.push({ col: 8, val: 'Yes' });
+    if (String(r[7] || '').toLowerCase() !== 'yes') updates.push({ col: 11, val: now });
+  } else if (payload.done === false) {
+    updates.push({ col: 8, val: '' });
+    updates.push({ col: 11, val: '' });
+  }
+  if (payload.sent === true) {
+    updates.push({ col: 9, val: 'Yes' });
+    if (String(r[8] || '').toLowerCase() !== 'yes') updates.push({ col: 12, val: now });
+  } else if (payload.sent === false) {
+    updates.push({ col: 9, val: '' });
+    updates.push({ col: 12, val: '' });
+  }
+  if (payload.file_id    !== undefined) updates.push({ col: 10, val: payload.file_id });
+  if (payload.notes      !== undefined) updates.push({ col: 13, val: payload.notes });
+
+  updates.forEach(u => sheet.getRange(foundRow, u.col).setValue(u.val));
+}
+
+/**
+ * Lighter helper: flip Done and/or Sent on an existing row by Doc ID.
+ * Throws no-op if the row doesn't exist (caller should have done an
+ * upsert first via _upsertDocLifecycleRow_).
+ */
+function _setDocLifecycleStatus_(ss, docId, flags) {
+  if (!docId || !flags || (flags.done == null && flags.sent == null)) return;
+  _upsertDocLifecycleRow_(ss, {
+    doc_id: docId,
+    done:   flags.done,
+    sent:   flags.sent,
+  });
+}
+
+/**
+ * One-time backfill: walks Work Day Log to enumerate every (date,
+ * contract, borough) tuple where work happened. For each tuple, inserts:
+ *   - one Production Log row in Doc Lifecycle Log
+ *   - one Sign-In row
+ * Plus, for each unique (week_start, contract, borough) tuple,
+ * one Certified Payroll row.
+ *
+ * Done and Sent columns are LEFT BLANK. The admin works through them
+ * manually via the Doc Status tab's pending list — automated status
+ * inference would pollute results given the user has test docs.
+ *
+ * Idempotent: skips Doc IDs already present in the Log. Safe to re-run.
+ *
+ * Public name (no underscore) so the editor function-runner picks it up.
+ */
+function backfillDocLifecycleLog() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  const logSheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!logSheet) {
+    Logger.log('❌ backfillDocLifecycleLog: Doc Lifecycle Log sheet not found — run setupDocLifecycleLog first');
+    return;
+  }
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) {
+    Logger.log('❌ backfillDocLifecycleLog: Work Day Log not found — backfill source unavailable');
+    return;
+  }
+
+  // Set of existing Doc IDs so re-runs skip duplicates.
+  const { byId: existingById } = _readDocLifecycle_(ss);
+
+  // Walk WDL once. Group rows by (date, contractor, contract, borough);
+  // dedupe WOs within each group.
+  const wdlData = wdlSheet.getDataRange().getValues();
+  const dayGroups = {};   // key: date|contractor|contractNum|borough → { contractor, contractNum, borough, anchor, wo_ids: Set }
+  const weekTuples = {};  // key: weekStartIso|contractNum|borough → { contractor, contractNum, borough, anchor, wo_ids: Set }
+
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  // Sunday-anchored week start for a given Date.
+  const weekStartIsoFor = (date) => {
+    const d = new Date(date);
+    const dow = d.getDay();   // 0 = Sunday
+    const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
+    return Utilities.formatDate(start, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  };
+
+  for (let i = 1; i < wdlData.length; i++) {
+    const r = wdlData[i];
+    const dateIso = ymd(r[0]);
+    if (!dateIso) continue;
+    const woId        = String(r[1] || '').trim();
+    const contractor  = String(r[2] || '').trim();
+    const contractNum = String(r[3] || '').split('/')[0].trim();
+    const borough     = String(r[4] || '').trim();
+    if (!woId || !contractor || !contractNum || !borough) continue;
+
+    const dayKey = dateIso + '|' + contractor + '|' + contractNum + '|' + borough;
+    if (!dayGroups[dayKey]) {
+      dayGroups[dayKey] = {
+        anchor: dateIso, contractor, contractNum, borough, wo_ids: new Set(),
+      };
+    }
+    dayGroups[dayKey].wo_ids.add(woId);
+
+    // Week tuple uses Sunday anchor of the day's date. Contractor stored
+    // for backfill purposes — matches what archiveDocument_'s CP branch does.
+    const wkStart = weekStartIsoFor(new Date(dateIso + 'T12:00:00'));
+    const weekKey = wkStart + '|' + contractNum + '|' + borough;
+    if (!weekTuples[weekKey]) {
+      weekTuples[weekKey] = {
+        anchor: wkStart, contractor, contractNum, borough, wo_ids: new Set(),
+      };
+    }
+    weekTuples[weekKey].wo_ids.add(woId);
+  }
+
+  let plInserted = 0, siInserted = 0, cpInserted = 0, skipped = 0;
+
+  Object.values(dayGroups).forEach(g => {
+    const woArr = Array.from(g.wo_ids);
+    const plId = _docLifecycleId_('Production Log', g.anchor, g.contractNum, g.borough);
+    const siId = _docLifecycleId_('Sign-In',        g.anchor, g.contractNum, g.borough);
+    if (!existingById[plId]) {
+      _upsertDocLifecycleRow_(ss, {
+        doc_id: plId, doc_type: 'Production Log', anchor: g.anchor,
+        contractor: g.contractor, contract_num: g.contractNum, borough: g.borough,
+        wo_ids: woArr,
+      });
+      plInserted++;
+    } else skipped++;
+    if (!existingById[siId]) {
+      _upsertDocLifecycleRow_(ss, {
+        doc_id: siId, doc_type: 'Sign-In', anchor: g.anchor,
+        contractor: g.contractor, contract_num: g.contractNum, borough: g.borough,
+        wo_ids: woArr,
+      });
+      siInserted++;
+    } else skipped++;
+  });
+
+  Object.values(weekTuples).forEach(w => {
+    const woArr = Array.from(w.wo_ids);
+    const cpId = _docLifecycleId_('Certified Payroll', w.anchor, w.contractNum, w.borough);
+    if (!existingById[cpId]) {
+      _upsertDocLifecycleRow_(ss, {
+        doc_id: cpId, doc_type: 'Certified Payroll', anchor: w.anchor,
+        contractor: w.contractor, contract_num: w.contractNum, borough: w.borough,
+        wo_ids: woArr,
+      });
+      cpInserted++;
+    } else skipped++;
+  });
+
+  _invalidateCacheKeys_([]);   // bump cache token so any UI re-fetches see the new rows
+  Logger.log('✅ backfillDocLifecycleLog: PL=' + plInserted +
+             ', SI=' + siInserted +
+             ', CP=' + cpInserted +
+             ', skippedExisting=' + skipped);
+}
+
+/**
+ * One-time migration: trim the now-obsolete PL/SI/CP Done/Sent columns
+ * from the WO Tracker, since per-doc tracking moved to the Doc
+ * Lifecycle Log. After this runs, Google Sheets shifts trailing
+ * columns left, and DOC_TYPE_DONE_COL_['Invoice'] needs to be updated
+ * from 50 → 45 in a follow-up deploy.
+ *
+ * **Run prerequisites:**
+ *   1. setupDocLifecycleLog has been run.
+ *   2. backfillDocLifecycleLog has been run (so existing PL/SI/CP
+ *      state is captured before we lose the WO Tracker columns).
+ *   3. You're prepared to follow up with a code deploy that updates
+ *      DOC_TYPE_DONE_COL_['Invoice'] = 45 + trims ensureWoTrackerExtraCols_.
+ *
+ * Without #3, the Invoice Done chip on the WO Tracker tab will read
+ * the wrong column until the deploy lands.
+ *
+ * Public name (no underscore) so it shows in the editor dropdown.
+ */
+function migrateRemoveObsoleteDocColumns() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) {
+    Logger.log('❌ migrateRemoveObsoleteDocColumns: Work Order Tracker not found');
+    return;
+  }
+  const logSheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!logSheet) {
+    Logger.log('❌ migrateRemoveObsoleteDocColumns: Doc Lifecycle Log missing — run setupDocLifecycleLog + backfillDocLifecycleLog first');
+    return;
+  }
+  if (logSheet.getLastRow() < 2) {
+    Logger.log('❌ migrateRemoveObsoleteDocColumns: Doc Lifecycle Log is empty — run backfillDocLifecycleLog first');
+    return;
+  }
+
+  // Sanity-check the columns about to be deleted have the expected
+  // headers, so we don't accidentally trim something else if the
+  // schema's drifted.
+  const expected = [
+    { col: 46, header: 'Prod Log Sent?' },     // 1-idx 46 = 0-idx 45
+    { col: 47, header: 'Sign-In Done?' },      // 1-idx 47 = 0-idx 46
+    { col: 48, header: 'Sign-In Sent?' },      // 1-idx 48 = 0-idx 47
+    { col: 49, header: 'CP Done?' },           // 1-idx 49 = 0-idx 48
+    { col: 50, header: 'CP Sent?' },           // 1-idx 50 = 0-idx 49
+  ];
+  const headers = woSheet.getRange(1, 46, 1, 5).getValues()[0];
+  for (let i = 0; i < 5; i++) {
+    if (String(headers[i] || '').trim() !== expected[i].header) {
+      Logger.log('❌ migrateRemoveObsoleteDocColumns: header mismatch at col ' +
+                 expected[i].col + ' — expected "' + expected[i].header +
+                 '" got "' + headers[i] + '". Aborting.');
+      return;
+    }
+  }
+
+  woSheet.deleteColumns(46, 5);
+  Logger.log('✅ migrateRemoveObsoleteDocColumns: deleted 5 cols (1-idx 46-50). ' +
+             'Invoice Done shifted to 0-idx 45. Now follow up with a code deploy ' +
+             'that updates DOC_TYPE_DONE_COL_[\'Invoice\'] = 45 and trims ' +
+             'ensureWoTrackerExtraCols_ EXTRA_HEADERS.');
+
+  _invalidateCacheKeys_(['dashboard_v1']);
 }
 
 /**
@@ -7468,6 +7990,17 @@ function handleListDocumentsForBatch_(body) {
 
   const data = woSheet.getDataRange().getValues();
 
+  // Doc Lifecycle Log → authoritative state for PL / SI / CP. The
+  // legacy per-WO Done/Sent columns on the WO Tracker for those types
+  // are no longer maintained, so we look up done/sent by Doc ID here.
+  const docLog = _readDocLifecycle_(ss);
+  const docStateForMaster = (docType, anchorIso, contractNum, borough) => {
+    const id = _docLifecycleId_(docType, anchorIso, contractNum, borough);
+    const row = docLog.byId[id];
+    if (!row) return { done: false, sent: false, doc_id: id };
+    return { done: !!row.done, sent: !!row.sent, doc_id: id };
+  };
+
   // Date helper — match the same fmtDate used by other handlers.
   const fmtDate = (v) => {
     if (v instanceof Date && !isNaN(v.getTime())) {
@@ -7737,15 +8270,14 @@ function handleListDocumentsForBatch_(body) {
                          : docType === 'Sign-In'        ? /^SignIn_/i
                                                         : /^Certified_Payroll_/i;
 
-      // Determine which group WOs qualify for this doc type.
-      const qualifyingWos = groupWos.filter(w => {
-        const q = qualifies(w, docType);
-        if (!q.include && q.missingReason) {
-          missing.push({ wo_id: w.wo_id, doc_type: _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType], reason: q.missingReason });
-        }
-        return q.include;
-      });
-      if (qualifyingWos.length === 0) return;
+      // For master-docs (PL / SI / CP), we no longer use the per-WO
+      // qualifies() check (those columns are stale post-refactor).
+      // Instead, the Doc Lifecycle Log is the source of truth for
+      // Done/Sent state per (date, contract, borough) or (week,
+      // contract, borough). We still need the scope check though:
+      // ensure at least one of this group's WOs is in the user's
+      // selected scope (wo_numbers / date_range / unsent semantics
+      // applied below per-file via the Log lookup).
 
       const fIter = masterFolder.getFiles();
       while (fIter.hasNext()) {
@@ -7779,24 +8311,29 @@ function handleListDocumentsForBatch_(body) {
         }
         if (coveredWoIds.length === 0) continue;
 
-        // For modes that filter by WO scope (wo_numbers / date_range
-        // intersected with scope), check that at least one covered WO
-        // overlaps with our qualifyingWos. Otherwise this master file
-        // belongs to a WO outside the scope.
-        const inScopeIds = new Set(qualifyingWos.map(w => w.wo_id));
+        // For modes that filter by WO scope, check that at least one
+        // covered WO overlaps with the user's scope. Group-level scope
+        // is computed against the WOs they explicitly selected (if
+        // wo_numbers) or those whose Work End falls in range (date_range).
+        const inScopeIds = new Set(groupWos.map(w => w.wo_id));
         const overlaps = coveredWoIds.some(id => inScopeIds.has(id));
         if (!overlaps && (mode === 'wo_numbers' || mode === 'date_range')) continue;
-        // unsent mode: include if any covered WO has Done?=Yes & Sent?!=Yes
+
+        // Look up doc state in the Log. Anchor for PL/SI is the file's
+        // shift date; for CP it's the week-start (which is what's
+        // already in the filename).
+        const logState = docStateForMaster(docType, fileDate, contractNum, borough);
+
+        // unsent mode: include only if Done=Yes and Sent=No (or for
+        // SI, Done=Yes — SI Sent isn't tracked, so missing == done false).
         if (mode === 'unsent') {
-          const anyUnsent = coveredWoIds.some(id => {
-            const w = woById[id];
-            return w && w.done[docType] && !w.sent[docType];
-          });
-          if (!anyUnsent) continue;
+          if (!logState.done) continue;
+          if (docType !== 'Sign-In' && logState.sent) continue;
+          // SI has no separate Sent state — once Done it never becomes
+          // "unsent." Keep including SI rows so they show up in batches.
         }
 
-        // Sent? state for this batch entry — true if EVERY covered WO is sent
-        const allSent = coveredWoIds.every(id => woById[id] && woById[id].sent[docType]);
+        const allSent = !!logState.sent;
 
         pushFile({
           file_id:      f.getId(),
@@ -8052,6 +8589,240 @@ function _buildProductionPayload_(startIso, endIso) {
     by_contractor: byContractor,
     by_category:   byCategory,
     top_wos:       topWos,
+  };
+}
+
+
+// ── action: get_doc_status_calendar ───────────────────────────
+//
+// Returns the calendar payload for the Doc Status tab. Two calendars
+// per request (day + week) for the requested month, plus an
+// always-current pending list of every doc instance still missing a
+// Done or Sent flag.
+//
+// Body: { month: 'YYYY-MM' }   (defaults to current month in TZ)
+//
+// Source data:
+//   - Doc Lifecycle Log → authoritative state per doc instance.
+//   - Daily Sign-In Data → enumerates days+weeks that had work but
+//     don't yet have a Log row (admin can see "you worked Tuesday,
+//     no PL filed yet" on the calendar even before backfill).
+//
+// Color rollup per cell:
+//   gray  — work happened, nothing done.
+//   amber — at least one of the breakdown's docs is partially done.
+//   green — every breakdown is fully sent (or done, for SI which has
+//           no separate Sent state).
+function handleGetDocStatusCalendar_(body) {
+  const d = body.data || {};
+  const monthRaw = String(d.month || '').trim();
+  const today = new Date();
+  const monthEff = /^\d{4}-\d{2}$/.test(monthRaw)
+    ? monthRaw
+    : Utilities.formatDate(today, CONFIG.TIMEZONE, 'yyyy-MM');
+
+  const token = _getCacheToken_();
+  const key = 'doc_status_v1_' + token + '_' + monthEff;
+  const payload = _withScriptCache_(key, 60, () => _buildDocStatusPayload_(monthEff));
+  return jsonResponse_(payload);
+}
+
+function _buildDocStatusPayload_(monthIso) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Read Doc Lifecycle Log + Daily Sign-In Data once.
+  const { rows: logRows, byId: logById } = _readDocLifecycle_(ss);
+  const signInSheet = ss.getSheetByName('Daily Sign-In Data');
+  const signInData  = signInSheet ? signInSheet.getDataRange().getValues() : [];
+
+  // Date helpers
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  const weekStartIsoFor = (date) => {
+    const d = (date instanceof Date) ? date : new Date(String(date) + 'T12:00:00');
+    const dow = d.getDay();
+    const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
+    return Utilities.formatDate(start, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  };
+
+  // Month bounds
+  const [yyyy, mm] = monthIso.split('-').map(Number);
+  const monthStart = monthIso + '-01';
+  // Use day 0 of next month → last day of this month
+  const monthEnd = Utilities.formatDate(
+    new Date(yyyy, mm, 0), CONFIG.TIMEZONE, 'yyyy-MM-dd'
+  );
+
+  // Walk Daily Sign-In Data → group by (date, contractor, contract, borough)
+  // for ALL TIME (pending list is all-time), but only emit calendar
+  // entries within the requested month.
+  const dayGroups = {};   // key: dateIso|contractor|contractNum|borough → group
+  const weekTuples = {};  // key: weekStart|contractNum|borough → group
+
+  for (let i = 1; i < signInData.length; i++) {
+    const r = signInData[i];
+    const dateIso = ymd(r[0]);
+    if (!dateIso) continue;
+    const woId        = String(r[1] || '').trim();
+    const contractor  = String(r[2] || '').trim();
+    const contractNum = String(r[3] || '').split('/')[0].trim();
+    const borough     = String(r[4] || '').trim();
+    if (!woId || !contractor || !contractNum || !borough) continue;
+
+    const dKey = dateIso + '|' + contractor + '|' + contractNum + '|' + borough;
+    if (!dayGroups[dKey]) {
+      dayGroups[dKey] = {
+        date: dateIso, contractor, contract_num: contractNum, borough,
+        wo_ids: new Set(),
+      };
+    }
+    dayGroups[dKey].wo_ids.add(woId);
+
+    const wkStart = weekStartIsoFor(dateIso);
+    const wKey = wkStart + '|' + contractNum + '|' + borough;
+    if (!weekTuples[wKey]) {
+      weekTuples[wKey] = {
+        week_start: wkStart, contractor, contract_num: contractNum, borough,
+        wo_ids: new Set(),
+      };
+    }
+    weekTuples[wKey].wo_ids.add(woId);
+  }
+
+  // Build the days[] entries — only those whose date falls in the month.
+  const dayCellByDate = {};  // dateIso → { date, status, breakdown[] }
+  Object.values(dayGroups).forEach(g => {
+    if (g.date < monthStart || g.date > monthEnd) return;
+    const plId = _docLifecycleId_('Production Log', g.date, g.contract_num, g.borough);
+    const siId = _docLifecycleId_('Sign-In',        g.date, g.contract_num, g.borough);
+    const pl = logById[plId];
+    const si = logById[siId];
+    const wos = Array.from(g.wo_ids).sort();
+
+    const bdRow = {
+      contractor:   g.contractor,
+      contract_num: g.contract_num,
+      borough:      g.borough,
+      wo_ids:       wos,
+      pl: pl
+        ? { doc_id: pl.doc_id, done: pl.done, sent: pl.sent }
+        : { doc_id: plId,      done: false,    sent: false },
+      si: si
+        ? { doc_id: si.doc_id, done: si.done }
+        : { doc_id: siId,      done: false },
+    };
+
+    if (!dayCellByDate[g.date]) {
+      dayCellByDate[g.date] = { date: g.date, status: 'gray', breakdown: [] };
+    }
+    dayCellByDate[g.date].breakdown.push(bdRow);
+  });
+
+  // Day cell status rollup: green if every breakdown row has PL Sent
+  // AND PL Done AND SI Done. Amber if any partial. Gray if all empty.
+  Object.values(dayCellByDate).forEach(cell => {
+    let anyPartial = false, allFull = cell.breakdown.length > 0, allEmpty = true;
+    cell.breakdown.forEach(b => {
+      const full  = b.pl.done && b.pl.sent && b.si.done;
+      const empty = !b.pl.done && !b.pl.sent && !b.si.done;
+      if (!full)  allFull  = false;
+      if (!empty) allEmpty = false;
+      if (!full && !empty) anyPartial = true;
+    });
+    cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
+  });
+
+  // Build the weeks[] entries — week_start in the requested month.
+  const weekCellByStart = {};
+  Object.values(weekTuples).forEach(w => {
+    if (w.week_start < monthStart || w.week_start > monthEnd) return;
+    const cpId = _docLifecycleId_('Certified Payroll', w.week_start, w.contract_num, w.borough);
+    const cp = logById[cpId];
+    const wos = Array.from(w.wo_ids).sort();
+    const bdRow = {
+      contractor:   w.contractor,
+      contract_num: w.contract_num,
+      borough:      w.borough,
+      wo_ids:       wos,
+      cp: cp
+        ? { doc_id: cp.doc_id, done: cp.done, sent: cp.sent }
+        : { doc_id: cpId,      done: false,    sent: false },
+    };
+    if (!weekCellByStart[w.week_start]) {
+      weekCellByStart[w.week_start] = { week_start: w.week_start, status: 'gray', breakdown: [] };
+    }
+    weekCellByStart[w.week_start].breakdown.push(bdRow);
+  });
+  Object.values(weekCellByStart).forEach(cell => {
+    let anyPartial = false, allFull = cell.breakdown.length > 0, allEmpty = true;
+    cell.breakdown.forEach(b => {
+      const full  = b.cp.done && b.cp.sent;
+      const empty = !b.cp.done && !b.cp.sent;
+      if (!full)  allFull  = false;
+      if (!empty) allEmpty = false;
+      if (!full && !empty) anyPartial = true;
+    });
+    cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
+  });
+
+  // Pending list (all-time, FIFO oldest first). We emit one entry per
+  // "missing" doc — so a (date, contract, borough) where both PL and
+  // SI are unfilled creates two entries. Frontend caps the visible
+  // window at 10 with scroll for the rest.
+  const pending = [];
+  const nowMs = today.getTime ? today.getTime() : new Date().getTime();
+  const pushPending = (g, kind, anchor, doc_id, missing) => {
+    const ageDays = Math.max(0, Math.round((nowMs - new Date(anchor + 'T12:00:00').getTime()) / 86400000));
+    pending.push({
+      kind,
+      anchor,
+      contractor:   g.contractor,
+      contract_num: g.contract_num,
+      borough:      g.borough,
+      missing,
+      doc_id,
+      wo_ids:       Array.from(g.wo_ids).sort(),
+      age_days:     ageDays,
+    });
+  };
+  // Day-kind pending: PL Done, PL Sent, SI Done
+  Object.values(dayGroups).forEach(g => {
+    const plId = _docLifecycleId_('Production Log', g.date, g.contract_num, g.borough);
+    const siId = _docLifecycleId_('Sign-In',        g.date, g.contract_num, g.borough);
+    const pl = logById[plId];
+    const si = logById[siId];
+    const plDone = pl && pl.done;
+    const plSent = pl && pl.sent;
+    const siDone = si && si.done;
+    if (!plDone) pushPending(g, 'day', g.date, plId, ['PL Done']);
+    if (plDone && !plSent) pushPending(g, 'day', g.date, plId, ['PL Sent']);
+    if (!siDone) pushPending(g, 'day', g.date, siId, ['SI Done']);
+  });
+  // Week-kind pending: CP Done, CP Sent
+  Object.values(weekTuples).forEach(w => {
+    const cpId = _docLifecycleId_('Certified Payroll', w.week_start, w.contract_num, w.borough);
+    const cp = logById[cpId];
+    const cpDone = cp && cp.done;
+    const cpSent = cp && cp.sent;
+    if (!cpDone) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
+    if (cpDone && !cpSent) pushPending(w, 'week', w.week_start, cpId, ['CP Sent']);
+  });
+  pending.sort((a, b) => {
+    if (a.anchor !== b.anchor) return a.anchor < b.anchor ? -1 : 1;
+    return String(a.contract_num).localeCompare(String(b.contract_num));
+  });
+
+  return {
+    month: monthIso,
+    days:   Object.values(dayCellByDate).sort((a, b) => a.date < b.date ? -1 : 1),
+    weeks:  Object.values(weekCellByStart).sort((a, b) => a.week_start < b.week_start ? -1 : 1),
+    pending,
   };
 }
 

@@ -18,13 +18,13 @@ import { useEffect, useRef, useState } from 'react'
 
 // Doc-type metadata keyed by the same keys used in the dashboard payload.
 // Keep `friendly` in sync with the strings the Apps Script set_docs_sent
-// action accepts (CFR, Production Log, Sign-In, Certified Payroll, Invoice).
+// action accepts. Slimmed to CFR + INV — those are the only doc types
+// that genuinely fit per-WO storage. Time-anchored docs (PL/SI/CP)
+// moved to the new Doc Lifecycle Log; their state lives on the Doc
+// Status tab calendar instead.
 const DOC_TYPES = [
-  { key: 'cfr',               friendly: 'CFR',               label: 'Contractor Field Report', short: 'CFR' },
-  { key: 'production_log',    friendly: 'Production Log',    label: 'Production Log',          short: 'PL'  },
-  { key: 'signin',            friendly: 'Sign-In',           label: 'Sign-In Sheet',           short: 'SI'  },
-  { key: 'certified_payroll', friendly: 'Certified Payroll', label: 'Certified Payroll',       short: 'CP'  },
-  { key: 'invoice',           friendly: 'Invoice',           label: 'Invoice',                 short: 'INV' },
+  { key: 'cfr',     friendly: 'CFR',     label: 'Contractor Field Report', short: 'CFR' },
+  { key: 'invoice', friendly: 'Invoice', label: 'Invoice',                 short: 'INV' },
 ]
 
 // Lifecycle state → visual style. Three states only: not done, done

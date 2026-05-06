@@ -7,6 +7,7 @@ import StatusBadge from '../components/StatusBadge'
 import { opToday } from '../lib/dateOps'
 import RevenueTab from './RevenueTab'
 import ProductionTab from './ProductionTab'
+import DocStatusTab from './DocStatusTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 import DocStatusChips from '../components/DocStatusChips'
 
@@ -442,6 +443,7 @@ function WORow({ wo, flagged, onDocsChange }) {
 // existing `?tab=operations` URLs; the user-facing label is WO Tracker.
 const TABS = [
   { id: 'operations', label: 'WO Tracker' },
+  { id: 'doc_status', label: 'Doc Status' },
   { id: 'production', label: 'Production' },
   { id: 'revenue',    label: 'Revenue'    },
 ]
@@ -659,6 +661,7 @@ export default function Dashboard() {
           <h1 className="text-2xl font-black text-navy leading-none">
             {activeTab === 'revenue'    ? 'Revenue Dashboard'
               : activeTab === 'production' ? 'Production Dashboard'
+              : activeTab === 'doc_status' ? 'Doc Status'
               : 'Work Order Tracker'}
           </h1>
           {activeTab === 'operations' && lastRefresh && (
@@ -700,6 +703,8 @@ export default function Dashboard() {
         <RevenueTab />
       ) : activeTab === 'production' ? (
         <ProductionTab />
+      ) : activeTab === 'doc_status' ? (
+        <DocStatusTab />
       ) : (
         <OperationsTabContent
           stats={stats}

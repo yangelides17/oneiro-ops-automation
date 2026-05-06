@@ -1109,6 +1109,41 @@ app.post('/api/documents/flags', async (req, res) => {
 })
 
 /**
+ * GET /api/doc-status?month=YYYY-MM
+ * Returns the calendar payload for the Doc Status tab. Defaults to
+ * current month when month is missing.
+ */
+app.get('/api/doc-status', async (req, res) => {
+  try {
+    const month = String(req.query?.month || '').trim()
+    const data = await callAppsScript('get_doc_status_calendar', { month })
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/doc-status error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/doc-status/flags
+ * Per-doc lifecycle update for time-anchored docs (PL / SI / CP).
+ * Body: { updates: [{ doc_id, done?, sent? }, ...] }
+ *
+ * Companion to /api/documents/flags, which still handles per-WO
+ * updates for CFR + Invoice. Sibling endpoints by design — the client
+ * calls whichever one matches the identifier shape it has in hand.
+ */
+app.post('/api/doc-status/flags', async (req, res) => {
+  try {
+    const data = await callAppsScript('set_doc_status', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/doc-status/flags error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/documents/list-batch
  * Returns metadata for documents matching the given filters — used by
  * the DownloadDocumentsModal's preview step before the user commits to
@@ -1270,24 +1305,63 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     // Wait for the response stream to fully drain before flipping Sent
     // flags. res.on('finish') is the right signal — it fires after the
     // last byte was written to the socket.
+    //
+    // Two storage shapes to handle:
+    //   - CFR + Invoice  → per-WO via /api/documents/flags-style updates
+    //                      (wo_id + doc_type + sent).
+    //   - PL / SI / CP   → per-doc via Doc Lifecycle Log keyed by Doc ID.
+    //                      Doc ID = <PREFIX>_<ANCHOR>_<CONTRACTNUM>_<BOROUGH>
+    //                      where ANCHOR is the work_date (already in
+    //                      the listing payload) and PREFIX is PL/SI/CP.
     res.on('finish', () => {
       if (cancelled || !markSent) return
-      // Build the per-(wo_id, doc_type) updates list.
-      const updates = []
-      const seen = new Set()
+
+      const PER_WO = { CFR: 1, Invoice: 1 }
+      const PER_DOC_PREFIX = {
+        'Production Log':    'PL',
+        'Sign-In':           'SI',
+        'Certified Payroll': 'CP',
+      }
+
+      const perWoUpdates = []
+      const perDocUpdates = []
+      const seenWo = new Set()
+      const seenDoc = new Set()
+
       files.forEach(f => {
-        const ids = f.wo_ids || []
-        ids.forEach(woId => {
-          const k = woId + '|' + f.doc_type
-          if (seen.has(k)) return
-          seen.add(k)
-          updates.push({ wo_id: woId, doc_type: f.doc_type, sent: true })
+        if (PER_WO[f.doc_type]) {
+          (f.wo_ids || []).forEach(woId => {
+            const k = woId + '|' + f.doc_type
+            if (seenWo.has(k)) return
+            seenWo.add(k)
+            perWoUpdates.push({ wo_id: woId, doc_type: f.doc_type, sent: true })
+          })
+          return
+        }
+        const prefix = PER_DOC_PREFIX[f.doc_type]
+        if (!prefix) return
+        const cn = String(f.contract_num || '').split('/')[0].trim()
+        const borough = String(f.borough || '').trim()
+        const anchor  = String(f.work_date || '').trim()
+        if (!cn || !borough || !anchor) return
+        const docId = `${prefix}_${anchor}_${cn}_${borough}`
+        if (seenDoc.has(docId)) return
+        seenDoc.add(docId)
+        perDocUpdates.push({ doc_id: docId, sent: true })
+      })
+
+      if (perWoUpdates.length) {
+        console.log(`batch-download: marking ${perWoUpdates.length} per-WO (CFR/INV) entries sent`)
+        callAppsScript('set_docs_sent', { updates: perWoUpdates }).catch(e => {
+          console.warn('batch-download: set_docs_sent (per-WO) failed:', e.message)
         })
-      })
-      console.log(`batch-download: marking ${updates.length} (wo_id, doc_type) tuples as sent`)
-      callAppsScript('set_docs_sent', { updates }).catch(e => {
-        console.warn('batch-download: set_docs_sent failed:', e.message)
-      })
+      }
+      if (perDocUpdates.length) {
+        console.log(`batch-download: marking ${perDocUpdates.length} per-doc (PL/SI/CP) entries sent`)
+        callAppsScript('set_doc_status', { updates: perDocUpdates }).catch(e => {
+          console.warn('batch-download: set_doc_status (per-doc) failed:', e.message)
+        })
+      }
     })
   } catch (err) {
     console.error('POST /api/documents/batch-download error:', err && err.stack || err.message)
