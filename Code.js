@@ -8776,7 +8776,7 @@ function _buildDocStatusPayload_(monthIso) {
   // SI are unfilled creates two entries. Frontend caps the visible
   // window at 10 with scroll for the rest.
   const pending = [];
-  const nowMs = today.getTime ? today.getTime() : new Date().getTime();
+  const nowMs = new Date().getTime();
   const pushPending = (g, kind, anchor, doc_id, missing) => {
     const ageDays = Math.max(0, Math.round((nowMs - new Date(anchor + 'T12:00:00').getTime()) / 86400000));
     pending.push({
