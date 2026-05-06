@@ -1238,8 +1238,8 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           continue
         }
         const buf = Buffer.from(fetched.data, 'base64')
-        const flat = await flattenPdfForDelivery(buf, file.filename)
-        archive.append(flat, { name: zipPathFor(file) })
+        const prepared = await prepPdfForDelivery(buf, file.filename)
+        archive.append(prepared, { name: zipPathFor(file) })
         appended++
       } catch (e) {
         failed++
@@ -1301,47 +1301,86 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
 })
 
 /**
- * Flatten a single PDF for inclusion in the delivery zip.
+ * Prep a single PDF for inclusion in the delivery zip.
  *
  * Why: every CFR (and other doc-type) coming out of the worker uses
  * the same AcroForm field names from a shared template (Hours,
- * Quantity_1, Date, etc). When the admin combines individual zip
- * PDFs via macOS's Create PDF Quick Action, the merged document has
- * a single AcroForm tree with collisions — Acrobat shows only the
- * first PDF's filled values, the rest appear blank. Flattening
- * removes the AcroForm so combine tools can't get confused.
+ * Quantity_1, Date, etc). When admin combines individual zip PDFs
+ * via macOS's Create PDF Quick Action, the merged document has a
+ * single AcroForm tree where the duplicated names collapse —
+ * Acrobat shows only the first PDF's filled values, the rest appear
+ * blank.
  *
- * Why pdf-lib's flatten with `updateFieldAppearances: false` works
- * for us (and the saved-memory warning about pdf-lib flatten doesn't
- * apply here): the option skips the regenerate-/AP-with-pdf-lib-fonts
- * step (PDFForm.js:449). The flatten body then just walks each
- * widget, takes its EXISTING /AP/N XObject ref, and emits a /Do
- * operator on the page at the widget's /Rect — preserving the exact
- * PyMuPDF-rendered visual byte-for-byte.
+ * Approach: rename every field's partial name with a per-file
+ * suffix and mark each field read-only. Combine tools see distinct
+ * names → no collision. Primes can't edit (read-only flag respected
+ * by Acrobat / Preview). Crucially, we never touch /AP — the
+ * PyMuPDF-rendered appearance is preserved byte-for-byte.
  *
- * Drive originals stay editable; only the zip-bound copy is flat.
+ * This deliberately avoids pdf-lib's `form.flatten()`, which:
+ *   - throws on certain merged WO docs (CFRs use _replaceArchivedWODoc_),
+ *     causing silent fall-through to an editable original;
+ *   - doesn't apply XObject /Matrix offsets when emitting /Do ops,
+ *     producing visible misalignment on radio button selected-state
+ *     indicators (Production Log borough circles).
+ *
+ * Drive originals stay untouched + editable; only the zip-bound copy
+ * is renamed + locked.
  *
  * Falls back to the original buffer on:
  *   - non-PDF inputs (Invoice_*.txt artifacts, magic-byte check)
  *   - PDFs with no form fields (nothing to do)
- *   - pdf-lib parse / flatten errors (defensive)
+ *   - pdf-lib parse errors (defensive)
  */
-async function flattenPdfForDelivery(buf, filename) {
+async function prepPdfForDelivery(buf, filename) {
   if (!buf || buf.length < 5 || buf.slice(0, 5).toString() !== '%PDF-') {
     return buf
   }
   try {
-    const { PDFDocument } = await import('pdf-lib')
+    const { PDFDocument, PDFName } = await import('pdf-lib')
     const doc = await PDFDocument.load(buf, { updateMetadata: false })
     const form = doc.getForm()
-    if (form.getFields().length === 0) return buf
-    // BOTH calls need updateFieldAppearances:false. The save default
-    // also re-runs updateFieldAppearances if a form was accessed, so
-    // forgetting either flag undoes everything we're trying to avoid.
-    form.flatten({ updateFieldAppearances: false })
-    return Buffer.from(await doc.save({ updateFieldAppearances: false }))
+    const fields = form.getFields()
+    if (fields.length === 0) return buf
+
+    // Suffix derived from the filename — guaranteed unique per file
+    // within the zip and human-readable if anyone inspects the form
+    // tool's field list. Strip extension + replace anything outside
+    // [a-zA-Z0-9_] so the resulting /T value is well-formed.
+    const suffix = '__' + String(filename).replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_')
+
+    let renamed = 0
+    let lockedRO = 0
+    for (const field of fields) {
+      try {
+        const partial = field.acroField.getPartialName() || field.getName() || 'field'
+        field.acroField.setPartialName(partial + suffix)
+        renamed++
+      } catch (e) {
+        // Some merged docs surface field shapes pdf-lib chokes on;
+        // skip the offender rather than abort the whole file.
+        console.warn(`prep: rename failed on a field in ${filename}: ${e.message}`)
+      }
+      try {
+        field.enableReadOnly()
+        lockedRO++
+      } catch (e) {
+        console.warn(`prep: enableReadOnly failed on a field in ${filename}: ${e.message}`)
+      }
+    }
+
+    // updateFieldAppearances:false is critical here too — the default
+    // save path regenerates /AP if a form was accessed via getForm(),
+    // and that regeneration uses pdf-lib's font logic which would
+    // clobber the PyMuPDF-rendered worker appearances.
+    const out = Buffer.from(await doc.save({ updateFieldAppearances: false }))
+    if (renamed === 0 && lockedRO === 0) {
+      console.warn(`prep: no fields modified in ${filename} (renamed=0 lockedRO=0) — sending original`)
+      return buf
+    }
+    return out
   } catch (e) {
-    console.warn(`flatten failed for ${filename}, sending original: ${e.message}`)
+    console.warn(`prep failed for ${filename}, sending original: ${e.message}`)
     return buf
   }
 }
