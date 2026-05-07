@@ -312,6 +312,44 @@ app.post('/api/tools/process-approved-docs', async (_req, res) => {
 })
 
 /**
+ * POST /api/tools/generate-pl-for-doc
+ * Per-doc Production Log generation — fired from a Doc Status tab
+ * pending-list "Generate" button. Apps Script validates SI Done for
+ * the (date, contract, borough) before running. Body: { doc_id }.
+ */
+app.post('/api/tools/generate-pl-for-doc', async (req, res) => {
+  try {
+    const { doc_id } = req.body || {}
+    if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
+    const data = await callAppsScript('generate_pl_for_doc', { doc_id })
+    if (data && data.error) return res.status(400).json(data)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/tools/generate-pl-for-doc error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/tools/generate-cp-for-doc
+ * Per-doc Certified Payroll generation. Validates that every worked
+ * day's SI for the (week, contract, borough) is Done before running.
+ * Body: { doc_id }.
+ */
+app.post('/api/tools/generate-cp-for-doc', async (req, res) => {
+  try {
+    const { doc_id } = req.body || {}
+    if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
+    const data = await callAppsScript('generate_cp_for_doc', { doc_id })
+    if (data && data.error) return res.status(400).json(data)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/tools/generate-cp-for-doc error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is

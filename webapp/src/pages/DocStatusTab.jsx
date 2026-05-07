@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import GenerateDocModal from '../components/GenerateDocModal'
 
 /**
  * DocStatusTab — calendar view of Production Log + Sign-In (per day)
@@ -507,8 +508,25 @@ function PendingActionButton({ item, onMark }) {
   )
 }
 
+// ── Generate button (for PL Done / CP Done pending items) ─────
+function PendingGenerateButton({ item, onGenerate }) {
+  const handle = () => onGenerate?.(item)
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center bg-green-500 text-white border-green-500 hover:bg-green-600"
+    >
+      Generate
+    </button>
+  )
+}
+
+const canGenerateForItem = (it) =>
+  it && (it.missing?.[0] === 'PL Done' || it.missing?.[0] === 'CP Done')
+
 // ── Pending list ──────────────────────────────────────────────
-function PendingList({ kind, pending, loading, onMark }) {
+function PendingList({ kind, pending, loading, onMark, onGenerate }) {
   if (loading && !pending) {
     return (
       <div className="card p-4 text-xs text-slate-400 italic flex items-center justify-center min-h-[80px]">
@@ -546,7 +564,12 @@ function PendingList({ kind, pending, loading, onMark }) {
                 {it.contractor} · <span className="font-mono">{it.contract_num}</span> · {it.borough}
               </p>
             </div>
-            <PendingActionButton item={it} onMark={onMark} />
+            <div className="flex gap-1.5 flex-shrink-0 items-center">
+              {canGenerateForItem(it) && (
+                <PendingGenerateButton item={it} onGenerate={onGenerate} />
+              )}
+              <PendingActionButton item={it} onMark={onMark} />
+            </div>
           </div>
         ))}
       </div>
@@ -563,6 +586,10 @@ export default function DocStatusTab() {
 
   const [activeDay,  setActiveDay]  = useState(null)
   const [activeWeek, setActiveWeek] = useState(null)
+
+  // GenerateDocModal state — `pendingItem` is the pending-list row the
+  // user clicked Generate on; null = modal closed.
+  const [pendingItem, setPendingItem] = useState(null)
 
   const load = async (iso) => {
     setLoading(true)
@@ -636,6 +663,31 @@ export default function DocStatusTab() {
 
   const onPendingMark = (docId, flag, value) => flip(docId, flag, value)
 
+  const onPendingGenerate = (item) => setPendingItem(item)
+  const closeGenerateModal = () => {
+    setPendingItem(null)
+    // Refetch so any state changes (e.g. Doc Lifecycle Log row created
+    // by an upsert during generation) are reflected.
+    load(monthIso)
+  }
+  const handleGenerateConfirm = async () => {
+    if (!pendingItem) return
+    const isCp = pendingItem.missing[0] === 'CP Done'
+    const url = isCp
+      ? '/api/tools/generate-cp-for-doc'
+      : '/api/tools/generate-pl-for-doc'
+    const res = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ doc_id: pendingItem.doc_id }),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok || body.error) {
+      throw new Error(body.error || `Request failed (HTTP ${res.status})`)
+    }
+    return { message: body.message, files: body.files || [] }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
@@ -663,12 +715,12 @@ export default function DocStatusTab() {
         <div className="space-y-3">
           <p className="section-label">Production Logs + Sign-Ins</p>
           <DayCalendar monthIso={monthIso} days={data?.days} loading={loading} onCellClick={setActiveDay} />
-          <PendingList kind="day" pending={data?.pending} loading={loading} onMark={onPendingMark} />
+          <PendingList kind="day" pending={data?.pending} loading={loading} onMark={onPendingMark} onGenerate={onPendingGenerate} />
         </div>
         <div className="space-y-3">
           <p className="section-label">Certified Payroll</p>
           <WeekCalendar monthIso={monthIso} weeks={data?.weeks} loading={loading} onCellClick={setActiveWeek} />
-          <PendingList kind="week" pending={data?.pending} loading={loading} onMark={onPendingMark} />
+          <PendingList kind="week" pending={data?.pending} loading={loading} onMark={onPendingMark} onGenerate={onPendingGenerate} />
         </div>
       </div>
 
@@ -686,6 +738,30 @@ export default function DocStatusTab() {
           onFlip={flip}
         />
       )}
+
+      <GenerateDocModal
+        open={!!pendingItem}
+        title={pendingItem?.missing?.[0] === 'CP Done'
+          ? 'Generate Certified Payroll'
+          : 'Generate Production Log'}
+        description={pendingItem ? (
+          <span>
+            <span className="block font-semibold text-slate-700">
+              {pendingItem.missing?.[0] === 'CP Done'
+                ? `Week of ${fmtShortDate(pendingItem.anchor)}`
+                : fmtShortDate(pendingItem.anchor)}
+            </span>
+            <span className="block text-slate-500">
+              {pendingItem.contractor} · {pendingItem.contract_num} · {pendingItem.borough}
+            </span>
+            <span className="block mt-2 text-[11px] text-slate-400">
+              Generates the JSON template. Review and sign the filled PDF in the Approvals tab to mark Done.
+            </span>
+          </span>
+        ) : null}
+        onConfirm={handleGenerateConfirm}
+        onClose={closeGenerateModal}
+      />
     </div>
   )
 }

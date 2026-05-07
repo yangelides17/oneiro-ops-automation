@@ -5,6 +5,7 @@ import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import PrincipalSignModal from '../components/PrincipalSignModal'
 import RowKebab from '../components/RowKebab'
+import GenerateDocModal from '../components/GenerateDocModal'
 
 // Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
 // from the Sign-In tab's "Upload PDF" path. The principal usually
@@ -50,8 +51,7 @@ export default function Approvals() {
   const [selectedId, setSelectedId] = useState(null)
   const [approving,  setApproving]  = useState(false)
   const [actionError, setActionError] = useState('')
-  const [processing, setProcessing] = useState(false)
-  const [toast,      setToast]      = useState(null)  // { ok, msg }
+  const [processingModalOpen, setProcessingModalOpen] = useState(false)
   const containerRef = useRef(null)
   const [viewerWidth, setViewerWidth] = useState(700)
 
@@ -70,44 +70,27 @@ export default function Approvals() {
   }
   useEffect(() => { refresh() }, [])
 
-  // Auto-dismiss toast after 6s
-  useEffect(() => {
-    if (!toast) return
-    const t = setTimeout(() => setToast(null), 6000)
-    return () => clearTimeout(t)
-  }, [toast])
-
-  // Manually trigger the same job the 10-min cron runs. Mirrors the
-  // Dashboard Tools menu's "Process approved docs now" with toast +
-  // approvals-list refresh on success.
-  const runProcessApproved = async () => {
-    if (processing) return
-    setToast(null)
-    setProcessing(true)
-    try {
-      const res  = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      const archived = data.archived ?? 0
-      const errored  = data.errored  ?? 0
-      let msg
-      if (data.skipped) {
-        msg = 'Another run is already in progress — it will finish shortly.'
-      } else if (archived === 0 && errored === 0) {
-        msg = 'No pending docs to process.'
-      } else {
-        const parts = []
-        if (archived > 0) parts.push(`archived ${archived}`)
-        if (errored  > 0) parts.push(`${errored} failed → Archive Errors`)
-        msg = `Processed: ${parts.join(', ')}.`
-      }
-      setToast({ ok: errored === 0, msg })
-      await refresh()
-    } catch (err) {
-      setToast({ ok: false, msg: err.message || 'Failed to process approved docs' })
-    } finally {
-      setProcessing(false)
+  // Manually trigger the same job the 10-min cron runs. Modal-driven
+  // for clear sticky feedback (replaces the old 6s auto-dismiss toast).
+  const openProcessModal = () => setProcessingModalOpen(true)
+  const handleProcessConfirm = async () => {
+    const res  = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+    const archived = data.archived ?? 0
+    const errored  = data.errored  ?? 0
+    if (data.skipped) {
+      return { message: 'Another run is already in progress — it will finish shortly.' }
     }
+    if (archived === 0 && errored === 0) {
+      return { message: 'No pending docs to process.' }
+    }
+    const parts = []
+    if (archived > 0) parts.push(`archived ${archived}`)
+    if (errored  > 0) parts.push(`${errored} failed → Archive Errors`)
+    const msg = `Processed: ${parts.join(', ')}.`
+    if (errored > 0) throw new Error(msg)
+    return { message: msg }
   }
 
   // Keep the viewer width in sync with its container (react-pdf needs
@@ -251,14 +234,12 @@ export default function Approvals() {
         <div className="flex items-center gap-3 flex-shrink-0">
           <button
             type="button"
-            onClick={runProcessApproved}
-            disabled={processing}
+            onClick={openProcessModal}
             title="Run the same archive + email job the 10-minute cron runs"
             className="text-xs font-bold px-3 py-1.5 rounded-lg
-                       bg-navy text-white hover:opacity-90
-                       disabled:opacity-50 disabled:cursor-not-allowed"
+                       bg-navy text-white hover:opacity-90"
           >
-            {processing ? 'Processing…' : 'Process Approved Docs now'}
+            Process Approved Docs now
           </button>
           <span className="text-xs font-bold text-slate-600">
             {pendingCount} pending
@@ -403,23 +384,22 @@ export default function Approvals() {
         </section>
       </div>
 
-      {/* Toast for the manual "Process Approved Docs now" trigger */}
-      {toast && (
-        <div className={`fixed bottom-6 right-6 z-50 max-w-md px-4 py-3 rounded-xl shadow-lg text-sm leading-snug
-          ${toast.ok
-            ? 'bg-green-50 border border-green-200 text-green-800'
-            : 'bg-red-50  border border-red-200  text-red-800'}`}>
-          <div className="flex items-start justify-between gap-3">
-            <span>{toast.msg}</span>
-            <button
-              type="button"
-              onClick={() => setToast(null)}
-              className="opacity-60 hover:opacity-100"
-              aria-label="Dismiss"
-            >✕</button>
-          </div>
-        </div>
-      )}
+      <GenerateDocModal
+        open={processingModalOpen}
+        title="Process Approved Documents"
+        description={
+          <span>
+            Run the same archive + email job the 10-minute cron runs. Safe to run alongside the cron — script-wide lock prevents double-processing.
+          </span>
+        }
+        confirmLabel="Run Now"
+        onConfirm={async () => {
+          const result = await handleProcessConfirm()
+          await refresh()
+          return result
+        }}
+        onClose={() => setProcessingModalOpen(false)}
+      />
 
       {/* Approval-with-signature modal — used for both Sign-In sheets and
           Certified Payroll. CP pre-binds its own signUrl on the signingItem;

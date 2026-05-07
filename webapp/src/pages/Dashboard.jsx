@@ -10,6 +10,7 @@ import ProductionTab from './ProductionTab'
 import DocStatusTab from './DocStatusTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 import DocStatusChips from '../components/DocStatusChips'
+import GenerateDocModal from '../components/GenerateDocModal'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -60,8 +61,8 @@ function ToolsMenu() {
   const [open,     setOpen]     = useState(false)
   const [picker,   setPicker]   = useState(null)   // null | 'daily' | 'cert'
   const [pickerVal,setPickerVal]= useState('')
-  const [busy,     setBusy]     = useState(false)
-  const [toast,    setToast]    = useState(null)   // { ok, msg }
+  // Active GenerateDocModal action — { title, description, onConfirm } or null.
+  const [modalAction, setModalAction] = useState(null)
   const wrapRef = useRef(null)
 
   // Close on outside-click / Esc (matches RowKebab pattern).
@@ -83,88 +84,92 @@ function ToolsMenu() {
     }
   }, [open, picker])
 
-  // Auto-dismiss the toast after 6s so it doesn't pile up if the
-  // user clicks several items in succession.
-  useEffect(() => {
-    if (!toast) return
-    const t = setTimeout(() => setToast(null), 6000)
-    return () => clearTimeout(t)
-  }, [toast])
-
-  async function runDailyDocs(isoDate) {
-    setBusy(true); setOpen(false); setPicker(null); setToast(null)
-    try {
-      const res = await fetch('/api/tools/daily-documents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date: isoDate || '' }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      const when = isoDate ? prettyDate(isoDate) : 'today'
-      const n    = data.entries_found ?? 0
-      setToast({
-        ok: true,
-        msg: n > 0
-          ? `Daily documents generated for ${when} — ${n} sign-in entr${n === 1 ? 'y' : 'ies'} processed. Check "Docs Needing Review" in Drive.`
-          : `No sign-in entries found for ${when}. Nothing generated.`,
-      })
-    } catch (err) {
-      setToast({ ok: false, msg: err.message || 'Failed to generate daily documents' })
-    } finally {
-      setBusy(false)
-    }
+  function runDailyDocs(isoDate) {
+    setOpen(false); setPicker(null)
+    const when = isoDate ? prettyDate(isoDate) : `today (${prettyDate(isoToday())})`
+    setModalAction({
+      title: 'Generate Daily Documents',
+      description: (
+        <span>
+          <span className="block font-semibold text-slate-700">{when}</span>
+          <span className="block mt-1">Sign-In Log, Production Log, and Contractor Field Reports for every WO with crew activity on this date.</span>
+        </span>
+      ),
+      onConfirm: async () => {
+        const res = await fetch('/api/tools/daily-documents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date: isoDate || '' }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+        const n = data.entries_found ?? 0
+        return {
+          message: n > 0
+            ? `Generated for ${when} — ${n} sign-in entr${n === 1 ? 'y' : 'ies'} processed. Find filled docs in "Docs Needing Review" → Approvals tab.`
+            : `No sign-in entries found for ${when}. Nothing generated.`,
+        }
+      },
+    })
   }
 
-  async function runProcessApproved() {
-    setBusy(true); setOpen(false); setPicker(null); setToast(null)
-    try {
-      const res = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      const archived = data.archived ?? 0
-      const errored  = data.errored ?? 0
-      let msg
-      if (data.skipped) {
-        msg = 'Another run is already in progress — it will finish shortly. No action taken.'
-      } else if (archived === 0 && errored === 0) {
-        msg = 'No pending docs in Approved Docs folder — nothing to process.'
-      } else {
+  function runProcessApproved() {
+    setOpen(false); setPicker(null)
+    setModalAction({
+      title: 'Process Approved Documents',
+      description: (
+        <span>
+          Run the same archive cron that fires automatically every 10 min — emails any pending doc and files them into Drive. Safe to run alongside the cron (script-wide lock).
+        </span>
+      ),
+      onConfirm: async () => {
+        const res = await fetch('/api/tools/process-approved-docs', { method: 'POST' })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+        const archived = data.archived ?? 0
+        const errored  = data.errored ?? 0
+        if (data.skipped) {
+          return { message: 'Another run is already in progress — it will finish shortly. No action taken here.' }
+        }
+        if (archived === 0 && errored === 0) {
+          return { message: 'No pending docs in Approved Docs folder — nothing to process.' }
+        }
         const parts = []
         if (archived > 0) parts.push(`archived ${archived}`)
         if (errored > 0)  parts.push(`${errored} failed → Archive Errors`)
-        msg = `Processed approved docs: ${parts.join(', ')}.`
-      }
-      setToast({ ok: errored === 0, msg })
-    } catch (err) {
-      setToast({ ok: false, msg: err.message || 'Failed to process approved docs' })
-    } finally {
-      setBusy(false)
-    }
+        const msg = `Processed approved docs: ${parts.join(', ')}.`
+        if (errored > 0) throw new Error(msg)
+        return { message: msg }
+      },
+    })
   }
 
-  async function runCertPayroll(isoWeekStart) {
-    setBusy(true); setOpen(false); setPicker(null); setToast(null)
-    try {
-      const res = await fetch('/api/tools/certified-payroll', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ week_start: isoWeekStart }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      const n = data.contract_groups ?? 0
-      setToast({
-        ok: true,
-        msg: n > 0
-          ? `Certified payroll generated for week of ${prettyDate(isoWeekStart)} — ${n} contract group${n === 1 ? '' : 's'}. Check "Docs Needing Review → Certified Payroll" in Drive.`
-          : `No sign-in entries found for week of ${prettyDate(isoWeekStart)}. Nothing generated.`,
-      })
-    } catch (err) {
-      setToast({ ok: false, msg: err.message || 'Failed to generate certified payroll' })
-    } finally {
-      setBusy(false)
-    }
+  function runCertPayroll(isoWeekStart) {
+    setOpen(false); setPicker(null)
+    setModalAction({
+      title: 'Generate Certified Payroll',
+      description: (
+        <span>
+          <span className="block font-semibold text-slate-700">Week of {prettyDate(isoWeekStart)}</span>
+          <span className="block mt-1">One Certified Payroll JSON per contract+borough that had sign-in activity in this Monday–Sunday week.</span>
+        </span>
+      ),
+      onConfirm: async () => {
+        const res = await fetch('/api/tools/certified-payroll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ week_start: isoWeekStart }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+        const n = data.contract_groups ?? 0
+        return {
+          message: n > 0
+            ? `Generated for week of ${prettyDate(isoWeekStart)} — ${n} contract group${n === 1 ? '' : 's'}. Find filled docs in "Docs Needing Review → Certified Payroll" → Approvals tab.`
+            : `No sign-in entries found for week of ${prettyDate(isoWeekStart)}. Nothing generated.`,
+        }
+      },
+    })
   }
 
   function openPicker(kind) {
@@ -188,11 +193,10 @@ function ToolsMenu() {
     <div ref={wrapRef} className="relative">
       <button
         type="button"
-        disabled={busy}
         onClick={() => setOpen(v => !v)}
-        className="btn-ghost flex items-center gap-1.5 disabled:opacity-50"
+        className="btn-ghost flex items-center gap-1.5"
       >
-        {busy ? <span className="animate-spin inline-block">⟳</span> : <span>🛠️</span>}
+        <span>🛠️</span>
         Tools
         <span className="text-xs opacity-60">▾</span>
       </button>
@@ -276,7 +280,7 @@ function ToolsMenu() {
               </button>
               <button
                 type="button"
-                disabled={!pickerVal || busy}
+                disabled={!pickerVal}
                 onClick={submitPicker}
                 className="flex-1 py-2.5 rounded-xl text-sm font-bold bg-navy text-white hover:opacity-90 disabled:opacity-50"
               >
@@ -287,22 +291,13 @@ function ToolsMenu() {
         </div>
       )}
 
-      {toast && (
-        <div className={`fixed bottom-6 right-6 z-50 max-w-md px-4 py-3 rounded-xl shadow-lg text-sm leading-snug
-          ${toast.ok
-            ? 'bg-green-50 border border-green-200 text-green-800'
-            : 'bg-red-50 border border-red-200 text-red-800'}`}>
-          <div className="flex items-start justify-between gap-3">
-            <span>{toast.msg}</span>
-            <button
-              type="button"
-              onClick={() => setToast(null)}
-              className="opacity-60 hover:opacity-100"
-              aria-label="Dismiss"
-            >✕</button>
-          </div>
-        </div>
-      )}
+      <GenerateDocModal
+        open={!!modalAction}
+        title={modalAction?.title || ''}
+        description={modalAction?.description || null}
+        onConfirm={modalAction?.onConfirm || (async () => ({}))}
+        onClose={() => setModalAction(null)}
+      />
     </div>
   )
 }

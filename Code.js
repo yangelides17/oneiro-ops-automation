@@ -525,7 +525,7 @@ function checkScanInbox() {
  *   correctly bucketed to yesterday's shift will pick up yesterday's
  *   Daily Sign-In Data rows.
  */
-function generateDailyDocuments(dateStr) {
+function generateDailyDocuments(dateStr, opts) {
   let targetDate;
   if (dateStr) {
     targetDate = new Date(dateStr);
@@ -540,23 +540,23 @@ function generateDailyDocuments(dateStr) {
       : new Date();
   }
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  
+
   // Get all sign-in data for this date
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const signInData = signInSheet.getDataRange().getValues();
   const headers = signInData[0];
-  
+
   const todaysEntries = signInData.slice(1).filter(row => {
     if (!row[0]) return false;
     const rowDate = new Date(row[0]);
     return rowDate.toDateString() === targetDate.toDateString();
   });
-  
+
   if (todaysEntries.length === 0) {
     Logger.log('No entries found for ' + targetDate.toDateString());
-    return;
+    return { generated: [] };
   }
-  
+
   // Group entries by Work Order. WO# column may be a comma-list when one
   // sign-in covers multiple WOs in the same shift — fan each row out into
   // every WO it references so each gets the same crew context.
@@ -574,18 +574,24 @@ function generateDailyDocuments(dateStr) {
   const woHeaders = woData[0];
 
   Logger.log(`📋 Processing ${Object.keys(byWorkOrder).length} work orders for ${targetDate.toDateString()}`);
-  
+
   // Generate Production Log (Metro Express format)
-  generateProductionLog_(targetDate, todaysEntries, byWorkOrder, woData, ss);
-  
-  // Generate Field Reports for completed WOs
-  Object.entries(byWorkOrder).forEach(([woId, entries]) => {
-    const isComplete = entries.some(e => String(e[14]).toLowerCase() === 'yes');
-    if (isComplete) {
-      generateFieldReport_(woId, entries, woData, ss);
-      generateInvoice_(woId, entries, woData, ss);
-    }
-  });
+  const plOpts = (opts && opts.contractorFilter) ? { contractorFilter: opts.contractorFilter } : undefined;
+  const plFiles = generateProductionLog_(targetDate, todaysEntries, byWorkOrder, woData, ss, plOpts) || [];
+
+  // Per-doc generation (PL only) skips Field Reports + Invoices — those
+  // are tied to WO completion events, not the per-day PL flow.
+  if (!opts || !opts.skipFieldReportsAndInvoices) {
+    Object.entries(byWorkOrder).forEach(([woId, entries]) => {
+      const isComplete = entries.some(e => String(e[14]).toLowerCase() === 'yes');
+      if (isComplete) {
+        generateFieldReport_(woId, entries, woData, ss);
+        generateInvoice_(woId, entries, woData, ss);
+      }
+    });
+  }
+
+  return { generated: plFiles.map(f => f.getName()) };
 }
 
 /** Lazy-cached spreadsheet timezone, so repeated formatTime_ calls
@@ -822,13 +828,21 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
  * - Returns an array of created Drive files (or empty array if no
  *   enabled contractor had work that day).
  */
-function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss) {
+function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss, opts) {
   const props = PropertiesService.getScriptProperties();
   const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
   const targetDayStr = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
 
-  const enabled = (CONFIG.PRODUCTION_LOG_CONTRACTORS || [])
+  let enabled = (CONFIG.PRODUCTION_LOG_CONTRACTORS || [])
     .map(s => String(s).trim()).filter(Boolean);
+  if (opts && opts.contractorFilter) {
+    const want = String(opts.contractorFilter).trim();
+    enabled = enabled.filter(c => c === want);
+    if (enabled.length === 0) {
+      Logger.log('Production Log: contractor "' + want + '" not enabled — nothing to generate.');
+      return [];
+    }
+  }
   if (enabled.length === 0) {
     Logger.log('No contractors enabled for production logs — skipping.');
     return [];
@@ -2357,7 +2371,7 @@ function computeYtdGrossForEmployee_(signInData, empName, stRate, otRate, weekEn
 }
 
 
-function generateCertifiedPayroll(weekStartStr) {
+function generateCertifiedPayroll(weekStartStr, opts) {
   // Parse MM/DD/YYYY explicitly to avoid UTC-shift issues
   const parts = weekStartStr.trim().split('/');
   if (parts.length !== 3) {
@@ -2398,6 +2412,17 @@ function generateCertifiedPayroll(weekStartStr) {
     if (!byContract[key]) byContract[key] = [];
     byContract[key].push(row);
   });
+
+  // Per-doc generation: filter byContract to a single (contract, borough) tuple.
+  if (opts && opts.contractFilter) {
+    const wantKey = `${opts.contractFilter.contractNum}|${opts.contractFilter.borough}`;
+    Object.keys(byContract).forEach(k => { if (k !== wantKey) delete byContract[k]; });
+    if (!byContract[wantKey]) {
+      Logger.log('⚠️ Certified Payroll: no Daily Sign-In rows for ' + wantKey +
+                 ' in week of ' + weekStartStr + ' — nothing to generate.');
+      return 0;
+    }
+  }
   
   // Full classification names — add new codes here as needed
   const CLASSIFICATION_NAMES = {
@@ -3182,6 +3207,10 @@ function doPost(e) {
       return handleGenerateDailyDocuments_(body);
     } else if (action === 'generate_certified_payroll') {
       return handleGenerateCertifiedPayroll_(body);
+    } else if (action === 'generate_pl_for_doc') {
+      return handleGeneratePLForDoc_(body);
+    } else if (action === 'generate_cp_for_doc') {
+      return handleGenerateCPForDoc_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
     } else if (action === 'list_employees') {
@@ -5114,6 +5143,130 @@ function _setDocLifecycleStatus_(ss, docId, flags) {
 }
 
 /**
+ * Inverse of _docLifecycleId_. Pulls (prefix, anchor, contractNum, borough)
+ * out of a synthetic Doc ID. Returns null on malformed input.
+ *
+ *   "PL_2026-04-13_84125MBTP701_BK" → { prefix:'PL', anchor:'2026-04-13',
+ *                                       contractNum:'84125MBTP701', borough:'BK' }
+ */
+function _parseDocLifecycleId_(docId) {
+  const m = String(docId || '').match(/^(PL|SI|CP)_(\d{4}-\d{2}-\d{2})_(.+)_([A-Z]{1,2})$/);
+  if (!m) return null;
+  return { prefix: m[1], anchor: m[2], contractNum: m[3], borough: m[4] };
+}
+
+/**
+ * Look up the contractor for a (date, contractNum, borough) tuple
+ * via Work Day Log. Returns the contractor string or '' if no match.
+ *
+ * WDL columns (0-idx): 0=Date, 1=WO, 2=Contractor, 3=Contract #, 4=Borough.
+ */
+function _lookupContractorForDateContractBorough_(ss, dateIso, contractNum, borough) {
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) return '';
+  const data = wdlSheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (ymd(r[0]) !== dateIso) continue;
+    const cn = String(r[3] || '').split('/')[0].trim();
+    if (cn !== contractNum) continue;
+    if (String(r[4] || '').trim() !== borough) continue;
+    return String(r[2] || '').trim();
+  }
+  return '';
+}
+
+/**
+ * Validate that the Sign-In sheet for a single (date, contract, borough)
+ * tuple is marked Done in the Doc Lifecycle Log. Returns:
+ *   { ok: true }
+ *   { ok: false, error_code: 'SI_NOT_DONE', error: '...' }
+ */
+function _validateSignInDoneForDay_(ss, dateIso, contractNum, borough) {
+  const siId = _docLifecycleId_('Sign-In', dateIso, contractNum, borough);
+  const { byId } = _readDocLifecycle_(ss);
+  const row = byId[siId];
+  if (row && row.done) return { ok: true };
+  return {
+    ok: false,
+    error_code: 'SI_NOT_DONE',
+    error: 'Sign-In sheet is not done for ' + dateIso + ' · ' + contractNum + ' · ' + borough +
+           '. Mark the Sign-In done first, then retry.',
+  };
+}
+
+/**
+ * Validate that every Sign-In sheet for a (week, contract, borough) is Done.
+ * Walks Work Day Log to find every (date) within [weekStart, weekStart+6]
+ * that worked for this contract+borough, then checks each one's SI row.
+ *
+ * Returns:
+ *   { ok: true }
+ *   { ok: false, error_code: 'SI_NOT_DONE', error: '...', missing_dates: [...] }
+ */
+function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) {
+    return { ok: false, error_code: 'NO_WORK_DAY_LOG', error: 'Work Day Log sheet missing.' };
+  }
+  const data = wdlSheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  const weekEndIso = (function () {
+    const [y, m, d] = weekStartIso.split('-').map(Number);
+    const end = new Date(y, m - 1, d + 6);
+    return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  })();
+  const workedDates = new Set();
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const dateIso = ymd(r[0]);
+    if (!dateIso || dateIso < weekStartIso || dateIso > weekEndIso) continue;
+    const cn = String(r[3] || '').split('/')[0].trim();
+    if (cn !== contractNum) continue;
+    if (String(r[4] || '').trim() !== borough) continue;
+    workedDates.add(dateIso);
+  }
+  if (workedDates.size === 0) {
+    return {
+      ok: false,
+      error_code: 'NO_WORK',
+      error: 'No work logged for ' + contractNum + ' · ' + borough +
+             ' during week of ' + weekStartIso + '. Nothing to put on a Certified Payroll.',
+    };
+  }
+  const { byId } = _readDocLifecycle_(ss);
+  const missing = [];
+  Array.from(workedDates).sort().forEach(dateIso => {
+    const siId = _docLifecycleId_('Sign-In', dateIso, contractNum, borough);
+    const row = byId[siId];
+    if (!row || !row.done) missing.push(dateIso);
+  });
+  if (missing.length === 0) return { ok: true };
+  return {
+    ok: false,
+    error_code: 'SI_NOT_DONE',
+    error: 'Sign-In sheets not done for: ' + missing.join(', ') +
+           ' (' + contractNum + ' · ' + borough + '). Mark them done first, then retry.',
+    missing_dates: missing,
+  };
+}
+
+/**
  * One-time backfill: walks Work Day Log to enumerate every (date,
  * contract, borough) tuple where work happened. For each tuple, inserts:
  *   - one Production Log row in Doc Lifecycle Log
@@ -5769,6 +5922,126 @@ function handleGenerateCertifiedPayroll_(body) {
       success:          true,
       week_start:       weekStart,
       contract_groups:  count,
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+
+/**
+ * Per-doc Production Log generation. Triggered from a Doc Status tab
+ * pending-list "Generate" button. Validates that the corresponding
+ * Sign-In sheet is Done before firing — refuses otherwise so we don't
+ * burn template seats on a PDF that's missing crew data.
+ *
+ * The actual PL file is per-contractor-per-day (existing behavior); a
+ * single PL covers all of that contractor's contracts/boroughs for
+ * the date. Validation here is per-(contract, borough) of the clicked
+ * doc_id so the modal's error message points at the specific SI to
+ * fix.
+ *
+ * body.data = { doc_id: 'PL_YYYY-MM-DD_<contractnum>_<borough>' }
+ */
+function handleGeneratePLForDoc_(body) {
+  const d     = body.data || {};
+  const docId = String(d.doc_id || '').trim();
+  if (!docId) return jsonResponse_({ error: 'Missing doc_id' }, 400);
+  const parsed = _parseDocLifecycleId_(docId);
+  if (!parsed || parsed.prefix !== 'PL') {
+    return jsonResponse_({ error: 'Malformed PL doc_id: ' + docId }, 400);
+  }
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Validate Sign-In Done for this (date, contract, borough)
+  const v = _validateSignInDoneForDay_(ss, parsed.anchor, parsed.contractNum, parsed.borough);
+  if (!v.ok) return jsonResponse_({ error: v.error, error_code: v.error_code }, 400);
+
+  // Resolve contractor from Work Day Log
+  const contractor = _lookupContractorForDateContractBorough_(ss, parsed.anchor, parsed.contractNum, parsed.borough);
+  if (!contractor) {
+    return jsonResponse_({
+      error:      'No Work Day Log entry found for ' + parsed.anchor + ' · ' +
+                  parsed.contractNum + ' · ' + parsed.borough +
+                  '. The work date may not have been logged yet.',
+      error_code: 'NO_WORK_DAY',
+    }, 400);
+  }
+
+  try {
+    // Convert ISO → MM/DD/YYYY (generateDailyDocuments parses both, but
+    // the Date parser is more reliable on the MM/DD form).
+    const [yyyy, mm, dd] = parsed.anchor.split('-');
+    const dateMmDd = `${mm}/${dd}/${yyyy}`;
+    const result = generateDailyDocuments(dateMmDd, {
+      contractorFilter:           contractor,
+      skipFieldReportsAndInvoices: true,
+    });
+    const files = (result && result.generated) || [];
+    if (files.length === 0) {
+      return jsonResponse_({
+        error:      'No Production Log file was created. ' + contractor +
+                    ' may not be enabled for PL generation, or no WOs were found for ' +
+                    parsed.anchor + '.',
+        error_code: 'NO_OUTPUT',
+      }, 400);
+    }
+    return jsonResponse_({
+      success: true,
+      message: 'Production Log JSON queued for ' + contractor + ' on ' + parsed.anchor +
+               '. Review the filled PDF in the Approvals tab — Done flips automatically when archived.',
+      files,
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+
+/**
+ * Per-doc Certified Payroll generation. Triggered from a Doc Status tab
+ * pending-list "Generate" button. Validates that every Sign-In sheet
+ * for the week's worked days (this contract+borough only) is Done
+ * before firing — refuses with a list of missing dates otherwise.
+ *
+ * body.data = { doc_id: 'CP_YYYY-MM-DD_<contractnum>_<borough>' }
+ */
+function handleGenerateCPForDoc_(body) {
+  const d     = body.data || {};
+  const docId = String(d.doc_id || '').trim();
+  if (!docId) return jsonResponse_({ error: 'Missing doc_id' }, 400);
+  const parsed = _parseDocLifecycleId_(docId);
+  if (!parsed || parsed.prefix !== 'CP') {
+    return jsonResponse_({ error: 'Malformed CP doc_id: ' + docId }, 400);
+  }
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Validate that every worked day's SI is done
+  const v = _validateSignInDoneForWeek_(ss, parsed.anchor, parsed.contractNum, parsed.borough);
+  if (!v.ok) {
+    return jsonResponse_({ error: v.error, error_code: v.error_code, missing_dates: v.missing_dates || [] }, 400);
+  }
+
+  try {
+    const [yyyy, mm, dd] = parsed.anchor.split('-');
+    const weekStartMmDd = `${mm}/${dd}/${yyyy}`;
+    const groupCount = generateCertifiedPayroll(weekStartMmDd, {
+      contractFilter: { contractNum: parsed.contractNum, borough: parsed.borough },
+    });
+    if (!groupCount) {
+      return jsonResponse_({
+        error:      'Certified Payroll generator produced 0 contract groups for ' +
+                    parsed.contractNum + ' · ' + parsed.borough +
+                    ' (week of ' + parsed.anchor + '). Check Daily Sign-In Data has rows in that range.',
+        error_code: 'NO_OUTPUT',
+      }, 400);
+    }
+    return jsonResponse_({
+      success: true,
+      message: 'Certified Payroll JSON queued for ' + parsed.contractNum + ' · ' +
+               parsed.borough + ' (week of ' + parsed.anchor +
+               '). Review the filled PDF in the Approvals tab — Done flips automatically when archived.',
+      contract_groups: groupCount,
     });
   } catch (err) {
     return jsonResponse_({ error: String(err && err.message || err) }, 500);
