@@ -165,16 +165,14 @@ async function flipDocFlags(updates) {
   return body
 }
 
-// ── Toggle pill (matches DocStatusChips's ToggleButton flavor) ─
-function TogglePill({ label, on, disabled, pending, onClick, color }) {
+// ── Toggle pill (binary: green=on, slate=off; amber reserved for rollups) ─
+function TogglePill({ label, on, disabled, pending, onClick }) {
   const base = 'text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border transition-all'
   let style
   if (disabled) {
     style = 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'
   } else if (on) {
-    style = color === 'green'
-      ? 'bg-green-500 text-white border-green-500 hover:bg-green-600'
-      : 'bg-amber-500 text-white border-amber-500 hover:bg-amber-600'
+    style = 'bg-green-500 text-white border-green-500 hover:bg-green-600'
   } else {
     style = 'bg-white text-slate-500 border-slate-200 hover:border-slate-400'
   }
@@ -188,6 +186,22 @@ function TogglePill({ label, on, disabled, pending, onClick, color }) {
       {pending ? '…' : label}
     </button>
   )
+}
+
+// ── Status rollup for a single contractor breakdown row ───────
+//   day  → 'gray' | 'amber' | 'green' from si.done + pl.done + pl.sent
+//   week → 'gray' | 'amber' | 'green' from cp.done + cp.sent
+function dayBreakdownStatus(b) {
+  const flags = [b.si?.done, b.pl?.done, b.pl?.sent]
+  const allDone = flags.every(Boolean)
+  const noneDone = flags.every(f => !f)
+  return allDone ? 'green' : noneDone ? 'gray' : 'amber'
+}
+function weekBreakdownStatus(b) {
+  const flags = [b.cp?.done, b.cp?.sent]
+  const allDone = flags.every(Boolean)
+  const noneDone = flags.every(f => !f)
+  return allDone ? 'green' : noneDone ? 'gray' : 'amber'
 }
 
 // ── Day cell popover (PL + SI per breakdown) ──────────────────
@@ -219,44 +233,46 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none">×</button>
         </div>
         <div className="space-y-3 max-h-[60vh] overflow-y-auto">
-          {(cell.breakdown || []).map((b, i) => (
-            <div key={i} className="border border-slate-100 rounded-lg p-3 space-y-2">
-              <div className="flex justify-between items-baseline">
-                <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
-                <p className="text-xs text-slate-500 font-mono">{b.contract_num} · {b.borough}</p>
-              </div>
-              {b.wo_ids?.length > 0 && (
-                <p className="text-[11px] text-slate-500 font-mono">
-                  WOs: {b.wo_ids.join(', ')}
-                </p>
-              )}
-              <div className="flex items-center gap-3 flex-wrap">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
-                  <TogglePill
-                    label="Done"
-                    on={b.si.done}
-                    onClick={() => onFlip(b.si.doc_id, 'done', !b.si.done)}
-                  />
+          {(cell.breakdown || []).map((b, i) => {
+            const rowBg = STATUS_BG[dayBreakdownStatus(b)]
+            return (
+              <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
+                <div className="flex justify-between items-baseline">
+                  <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
+                  <p className="text-xs text-slate-500 font-mono">{b.contract_num} · {b.borough}</p>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
-                  <TogglePill
-                    label="Done"
-                    on={b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
-                  />
-                  <TogglePill
-                    label="Sent"
-                    on={b.pl.sent}
-                    color="green"
-                    disabled={!b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                  />
+                {b.wo_ids?.length > 0 && (
+                  <p className="text-[11px] text-slate-500 font-mono">
+                    WOs: {b.wo_ids.join(', ')}
+                  </p>
+                )}
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
+                    <TogglePill
+                      label="Done"
+                      on={b.si.done}
+                      onClick={() => onFlip(b.si.doc_id, 'done', !b.si.done)}
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
+                    <TogglePill
+                      label="Done"
+                      on={b.pl.done}
+                      onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
+                    />
+                    <TogglePill
+                      label="Sent"
+                      on={b.pl.sent}
+                      disabled={!b.pl.done}
+                      onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
+                    />
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>
@@ -292,34 +308,36 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none">×</button>
         </div>
         <div className="space-y-3 max-h-[60vh] overflow-y-auto">
-          {(cell.breakdown || []).map((b, i) => (
-            <div key={i} className="border border-slate-100 rounded-lg p-3 space-y-2">
-              <div className="flex justify-between items-baseline">
-                <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
-                <p className="text-xs text-slate-500 font-mono">{b.contract_num} · {b.borough}</p>
+          {(cell.breakdown || []).map((b, i) => {
+            const rowBg = STATUS_BG[weekBreakdownStatus(b)]
+            return (
+              <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
+                <div className="flex justify-between items-baseline">
+                  <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
+                  <p className="text-xs text-slate-500 font-mono">{b.contract_num} · {b.borough}</p>
+                </div>
+                {b.wo_ids?.length > 0 && (
+                  <p className="text-[11px] text-slate-500 font-mono">
+                    WOs: {b.wo_ids.join(', ')}
+                  </p>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">CP</span>
+                  <TogglePill
+                    label="Done"
+                    on={b.cp.done}
+                    onClick={() => onFlip(b.cp.doc_id, 'done', !b.cp.done)}
+                  />
+                  <TogglePill
+                    label="Sent"
+                    on={b.cp.sent}
+                    disabled={!b.cp.done}
+                    onClick={() => onFlip(b.cp.doc_id, 'sent', !b.cp.sent)}
+                  />
+                </div>
               </div>
-              {b.wo_ids?.length > 0 && (
-                <p className="text-[11px] text-slate-500 font-mono">
-                  WOs: {b.wo_ids.join(', ')}
-                </p>
-              )}
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">CP</span>
-                <TogglePill
-                  label="Done"
-                  on={b.cp.done}
-                  onClick={() => onFlip(b.cp.doc_id, 'done', !b.cp.done)}
-                />
-                <TogglePill
-                  label="Sent"
-                  on={b.cp.sent}
-                  color="green"
-                  disabled={!b.cp.done}
-                  onClick={() => onFlip(b.cp.doc_id, 'sent', !b.cp.sent)}
-                />
-              </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>

@@ -146,14 +146,18 @@ export default function DocStatusChips({ woId, docs, onChange }) {
               aria-label="Close"
             >×</button>
           </div>
-          <div className="px-3 py-1 space-y-2">
+          <div className="px-2 py-1 space-y-1.5">
             {DOC_TYPES.map(d => {
               const s = local[d.key] || { done: false, sent: false }
               const sentDisabled = !s.done
               const donePending = pending[`${d.key}|done`]
               const sentPending = pending[`${d.key}|sent`]
+              // Row bg matches the chip color so the popover visually
+              // mirrors the chip cluster on the WO row.
+              const rowBg = chipClass(s.done, s.sent)
               return (
-                <div key={d.key} className="flex items-center justify-between gap-3">
+                <div key={d.key}
+                  className={`flex items-center justify-between gap-3 border rounded-md px-2 py-1.5 ${rowBg}`}>
                   <span className="text-xs text-slate-700 font-medium truncate">
                     {d.label}
                   </span>
@@ -189,9 +193,9 @@ function ToggleButton({ label, on, pending, disabled, title, onClick }) {
   if (disabled) {
     style = 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'
   } else if (on) {
-    style = label === 'Sent'
-      ? 'bg-green-500 text-white border-green-500 hover:bg-green-600'
-      : 'bg-amber-500 text-white border-amber-500 hover:bg-amber-600'
+    // Binary green/slate. Amber is reserved for partial-rollup chips at
+    // the row level, not for individual booleans.
+    style = 'bg-green-500 text-white border-green-500 hover:bg-green-600'
   } else {
     style = 'bg-white text-slate-500 border-slate-200 hover:border-slate-400'
   }
