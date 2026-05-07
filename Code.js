@@ -8633,10 +8633,12 @@ function handleGetDocStatusCalendar_(body) {
 function _buildDocStatusPayload_(monthIso) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
 
-  // Read Doc Lifecycle Log + Daily Sign-In Data once.
+  // Read Doc Lifecycle Log + Work Day Log once. Work Day Log is the
+  // canonical "days that worked" source — Daily Sign-In Data only
+  // populates once a sign-in sheet has been filled, so it lags.
   const { rows: logRows, byId: logById } = _readDocLifecycle_(ss);
-  const signInSheet = ss.getSheetByName('Daily Sign-In Data');
-  const signInData  = signInSheet ? signInSheet.getDataRange().getValues() : [];
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  const wdlData  = wdlSheet ? wdlSheet.getDataRange().getValues() : [];
 
   // Date helpers
   const ymd = (v) => {
@@ -8662,14 +8664,15 @@ function _buildDocStatusPayload_(monthIso) {
     new Date(yyyy, mm, 0), CONFIG.TIMEZONE, 'yyyy-MM-dd'
   );
 
-  // Walk Daily Sign-In Data → group by (date, contractor, contract, borough)
+  // Walk Work Day Log → group by (date, contractor, contract, borough)
   // for ALL TIME (pending list is all-time), but only emit calendar
-  // entries within the requested month.
+  // entries within the requested month. WDL columns (0-idx):
+  //   0=Date, 1=WO, 2=Prime Contractor, 3=Contract #, 4=Borough.
   const dayGroups = {};   // key: dateIso|contractor|contractNum|borough → group
   const weekTuples = {};  // key: weekStart|contractNum|borough → group
 
-  for (let i = 1; i < signInData.length; i++) {
-    const r = signInData[i];
+  for (let i = 1; i < wdlData.length; i++) {
+    const r = wdlData[i];
     const dateIso = ymd(r[0]);
     if (!dateIso) continue;
     const woId        = String(r[1] || '').trim();
@@ -8741,10 +8744,13 @@ function _buildDocStatusPayload_(monthIso) {
     cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
   });
 
-  // Build the weeks[] entries — week_start in the requested month.
+  // Build the weeks[] entries — include the leading week whose Sunday
+  // falls in the previous month (the calendar UI renders that week as
+  // its first row, e.g. May view shows the "Apr 26 – May 2" week at top).
+  const firstSunIso = weekStartIsoFor(monthStart);
   const weekCellByStart = {};
   Object.values(weekTuples).forEach(w => {
-    if (w.week_start < monthStart || w.week_start > monthEnd) return;
+    if (w.week_start < firstSunIso || w.week_start > monthEnd) return;
     const cpId = _docLifecycleId_('Certified Payroll', w.week_start, w.contract_num, w.borough);
     const cp = logById[cpId];
     const wos = Array.from(w.wo_ids).sort();
@@ -8794,7 +8800,8 @@ function _buildDocStatusPayload_(monthIso) {
       age_days:     ageDays,
     });
   };
-  // Day-kind pending: PL Done, PL Sent, SI Done
+  // Day-kind pending: SI Done first (sign-in must be done before a PL
+  // can be generated), then PL Done, then PL Sent.
   Object.values(dayGroups).forEach(g => {
     const plId = _docLifecycleId_('Production Log', g.date, g.contract_num, g.borough);
     const siId = _docLifecycleId_('Sign-In',        g.date, g.contract_num, g.borough);
@@ -8803,9 +8810,9 @@ function _buildDocStatusPayload_(monthIso) {
     const plDone = pl && pl.done;
     const plSent = pl && pl.sent;
     const siDone = si && si.done;
+    if (!siDone) pushPending(g, 'day', g.date, siId, ['SI Done']);
     if (!plDone) pushPending(g, 'day', g.date, plId, ['PL Done']);
     if (plDone && !plSent) pushPending(g, 'day', g.date, plId, ['PL Sent']);
-    if (!siDone) pushPending(g, 'day', g.date, siId, ['SI Done']);
   });
   // Week-kind pending: CP Done, CP Sent
   Object.values(weekTuples).forEach(w => {

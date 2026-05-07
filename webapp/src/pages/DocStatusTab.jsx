@@ -80,52 +80,55 @@ const ACTION_TITLE = {
 }
 
 // ── Bullet summary for a calendar cell's breakdown ────────────
-function bulletFor(prefix, verb, n, total) {
-  const noun = total > 1 ? `${prefix}s` : prefix
-  if (n === 0)     return { label: `${noun} Pending`,                  tone: 'slate' }
-  if (n === total) return { label: `${noun} ${verb}`,                  tone: 'green' }
-  return                  { label: `${noun} ${verb} (${n}/${total})`,  tone: 'amber' }
+//
+// State icons:
+//   ✓  all complete                    (green)
+//   ◐  partial — append (n/total)      (amber)
+//   ○  none yet                        (slate)
+//   –  no work that day/week           (slate)
+function bulletFor(label, n, total) {
+  if (total === 0)  return { icon: '–', label,                              tone: 'slate' }
+  if (n === 0)      return { icon: '○', label,                              tone: 'slate' }
+  if (n === total)  return { icon: '✓', label,                              tone: 'green' }
+  return                   { icon: '◐', label: `${label} ${n}/${total}`,    tone: 'amber' }
 }
 
 function summarizeBreakdown(breakdown, kind) {
   if (!breakdown || breakdown.length === 0) {
-    return [{ label: 'No Work', tone: 'slate' }]
+    return [{ icon: '–', label: 'No Work', tone: 'slate' }]
   }
   const total = breakdown.length
   if (kind === 'day') {
+    // Order: SI first (sign-in must be done before a PL can exist),
+    // then PL Done, then PL Sent.
+    const siDone = breakdown.filter(b => b.si.done).length
     const plDone = breakdown.filter(b => b.pl.done).length
     const plSent = breakdown.filter(b => b.pl.sent).length
-    const siDone = breakdown.filter(b => b.si.done).length
     return [
-      bulletFor('PL', 'Complete', plDone, total),
-      bulletFor('PL', 'Sent',     plSent, total),
-      bulletFor('SI', 'Complete', siDone, total),
+      bulletFor('SI Done', siDone, total),
+      bulletFor('PL Done', plDone, total),
+      bulletFor('PL Sent', plSent, total),
     ]
   }
   // kind === 'week' → CP only
   const cpDone = breakdown.filter(b => b.cp.done).length
   const cpSent = breakdown.filter(b => b.cp.sent).length
   return [
-    bulletFor('CP', 'Complete', cpDone, total),
-    bulletFor('CP', 'Sent',     cpSent, total),
+    bulletFor('CP Done', cpDone, total),
+    bulletFor('CP Sent', cpSent, total),
   ]
 }
 
-function StatusBullet({ label, tone }) {
-  const dot = {
-    green: 'bg-green-500',
-    amber: 'bg-amber-500',
-    slate: 'bg-slate-300',
-  }[tone] || 'bg-slate-300'
+function StatusBullet({ icon, label, tone }) {
   const text = {
     green: 'text-green-700',
     amber: 'text-amber-700',
     slate: 'text-slate-500',
   }[tone] || 'text-slate-500'
   return (
-    <div className="flex items-center gap-1.5 leading-tight">
-      <span className={`w-1 h-1 rounded-full ${dot} flex-shrink-0`} />
-      <span className={`text-[9px] font-medium truncate ${text}`}>{label}</span>
+    <div className={`flex items-center gap-1 leading-tight ${text}`}>
+      <span className="text-[10px] font-bold leading-none flex-shrink-0 w-2.5 text-center">{icon}</span>
+      <span className="text-[9px] font-medium truncate">{label}</span>
     </div>
   )
 }
@@ -229,6 +232,14 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
               )}
               <div className="flex items-center gap-3 flex-wrap">
                 <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
+                  <TogglePill
+                    label="Done"
+                    on={b.si.done}
+                    onClick={() => onFlip(b.si.doc_id, 'done', !b.si.done)}
+                  />
+                </div>
+                <div className="flex items-center gap-1.5">
                   <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
                   <TogglePill
                     label="Done"
@@ -241,14 +252,6 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                     color="green"
                     disabled={!b.pl.done}
                     onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                  />
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
-                  <TogglePill
-                    label="Done"
-                    on={b.si.done}
-                    onClick={() => onFlip(b.si.doc_id, 'done', !b.si.done)}
                   />
                 </div>
               </div>
@@ -378,7 +381,7 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
               <span className="text-[11px] font-semibold text-slate-700 self-end">{c.day}</span>
               <div className="mt-1 space-y-0.5 w-full">
                 {bullets.map((b, i) => (
-                  <StatusBullet key={i} label={b.label} tone={b.tone} />
+                  <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
                 ))}
               </div>
             </button>
@@ -441,7 +444,7 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
               </span>
               <div className="mt-1 space-y-0.5 w-full">
                 {bullets.map((b, i) => (
-                  <StatusBullet key={i} label={b.label} tone={b.tone} />
+                  <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
                 ))}
               </div>
             </button>
