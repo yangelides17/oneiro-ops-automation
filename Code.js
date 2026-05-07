@@ -1377,19 +1377,16 @@ function getRecipientsForDoc_(docType, woId, ss) {
 //
 // Doc-type strings match the values archiveDocument_ returns.
 // 0-idx column numbers (sheet col = idx+1).
+// Per-WO storage covers only CFR + Invoice now. PL/SI/CP moved to the
+// Doc Lifecycle Log (per-doc storage) — those entries were removed
+// from the WO Tracker by migrateRemoveObsoleteDocColumns.
 const DOC_TYPE_DONE_COL_ = Object.freeze({
-  'Field Report':      25,   // existing — Field Report Done?
-  'Production Log':    24,   // existing — Production Log Done?
-  'Sign-In':           46,   // new
-  'Certified Payroll': 48,   // new
-  'Invoice':           50,   // new
+  'Field Report': 25,   // legacy — Field Report Done?
+  'Invoice':      44,   // Invoice Done? — shifted left after the obsolete-col trim
 });
 const DOC_TYPE_SENT_COL_ = Object.freeze({
-  'Field Report':      44,   // new — CFR Sent?
-  'Production Log':    45,   // new — Prod Log Sent?
-  'Sign-In':           47,   // new
-  'Certified Payroll': 49,   // new
-  'Invoice':           29,   // existing — Invoice Sent?
+  'Field Report': 43,   // CFR Sent?
+  'Invoice':      29,   // legacy — Invoice Sent?
 });
 
 /**
@@ -4843,18 +4840,12 @@ function ensureWoTrackerExtraCols_(woSheet) {
     'Scan Upload Timestamp',   // col 41 / 0-idx 40 — for "today's uploads" query
     'Original Filename',       // col 42 / 0-idx 41 — filename the user picked in the webapp
     'Archive Folder URL',      // col 43 / 0-idx 42 — written once by getWOFolder_; read by dashboard
-    // Per-doc-type lifecycle flags. Each doc has a Done? (= archived in
-    // Drive) and Sent? (= delivered to prime contractor). Existing legacy
-    // Done? columns at 0-idx 24 (Production Log) and 25 (Field Report)
-    // stay where they are; existing Invoice Sent? at 0-idx 29 is also
-    // kept. The new columns below fill in the missing pairs.
-    'CFR Sent?',               // col 45 / 0-idx 44 — pairs with col 26/0-idx 25 Field Report Done?
-    'Prod Log Sent?',          // col 46 / 0-idx 45 — pairs with col 25/0-idx 24 Production Log Done?
-    'Sign-In Done?',           // col 47 / 0-idx 46
-    'Sign-In Sent?',           // col 48 / 0-idx 47
-    'CP Done?',                // col 49 / 0-idx 48 — Certified Payroll
-    'CP Sent?',                // col 50 / 0-idx 49
-    'Invoice Done?',           // col 51 / 0-idx 50 — pairs with col 30/0-idx 29 Invoice Sent?
+    // Per-WO doc lifecycle flags — only CFR + Invoice live here now.
+    // PL / SI / CP were trimmed by migrateRemoveObsoleteDocColumns and
+    // moved to the Doc Lifecycle Log (per-doc storage). Legacy Field
+    // Report Done? (0-idx 25) and Invoice Sent? (0-idx 29) stay put.
+    'CFR Sent?',               // col 44 / 0-idx 43 — pairs with col 26/0-idx 25 Field Report Done?
+    'Invoice Done?',           // col 45 / 0-idx 44 — pairs with col 30/0-idx 29 Invoice Sent?
   ];
   const START_COL = 36;
   const N = EXTRA_HEADERS.length;
@@ -5255,15 +5246,15 @@ function backfillDocLifecycleLog() {
  * One-time migration: trim the now-obsolete PL/SI/CP Done/Sent columns
  * from the WO Tracker, since per-doc tracking moved to the Doc
  * Lifecycle Log. After this runs, Google Sheets shifts trailing
- * columns left, and DOC_TYPE_DONE_COL_['Invoice'] needs to be updated
- * from 50 → 45 in a follow-up deploy.
+ * columns left and Invoice Done? lands at its new position — the
+ * follow-up deploy must update DOC_TYPE_DONE_COL_['Invoice'] to match.
  *
  * **Run prerequisites:**
  *   1. setupDocLifecycleLog has been run.
  *   2. backfillDocLifecycleLog has been run (so existing PL/SI/CP
  *      state is captured before we lose the WO Tracker columns).
  *   3. You're prepared to follow up with a code deploy that updates
- *      DOC_TYPE_DONE_COL_['Invoice'] = 45 + trims ensureWoTrackerExtraCols_.
+ *      DOC_TYPE_DONE_COL_['Invoice'] + trims ensureWoTrackerExtraCols_.
  *
  * Without #3, the Invoice Done chip on the WO Tracker tab will read
  * the wrong column until the deploy lands.
@@ -5287,31 +5278,44 @@ function migrateRemoveObsoleteDocColumns() {
     return;
   }
 
-  // Sanity-check the columns about to be deleted have the expected
-  // headers, so we don't accidentally trim something else if the
-  // schema's drifted.
-  const expected = [
-    { col: 46, header: 'Prod Log Sent?' },     // 1-idx 46 = 0-idx 45
-    { col: 47, header: 'Sign-In Done?' },      // 1-idx 47 = 0-idx 46
-    { col: 48, header: 'Sign-In Sent?' },      // 1-idx 48 = 0-idx 47
-    { col: 49, header: 'CP Done?' },           // 1-idx 49 = 0-idx 48
-    { col: 50, header: 'CP Sent?' },           // 1-idx 50 = 0-idx 49
-  ];
-  const headers = woSheet.getRange(1, 46, 1, 5).getValues()[0];
-  for (let i = 0; i < 5; i++) {
-    if (String(headers[i] || '').trim() !== expected[i].header) {
-      Logger.log('❌ migrateRemoveObsoleteDocColumns: header mismatch at col ' +
-                 expected[i].col + ' — expected "' + expected[i].header +
-                 '" got "' + headers[i] + '". Aborting.');
-      return;
+  // Header-driven trim: find whichever obsolete columns exist by name
+  // and delete them right-to-left. The live block has historically
+  // drifted from EXTRA_HEADERS's commented positions, so we don't
+  // hardcode 1-idx values here.
+  const OBSOLETE = new Set([
+    'Prod Log Sent?',
+    'Sign-In Done?',
+    'Sign-In Sent?',
+    'CP Done?',
+    'CP Sent?',
+  ]);
+  const lastCol = woSheet.getLastColumn();
+  const allHeaders = woSheet.getRange(1, 1, 1, lastCol).getValues()[0]
+    .map(h => String(h || '').trim());
+
+  const toDelete = [];
+  for (let i = 0; i < allHeaders.length; i++) {
+    if (OBSOLETE.has(allHeaders[i])) {
+      toDelete.push({ col: i + 1, header: allHeaders[i] });
     }
   }
+  if (toDelete.length === 0) {
+    Logger.log('ℹ️ migrateRemoveObsoleteDocColumns: no obsolete columns found — nothing to delete.');
+    return;
+  }
 
-  woSheet.deleteColumns(46, 5);
-  Logger.log('✅ migrateRemoveObsoleteDocColumns: deleted 5 cols (1-idx 46-50). ' +
-             'Invoice Done shifted to 0-idx 45. Now follow up with a code deploy ' +
-             'that updates DOC_TYPE_DONE_COL_[\'Invoice\'] = 45 and trims ' +
-             'ensureWoTrackerExtraCols_ EXTRA_HEADERS.');
+  toDelete.sort((a, b) => b.col - a.col);
+  toDelete.forEach(t => woSheet.deleteColumn(t.col));
+
+  const newHeaders = woSheet.getRange(1, 1, 1, woSheet.getLastColumn()).getValues()[0]
+    .map(h => String(h || '').trim());
+  const newInvoiceIdx = newHeaders.indexOf('Invoice Done?');
+
+  Logger.log('✅ migrateRemoveObsoleteDocColumns: deleted ' + toDelete.length +
+             ' col(s): ' + toDelete.map(t => '"' + t.header + '" @ 1-idx ' + t.col).join(', ') +
+             '. Invoice Done? now at 0-idx ' + newInvoiceIdx +
+             '. Follow up with a code deploy that sets DOC_TYPE_DONE_COL_[\'Invoice\']' +
+             ' = ' + newInvoiceIdx + ' and trims ensureWoTrackerExtraCols_ EXTRA_HEADERS.');
 
   _invalidateCacheKeys_(['dashboard_v1']);
 }
@@ -5469,12 +5473,11 @@ function backfillDocLifecycleFlags() {
 
     const sheetRow = i + 1;
     const set = (col, val) => woSheet.getRange(sheetRow, col + 1).setValue(val);
-    if (cfrFound)              set(DOC_TYPE_DONE_COL_['Field Report'],      'Yes');
-    if (invFound)              set(DOC_TYPE_DONE_COL_['Invoice'],           'Yes');
-    if (signInFound)           set(DOC_TYPE_DONE_COL_['Sign-In'],           'Yes');
-    if (masters.prod)          set(DOC_TYPE_DONE_COL_['Production Log'],    'Yes');
-    if (masters.cp)            set(DOC_TYPE_DONE_COL_['Certified Payroll'], 'Yes');
-    if (cfrFound || invFound || signInFound || masters.prod || masters.cp) touched++;
+    // PL/SI/CP per-WO columns no longer exist — those flags live in the
+    // Doc Lifecycle Log now. This backfill stays narrow: just CFR + INV.
+    if (cfrFound) set(DOC_TYPE_DONE_COL_['Field Report'], 'Yes');
+    if (invFound) set(DOC_TYPE_DONE_COL_['Invoice'],      'Yes');
+    if (cfrFound || invFound) touched++;
   }
 
   _invalidateCacheKeys_(['dashboard_v1']);
@@ -7626,19 +7629,17 @@ function _buildDashboardPayload_() {
         const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
         if (folder) folderUrl = folder.getUrl();
       }
-      // Per-doc-type lifecycle flags. Reads come through the
-      // DOC_TYPE_DONE_COL_ / DOC_TYPE_SENT_COL_ maps so column
-      // positions stay abstracted. Returned as a nested `docs` object
-      // for the React DocStatusChips component; legacy flat keys
-      // (prod_log / field_report / invoice_sent) kept for back-compat
-      // with existing dashboard reads — drop in a follow-up.
+      // Per-doc-type lifecycle flags. Only CFR + Invoice still live
+      // on the WO row. PL/SI/CP moved to the Doc Lifecycle Log; their
+      // entries in the `docs` payload are kept (always false) so the
+      // shape stays back-compat for the Download Documents modal.
       const yes = (col) => String(r[col] || '').toLowerCase() === 'yes';
       const docs = {
-        cfr:               { done: yes(DOC_TYPE_DONE_COL_['Field Report']),      sent: yes(DOC_TYPE_SENT_COL_['Field Report']) },
-        production_log:    { done: yes(DOC_TYPE_DONE_COL_['Production Log']),    sent: yes(DOC_TYPE_SENT_COL_['Production Log']) },
-        signin:            { done: yes(DOC_TYPE_DONE_COL_['Sign-In']),           sent: yes(DOC_TYPE_SENT_COL_['Sign-In']) },
-        certified_payroll: { done: yes(DOC_TYPE_DONE_COL_['Certified Payroll']), sent: yes(DOC_TYPE_SENT_COL_['Certified Payroll']) },
-        invoice:           { done: yes(DOC_TYPE_DONE_COL_['Invoice']),           sent: yes(DOC_TYPE_SENT_COL_['Invoice']) },
+        cfr:               { done: yes(DOC_TYPE_DONE_COL_['Field Report']), sent: yes(DOC_TYPE_SENT_COL_['Field Report']) },
+        production_log:    { done: false, sent: false },
+        signin:            { done: false, sent: false },
+        certified_payroll: { done: false, sent: false },
+        invoice:           { done: yes(DOC_TYPE_DONE_COL_['Invoice']),      sent: yes(DOC_TYPE_SENT_COL_['Invoice']) },
       };
       return {
         id:                  woId,
@@ -8024,20 +8025,22 @@ function handleListDocumentsForBatch_(body) {
       borough:      String(row[3] || '').trim(),
       location:     String(row[5] || '').trim(),
       work_end:     fmtDate(row[18]),
-      // Per-doc Done/Sent flags
+      // Per-doc Done/Sent flags. PL/SI/CP no longer have per-WO cols —
+      // those statuses are looked up against the Doc Lifecycle Log
+      // elsewhere in the batch flow. Defaulting them to false here.
       done: {
-        'Field Report':      String(row[DOC_TYPE_DONE_COL_['Field Report']]      || '').toLowerCase() === 'yes',
-        'Production Log':    String(row[DOC_TYPE_DONE_COL_['Production Log']]    || '').toLowerCase() === 'yes',
-        'Sign-In':           String(row[DOC_TYPE_DONE_COL_['Sign-In']]           || '').toLowerCase() === 'yes',
-        'Certified Payroll': String(row[DOC_TYPE_DONE_COL_['Certified Payroll']] || '').toLowerCase() === 'yes',
-        'Invoice':           String(row[DOC_TYPE_DONE_COL_['Invoice']]           || '').toLowerCase() === 'yes',
+        'Field Report':      String(row[DOC_TYPE_DONE_COL_['Field Report']] || '').toLowerCase() === 'yes',
+        'Production Log':    false,
+        'Sign-In':           false,
+        'Certified Payroll': false,
+        'Invoice':           String(row[DOC_TYPE_DONE_COL_['Invoice']]      || '').toLowerCase() === 'yes',
       },
       sent: {
-        'Field Report':      String(row[DOC_TYPE_SENT_COL_['Field Report']]      || '').toLowerCase() === 'yes',
-        'Production Log':    String(row[DOC_TYPE_SENT_COL_['Production Log']]    || '').toLowerCase() === 'yes',
-        'Sign-In':           String(row[DOC_TYPE_SENT_COL_['Sign-In']]           || '').toLowerCase() === 'yes',
-        'Certified Payroll': String(row[DOC_TYPE_SENT_COL_['Certified Payroll']] || '').toLowerCase() === 'yes',
-        'Invoice':           String(row[DOC_TYPE_SENT_COL_['Invoice']]           || '').toLowerCase() === 'yes',
+        'Field Report':      String(row[DOC_TYPE_SENT_COL_['Field Report']] || '').toLowerCase() === 'yes',
+        'Production Log':    false,
+        'Sign-In':           false,
+        'Certified Payroll': false,
+        'Invoice':           String(row[DOC_TYPE_SENT_COL_['Invoice']]      || '').toLowerCase() === 'yes',
       },
     });
   }
