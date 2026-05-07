@@ -52,11 +52,94 @@ const fmtShortDate = (iso) => {
   return `${MONTHS[m - 1].slice(0, 3)} ${d}, ${y}`
 }
 
+// "Apr 13 – Apr 19" for a Sunday-anchored week-start ISO.
+const fmtWeekRange = (sundayIso) => {
+  const [y, m, d] = String(sundayIso || '').split('-').map(Number)
+  if (!y || !m || !d) return sundayIso
+  const start = new Date(y, m - 1, d)
+  const end   = new Date(y, m - 1, d + 6)
+  const a = `${MONTHS[start.getMonth()].slice(0, 3)} ${start.getDate()}`
+  const b = `${MONTHS[end.getMonth()].slice(0, 3)} ${end.getDate()}`
+  return `${a} – ${b}`
+}
+
 // ── Cell background per status ────────────────────────────────
 const STATUS_BG = {
   gray:  'bg-slate-100  text-slate-500 border-slate-200',
   amber: 'bg-amber-100  text-amber-800 border-amber-200',
   green: 'bg-green-100  text-green-800 border-green-200',
+}
+
+// ── Pending-list action label per missing-flag ────────────────
+const ACTION_TITLE = {
+  'PL Done': 'Complete Production Log',
+  'PL Sent': 'Send Production Log',
+  'SI Done': 'Complete Sign-In Sheet',
+  'CP Done': 'Complete Certified Payroll',
+  'CP Sent': 'Send Certified Payroll',
+}
+
+// ── Bullet summary for a calendar cell's breakdown ────────────
+function bulletFor(prefix, verb, n, total) {
+  const noun = total > 1 ? `${prefix}s` : prefix
+  if (n === 0)     return { label: `${noun} Pending`,                  tone: 'slate' }
+  if (n === total) return { label: `${noun} ${verb}`,                  tone: 'green' }
+  return                  { label: `${noun} ${verb} (${n}/${total})`,  tone: 'amber' }
+}
+
+function summarizeBreakdown(breakdown, kind) {
+  if (!breakdown || breakdown.length === 0) {
+    return [{ label: 'No Work', tone: 'slate' }]
+  }
+  const total = breakdown.length
+  if (kind === 'day') {
+    const plDone = breakdown.filter(b => b.pl.done).length
+    const plSent = breakdown.filter(b => b.pl.sent).length
+    const siDone = breakdown.filter(b => b.si.done).length
+    return [
+      bulletFor('PL', 'Complete', plDone, total),
+      bulletFor('PL', 'Sent',     plSent, total),
+      bulletFor('SI', 'Complete', siDone, total),
+    ]
+  }
+  // kind === 'week' → CP only
+  const cpDone = breakdown.filter(b => b.cp.done).length
+  const cpSent = breakdown.filter(b => b.cp.sent).length
+  return [
+    bulletFor('CP', 'Complete', cpDone, total),
+    bulletFor('CP', 'Sent',     cpSent, total),
+  ]
+}
+
+function StatusBullet({ label, tone }) {
+  const dot = {
+    green: 'bg-green-500',
+    amber: 'bg-amber-500',
+    slate: 'bg-slate-300',
+  }[tone] || 'bg-slate-300'
+  const text = {
+    green: 'text-green-700',
+    amber: 'text-amber-700',
+    slate: 'text-slate-500',
+  }[tone] || 'text-slate-500'
+  return (
+    <div className="flex items-center gap-1.5 leading-tight">
+      <span className={`w-1 h-1 rounded-full ${dot} flex-shrink-0`} />
+      <span className={`text-[9px] font-medium truncate ${text}`}>{label}</span>
+    </div>
+  )
+}
+
+// ── Loading overlay for calendars ─────────────────────────────
+function CalendarLoadingOverlay() {
+  return (
+    <div className="card p-4 min-h-[280px] relative">
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
+        <div className="w-6 h-6 rounded-full border-2 border-slate-300 border-t-navy animate-spin" />
+        <span className="text-xs text-slate-500 font-medium">Loading…</span>
+      </div>
+    </div>
+  )
 }
 
 // ── Fetch ─────────────────────────────────────────────────────
@@ -241,13 +324,16 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
 }
 
 // ── Day calendar grid ─────────────────────────────────────────
-function DayCalendar({ monthIso, days, onCellClick }) {
+function DayCalendar({ monthIso, days, loading, onCellClick }) {
   const todayLocal = todayIso()
   const dayByDate = useMemo(() => {
     const m = {}
     ;(days || []).forEach(d => { m[d.date] = d })
     return m
   }, [days])
+
+  // First load: no data yet → full skeleton + spinner.
+  if (loading && !days) return <CalendarLoadingOverlay />
 
   const [y, m] = monthIso.split('-').map(Number)
   const firstDow = new Date(y, m - 1, 1).getDay()  // 0 = Sun
@@ -264,31 +350,37 @@ function DayCalendar({ monthIso, days, onCellClick }) {
   while (cells.length % 7 !== 0) cells.push({ blank: true, key: 'trail-' + cells.length })
 
   return (
-    <div className="card p-4">
+    <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
       <div className="grid grid-cols-7 gap-1 text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-1">
         {['S','M','T','W','T','F','S'].map((d, i) => <div key={i} className="text-center">{d}</div>)}
       </div>
       <div className="grid grid-cols-7 gap-1">
         {cells.map(c => {
-          if (c.blank) return <div key={c.key} className="aspect-square" />
+          if (c.blank) return <div key={c.key} className="min-h-[64px]" />
           const cell = c.cell
-          const status = cell?.status || ''
-          const bg = status ? STATUS_BG[status] : 'bg-white text-slate-400 border-slate-100'
+          const status = cell?.status || 'gray'
+          const bg = STATUS_BG[status] || STATUS_BG.gray
           const isToday = c.date === todayLocal
           const clickable = !!cell
+          const bullets = summarizeBreakdown(cell?.breakdown, 'day')
           return (
             <button
               key={c.key}
               type="button"
               disabled={!clickable}
               onClick={() => clickable && onCellClick(cell)}
-              className={`aspect-square rounded-md border text-xs font-semibold relative
-                          flex items-start justify-end p-1.5 transition-all
+              className={`min-h-[64px] rounded-md border text-left p-1.5 transition-all
+                          flex flex-col items-stretch
                           ${bg}
                           ${isToday ? 'ring-2 ring-navy/40' : ''}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
             >
-              <span className="text-[11px]">{c.day}</span>
+              <span className="text-[11px] font-semibold text-slate-700 self-end">{c.day}</span>
+              <div className="mt-1 space-y-0.5 w-full">
+                {bullets.map((b, i) => (
+                  <StatusBullet key={i} label={b.label} tone={b.tone} />
+                ))}
+              </div>
             </button>
           )
         })}
@@ -298,12 +390,15 @@ function DayCalendar({ monthIso, days, onCellClick }) {
 }
 
 // ── Week calendar (Sunday-anchored, ~5 cells per month) ───────
-function WeekCalendar({ monthIso, weeks, onCellClick }) {
+function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
   const weekByStart = useMemo(() => {
     const m = {}
     ;(weeks || []).forEach(w => { m[w.week_start] = w })
     return m
   }, [weeks])
+
+  // First load: no data yet → full skeleton + spinner.
+  if (loading && !weeks) return <CalendarLoadingOverlay />
 
   // Build all weeks whose start falls in this month.
   const [y, m] = monthIso.split('-').map(Number)
@@ -321,27 +416,34 @@ function WeekCalendar({ monthIso, weeks, onCellClick }) {
   }
 
   return (
-    <div className="card p-4">
-      <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-2">Week starting</p>
-      <div className="space-y-1.5">
+    <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
+      <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-2">Week of</p>
+      <div className="space-y-2">
         {cells.map(c => {
           const cell = c.cell
-          const status = cell?.status || ''
-          const bg = status ? STATUS_BG[status] : 'bg-white text-slate-400 border-slate-100'
+          const status = cell?.status || 'gray'
+          const bg = STATUS_BG[status] || STATUS_BG.gray
           const clickable = !!cell
+          const bullets = summarizeBreakdown(cell?.breakdown, 'week')
           return (
             <button
               key={c.week_start}
               type="button"
               disabled={!clickable}
               onClick={() => clickable && onCellClick(cell)}
-              className={`w-full rounded-md border text-sm font-semibold
-                          flex items-center justify-between px-3 py-2 transition-all
+              className={`w-full rounded-md border text-left p-2 transition-all
+                          flex flex-col items-stretch min-h-[64px]
                           ${bg}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
             >
-              <span>{fmtShortDate(c.week_start)}</span>
-              {!status && <span className="text-[10px] text-slate-400 italic">no work</span>}
+              <span className="text-[11px] font-semibold text-slate-700">
+                {fmtWeekRange(c.week_start)}
+              </span>
+              <div className="mt-1 space-y-0.5 w-full">
+                {bullets.map((b, i) => (
+                  <StatusBullet key={i} label={b.label} tone={b.tone} />
+                ))}
+              </div>
             </button>
           )
         })}
@@ -350,8 +452,49 @@ function WeekCalendar({ monthIso, weeks, onCellClick }) {
   )
 }
 
+// ── Pending list action button (per-button loading state) ─────
+function PendingActionButton({ item, onMark }) {
+  const [pending, setPending] = useState(false)
+  const flag = item.missing[0]
+  const isSent = flag === 'PL Sent' || flag === 'CP Sent'
+  const label  = isSent ? 'Mark Sent' : 'Mark Done'
+
+  const handle = async () => {
+    if (pending) return
+    setPending(true)
+    try {
+      await onMark(item.doc_id, isSent ? 'sent' : 'done', true)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  const base = 'text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center'
+  const style = isSent
+    ? 'bg-green-500 text-white border-green-500 hover:bg-green-600'
+    : 'bg-amber-500 text-white border-amber-500 hover:bg-amber-600'
+
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      disabled={pending}
+      className={`${base} ${style} ${pending ? 'opacity-60 cursor-wait' : ''}`}
+    >
+      {pending ? '…' : label}
+    </button>
+  )
+}
+
 // ── Pending list ──────────────────────────────────────────────
-function PendingList({ kind, pending, onMark }) {
+function PendingList({ kind, pending, loading, onMark }) {
+  if (loading && !pending) {
+    return (
+      <div className="card p-4 text-xs text-slate-400 italic flex items-center justify-center min-h-[80px]">
+        Loading…
+      </div>
+    )
+  }
   const items = (pending || []).filter(p => p.kind === kind)
   if (items.length === 0) {
     return (
@@ -361,7 +504,7 @@ function PendingList({ kind, pending, onMark }) {
     )
   }
   return (
-    <div className="card overflow-hidden">
+    <div className={`card overflow-hidden ${loading ? 'opacity-60 transition-opacity' : ''}`}>
       <div className="px-3 py-2 border-b border-slate-100 flex justify-between">
         <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
           Pending ({items.length})
@@ -370,48 +513,19 @@ function PendingList({ kind, pending, onMark }) {
       </div>
       <div className="max-h-[280px] overflow-y-auto divide-y divide-slate-100">
         {items.map((it, i) => (
-          <div key={i} className="px-3 py-2 text-xs flex items-center justify-between gap-3">
+          <div key={i} className="px-3 py-2.5 flex items-center justify-between gap-3">
             <div className="min-w-0 flex-1">
-              <p className="font-mono text-slate-700">{it.anchor}</p>
-              <p className="text-slate-500 truncate">
+              <p className="font-semibold text-sm text-slate-800 truncate">
+                {ACTION_TITLE[it.missing[0]] || it.missing.join(', ')}
+              </p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {it.kind === 'week' ? `Week of ${fmtShortDate(it.anchor)}` : fmtShortDate(it.anchor)}
+              </p>
+              <p className="text-xs text-slate-500 truncate">
                 {it.contractor} · <span className="font-mono">{it.contract_num}</span> · {it.borough}
               </p>
-              <p className="text-[10px] text-amber-700 font-semibold">
-                {it.missing.join(', ')}
-              </p>
             </div>
-            <div className="flex gap-1.5">
-              {it.missing.includes('PL Done') && (
-                <button onClick={() => onMark(it.doc_id, 'done', true)}
-                  className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-amber-500 text-white border-amber-500 hover:bg-amber-600">
-                  Mark Done
-                </button>
-              )}
-              {it.missing.includes('PL Sent') && (
-                <button onClick={() => onMark(it.doc_id, 'sent', true)}
-                  className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-green-500 text-white border-green-500 hover:bg-green-600">
-                  Mark Sent
-                </button>
-              )}
-              {it.missing.includes('SI Done') && (
-                <button onClick={() => onMark(it.doc_id, 'done', true)}
-                  className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-amber-500 text-white border-amber-500 hover:bg-amber-600">
-                  Mark Done
-                </button>
-              )}
-              {it.missing.includes('CP Done') && (
-                <button onClick={() => onMark(it.doc_id, 'done', true)}
-                  className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-amber-500 text-white border-amber-500 hover:bg-amber-600">
-                  Mark Done
-                </button>
-              )}
-              {it.missing.includes('CP Sent') && (
-                <button onClick={() => onMark(it.doc_id, 'sent', true)}
-                  className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-green-500 text-white border-green-500 hover:bg-green-600">
-                  Mark Sent
-                </button>
-              )}
-            </div>
+            <PendingActionButton item={it} onMark={onMark} />
           </div>
         ))}
       </div>
@@ -521,20 +635,19 @@ export default function DocStatusTab() {
             >Today</button>
           )}
         </div>
-        {loading && <span className="text-xs text-slate-400">loading…</span>}
         {error && <span className="text-xs text-red-600">⚠ {error}</span>}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="space-y-3">
           <p className="section-label">Production Logs + Sign-Ins</p>
-          <DayCalendar monthIso={monthIso} days={data?.days} onCellClick={setActiveDay} />
-          <PendingList kind="day" pending={data?.pending} onMark={onPendingMark} />
+          <DayCalendar monthIso={monthIso} days={data?.days} loading={loading} onCellClick={setActiveDay} />
+          <PendingList kind="day" pending={data?.pending} loading={loading} onMark={onPendingMark} />
         </div>
         <div className="space-y-3">
           <p className="section-label">Certified Payroll</p>
-          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} onCellClick={setActiveWeek} />
-          <PendingList kind="week" pending={data?.pending} onMark={onPendingMark} />
+          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} loading={loading} onCellClick={setActiveWeek} />
+          <PendingList kind="week" pending={data?.pending} loading={loading} onMark={onPendingMark} />
         </div>
       </div>
 
