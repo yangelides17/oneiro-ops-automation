@@ -439,8 +439,8 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
 
   return (
     <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
-      <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-2">Week of</p>
-      <div className="space-y-2">
+      <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-1">Week of</p>
+      <div className="space-y-1">
         {cells.map(c => {
           const cell = c.cell
           const status = cell?.status || 'gray'
@@ -453,7 +453,7 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
               type="button"
               disabled={!clickable}
               onClick={() => clickable && onCellClick(cell)}
-              className={`w-full rounded-md border text-left p-2 transition-all
+              className={`w-full rounded-md border text-left p-1.5 transition-all
                           flex flex-col items-stretch min-h-[64px]
                           ${bg}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
