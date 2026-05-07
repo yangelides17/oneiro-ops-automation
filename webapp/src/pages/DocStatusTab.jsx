@@ -491,10 +491,11 @@ function PendingActionButton({ item, onMark }) {
     }
   }
 
+  // Both Mark Done and Mark Sent share the green palette — completion =
+  // green is the convention. Slate is reserved for "pending / not done"
+  // and amber is reserved for partial-rollup states.
   const base = 'text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center'
-  const style = isSent
-    ? 'bg-green-500 text-white border-green-500 hover:bg-green-600'
-    : 'bg-amber-500 text-white border-amber-500 hover:bg-amber-600'
+  const style = 'bg-green-500 text-white border-green-500 hover:bg-green-600'
 
   return (
     <button

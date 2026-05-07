@@ -5199,7 +5199,7 @@ function _validateSignInDoneForDay_(ss, dateIso, contractNum, borough) {
     ok: false,
     error_code: 'SI_NOT_DONE',
     error: 'Sign-In sheet is not done for ' + dateIso + ' · ' + contractNum + ' · ' + borough +
-           '. Mark the Sign-In done first, then retry.',
+           '. Ensure the Sign-In sheet is complete, then retry.',
   };
 }
 
@@ -5261,7 +5261,7 @@ function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
     ok: false,
     error_code: 'SI_NOT_DONE',
     error: 'Sign-In sheets not done for: ' + missing.join(', ') +
-           ' (' + contractNum + ' · ' + borough + '). Mark them done first, then retry.',
+           ' (' + contractNum + ' · ' + borough + '). Ensure each Sign-In sheet is complete, then retry.',
     missing_dates: missing,
   };
 }
