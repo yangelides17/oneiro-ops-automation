@@ -101,22 +101,24 @@ function summarizeBreakdown(breakdown, kind) {
   if (kind === 'day') {
     // Day breakdown is contractor-grouped: PL state lives on the group
     // (one PL per contractor per day), SI lives on each contracts[]
-    // sub-entry (one SI per (contract, borough)). Counts use the right
-    // denominators for each axis.
-    const totalContractors = breakdown.length
-    const plDone = breakdown.filter(b => b.pl?.done).length
-    const plSent = breakdown.filter(b => b.pl?.sent).length
+    // sub-entry (one SI per (contract, borough)). PL counts use only
+    // PL-eligible contractors; SI counts use every contract.
+    const plRows = breakdown.filter(b => b.pl_required)
+    const totalPlCtrs = plRows.length
+    const plDone = plRows.filter(b => b.pl?.done).length
+    const plSent = plRows.filter(b => b.pl?.sent).length
     let totalContracts = 0, siDone = 0
     breakdown.forEach(b => {
       const contracts = b.contracts || []
       totalContracts += contracts.length
       siDone += contracts.filter(c => c.si?.done).length
     })
-    return [
-      bulletFor('SI Done', siDone, totalContracts),
-      bulletFor('PL Done', plDone, totalContractors),
-      bulletFor('PL Sent', plSent, totalContractors),
-    ]
+    const bullets = [bulletFor('SI Done', siDone, totalContracts)]
+    if (totalPlCtrs > 0) {
+      bullets.push(bulletFor('PL Done', plDone, totalPlCtrs))
+      bullets.push(bulletFor('PL Sent', plSent, totalPlCtrs))
+    }
+    return bullets
   }
   // kind === 'week' → CP only
   const total = breakdown.length
@@ -198,15 +200,18 @@ function TogglePill({ label, on, disabled, pending, onClick }) {
 }
 
 // ── Status rollup for a single contractor breakdown row ───────
-//   day  → 'gray' | 'amber' | 'green' from contractor.pl + every contracts[].si
+//   day  → 'gray' | 'amber' | 'green' from contractor.pl (when required)
+//                                      + every contracts[].si
 //   week → 'gray' | 'amber' | 'green' from cp.done + cp.sent
 function dayBreakdownStatus(b) {
   const contracts = b.contracts || []
   const siAllDone = contracts.length > 0 && contracts.every(c => c.si?.done)
   const siAllBlank = contracts.every(c => !c.si?.done)
-  const plDone = !!b.pl?.done, plSent = !!b.pl?.sent
-  const allDone  = siAllDone && plDone && plSent
-  const allBlank = siAllBlank && !plDone && !plSent
+  const plRequired = !!b.pl_required
+  const plFull  = !plRequired || (b.pl?.done && b.pl?.sent)
+  const plBlank = !plRequired || (!b.pl?.done && !b.pl?.sent)
+  const allDone  = siAllDone && plFull
+  const allBlank = siAllBlank && plBlank
   return allDone ? 'green' : allBlank ? 'gray' : 'amber'
 }
 function weekBreakdownStatus(b) {
@@ -283,20 +288,22 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                             onClick={() => onFlip(c.si.doc_id, 'done', !c.si.done)}
                           />
                         </div>
-                        <div className="flex items-center gap-1">
-                          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
-                          <TogglePill
-                            label="Done"
-                            on={b.pl.done}
-                            onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
-                          />
-                          <TogglePill
-                            label="Sent"
-                            on={b.pl.sent}
-                            disabled={!b.pl.done}
-                            onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                          />
-                        </div>
+                        {b.pl_required && (
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
+                            <TogglePill
+                              label="Done"
+                              on={b.pl.done}
+                              onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
+                            />
+                            <TogglePill
+                              label="Sent"
+                              on={b.pl.sent}
+                              disabled={!b.pl.done}
+                              onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -681,8 +688,11 @@ export default function DocStatusTab() {
           const contracts = b.contracts || []
           const siAllDone  = contracts.length > 0 && contracts.every(c => c.si?.done)
           const siAllBlank = contracts.every(c => !c.si?.done)
-          const full  = b.pl?.done && b.pl?.sent && siAllDone
-          const empty = !b.pl?.done && !b.pl?.sent && siAllBlank
+          const plRequired = !!b.pl_required
+          const plFull  = !plRequired || (b.pl?.done && b.pl?.sent)
+          const plBlank = !plRequired || (!b.pl?.done && !b.pl?.sent)
+          const full  = plFull  && siAllDone
+          const empty = plBlank && siAllBlank
           if (!full)  allFull  = false
           if (!empty) allEmpty = false
         })

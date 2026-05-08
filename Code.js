@@ -6232,6 +6232,20 @@ function handleGeneratePLForDoc_(body) {
   if (!parsed) {
     return jsonResponse_({ error: 'Malformed PL doc_id: ' + docId }, 400);
   }
+
+  // Defense in depth — refuse if contractor isn't on the PL-required
+  // list. Stale clients shouldn't surface a Generate button for them
+  // anyway, but lock the door at the backend regardless.
+  const enabled = new Set(
+    (CONFIG.PRODUCTION_LOG_CONTRACTORS || []).map(s => String(s).trim()).filter(Boolean)
+  );
+  if (!enabled.has(parsed.contractor)) {
+    return jsonResponse_({
+      error: parsed.contractor + ' is not currently configured to require Production Logs.',
+      error_code: 'PL_NOT_REQUIRED',
+    }, 400);
+  }
+
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
 
   // Validate every (contract, borough) the contractor worked that day
@@ -9253,6 +9267,15 @@ function _buildDocStatusPayload_(monthIso) {
   const wdlSheet = ss.getSheetByName('Work Day Log');
   const wdlData  = wdlSheet ? wdlSheet.getDataRange().getValues() : [];
 
+  // Per-contractor PL eligibility: only contractors in
+  // CONFIG.PRODUCTION_LOG_CONTRACTORS need PLs. Other primes' breakdown
+  // entries get pl_required=false and the calendar/popover/pending list
+  // skip the PL surface for them. Edit the CONFIG list to enable a new
+  // prime — no migration needed.
+  const PL_ENABLED = new Set(
+    (CONFIG.PRODUCTION_LOG_CONTRACTORS || []).map(s => String(s).trim()).filter(Boolean)
+  );
+
   // Date helpers
   const ymd = (v) => {
     if (v instanceof Date && !isNaN(v.getTime())) {
@@ -9333,6 +9356,7 @@ function _buildDocStatusPayload_(monthIso) {
   const dayCellByDate = {};  // dateIso → { date, status, breakdown[] }
   Object.values(contractorDays).forEach(cd => {
     if (cd.date < monthStart || cd.date > monthEnd) return;
+    const plRequired = PL_ENABLED.has(cd.contractor);
     const plId = _plDocId_(cd.date, cd.contractor);
     const pl = logById[plId];
     const contractsArr = Object.values(cd.contracts).map(c => {
@@ -9349,11 +9373,14 @@ function _buildDocStatusPayload_(monthIso) {
     }).sort((a, b) => (a.contract_num + a.borough).localeCompare(b.contract_num + b.borough));
 
     const bdRow = {
-      contractor: cd.contractor,
-      wo_ids:     Array.from(cd.wo_ids).sort(),
-      pl: pl
-        ? { doc_id: pl.doc_id, done: pl.done, sent: pl.sent }
-        : { doc_id: plId,      done: false,    sent: false },
+      contractor:  cd.contractor,
+      pl_required: plRequired,
+      wo_ids:      Array.from(cd.wo_ids).sort(),
+      pl: plRequired
+        ? (pl
+            ? { doc_id: pl.doc_id, done: pl.done, sent: pl.sent }
+            : { doc_id: plId,      done: false,    sent: false })
+        : null,
       contracts: contractsArr,
     };
 
@@ -9363,14 +9390,15 @@ function _buildDocStatusPayload_(monthIso) {
     dayCellByDate[cd.date].breakdown.push(bdRow);
   });
 
-  // Day cell status rollup: green if every contractor's PL is Done+Sent
-  // AND every contract's SI is Done. Amber if any partial. Gray if all
-  // empty.
+  // Day cell status rollup: green if every contractor's PL (when required)
+  // is Done+Sent AND every contract's SI is Done. Amber if any partial.
+  // Gray if all empty. PL is treated as "satisfied" for non-required
+  // contractors (they don't need a PL to count as full).
   Object.values(dayCellByDate).forEach(cell => {
     let allFull = cell.breakdown.length > 0, allEmpty = true;
     cell.breakdown.forEach(b => {
-      const plFull  = b.pl.done && b.pl.sent;
-      const plEmpty = !b.pl.done && !b.pl.sent;
+      const plFull  = !b.pl_required || (b.pl?.done && b.pl?.sent);
+      const plEmpty = !b.pl_required || (!b.pl?.done && !b.pl?.sent);
       const siAllDone  = b.contracts.every(c => c.si.done);
       const siAllBlank = b.contracts.every(c => !c.si.done);
       const full  = plFull  && siAllDone;
@@ -9454,19 +9482,21 @@ function _buildDocStatusPayload_(monthIso) {
         }, 'day', cd.date, siId, ['SI Done']);
       }
     });
-    // PL per contractor
-    const plId = _plDocId_(cd.date, cd.contractor);
-    const pl = logById[plId];
-    const plDone = pl && pl.done;
-    const plSent = pl && pl.sent;
-    const cdProxy = {
-      contractor:   cd.contractor,
-      contract_num: '',                  // PL spans contracts — none singular
-      borough:      '',
-      wo_ids:       cd.wo_ids,
-    };
-    if (!plDone) pushPending(cdProxy, 'day', cd.date, plId, ['PL Done']);
-    if (plDone && !plSent) pushPending(cdProxy, 'day', cd.date, plId, ['PL Sent']);
+    // PL per contractor — only for contractors in CONFIG.PRODUCTION_LOG_CONTRACTORS.
+    if (PL_ENABLED.has(cd.contractor)) {
+      const plId = _plDocId_(cd.date, cd.contractor);
+      const pl = logById[plId];
+      const plDone = pl && pl.done;
+      const plSent = pl && pl.sent;
+      const cdProxy = {
+        contractor:   cd.contractor,
+        contract_num: '',                  // PL spans contracts — none singular
+        borough:      '',
+        wo_ids:       cd.wo_ids,
+      };
+      if (!plDone) pushPending(cdProxy, 'day', cd.date, plId, ['PL Done']);
+      if (plDone && !plSent) pushPending(cdProxy, 'day', cd.date, plId, ['PL Sent']);
+    }
   });
   // Week-kind pending: CP Done, CP Sent
   Object.values(weekTuples).forEach(w => {
