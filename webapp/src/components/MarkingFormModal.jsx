@@ -228,6 +228,17 @@ export default function MarkingFormModal({
             </div>
           )}
 
+          {layout === 'default' && (
+            <Field label="Intersection / Between (optional)">
+              <IntersectionSelect
+                value={form.intersection}
+                onChange={(v) => setField('intersection', v)}
+                intersections={wo_intersections}
+                betweens={wo_betweens}
+              />
+            </Field>
+          )}
+
           {layout === 'mma' && (
             <Field label="Color / Material">
               <input

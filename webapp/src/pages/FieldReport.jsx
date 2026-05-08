@@ -359,6 +359,13 @@ function MarkingItemRow({
         { label: 'Bulk delete', onClick: () => onStartBulk() },
       ]} />
 
+  // Default-layout rows with an intersection set get an extra read-only
+  // intersection cell so "between" locations (e.g. "5 AV – 6 AV") on
+  // top-table items like Lane Lines / Double Yellow Lines are visible
+  // at a glance. When intersection is empty the row falls back to the
+  // compact 3-cell layout.
+  const hasInt = layout === 'default' && !!String(item.intersection || '').trim()
+
   // Grid templates — [checkbox?] + fields + [action]. Checkbox col is
   // 0px when bulk mode is off (hidden entirely).
   const CB  = bulkMode ? '24px ' : ''
@@ -368,18 +375,21 @@ function MarkingItemRow({
     ? `${CB}1fr 110px 64px 90px 56px${END}`
     : layout === 'mma'
       ? `${CB}1fr 1fr 90px 56px${END}`
-      : `${CB}1fr 90px 56px${END}`
-  // Mobile (< sm) — for grid + mma layouts the row stacks onto two
-  // lines: line 1 = [bulk-cb?] [type] [action], line 2 = the
-  // contextual fields. Top-table only has 3 cells so it stays
-  // single-line on mobile too — just slightly tighter.
+      : hasInt
+        ? `${CB}1fr 110px 90px 56px${END}`
+        : `${CB}1fr 90px 56px${END}`
+  // Mobile (< sm) — for grid / mma / default-with-intersection layouts
+  // the row stacks onto two lines: line 1 = [bulk-cb?] [type] [action],
+  // line 2 = the contextual fields. Plain default (no intersection)
+  // stays single-line — just slightly tighter.
   const tplMobileLine1   = `${CB}1fr ${END.trim()}`
-  const tplMobileLine2Grid = '1fr 56px 80px 48px'
-  const tplMobileLine2Mma  = '1fr 80px 48px'
+  const tplMobileLine2Grid       = '1fr 56px 80px 48px'
+  const tplMobileLine2Mma        = '1fr 80px 48px'
+  const tplMobileLine2DefaultInt = '1fr 80px 48px'
 
   // Extract the intersection / direction cells so the same input
   // node can render in both the desktop and mobile branches.
-  const IntersectionBox = layout === 'grid' ? (
+  const IntersectionBox = (layout === 'grid' || hasInt) ? (
     <input type="text" readOnly value={item.intersection ?? ''}
       placeholder="Intersection" className={RO} />
   ) : null
@@ -392,7 +402,7 @@ function MarkingItemRow({
     ? <p className={`text-[11px] text-slate-400 ${bulkMode ? 'pl-9' : 'pl-1'}`}>Note: {item.description}</p>
     : null
 
-  const isMultiCell = layout === 'grid' || layout === 'mma'
+  const isMultiCell = layout === 'grid' || layout === 'mma' || hasInt
 
   return (
     <div className="space-y-0.5">
@@ -403,12 +413,14 @@ function MarkingItemRow({
         {CategoryBox}
         {layout === 'grid' && <>{IntersectionBox}{DirectionBox}</>}
         {layout === 'mma' && ColorBox}
+        {layout === 'default' && hasInt && IntersectionBox}
         {QtyBox}
         {UnitBox}
         {ActionCell}
       </div>
 
-      {/* Mobile — two lines for grid/mma, single line for top-table. */}
+      {/* Mobile — two lines for grid / mma / default-with-intersection,
+          single line for plain default. */}
       <div className="sm:hidden">
         {isMultiCell ? (
           <div className="space-y-2">
@@ -419,9 +431,15 @@ function MarkingItemRow({
               {ActionCell}
             </div>
             <div className="grid items-center gap-2"
-                 style={{ gridTemplateColumns: layout === 'grid' ? tplMobileLine2Grid : tplMobileLine2Mma }}>
+                 style={{
+                   gridTemplateColumns:
+                     layout === 'grid' ? tplMobileLine2Grid
+                     : layout === 'mma' ? tplMobileLine2Mma
+                     : tplMobileLine2DefaultInt
+                 }}>
               {layout === 'grid' && <>{IntersectionBox}{DirectionBox}</>}
               {layout === 'mma' && ColorBox}
+              {layout === 'default' && hasInt && IntersectionBox}
               {QtyBox}
               {UnitBox}
             </div>
