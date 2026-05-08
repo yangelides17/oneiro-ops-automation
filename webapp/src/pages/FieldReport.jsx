@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import StatusBadge      from '../components/StatusBadge'
 import ConfirmModal     from '../components/ConfirmModal'
@@ -656,6 +656,28 @@ export default function FieldReport() {
   const [deleteConfirm, setDeleteConfirm] = useState(null)  // {ids:[...], label?} or null
   const [qtyConfirm,    setQtyConfirm]    = useState(null)  // {itemId, category, parsedStr, message} or null
   const [rowError,      setRowError]      = useState('')
+
+  // Distinct intersections (in seeded order) + derived "X – Y" between
+  // pairs, fed into the Add/Edit modal's Intersection combobox. Source
+  // of truth = the WO's marking items themselves (intersection grid was
+  // seeded from d.intersection_grid at WO intake).
+  const woIntersections = useMemo(() => {
+    const seen = new Set(), out = []
+    markingItems.forEach(it => {
+      if (it.section !== 'Intersection Grid') return
+      const v = String(it.intersection || '').trim()
+      if (!v || seen.has(v)) return
+      seen.add(v); out.push(v)
+    })
+    return out
+  }, [markingItems])
+  const woBetweens = useMemo(() => {
+    const out = []
+    for (let i = 1; i < woIntersections.length; i++) {
+      out.push(`${woIntersections[i - 1]} – ${woIntersections[i]}`)
+    }
+    return out
+  }, [woIntersections])
   // In-flight saves mirror of rowSaving for awaitable access from doSubmit.
   const inFlightRef = useRef(new Set())
   // Ref on the error banner so we can scroll it into view when it appears —
@@ -1183,6 +1205,8 @@ export default function FieldReport() {
           item={formModal.item}
           woId={selectedWOId}
           workType={inferredWorkType}
+          wo_intersections={woIntersections}
+          wo_betweens={woBetweens}
           onClose={() => setFormModal(null)}
           onSaved={(savedItem) => {
             if (formModal.mode === 'add') {
@@ -1332,15 +1356,28 @@ export default function FieldReport() {
 
             {/* Planned + manual items in sheet order, with a divider each
                 time the Section value changes so the crew can read
-                top-to-bottom against the paper WO. */}
+                top-to-bottom against the paper WO. Inside the
+                "Intersection Grid" section we add a second-level
+                subheader that fires whenever the intersection changes,
+                so the crew can scan vertically by intersection. */}
             {markingItems.map((item, idx) => {
-              const prevSection = idx > 0 ? markingItems[idx - 1].section : null
-              const showHeader  = item.section !== prevSection
+              const prev = idx > 0 ? markingItems[idx - 1] : null
+              const showSectionHeader = !prev || item.section !== prev.section
+              const isInGrid = item.section === 'Intersection Grid'
+              const intName = String(item.intersection || '').trim()
+              const showIntHeader =
+                isInGrid && intName &&
+                (showSectionHeader || (prev && intName !== String(prev.intersection || '').trim()))
               return (
                 <div key={item.item_id}>
-                  {showHeader && (
+                  {showSectionHeader && (
                     <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-3 mb-1">
                       {SECTION_HEADERS[item.section] || item.section || 'Other'}
+                    </p>
+                  )}
+                  {showIntHeader && (
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-slate-600 mt-2 mb-1 pl-2 border-l-2 border-slate-300">
+                      {intName}
                     </p>
                   )}
                   <MarkingItemRow
