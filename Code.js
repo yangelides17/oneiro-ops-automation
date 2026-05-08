@@ -5135,17 +5135,108 @@ function _upsertDocLifecycleRow_(ss, payload) {
 }
 
 /**
- * Lighter helper: flip Done and/or Sent on an existing row by Doc ID.
- * Throws no-op if the row doesn't exist (caller should have done an
- * upsert first via _upsertDocLifecycleRow_).
+ * Flip Done and/or Sent on a row by Doc ID. If the row doesn't exist
+ * yet (manual Mark Done on a fresh work-day item that hasn't been
+ * archived or backfilled), derive the row's metadata — doc_type,
+ * anchor, contractor, contract_num, borough, wo_ids — from the doc_id
+ * + Work Day Log so we don't leave a phantom skeleton row in the Log.
  */
 function _setDocLifecycleStatus_(ss, docId, flags) {
   if (!docId || !flags || (flags.done == null && flags.sent == null)) return;
-  _upsertDocLifecycleRow_(ss, {
+  const payload = {
     doc_id: docId,
     done:   flags.done,
     sent:   flags.sent,
-  });
+  };
+  const { byId } = _readDocLifecycle_(ss);
+  if (!byId[docId]) {
+    const meta = _resolveDocLifecycleMetadata_(ss, docId);
+    if (meta) Object.assign(payload, meta);
+  }
+  _upsertDocLifecycleRow_(ss, payload);
+}
+
+/**
+ * Reverse-engineer doc-row metadata from a synthetic Doc ID + the
+ * Work Day Log. Used when a manual Mark Done flips a doc whose Log
+ * row doesn't exist yet — without this helper the upsert would
+ * append a row with only Doc ID / Done / timestamp populated.
+ *
+ * Returns null on unparseable doc_id.
+ */
+function _resolveDocLifecycleMetadata_(ss, docId) {
+  // PL — PL_<date>_<contractor_slug>
+  const plParsed = _parsePLDocId_(docId);
+  if (plParsed) {
+    const day = _scanWorkDayLogForDate_(ss, plParsed.anchor);
+    const woIds = Array.from(new Set(
+      day.filter(r => r.contractor === plParsed.contractor).map(r => r.wo_id).filter(Boolean)
+    ));
+    return {
+      doc_type:   'Production Log',
+      anchor:     plParsed.anchor,
+      contractor: plParsed.contractor,
+      wo_ids:     woIds,
+    };
+  }
+  // SI / CP — <prefix>_<date-or-week>_<contractnum>_<borough>
+  const stdParsed = _parseDocLifecycleId_(docId);
+  if (!stdParsed) return null;
+  if (stdParsed.prefix === 'SI') {
+    const matches = _scanWorkDayLogForDate_(ss, stdParsed.anchor)
+      .filter(r => r.contract_num === stdParsed.contractNum && r.borough === stdParsed.borough);
+    return {
+      doc_type:     'Sign-In',
+      anchor:       stdParsed.anchor,
+      contractor:   matches.length > 0 ? matches[0].contractor : '',
+      contract_num: stdParsed.contractNum,
+      borough:      stdParsed.borough,
+      wo_ids:       Array.from(new Set(matches.map(r => r.wo_id).filter(Boolean))),
+    };
+  }
+  if (stdParsed.prefix === 'CP') {
+    const weekStart = new Date(stdParsed.anchor + 'T12:00:00');
+    const wos = getWOsForPayrollWeek_(stdParsed.contractNum, stdParsed.borough, weekStart, ss);
+    return {
+      doc_type:     'Certified Payroll',
+      anchor:       stdParsed.anchor,
+      contractor:   wos.length > 0 ? (wos[0].contractor || '') : '',
+      contract_num: stdParsed.contractNum,
+      borough:      stdParsed.borough,
+      wo_ids:       wos.map(w => w.id),
+    };
+  }
+  return null;
+}
+
+/**
+ * Read every Work Day Log row matching the given ISO date.
+ * Returns [{ wo_id, contractor, contract_num, borough }, ...].
+ */
+function _scanWorkDayLogForDate_(ss, dateIso) {
+  const sheet = ss.getSheetByName('Work Day Log');
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (ymd(r[0]) !== dateIso) continue;
+    out.push({
+      wo_id:        String(r[1] || '').trim(),
+      contractor:   String(r[2] || '').trim(),
+      contract_num: String(r[3] || '').split('/')[0].trim(),
+      borough:      String(r[4] || '').trim(),
+    });
+  }
+  return out;
 }
 
 /**
