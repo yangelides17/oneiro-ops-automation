@@ -3201,6 +3201,8 @@ function doPost(e) {
       return handleLogWOScanFailure_(body);
     } else if (action === 'list_pending_approvals') {
       return handleListPendingApprovals_(body);
+    } else if (action === 'get_pending_counts') {
+      return handleGetPendingCounts_(body);
     } else if (action === 'get_drive_file_bytes') {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
@@ -3605,8 +3607,116 @@ function handleListPendingApprovals_(body) {
     }
   });
 
-  approvals.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
-  return jsonResponse_({ approvals });
+  // FIFO: oldest first so the longest-waiting reviews surface at the top.
+  approvals.sort((a, b) => a.created_at < b.created_at ? -1 : 1);
+  // approved_docs_pending = files sitting in the Approved Docs folder
+  // waiting for processApprovedDocuments to pick them up. Excludes the
+  // 📨-prefixed already-sent rows. The Approvals page surfaces this number
+  // next to the "Process Approved Docs Now" worker button.
+  let approved_docs_pending = null;
+  try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
+  return jsonResponse_({ approvals, approved_docs_pending });
+}
+
+
+// ── helpers: pending-count primitives ─────────────────────────
+//
+// Each helper does one focused count, reusing the same iteration the
+// matching list_* action does. Wrapped individually so a misconfigured
+// prop in one folder doesn't sink the whole counts response.
+
+// Count PDFs sitting in the four Docs Needing Review subfolders. Same
+// scoping as handleListPendingApprovals_ but skips the per-file payload
+// build for speed.
+function _countDocsNeedingReview_() {
+  const props = PropertiesService.getScriptProperties();
+  const needsReviewId = props.getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
+  const reviewFolder = DriveApp.getFolderById(needsReviewId);
+  let n = 0;
+  Object.entries(APPROVAL_SUBFOLDERS_).forEach(([_docType, subName]) => {
+    const sub = reviewFolder.getFoldersByName(subName);
+    if (!sub.hasNext()) return;
+    const files = sub.next().getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      if (f.isTrashed()) continue;
+      if (f.getMimeType() !== 'application/pdf') continue;
+      n++;
+    }
+  });
+  return n;
+}
+
+// Count files in the Approved Docs folder waiting for the worker. The
+// 📨 prefix marks already-sent files (processApprovedDocuments rewrites
+// the name on success), so they're excluded.
+function _countApprovedDocsPending_() {
+  const props = PropertiesService.getScriptProperties();
+  const approvedId = props.getProperty('APPROVED_SENT_ID');
+  if (!approvedId) throw new Error('APPROVED_SENT_ID not set');
+  const folder = DriveApp.getFolderById(approvedId);
+  let n = 0;
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    if (f.isTrashed()) continue;
+    if (f.getName().startsWith('📨')) continue;
+    n++;
+  }
+  return n;
+}
+
+// Count outstanding (date, contract, borough) sign-in groups from Work
+// Day Log. Same Pending-status filter and grouping as
+// handleListSignInQueue_ — just returns the group count, not the full
+// payload.
+function _countPendingSignins_() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Work Day Log');
+  if (!sheet) return 0;
+  const data = sheet.getDataRange().getValues();
+  const seen = new Set();
+  data.slice(1).forEach(row => {
+    if (String(row[7] || '').trim() !== 'Pending') return;
+    const dateStr     = (row[0] instanceof Date && !isNaN(row[0].getTime()))
+      ? Utilities.formatDate(row[0], Session.getScriptTimeZone(), 'yyyy-MM-dd')
+      : (String(row[0] || '').match(/^(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+    const contractNum = String(row[3] || '').split('/')[0].trim();
+    const borough     = String(row[4] || '').trim();
+    if (!dateStr || !contractNum || !borough) return;
+    seen.add(`${dateStr}|${contractNum}|${borough}`);
+  });
+  return seen.size;
+}
+
+
+// ── action: get_pending_counts ────────────────────────────────
+//
+// Cold-start endpoint for the webapp's nav badges. Returns three cheap
+// counts in one round-trip so a fresh visitor on any non-queue page
+// (Field Report, Scan WO, etc.) still sees how much work is queued.
+//
+// Intentionally OMITS the Doc Status pending count — that requires
+// _buildDocStatusPayload_ which is expensive. The Doc Status tab badge
+// instead populates from the regular /api/doc-status fetch when the
+// user actually visits Dashboard.
+//
+// Each count is wrapped in try/catch so a misconfigured Drive prop only
+// nulls out the matching field, not the whole response. UI hides any
+// `null` field.
+function handleGetPendingCounts_(_body) {
+  let approvals_review = null;
+  let approved_docs_pending = null;
+  let signins_pending = null;
+  try { approvals_review      = _countDocsNeedingReview_(); }   catch (e) {}
+  try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
+  try { signins_pending       = _countPendingSignins_(); }      catch (e) {}
+  return jsonResponse_({
+    approvals_review,
+    approved_docs_pending,
+    signins_pending,
+  });
 }
 
 
@@ -4025,8 +4135,9 @@ function handleListSignInQueue_(body) {
   });
 
   const queue = Array.from(groups.values());
+  // FIFO: oldest work day on top so overdue sign-ins clear first.
   queue.sort((a, b) => {
-    if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
     return a.contract_number.localeCompare(b.contract_number);
   });
 

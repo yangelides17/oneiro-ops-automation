@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import GenerateDocModal from '../components/GenerateDocModal'
+import { usePendingCounts } from '../lib/PendingCountsContext'
 
 /**
  * DocStatusTab — calendar view of Production Log + Sign-In (per day)
@@ -631,12 +632,18 @@ export default function DocStatusTab() {
   // user clicked Generate on; null = modal closed.
   const [pendingItem, setPendingItem] = useState(null)
 
+  // Push the pending count into the shared context so the Doc Status
+  // tab in Dashboard's TabStrip can show a badge. Only updates when
+  // this tab is active (since we only fetch when active).
+  const { setCount } = usePendingCounts()
+
   const load = async (iso) => {
     setLoading(true)
     setError(null)
     try {
       const d = await fetchDocStatus(iso)
       setData(d)
+      setCount('doc_status_pending', (d?.pending || []).length)
     } catch (e) {
       setError(e.message)
     } finally {

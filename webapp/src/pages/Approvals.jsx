@@ -6,6 +6,7 @@ import 'react-pdf/dist/Page/TextLayer.css'
 import PrincipalSignModal from '../components/PrincipalSignModal'
 import RowKebab from '../components/RowKebab'
 import GenerateDocModal from '../components/GenerateDocModal'
+import { usePendingCounts } from '../lib/PendingCountsContext'
 
 // Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
 // from the Sign-In tab's "Upload PDF" path. The principal usually
@@ -54,6 +55,10 @@ export default function Approvals() {
   const [processingModalOpen, setProcessingModalOpen] = useState(false)
   const containerRef = useRef(null)
   const [viewerWidth, setViewerWidth] = useState(700)
+  // Shared cache feeding the nav badge + the worker-button label. We
+  // overwrite these counts after every refresh so the rest of the app
+  // sees fresh numbers without a separate poll.
+  const { counts, setCount } = usePendingCounts()
 
   // Fetch pending approvals once on mount + after each approve action
   const refresh = async () => {
@@ -61,8 +66,16 @@ export default function Approvals() {
       const res  = await fetch('/api/approvals')
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      setApprovals(Array.isArray(data.approvals) ? data.approvals : [])
+      const approvalsList = Array.isArray(data.approvals) ? data.approvals : []
+      setApprovals(approvalsList)
       setLoadError('')
+      // Push the freshest counts into the shared context. approvals_review
+      // = needs-review queue length; approved_docs_pending = files in the
+      // Approved Docs folder waiting for the worker to pick them up.
+      setCount('approvals_review', approvalsList.length)
+      if (data.approved_docs_pending !== undefined) {
+        setCount('approved_docs_pending', data.approved_docs_pending)
+      }
     } catch (err) {
       setLoadError(err.message || 'Failed to load approvals')
       setApprovals([])
@@ -241,9 +254,18 @@ export default function Approvals() {
           >
             Process Approved Docs now
           </button>
-          <span className="text-xs font-bold text-slate-600">
-            {pendingCount} pending
-          </span>
+          {/* Number of files waiting in the Approved Docs folder for the
+              worker — distinct from the Need Review count above (the All
+              pill already surfaces that). Hidden until backend fills the
+              field so old proxies don't show a stale "0 pending". */}
+          {counts.approved_docs_pending != null && (
+            <span
+              className="text-xs font-bold text-slate-600"
+              title={`${counts.approved_docs_pending} file(s) waiting in the Approved Docs folder for the next processing run`}
+            >
+              {counts.approved_docs_pending} pending
+            </span>
+          )}
         </div>
       </div>
 

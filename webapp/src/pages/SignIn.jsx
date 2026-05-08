@@ -7,6 +7,7 @@ import SignaturePad from '../components/SignaturePad'
 import RowKebab     from '../components/RowKebab'
 import ConfirmModal from '../components/ConfirmModal'
 import { opDayFromIsoTime } from '../lib/dateOps'
+import { usePendingCounts } from '../lib/PendingCountsContext'
 
 // Mirror the Approvals page wiring — same pdf.js worker URL, version
 // pinned to the bundled react-pdf so we don't drift if Vite swaps it.
@@ -363,6 +364,10 @@ export default function SignIn() {
   const [toast, setToast] = useState({ message: '', kind: 'success' })
   const toastTimer = useRef(null)
 
+  // Shared cache feeding the Sign-In nav badge. Updated whenever the
+  // queue length changes (load + submit-and-remove flows).
+  const { setCount } = usePendingCounts()
+
   // ── Load queue + employees on mount ──────────────────────────
   useEffect(() => {
     let cancelled = false
@@ -390,6 +395,13 @@ export default function SignIn() {
       })
     return () => { cancelled = true }
   }, [])
+
+  // Keep the nav badge in sync with the live queue length, including
+  // post-submit removals (setQueue(remaining)).
+  useEffect(() => {
+    if (queue == null) return
+    setCount('signins_pending', queue.length)
+  }, [queue, setCount])
 
   // ── Toast helper ─────────────────────────────────────────────
   const showToast = (message, kind = 'success') => {

@@ -11,6 +11,8 @@ import DocStatusTab from './DocStatusTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 import DocStatusChips from '../components/DocStatusChips'
 import GenerateDocModal from '../components/GenerateDocModal'
+import { usePendingCounts } from '../lib/PendingCountsContext'
+import { NavBadge } from '../App'
 
 // ── API ───────────────────────────────────────────────────────
 async function fetchDashboard() {
@@ -444,6 +446,11 @@ const TABS = [
 ]
 
 function TabStrip({ active, onChange }) {
+  const { counts } = usePendingCounts()
+  // Only the Doc Status tab carries a badge today — surfaces the
+  // combined SI + PL + CP pending count after the user has visited
+  // the tab once (cold-start endpoint intentionally skips it).
+  const badgeFor = (id) => id === 'doc_status' ? counts.doc_status_pending : null
   return (
     <div className="flex items-center gap-1 border-b border-slate-200">
       {TABS.map(t => (
@@ -457,6 +464,7 @@ function TabStrip({ active, onChange }) {
             }`}
         >
           {t.label}
+          <NavBadge n={badgeFor(t.id)} />
         </button>
       ))}
     </div>

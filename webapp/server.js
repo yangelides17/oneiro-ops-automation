@@ -447,6 +447,24 @@ app.get('/api/approvals', async (_req, res) => {
 })
 
 /**
+ * GET /api/pending-counts
+ * Cold-start endpoint for the webapp's nav badges. Returns three cheap
+ * counts in one round-trip: docs needing review, approved-docs waiting
+ * for the worker, and pending sign-ins. Doc Status pending is NOT here
+ * — that's expensive and is populated from the regular /api/doc-status
+ * fetch when the user actually visits Dashboard.
+ */
+app.get('/api/pending-counts', async (_req, res) => {
+  try {
+    const data = await callAppsScript('get_pending_counts')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/pending-counts error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/approvals/:fileId/pdf
  * Streams the raw PDF bytes for a pending-approval file. Apps Script
  * returns base64; we decode and send as application/pdf so react-pdf

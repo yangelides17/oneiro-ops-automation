@@ -1,23 +1,52 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Routes, Route, NavLink } from 'react-router-dom'
 import Dashboard   from './pages/Dashboard'
 import FieldReport from './pages/FieldReport'
 import SignIn      from './pages/SignIn'
 import ScanWO      from './pages/ScanWO'
 import Approvals   from './pages/Approvals'
+import {
+  PendingCountsProvider,
+  usePendingCounts,
+} from './lib/PendingCountsContext'
 
 const NAV_ITEMS = [
-  { to: '/',             label: 'Dashboard',    end: true  },
-  { to: '/scan-wo',      label: 'Scan WO',      end: false },
-  { to: '/approvals',    label: 'Approvals',    end: false },
-  { to: '/field-report', label: 'Field Report', end: false },
-  { to: '/sign-in',      label: 'Sign-In',      end: false },
+  { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null                },
+  { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null                },
+  { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review'  },
+  { to: '/field-report', label: 'Field Report', end: false, badgeKey: null                },
+  { to: '/sign-in',      label: 'Sign-In',      end: false, badgeKey: 'signins_pending'   },
 ]
+
+// Subtle amber pill matching the visual weight of the existing nav.
+// Hidden when the count is null (unknown) or 0 (known-empty) so the
+// nav reads exactly like today when there's nothing to act on.
+export function NavBadge({ n }) {
+  if (n == null || n === 0) return null
+  return (
+    <span className="ml-1.5 inline-flex items-center justify-center
+                     min-w-[18px] h-[18px] px-1 rounded-full
+                     text-[10px] font-bold bg-amber-500 text-white
+                     align-middle leading-none">
+      {n > 99 ? '99+' : n}
+    </span>
+  )
+}
 
 function Header() {
   // Below sm: (640px) the five tabs collapse into a hamburger panel.
   // At sm+ the inline tab row stays exactly as it was on desktop.
   const [open, setOpen] = useState(false)
+  const { counts } = usePendingCounts()
+
+  // Render label + optional badge. badgeKey is null for nav items that
+  // shouldn't surface a count (Dashboard / Scan WO / Field Report).
+  const linkContent = (item) => (
+    <>
+      {item.label}
+      {item.badgeKey && <NavBadge n={counts[item.badgeKey]} />}
+    </>
+  )
 
   return (
     <header className="bg-navy sticky top-0 z-50 shadow-lg">
@@ -45,7 +74,7 @@ function Header() {
               end={item.end}
               className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
             >
-              {item.label}
+              {linkContent(item)}
             </NavLink>
           ))}
         </nav>
@@ -88,7 +117,7 @@ function Header() {
               onClick={() => setOpen(false)}
               className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
             >
-              {item.label}
+              {linkContent(item)}
             </NavLink>
           ))}
         </nav>
@@ -97,22 +126,53 @@ function Header() {
   )
 }
 
+// Cold-start fetch: populate the three cheap nav-badge counts so a
+// fresh visitor on Field Report / Scan WO still sees pending work in
+// the nav. Pages with their own queue fetches will overwrite their
+// matching slot afterwards. No polling — counts refresh as the user
+// navigates between queue pages.
+function ColdStartCounts() {
+  const { setCount } = usePendingCounts()
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/pending-counts')
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then(d => {
+        if (cancelled) return
+        if (d?.approvals_review      !== undefined) setCount('approvals_review',      d.approvals_review)
+        if (d?.approved_docs_pending !== undefined) setCount('approved_docs_pending', d.approved_docs_pending)
+        if (d?.signins_pending       !== undefined) setCount('signins_pending',       d.signins_pending)
+      })
+      .catch(err => {
+        // Cold-start failure is non-fatal — pages with their own queue
+        // fetches still populate counts. Just log so we notice if the
+        // proxy is wedged.
+        console.warn('cold-start /api/pending-counts failed:', err)
+      })
+    return () => { cancelled = true }
+  }, [setCount])
+  return null
+}
+
 export default function App() {
   return (
-    <div className="min-h-screen flex flex-col">
-      <Header />
-      <main className="flex-1">
-        <Routes>
-          <Route path="/"             element={<Dashboard />} />
-          <Route path="/scan-wo"      element={<ScanWO />} />
-          <Route path="/approvals"    element={<Approvals />} />
-          <Route path="/field-report" element={<FieldReport />} />
-          <Route path="/sign-in"      element={<SignIn />} />
-        </Routes>
-      </main>
-      <footer className="text-center text-slate-400 text-xs py-6">
-        Oneiro Collection LLC &mdash; Operations Platform
-      </footer>
-    </div>
+    <PendingCountsProvider>
+      <ColdStartCounts />
+      <div className="min-h-screen flex flex-col">
+        <Header />
+        <main className="flex-1">
+          <Routes>
+            <Route path="/"             element={<Dashboard />} />
+            <Route path="/scan-wo"      element={<ScanWO />} />
+            <Route path="/approvals"    element={<Approvals />} />
+            <Route path="/field-report" element={<FieldReport />} />
+            <Route path="/sign-in"      element={<SignIn />} />
+          </Routes>
+        </main>
+        <footer className="text-center text-slate-400 text-xs py-6">
+          Oneiro Collection LLC &mdash; Operations Platform
+        </footer>
+      </div>
+    </PendingCountsProvider>
   )
 }
