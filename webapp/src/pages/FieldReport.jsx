@@ -710,6 +710,14 @@ export default function FieldReport() {
   const [submitting,     setSubmitting]     = useState(false)
   const [submitted,      setSubmitted]      = useState(null)
   const [showPhotoModal, setShowPhotoModal] = useState(false)
+  // "All marking items look complete — did you mean to mark the WO complete?"
+  // suggestion modal. Fires when the user submits with the WO Complete
+  // toggle still on No but every Marking Item is fully filled in.
+  const [showCompleteSuggestModal, setShowCompleteSuggestModal] = useState(false)
+  // Imperative override for the "Mark Complete & Submit" path so doSubmit
+  // sees the flipped value without waiting for the setWoComplete state
+  // update to flush. Read once + reset inside doSubmit.
+  const completeOverrideRef = useRef(null)
 
   const selectedWO = wos.find(w => w.id === selectedWOId) ?? null
 
@@ -996,6 +1004,13 @@ export default function FieldReport() {
   async function doSubmit() {
     setFormError('')
     setSubmitting(true)
+    // "Mark Complete & Submit" sets the override so this submit posts
+    // wo_complete=true even though setWoComplete('yes') won't have
+    // flushed yet. One-shot — clear after read so a normal submit doesn't
+    // accidentally inherit it.
+    const completeOverride = completeOverrideRef.current
+    completeOverrideRef.current = null
+    const woCompleteFinal = completeOverride !== null ? completeOverride : (woComplete === 'yes')
 
     // Step 0 — make sure any focused input flushes its save, then wait
     // for all in-flight PATCHes to land so finalize/rollup on the server
@@ -1064,7 +1079,7 @@ export default function FieldReport() {
     const reportBody = {
       wo_id:       selectedWOId,
       date:        workDate,
-      wo_complete: woComplete==='yes',
+      wo_complete: woCompleteFinal,
       work_type:   inferredWorkType,
       issues:          issues.trim(),
       photos_uploaded: photosUploaded,
@@ -1142,9 +1157,34 @@ export default function FieldReport() {
         return
       }
     }
+    // Soft prompt: WO toggle is still No but every Marking Item is fully
+    // filled in. Likely the user forgot to flip the toggle; ask before
+    // proceeding. Only triggers when items exist (an empty list isn't a
+    // meaningful "all complete" state).
+    if (
+      woComplete === 'no'
+      && markingItems.length > 0
+      && markingItems.every(rowIsCompletable)
+    ) {
+      setShowCompleteSuggestModal(true)
+      return
+    }
     // Guard: no photos selected
     if (photoFiles.length===0) { setShowPhotoModal(true); return }
     doSubmit()
+  }
+
+  // Helpers used by the "Did you mean to mark complete?" modal so the
+  // photo guard still fires after the user resolves the suggestion.
+  function continueAfterCompleteSuggest() {
+    setShowCompleteSuggestModal(false)
+    if (photoFiles.length === 0) { setShowPhotoModal(true); return }
+    doSubmit()
+  }
+  function markCompleteAndSubmit() {
+    setWoComplete('yes')
+    completeOverrideRef.current = true
+    continueAfterCompleteSuggest()
   }
 
   // ── Reset ─────────────────────────────────────────────────
@@ -1211,6 +1251,55 @@ export default function FieldReport() {
           onConfirm={()=>{ setShowPhotoModal(false); doSubmit() }}
           onCancel={()=>setShowPhotoModal(false)}
         />
+      )}
+
+      {/* "All marking items look complete — flip the WO Complete toggle?"
+          suggestion modal. Three buttons because cancel ≠ submit-as-is ≠
+          mark-complete-and-submit. */}
+      {showCompleteSuggestModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
+          onClick={() => setShowCompleteSuggestModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-3xl text-center">⚠️</div>
+            <div className="text-center space-y-1.5">
+              <h2 className="text-lg font-black text-navy">Mark Work Order Complete?</h2>
+              <p className="text-slate-500 text-sm leading-relaxed">
+                You've filled in every Marking Item for this WO but the
+                "WO Complete" toggle is still set to No. Mark it complete
+                before submitting?
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                onClick={markCompleteAndSubmit}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white
+                           hover:opacity-90 active:opacity-80 transition-all"
+              >
+                Mark Complete & Submit
+              </button>
+              <button
+                onClick={continueAfterCompleteSuggest}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-amber-500 text-white
+                           hover:bg-amber-600 active:opacity-80 transition-all"
+              >
+                Submit Without Marking Complete
+              </button>
+              <button
+                onClick={() => setShowCompleteSuggestModal(false)}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
+                           text-slate-600 hover:bg-slate-200 transition-all"
+              >
+                Go Back
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Marking Items — Add / Edit form modal */}
