@@ -263,7 +263,7 @@ export default function MarkingFormModal({
                   const v = (e.target.value.match(/[\d.+*xX\s]/g) || []).join('')
                   setField('quantity', v)
                 }}
-                placeholder="0  (or 15*10, 5+5+5)"
+                placeholder="Type Qty (or 15*10, 150+200)"
                 className="field-input"
               />
             </Field>
