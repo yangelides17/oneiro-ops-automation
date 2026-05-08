@@ -120,15 +120,16 @@ function Field({ label, required, hint, children }) {
 }
 
 // ── Work Order combobox ───────────────────────────────────────
-// Single control: input doubles as both the selected-WO display and
-// the live filter. Clicking/focusing opens the dropdown panel below;
-// typing filters; clicking a row selects + closes. Replaces the old
-// "search input + native <select>" pair so the search and the list
-// feel like one element.
+// Button-trigger dropdown matching the CategorySelect / IntersectionSelect
+// pattern from MarkingFormModal: the button shows the current selection
+// (or a placeholder), clicking opens a panel with a dedicated search
+// input above a scrollable list. No free-text on the trigger — picking
+// from the list is the only way to set the WO.
 function WOCombobox({ wos, selectedWOId, onSelect }) {
+  const [open, setOpen]   = useState(false)
   const [query, setQuery] = useState('')
-  const [open,  setOpen]  = useState(false)
-  const wrapRef = useRef(null)
+  const wrapRef   = useRef(null)
+  const searchRef = useRef(null)
 
   const selected = wos.find(w => w.id === selectedWOId) || null
   const labelOf  = (wo) => `${wo.id} — ${wo.location} (${wo.borough})`
@@ -136,37 +137,37 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
   // Sort WOs by the numeric portion of their ID (e.g. "RM-43282" → 43282)
   // so the dropdown reads in WO-number order regardless of how /api/wos
   // returned them. WOs whose ID has no digits sink to the end.
-  const sortedWOs = [...wos].sort((a, b) => {
-    const na = parseInt(String(a.id || '').match(/\d+/)?.[0] ?? '', 10)
-    const nb = parseInt(String(b.id || '').match(/\d+/)?.[0] ?? '', 10)
-    if (Number.isNaN(na) && Number.isNaN(nb)) return String(a.id).localeCompare(String(b.id))
-    if (Number.isNaN(na)) return 1
-    if (Number.isNaN(nb)) return -1
-    return na - nb
-  })
+  const sortedWOs = useMemo(() => {
+    return [...wos].sort((a, b) => {
+      const na = parseInt(String(a.id || '').match(/\d+/)?.[0] ?? '', 10)
+      const nb = parseInt(String(b.id || '').match(/\d+/)?.[0] ?? '', 10)
+      if (Number.isNaN(na) && Number.isNaN(nb)) return String(a.id).localeCompare(String(b.id))
+      if (Number.isNaN(na)) return 1
+      if (Number.isNaN(nb)) return -1
+      return na - nb
+    })
+  }, [wos])
 
-  // When closed, mirror the selected WO's label into the input. When
-  // open, leave whatever the user typed alone so filtering works.
-  useEffect(() => {
-    if (!open) setQuery(selected ? labelOf(selected) : '')
-  }, [selectedWOId, open])  // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Click outside closes the panel.
+  // Reset query + autofocus search whenever the panel opens; wire up
+  // outside-click and Escape handlers so the panel feels native.
   useEffect(() => {
     if (!open) return
-    function onMouseDown(e) {
+    setQuery('')
+    setTimeout(() => searchRef.current?.focus(), 0)
+    const onMouseDown = (e) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
     }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
     document.addEventListener('mousedown', onMouseDown)
-    return () => document.removeEventListener('mousedown', onMouseDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown)
+      document.removeEventListener('keydown', onKey)
+    }
   }, [open])
 
-  // If the input still shows the selected WO's label verbatim, treat
-  // that as "no active query" so the panel lists everything for
-  // browsing. Once the user edits it, filter normally.
-  const showingSelectedLabel = selected && query === labelOf(selected)
   const trimmed = query.trim().toLowerCase()
-  const filtered = (showingSelectedLabel || !trimmed)
+  const filtered = !trimmed
     ? sortedWOs
     : sortedWOs.filter(wo =>
         `${wo.id} ${wo.location || ''} ${wo.borough || ''}`
@@ -176,54 +177,50 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
 
   return (
     <div ref={wrapRef} className="relative">
-      <input
-        type="text"
-        value={query}
-        onChange={e => { setQuery(e.target.value); setOpen(true) }}
-        onFocus={() => {
-          // Clear the mirrored label so the user can type fresh; the
-          // selection itself is preserved in selectedWOId.
-          if (showingSelectedLabel) setQuery('')
-          setOpen(true)
-        }}
-        onKeyDown={e => { if (e.key === 'Escape') setOpen(false) }}
-        placeholder="— Choose or search Work Order —"
-        className="field-input pr-8"
-      />
-      {/* down chevron — purely decorative, the input stays the focus target */}
-      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs">▾</span>
-
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="field-input w-full text-left flex items-center justify-between"
+      >
+        <span className={selected ? 'text-slate-800 truncate' : 'text-slate-400'}>
+          {selected ? labelOf(selected) : '— Choose or search Work Order —'}
+        </span>
+        <span className="text-slate-400 text-xs ml-2 flex-shrink-0">▾</span>
+      </button>
       {open && (
-        <ul
-          role="listbox"
-          className="absolute z-20 left-0 right-0 mt-1 max-h-72 overflow-auto
-                     bg-white border border-slate-200 rounded-lg shadow-lg"
-        >
-          {filtered.length === 0 && (
-            <li className="px-3 py-2 text-sm text-slate-400 italic">
-              No matching work orders
-            </li>
-          )}
-          {filtered.map(wo => (
-            <li
-              key={wo.id}
-              role="option"
-              aria-selected={wo.id === selectedWOId}
-              // onMouseDown (with preventDefault) so the click registers
-              // before the input's blur fires and tears down the panel.
-              onMouseDown={e => {
-                e.preventDefault()
-                onSelect(wo.id)
-                setQuery(labelOf(wo))
-                setOpen(false)
-              }}
-              className={`px-3 py-2 text-sm cursor-pointer hover:bg-slate-100
-                ${wo.id === selectedWOId ? 'bg-navy/5 font-semibold' : ''}`}
-            >
-              {labelOf(wo)}
-            </li>
-          ))}
-        </ul>
+        <div className="absolute z-30 mt-1 left-0 right-0 bg-white rounded-xl shadow-lg border border-slate-200 overflow-hidden">
+          <div className="p-2 border-b border-slate-100">
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Search work orders…"
+              className="field-input text-base sm:text-sm"
+            />
+          </div>
+          <div className="max-h-[260px] overflow-y-auto">
+            {filtered.length === 0 && (
+              <p className="px-3 py-2 text-xs text-slate-400 italic">
+                No matching work orders
+              </p>
+            )}
+            {filtered.map(wo => {
+              const isSelected = wo.id === selectedWOId
+              return (
+                <button
+                  key={wo.id}
+                  type="button"
+                  onClick={() => { onSelect(wo.id); setOpen(false) }}
+                  className={`w-full text-left px-3 py-2 text-sm hover:bg-slate-50
+                              ${isSelected ? 'bg-navy/5 font-semibold text-navy' : 'text-slate-700'}`}
+                >
+                  {labelOf(wo)}
+                </button>
+              )
+            })}
+          </div>
+        </div>
       )}
     </div>
   )
