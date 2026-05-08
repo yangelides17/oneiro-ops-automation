@@ -378,7 +378,7 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
       </div>
       <div className="grid grid-cols-7 gap-1">
         {cells.map(c => {
-          if (c.blank) return <div key={c.key} className="min-h-[64px]" />
+          if (c.blank) return <div key={c.key} className="h-[80px]" />
           const cell = c.cell
           const status = cell?.status || 'gray'
           const bg = STATUS_BG[status] || STATUS_BG.gray
@@ -391,8 +391,8 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
               type="button"
               disabled={!clickable}
               onClick={() => clickable && onCellClick(cell)}
-              className={`min-h-[64px] rounded-md border text-left p-1.5 transition-all
-                          flex flex-col items-stretch
+              className={`h-[80px] rounded-md border text-left p-1.5 transition-all
+                          flex flex-col items-stretch overflow-hidden
                           ${bg}
                           ${isToday ? 'ring-2 ring-navy/40' : ''}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
@@ -454,7 +454,7 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
               disabled={!clickable}
               onClick={() => clickable && onCellClick(cell)}
               className={`w-full rounded-md border text-left p-1.5 transition-all
-                          flex flex-col items-stretch min-h-[64px]
+                          flex flex-col items-stretch h-[80px] overflow-hidden
                           ${bg}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
             >
