@@ -1355,9 +1355,12 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       if (cancelled || !markSent) return
 
       const PER_WO = { CFR: 1, Invoice: 1 }
+      // Sign-In Sent isn't tracked anywhere — Sign-Ins ride out with
+      // the Certified Payroll, so CP Sent implies SI Sent. Skip SI
+      // files entirely to avoid writing dead data into the SI rows'
+      // Sent column.
       const PER_DOC_PREFIX = {
         'Production Log':    'PL',
-        'Sign-In':           'SI',
         'Certified Payroll': 'CP',
       }
 
