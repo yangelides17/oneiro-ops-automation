@@ -17,7 +17,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
  *   onClose     — called when the user explicitly closes the modal
  */
 
-const DOC_TYPES = ['CFR', 'Production Log', 'Sign-In', 'Certified Payroll', 'Invoice']
+const ALL_DOC_TYPES = ['CFR', 'Production Log', 'Sign-In', 'Certified Payroll', 'Invoice']
+// SI is hidden from the unsent picker — admin gets a checkbox to bundle
+// SIs alongside CP instead. Other modes still expose SI as a regular pill.
+const docTypesForMode = (mode) =>
+  mode === 'unsent'
+    ? ALL_DOC_TYPES.filter(dt => dt !== 'Sign-In')
+    : ALL_DOC_TYPES
 
 const MODES = [
   { id: 'unsent',     title: 'Unsent backlog',
@@ -57,6 +63,9 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     const d = new Date(); d.setDate(d.getDate() - 6); return isoOf(d)
   })
   const [dateEnd, setDateEnd] = useState(() => isoOf(new Date()))
+  // Mode-specific extras
+  const [includeSIsWithCP, setIncludeSIsWithCP] = useState(false)   // unsent + CP
+  const [includePhotos,    setIncludePhotos]    = useState(false)   // wo_numbers
   // Preview
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError,   setPreviewError]   = useState(null)
@@ -83,13 +92,16 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   useEffect(() => {
     setSelectedContractors([])
     setSelectedDocTypes([])
+    setIncludeSIsWithCP(false)
+    setIncludePhotos(false)
   }, [mode])
 
   // ── Filter payload built from current state ───────────────────
   const filters = useMemo(() => {
     const f = {
       mode,
-      contractors: selectedContractors,
+      // wo_numbers: contractor is implicit in the WO list, skip the filter.
+      contractors: mode === 'wo_numbers' ? [] : selectedContractors,
       doc_types:   selectedDocTypes,
     }
     if (mode === 'wo_numbers') {
@@ -97,13 +109,17 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
         .split(/[\s,]+/)
         .map(s => s.trim().toUpperCase())
         .filter(Boolean)
+      if (includePhotos) f.include_photos = true
     }
     if (mode === 'date_range') {
       f.date_start = dateStart
       f.date_end   = dateEnd
     }
+    if (mode === 'unsent' && selectedDocTypes.indexOf('Certified Payroll') !== -1 && includeSIsWithCP) {
+      f.include_sis_with_cp = true
+    }
     return f
-  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd])
+  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos])
 
   // ── Step transitions ──────────────────────────────────────────
   const goToStep = async (next) => {
@@ -132,7 +148,8 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
 
   // ── Step 2 validity ───────────────────────────────────────────
   const step2Valid = (() => {
-    if (selectedContractors.length === 0) return false
+    // Contractor selector is hidden for wo_numbers (contractor implicit).
+    if (mode !== 'wo_numbers' && selectedContractors.length === 0) return false
     if (selectedDocTypes.length === 0)    return false
     if (mode === 'wo_numbers' && filters.wo_ids.length === 0) return false
     if (mode === 'date_range' && (!dateStart || !dateEnd))    return false
@@ -269,7 +286,22 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                   Document types
                 </p>
                 <div className="flex flex-wrap gap-2">
-                  {DOC_TYPES.map(dt => {
+                  {(() => {
+                    const opts = docTypesForMode(mode)
+                    const allOn = opts.length > 0 && opts.every(dt => selectedDocTypes.indexOf(dt) !== -1)
+                    return (
+                      <button
+                        onClick={() => setSelectedDocTypes(allOn ? [] : opts.slice())}
+                        className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
+                          ${allOn
+                            ? 'bg-navy text-white border-navy'
+                            : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
+                      >
+                        {allOn ? '✓ All' : 'All'}
+                      </button>
+                    )
+                  })()}
+                  {docTypesForMode(mode).map(dt => {
                     const on = selectedDocTypes.indexOf(dt) !== -1
                     return (
                       <button
@@ -285,53 +317,103 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                     )
                   })}
                 </div>
-              </div>
 
-              {/* Contractors */}
-              <div>
-                <p className="text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
-                  Contractors
-                </p>
-                {contractors.length === 0 ? (
-                  <p className="text-sm text-slate-400">No contractors loaded yet — refresh the dashboard first.</p>
-                ) : (
-                  <div className="flex flex-wrap gap-2">
-                    {contractors.map(c => {
-                      const on = selectedContractors.indexOf(c) !== -1
-                      return (
-                        <button
-                          key={c}
-                          onClick={() => toggleContractor(c)}
-                          className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
-                            ${on
-                              ? 'bg-navy text-white border-navy'
-                              : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
-                        >
-                          {c}
-                        </button>
-                      )
-                    })}
-                  </div>
+                {/* Unsent + CP → bundle SIs */}
+                {mode === 'unsent' && selectedDocTypes.indexOf('Certified Payroll') !== -1 && (
+                  <label className="mt-3 flex items-start gap-2 text-sm text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={includeSIsWithCP}
+                      onChange={e => setIncludeSIsWithCP(e.target.checked)}
+                    />
+                    <span>
+                      Include matching Sign-Ins for each Certified Payroll
+                      <span className="block text-[11px] text-slate-400">
+                        Done Sign-Ins for the CP's contract+borough that fall within its payroll week, bundled into a sibling folder per CP.
+                      </span>
+                    </span>
+                  </label>
                 )}
               </div>
 
+              {/* Contractors — hidden in wo_numbers mode (WO list implies contractor) */}
+              {mode !== 'wo_numbers' && (
+                <div>
+                  <p className="text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
+                    Contractors
+                  </p>
+                  {contractors.length === 0 ? (
+                    <p className="text-sm text-slate-400">No contractors loaded yet — refresh the dashboard first.</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {(() => {
+                        const allOn = contractors.length > 0 && contractors.every(c => selectedContractors.indexOf(c) !== -1)
+                        return (
+                          <button
+                            onClick={() => setSelectedContractors(allOn ? [] : contractors.slice())}
+                            className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
+                              ${allOn
+                                ? 'bg-navy text-white border-navy'
+                                : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
+                          >
+                            {allOn ? '✓ All' : 'All'}
+                          </button>
+                        )
+                      })()}
+                      {contractors.map(c => {
+                        const on = selectedContractors.indexOf(c) !== -1
+                        return (
+                          <button
+                            key={c}
+                            onClick={() => toggleContractor(c)}
+                            className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
+                              ${on
+                                ? 'bg-navy text-white border-navy'
+                                : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
+                          >
+                            {c}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Mode-specific */}
               {mode === 'wo_numbers' && (
-                <div>
-                  <label className="block text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
-                    WO numbers
+                <>
+                  <div>
+                    <label className="block text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
+                      WO numbers
+                    </label>
+                    <textarea
+                      value={woInput}
+                      onChange={e => setWoInput(e.target.value)}
+                      placeholder="RM-43101, RM-43102, PT-12345"
+                      rows={3}
+                      className="field-input w-full text-sm font-mono"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Comma- or whitespace-separated. Case-insensitive.
+                    </p>
+                  </div>
+                  <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={includePhotos}
+                      onChange={e => setIncludePhotos(e.target.checked)}
+                    />
+                    <span>
+                      Include site photos
+                      <span className="block text-[11px] text-slate-400">
+                        Bundles every image in each WO's <code className="text-[10px]">Photos/</code> folder under <code className="text-[10px]">&lt;wo&gt;/Photos/</code> in the zip. Useful for audits.
+                      </span>
+                    </span>
                   </label>
-                  <textarea
-                    value={woInput}
-                    onChange={e => setWoInput(e.target.value)}
-                    placeholder="RM-43101, RM-43102, PT-12345"
-                    rows={3}
-                    className="field-input w-full text-sm font-mono"
-                  />
-                  <p className="text-[11px] text-slate-400 mt-1">
-                    Comma- or whitespace-separated. Case-insensitive.
-                  </p>
-                </div>
+                </>
               )}
 
               {mode === 'date_range' && (

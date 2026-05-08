@@ -1281,18 +1281,28 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     })[dt] || dt
     const usedPaths = new Set()
     const zipPathFor = (file) => {
-      const folder = (includeContractorFolder ? `${file.contractor}/` : '') + docTypeFolder(file.doc_type)
-      let candidate = `${folder}/${file.filename}`
+      // Bundled entries (CP+SI bundle, photos) carry an explicit zip_path
+      // from the listing handler — honor it verbatim. Defensive uniqueness
+      // check below still applies.
+      let candidate
+      if (file.zip_path) {
+        candidate = String(file.zip_path)
+      } else {
+        const folder = (includeContractorFolder ? `${file.contractor}/` : '') + docTypeFolder(file.doc_type)
+        candidate = `${folder}/${file.filename}`
+      }
       if (!usedPaths.has(candidate)) {
         usedPaths.add(candidate)
         return candidate
       }
       // Collision — prefix with WO id (or first wo id for multi-WO files)
       const prefix = (file.wo_ids && file.wo_ids[0]) || 'unknown-wo'
-      candidate = `${folder}/${prefix}_${file.filename}`
+      const dir = candidate.substring(0, candidate.lastIndexOf('/'))
+      const base = candidate.substring(candidate.lastIndexOf('/') + 1)
+      candidate = `${dir}/${prefix}_${base}`
       let i = 2
       while (usedPaths.has(candidate)) {
-        candidate = `${folder}/${prefix}_${i}_${file.filename}`
+        candidate = `${dir}/${prefix}_${i}_${base}`
         i++
       }
       usedPaths.add(candidate)
@@ -1369,6 +1379,9 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       const slug = (s) => String(s || '').trim().replace(/\s+/g, '_')
 
       files.forEach(f => {
+        // Bundled entries (CP+SI bundle, Photos) ride along with other
+        // docs and don't carry their own Sent semantic — skip the flip.
+        if (f.bundled) return
         if (PER_WO[f.doc_type]) {
           (f.wo_ids || []).forEach(woId => {
             const k = woId + '|' + f.doc_type
@@ -1391,7 +1404,7 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           if (!cn || !borough) return
           docId = `CP_${anchor}_${cn}_${borough}`
         } else {
-          return  // SI / unsupported types
+          return  // SI / Photo / unsupported types
         }
         if (seenDoc.has(docId)) return
         seenDoc.add(docId)

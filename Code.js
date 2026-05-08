@@ -6143,12 +6143,22 @@ function handleGenerateDailyDocuments_(body) {
   const d       = body.data || {};
   const dateStr = String(d.date || '').trim();
   try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const targetDate = dateStr ? new Date(dateStr) : new Date();
+    const dateIso = Utilities.formatDate(targetDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+
+    // SI validation — refuse if any PL-eligible contractor that worked
+    // this day has any (contract, borough) tuple whose Sign-In isn't Done.
+    // Same gate as the per-doc Generate button on the Doc Status tab.
+    const v = _validateAllPLEligibleForDay_(ss, dateIso);
+    if (!v.ok) {
+      return jsonResponse_({ error: v.error, error_code: v.error_code, missing: v.missing || [] }, 400);
+    }
+
     // generateDailyDocuments(dateStr) accepts anything Date parses
     // (MM/DD/YYYY, YYYY-MM-DD, empty → today).  No return value today,
     // so fetch the entry count ourselves for the UI.
     generateDailyDocuments(dateStr);
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const targetDate = dateStr ? new Date(dateStr) : new Date();
     const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
     let entries = 0;
     data.slice(1).forEach(row => {
@@ -6203,6 +6213,23 @@ function handleGenerateCertifiedPayroll_(body) {
   const weekStart = String(d.week_start || '').trim();
   if (!weekStart) return jsonResponse_({ error: 'Missing week_start' }, 400);
   try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+    // Convert MM/DD/YYYY → YYYY-MM-DD for the validator
+    const parts = weekStart.split('/');
+    const weekStartIso = (parts.length === 3)
+      ? Utilities.formatDate(
+          new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]), 12, 0, 0),
+          CONFIG.TIMEZONE, 'yyyy-MM-dd')
+      : weekStart;
+
+    // SI validation — refuse if any (contract, borough) that worked this
+    // week has any day's Sign-In incomplete. Mirrors the per-doc gate.
+    const v = _validateAllCPForWeek_(ss, weekStartIso);
+    if (!v.ok) {
+      return jsonResponse_({ error: v.error, error_code: v.error_code, missing: v.missing || [] }, 400);
+    }
+
     const count = generateCertifiedPayroll(weekStart);
     return jsonResponse_({
       success:          true,
@@ -6344,6 +6371,131 @@ function _validateAllSIsDoneForContractorDay_(ss, contractor, dateIso) {
     error: 'Sign-In sheet not complete for: ' + missing.join('; ') +
            ' on ' + dateIso + '. ' + contractor +
            '’s Production Log would be missing crew data — ensure each Sign-In is complete, then retry.',
+    missing,
+  };
+}
+
+/**
+ * Fanout validator for the Tools-dropdown Production Log run.
+ * Walks every PL-eligible contractor that worked this day, validates
+ * each one's (contract, borough) Sign-Ins are Done. Refuses the entire
+ * run if any are missing — matches the per-doc strict gate.
+ */
+function _validateAllPLEligibleForDay_(ss, dateIso) {
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) {
+    return { ok: false, error_code: 'NO_WORK_DAY_LOG', error: 'Work Day Log sheet missing.' };
+  }
+  const enabled = new Set(
+    (CONFIG.PRODUCTION_LOG_CONTRACTORS || []).map(s => String(s).trim()).filter(Boolean)
+  );
+  if (enabled.size === 0) return { ok: true, missing: [] };
+
+  const data = wdlSheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  // contractor → Set of "cn|bor"
+  const tuplesByContractor = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (ymd(r[0]) !== dateIso) continue;
+    const contractor = String(r[2] || '').trim();
+    if (!enabled.has(contractor)) continue;
+    const cn  = String(r[3] || '').split('/')[0].trim();
+    const bor = String(r[4] || '').trim();
+    if (!cn || !bor) continue;
+    if (!tuplesByContractor[contractor]) tuplesByContractor[contractor] = new Set();
+    tuplesByContractor[contractor].add(cn + '|' + bor);
+  }
+  if (Object.keys(tuplesByContractor).length === 0) {
+    // No PL-eligible contractor worked this day — nothing to validate.
+    return { ok: true, missing: [] };
+  }
+
+  const { byId } = _readDocLifecycle_(ss);
+  const missing = [];
+  Object.keys(tuplesByContractor).forEach(contractor => {
+    Array.from(tuplesByContractor[contractor]).forEach(t => {
+      const [cn, bor] = t.split('|');
+      const siId = _docLifecycleId_('Sign-In', dateIso, cn, bor);
+      const row = byId[siId];
+      if (!row || !row.done) missing.push(contractor + ' · ' + cn + ' · ' + bor);
+    });
+  });
+  if (missing.length === 0) return { ok: true, missing: [] };
+  return {
+    ok: false,
+    error_code: 'SI_NOT_DONE',
+    error: 'Sign-In sheets not complete for ' + dateIso + ': ' + missing.join('; ') +
+           '. Ensure each Sign-In is complete, then retry — the affected Production Logs would otherwise be missing crew data.',
+    missing,
+  };
+}
+
+/**
+ * Fanout validator for the Tools-dropdown Certified Payroll run.
+ * Walks every (contract, borough) that worked this week, validates
+ * every worked day's Sign-In is Done. Refuses the entire run if any
+ * are missing — matches the per-doc strict gate.
+ */
+function _validateAllCPForWeek_(ss, weekStartIso) {
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) {
+    return { ok: false, error_code: 'NO_WORK_DAY_LOG', error: 'Work Day Log sheet missing.' };
+  }
+  const data = wdlSheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  const weekEndIso = (function () {
+    const [y, m, dd] = weekStartIso.split('-').map(Number);
+    const end = new Date(y, m - 1, dd + 6);
+    return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  })();
+  // (cn|bor) → Set of dateIso
+  const tupleDates = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const dateIso = ymd(r[0]);
+    if (!dateIso || dateIso < weekStartIso || dateIso > weekEndIso) continue;
+    const cn  = String(r[3] || '').split('/')[0].trim();
+    const bor = String(r[4] || '').trim();
+    if (!cn || !bor) continue;
+    const k = cn + '|' + bor;
+    if (!tupleDates[k]) tupleDates[k] = new Set();
+    tupleDates[k].add(dateIso);
+  }
+  if (Object.keys(tupleDates).length === 0) {
+    // No work this week — nothing to validate, generation will simply produce 0.
+    return { ok: true, missing: [] };
+  }
+  const { byId } = _readDocLifecycle_(ss);
+  const missing = [];
+  Object.keys(tupleDates).forEach(k => {
+    const [cn, bor] = k.split('|');
+    Array.from(tupleDates[k]).sort().forEach(dateIso => {
+      const siId = _docLifecycleId_('Sign-In', dateIso, cn, bor);
+      const row = byId[siId];
+      if (!row || !row.done) missing.push(cn + ' · ' + bor + ' · ' + dateIso);
+    });
+  });
+  if (missing.length === 0) return { ok: true, missing: [] };
+  return {
+    ok: false,
+    error_code: 'SI_NOT_DONE',
+    error: 'Sign-In sheets not complete for week of ' + weekStartIso + ': ' + missing.join('; ') +
+           '. Ensure each Sign-In is complete, then retry — the affected Certified Payrolls would otherwise be missing hours.',
     missing,
   };
 }
@@ -8596,6 +8748,8 @@ function handleListDocumentsForBatch_(body) {
     : [];
   const dateStart = String(d.date_start || '').trim();
   const dateEnd   = String(d.date_end   || '').trim();
+  const includeSIsWithCP = !!d.include_sis_with_cp;   // unsent + CP only
+  const includePhotos    = !!d.include_photos;         // wo_numbers only
   if (mode === 'wo_numbers' && woIdsFilter.length === 0) {
     return jsonResponse_({ error: 'wo_numbers mode requires wo_ids' }, 400);
   }
@@ -8919,15 +9073,25 @@ function handleListDocumentsForBatch_(body) {
         if (!dm) continue;
         const fileDate = dm[1];
 
-        // Apply date_range filter
+        // Apply date_range filter — natural date per doc type:
+        //   PL/SI: production date / sign-in date (file's own anchor)
+        //   CP:    week_start..week_start+6 must overlap [dateStart, dateEnd]
         if (mode === 'date_range') {
-          if (fileDate < dateStart || fileDate > dateEnd) continue;
+          if (docType === 'Certified Payroll') {
+            const [y, m, dd] = fileDate.split('-').map(Number);
+            const weekEnd = Utilities.formatDate(
+              new Date(y, m - 1, dd + 6), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+            if (weekEnd < dateStart || fileDate > dateEnd) continue;
+          } else {
+            if (fileDate < dateStart || fileDate > dateEnd) continue;
+          }
         }
 
-        // Resolve covered WOs.
+        // Resolve covered WOs (used for the manifest + the wo_numbers
+        // overlap gate; not used to gate date_range any more — that's
+        // the file's own date that matters).
         let coveredWoIds;
         if (docType === 'Production Log' || docType === 'Sign-In') {
-          // Both keyed by shift date — same WO group resolves both.
           const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
           const keyMatch = Object.keys(map).find(k => {
             const parts = k.split('|');
@@ -8935,19 +9099,18 @@ function handleListDocumentsForBatch_(body) {
           });
           coveredWoIds = keyMatch ? map[keyMatch].map(x => x.id) : [];
         } else {
-          // Certified Payroll — keyed by week
           const wos = getWOsForPayrollWeek_(contractNum, borough, new Date(fileDate + 'T12:00:00'), ss);
           coveredWoIds = wos.map(x => x.id);
         }
         if (coveredWoIds.length === 0) continue;
 
-        // For modes that filter by WO scope, check that at least one
-        // covered WO overlaps with the user's scope. Group-level scope
-        // is computed against the WOs they explicitly selected (if
-        // wo_numbers) or those whose Work End falls in range (date_range).
-        const inScopeIds = new Set(groupWos.map(w => w.wo_id));
-        const overlaps = coveredWoIds.some(id => inScopeIds.has(id));
-        if (!overlaps && (mode === 'wo_numbers' || mode === 'date_range')) continue;
+        // wo_numbers mode only: at least one covered WO must overlap
+        // with the user's selected list. date_range and unsent gate
+        // the file via its own date / Log state, not via the WO list.
+        if (mode === 'wo_numbers') {
+          const inScopeIds = new Set(groupWos.map(w => w.wo_id));
+          if (!coveredWoIds.some(id => inScopeIds.has(id))) continue;
+        }
 
         // Look up doc state in the Log. Anchor for PL/SI is the file's
         // shift date; for CP it's the week-start (which is what's
@@ -8979,6 +9142,52 @@ function handleListDocumentsForBatch_(body) {
           done:         true,
           sent:         allSent,
         });
+
+        // CP + SI bundle: when admin checked "Include matching Sign-Ins"
+        // in unsent mode, attach every Done SI for this CP's week into
+        // a sibling folder so the recipient sees one zip with the CP
+        // at the root and "Sign-Ins for CP …/" alongside.
+        if (docType === 'Certified Payroll' && includeSIsWithCP && mode === 'unsent') {
+          const [yy, mm, ddd] = fileDate.split('-').map(Number);
+          const weekStartDt = new Date(yy, mm - 1, ddd);
+          const weekEndIso = Utilities.formatDate(
+            new Date(yy, mm - 1, ddd + 6), CONFIG.TIMEZONE, 'yyyy-MM-dd'
+          );
+          const siFolder = masters.signin;
+          if (siFolder) {
+            const bundleDir = 'Sign-Ins for CP ' + contractNum + ' ' + borough + ' ' + fileDate;
+            const siIter = siFolder.getFiles();
+            while (siIter.hasNext()) {
+              if (files.length >= MAX_BATCH_FILES_) break;
+              const sf = siIter.next();
+              const sname = sf.getName();
+              if (!/^SignIn_/i.test(sname)) continue;
+              const sm = sname.match(/(\d{4}-\d{2}-\d{2})/);
+              if (!sm) continue;
+              const sDate = sm[1];
+              if (sDate < fileDate || sDate > weekEndIso) continue;
+              // Only include SIs that are Done in the Log.
+              const siState = docStateForMaster('Sign-In', sDate, contractNum, borough, contractor);
+              if (!siState.done) continue;
+              pushFile({
+                file_id:      sf.getId(),
+                filename:     sname,
+                zip_path:     bundleDir + '/' + sname,
+                mime_type:    sf.getMimeType(),
+                size:         sf.getSize(),
+                contractor,
+                contract_num: contractNum,
+                borough,
+                doc_type:     'Sign-In',
+                wo_ids:       [],
+                work_date:    sDate,
+                done:         true,
+                sent:         false,        // bundled — not part of mark-sent flip
+                bundled:      true,         // signals "do not flip flags on download"
+              });
+            }
+          }
+        }
       }
     });
   });
@@ -8986,6 +9195,46 @@ function handleListDocumentsForBatch_(body) {
   // Sign-In is now handled by the master-doc loop above (it lives in
   // its own contract-level "Sign-Ins/" master folder, mirroring
   // Production Logs and Certified Payroll).
+
+  // Photos — only for wo_numbers mode when admin checked "Include Photos."
+  // Walks each WO's <wo>/Photos/ subfolder and bundles every image into
+  // a per-WO subdirectory in the zip. Counts toward MAX_BATCH_FILES_.
+  if (includePhotos && mode === 'wo_numbers') {
+    wosInScope.forEach(w => {
+      if (files.length >= MAX_BATCH_FILES_) return;
+      const folder = getWoFolder(w);
+      if (!folder) return;
+      let photosFolder = null;
+      try {
+        const it = folder.getFoldersByName('Photos');
+        if (it.hasNext()) photosFolder = it.next();
+      } catch (e) { /* ignore */ }
+      if (!photosFolder) return;
+      const bundleDir = w.wo_id + '/Photos';
+      const fIt = photosFolder.getFiles();
+      while (fIt.hasNext()) {
+        if (files.length >= MAX_BATCH_FILES_) break;
+        const f = fIt.next();
+        pushFile({
+          file_id:      f.getId(),
+          filename:     f.getName(),
+          zip_path:     bundleDir + '/' + f.getName(),
+          mime_type:    f.getMimeType(),
+          size:         f.getSize(),
+          contractor:   w.contractor,
+          contract_num: w.contract_num,
+          borough:      w.borough,
+          location:     w.location,
+          doc_type:     'Photo',
+          wo_ids:       [w.wo_id],
+          work_date:    w.work_end,
+          done:         true,
+          sent:         false,
+          bundled:      true,
+        });
+      }
+    });
+  }
 
   // Counts
   const counts = { total: files.length, by_doc_type: {}, by_contractor: {} };
