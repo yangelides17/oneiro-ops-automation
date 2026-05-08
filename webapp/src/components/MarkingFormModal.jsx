@@ -609,6 +609,15 @@ function IntersectionSelect({ value, onChange, intersections = [], betweens = []
                   >
                     Other (type a custom value)…
                   </button>
+                  {value && (
+                    <button
+                      type="button"
+                      onClick={() => pick('')}
+                      className="w-full text-left px-3 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 border-t border-slate-100"
+                    >
+                      Clear selection
+                    </button>
+                  )}
                 </div>
               </div>
             </>
