@@ -258,20 +258,7 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                     </p>
                   )}
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
-                  <TogglePill
-                    label="Done"
-                    on={b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
-                  />
-                  <TogglePill
-                    label="Sent"
-                    on={b.pl.sent}
-                    disabled={!b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                  />
-                </div>
+                {/* SI sub-rows first (sign-ins precede the PL workflow). */}
                 <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
                   {contracts.map((c, j) => (
                     <div key={j} className="flex items-center justify-between gap-2 py-1">
@@ -295,6 +282,21 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                       </div>
                     </div>
                   ))}
+                </div>
+                {/* PL toggles at the bottom — last step in the day's lifecycle. */}
+                <div className="flex items-center gap-1.5 pt-1">
+                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
+                  <TogglePill
+                    label="Done"
+                    on={b.pl.done}
+                    onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
+                  />
+                  <TogglePill
+                    label="Sent"
+                    on={b.pl.sent}
+                    disabled={!b.pl.done}
+                    onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
+                  />
                 </div>
               </div>
             )
