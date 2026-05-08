@@ -1355,19 +1355,18 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       if (cancelled || !markSent) return
 
       const PER_WO = { CFR: 1, Invoice: 1 }
-      // Sign-In Sent isn't tracked anywhere — Sign-Ins ride out with
-      // the Certified Payroll, so CP Sent implies SI Sent. Skip SI
-      // files entirely to avoid writing dead data into the SI rows'
-      // Sent column.
-      const PER_DOC_PREFIX = {
-        'Production Log':    'PL',
-        'Certified Payroll': 'CP',
-      }
+      // SI Sent isn't tracked (Sign-Ins ride out with the CP, CP Sent
+      // implies SI Sent) so it's omitted here.
+      // PL is keyed per-(date, contractor) — one row per file regardless
+      // of how many contracts the PL covers.
+      // CP is keyed per-(weekstart, contract, borough).
 
       const perWoUpdates = []
       const perDocUpdates = []
       const seenWo = new Set()
       const seenDoc = new Set()
+
+      const slug = (s) => String(s || '').trim().replace(/\s+/g, '_')
 
       files.forEach(f => {
         if (PER_WO[f.doc_type]) {
@@ -1379,13 +1378,21 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           })
           return
         }
-        const prefix = PER_DOC_PREFIX[f.doc_type]
-        if (!prefix) return
-        const cn = String(f.contract_num || '').split('/')[0].trim()
-        const borough = String(f.borough || '').trim()
-        const anchor  = String(f.work_date || '').trim()
-        if (!cn || !borough || !anchor) return
-        const docId = `${prefix}_${anchor}_${cn}_${borough}`
+        const anchor = String(f.work_date || '').trim()
+        if (!anchor) return
+        let docId = ''
+        if (f.doc_type === 'Production Log') {
+          const contractor = slug(f.contractor)
+          if (!contractor) return
+          docId = `PL_${anchor}_${contractor}`
+        } else if (f.doc_type === 'Certified Payroll') {
+          const cn = String(f.contract_num || '').split('/')[0].trim()
+          const borough = String(f.borough || '').trim()
+          if (!cn || !borough) return
+          docId = `CP_${anchor}_${cn}_${borough}`
+        } else {
+          return  // SI / unsupported types
+        }
         if (seenDoc.has(docId)) return
         seenDoc.add(docId)
         perDocUpdates.push({ doc_id: docId, sent: true })

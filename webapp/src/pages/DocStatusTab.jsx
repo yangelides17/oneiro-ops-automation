@@ -98,20 +98,28 @@ function summarizeBreakdown(breakdown, kind) {
   if (!breakdown || breakdown.length === 0) {
     return [{ icon: '–', label: 'No Work', tone: 'slate' }]
   }
-  const total = breakdown.length
   if (kind === 'day') {
-    // Order: SI first (sign-in must be done before a PL can exist),
-    // then PL Done, then PL Sent.
-    const siDone = breakdown.filter(b => b.si.done).length
-    const plDone = breakdown.filter(b => b.pl.done).length
-    const plSent = breakdown.filter(b => b.pl.sent).length
+    // Day breakdown is contractor-grouped: PL state lives on the group
+    // (one PL per contractor per day), SI lives on each contracts[]
+    // sub-entry (one SI per (contract, borough)). Counts use the right
+    // denominators for each axis.
+    const totalContractors = breakdown.length
+    const plDone = breakdown.filter(b => b.pl?.done).length
+    const plSent = breakdown.filter(b => b.pl?.sent).length
+    let totalContracts = 0, siDone = 0
+    breakdown.forEach(b => {
+      const contracts = b.contracts || []
+      totalContracts += contracts.length
+      siDone += contracts.filter(c => c.si?.done).length
+    })
     return [
-      bulletFor('SI Done', siDone, total),
-      bulletFor('PL Done', plDone, total),
-      bulletFor('PL Sent', plSent, total),
+      bulletFor('SI Done', siDone, totalContracts),
+      bulletFor('PL Done', plDone, totalContractors),
+      bulletFor('PL Sent', plSent, totalContractors),
     ]
   }
   // kind === 'week' → CP only
+  const total = breakdown.length
   const cpDone = breakdown.filter(b => b.cp.done).length
   const cpSent = breakdown.filter(b => b.cp.sent).length
   return [
@@ -190,13 +198,16 @@ function TogglePill({ label, on, disabled, pending, onClick }) {
 }
 
 // ── Status rollup for a single contractor breakdown row ───────
-//   day  → 'gray' | 'amber' | 'green' from si.done + pl.done + pl.sent
+//   day  → 'gray' | 'amber' | 'green' from contractor.pl + every contracts[].si
 //   week → 'gray' | 'amber' | 'green' from cp.done + cp.sent
 function dayBreakdownStatus(b) {
-  const flags = [b.si?.done, b.pl?.done, b.pl?.sent]
-  const allDone = flags.every(Boolean)
-  const noneDone = flags.every(f => !f)
-  return allDone ? 'green' : noneDone ? 'gray' : 'amber'
+  const contracts = b.contracts || []
+  const siAllDone = contracts.length > 0 && contracts.every(c => c.si?.done)
+  const siAllBlank = contracts.every(c => !c.si?.done)
+  const plDone = !!b.pl?.done, plSent = !!b.pl?.sent
+  const allDone  = siAllDone && plDone && plSent
+  const allBlank = siAllBlank && !plDone && !plSent
+  return allDone ? 'green' : allBlank ? 'gray' : 'amber'
 }
 function weekBreakdownStatus(b) {
   const flags = [b.cp?.done, b.cp?.sent]
@@ -236,40 +247,54 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
         <div className="space-y-3 max-h-[60vh] overflow-y-auto">
           {(cell.breakdown || []).map((b, i) => {
             const rowBg = STATUS_BG[dayBreakdownStatus(b)]
+            const contracts = b.contracts || []
             return (
               <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
                 <div className="flex justify-between items-baseline">
                   <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
-                  <p className="text-xs text-slate-500 font-mono">{b.contract_num} · {b.borough}</p>
+                  {contracts.length > 1 && (
+                    <p className="text-[10px] text-slate-500">
+                      {contracts.length} contracts
+                    </p>
+                  )}
                 </div>
-                {b.wo_ids?.length > 0 && (
-                  <p className="text-[11px] text-slate-500 font-mono">
-                    WOs: {b.wo_ids.join(', ')}
-                  </p>
-                )}
-                <div className="flex items-center gap-3 flex-wrap">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
-                    <TogglePill
-                      label="Done"
-                      on={b.si.done}
-                      onClick={() => onFlip(b.si.doc_id, 'done', !b.si.done)}
-                    />
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
-                    <TogglePill
-                      label="Done"
-                      on={b.pl.done}
-                      onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
-                    />
-                    <TogglePill
-                      label="Sent"
-                      on={b.pl.sent}
-                      disabled={!b.pl.done}
-                      onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                    />
-                  </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
+                  <TogglePill
+                    label="Done"
+                    on={b.pl.done}
+                    onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
+                  />
+                  <TogglePill
+                    label="Sent"
+                    on={b.pl.sent}
+                    disabled={!b.pl.done}
+                    onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
+                  />
+                </div>
+                <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
+                  {contracts.map((c, j) => (
+                    <div key={j} className="flex items-center justify-between gap-2 py-1">
+                      <div className="min-w-0">
+                        <p className="text-xs text-slate-700 font-mono truncate">
+                          {c.contract_num} · {c.borough}
+                        </p>
+                        {c.wo_ids?.length > 0 && (
+                          <p className="text-[10px] text-slate-500 font-mono truncate">
+                            WOs: {c.wo_ids.join(', ')}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
+                        <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
+                        <TogglePill
+                          label="Done"
+                          on={c.si.done}
+                          onClick={() => onFlip(c.si.doc_id, 'done', !c.si.done)}
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
             )
@@ -562,7 +587,9 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
                 {it.kind === 'week' ? `Week of ${fmtShortDate(it.anchor)}` : fmtShortDate(it.anchor)}
               </p>
               <p className="text-xs text-slate-500 truncate">
-                {it.contractor} · <span className="font-mono">{it.contract_num}</span> · {it.borough}
+                {it.contract_num
+                  ? <>{it.contractor} · <span className="font-mono">{it.contract_num}</span> · {it.borough}</>
+                  : it.contractor}
               </p>
             </div>
             <div className="flex gap-1.5 flex-shrink-0 items-center">
@@ -611,24 +638,46 @@ export default function DocStatusTab() {
     // Optimistically mutate the local data.
     setData(prev => {
       if (!prev) return prev
-      const updateInBreakdown = (b, key) => {
-        if (!b[key] || b[key].doc_id !== docId) return b
-        return { ...b, [key]: { ...b[key], [flag]: value } }
+      // Day breakdown: flip PL on the contractor row OR SI on any matching
+      // contract sub-entry. Either match-or-pass-through.
+      const updateDayBreakdown = (b) => {
+        let next = b
+        if (b.pl && b.pl.doc_id === docId) {
+          next = { ...next, pl: { ...next.pl, [flag]: value } }
+        }
+        if (Array.isArray(b.contracts)) {
+          let touched = false
+          const contracts = b.contracts.map(c => {
+            if (c.si && c.si.doc_id === docId) {
+              touched = true
+              return { ...c, si: { ...c.si, [flag]: value } }
+            }
+            return c
+          })
+          if (touched) next = { ...next, contracts }
+        }
+        return next
+      }
+      const updateWeekBreakdown = (b) => {
+        if (!b.cp || b.cp.doc_id !== docId) return b
+        return { ...b, cp: { ...b.cp, [flag]: value } }
       }
       const days = prev.days?.map(d => ({
         ...d,
-        breakdown: d.breakdown.map(b => updateInBreakdown(updateInBreakdown(b, 'pl'), 'si')),
+        breakdown: d.breakdown.map(updateDayBreakdown),
       }))
       const weeks = prev.weeks?.map(w => ({
         ...w,
-        breakdown: w.breakdown.map(b => updateInBreakdown(b, 'cp')),
+        breakdown: w.breakdown.map(updateWeekBreakdown),
       }))
-      // Recompute cell statuses (matches server-side rollup)
       const recolorDay = (cell) => {
         let allFull = cell.breakdown.length > 0, allEmpty = true
         cell.breakdown.forEach(b => {
-          const full  = b.pl.done && b.pl.sent && b.si.done
-          const empty = !b.pl.done && !b.pl.sent && !b.si.done
+          const contracts = b.contracts || []
+          const siAllDone  = contracts.length > 0 && contracts.every(c => c.si?.done)
+          const siAllBlank = contracts.every(c => !c.si?.done)
+          const full  = b.pl?.done && b.pl?.sent && siAllDone
+          const empty = !b.pl?.done && !b.pl?.sent && siAllBlank
           if (!full)  allFull  = false
           if (!empty) allEmpty = false
         })
@@ -753,10 +802,14 @@ export default function DocStatusTab() {
                 : fmtShortDate(pendingItem.anchor)}
             </span>
             <span className="block text-slate-500">
-              {pendingItem.contractor} · {pendingItem.contract_num} · {pendingItem.borough}
+              {pendingItem.contract_num
+                ? `${pendingItem.contractor} · ${pendingItem.contract_num} · ${pendingItem.borough}`
+                : pendingItem.contractor}
             </span>
             <span className="block mt-2 text-[11px] text-slate-400">
-              Generates the JSON template. Review and sign the filled PDF in the Approvals tab to mark Done.
+              {pendingItem.missing?.[0] === 'PL Done'
+                ? 'Covers all of this contractor’s contracts for the day. Review and sign the filled PDF in Approvals — Done flips automatically when archived.'
+                : 'Generates the JSON template. Review and sign the filled PDF in the Approvals tab to mark Done.'}
             </span>
           </span>
         ) : null}
