@@ -258,7 +258,9 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                     </p>
                   )}
                 </div>
-                {/* SI sub-rows first (sign-ins precede the PL workflow). */}
+                {/* One row per contract — SI (per-contract) + PL (per-contractor)
+                    toggles all on the same line. PL toggles flip the contractor's
+                    single PL doc_id no matter which row they're clicked from. */}
                 <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
                   {contracts.map((c, j) => (
                     <div key={j} className="flex items-center justify-between gap-2 py-1">
@@ -272,31 +274,32 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                           </p>
                         )}
                       </div>
-                      <div className="flex items-center gap-1.5 flex-shrink-0">
-                        <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
-                        <TogglePill
-                          label="Done"
-                          on={c.si.done}
-                          onClick={() => onFlip(c.si.doc_id, 'done', !c.si.done)}
-                        />
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <div className="flex items-center gap-1">
+                          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">SI</span>
+                          <TogglePill
+                            label="Done"
+                            on={c.si.done}
+                            onClick={() => onFlip(c.si.doc_id, 'done', !c.si.done)}
+                          />
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
+                          <TogglePill
+                            label="Done"
+                            on={b.pl.done}
+                            onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
+                          />
+                          <TogglePill
+                            label="Sent"
+                            on={b.pl.sent}
+                            disabled={!b.pl.done}
+                            onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
+                          />
+                        </div>
                       </div>
                     </div>
                   ))}
-                </div>
-                {/* PL toggles at the bottom — last step in the day's lifecycle. */}
-                <div className="flex items-center gap-1.5 pt-1">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">PL</span>
-                  <TogglePill
-                    label="Done"
-                    on={b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
-                  />
-                  <TogglePill
-                    label="Sent"
-                    on={b.pl.sent}
-                    disabled={!b.pl.done}
-                    onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
-                  />
                 </div>
               </div>
             )
