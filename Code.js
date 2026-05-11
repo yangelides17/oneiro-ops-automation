@@ -1219,19 +1219,33 @@ function _processApprovedDocumentsImpl_() {
 
   const approvedFolder = DriveApp.getFolderById(approvedId);
   const files = approvedFolder.getFiles();
+
+  // Cheap pre-flight: if the folder is empty (or every file is already
+  // 📨-prefixed), bail before we open the spreadsheet or run any of the
+  // heavier setup. The Python worker pokes this every ~15s; the vast
+  // majority of those calls have no work to do, and skipping the
+  // SpreadsheetApp.openById + Logger noise keeps the GAS execution log
+  // readable when something does go wrong.
+  let hasWork = false;
+  const queued = [];
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getName().startsWith('📨')) continue;
+    hasWork = true;
+    queued.push(f);
+  }
+  if (!hasWork) return { archived: 0, errored: 0 };
+
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
 
   // Counts returned to the caller (Tools menu → toast feedback).
   let archivedCount = 0;
   let erroredCount  = 0;
 
-  while (files.hasNext()) {
-    const file = files.next();
+  for (let qi = 0; qi < queued.length; qi++) {
+    const file = queued[qi];
     const fileName = file.getName();
-    
-    // Skip already-processed files
-    if (fileName.startsWith('📨')) continue;
-    
+
     // Determine document type and extract WO info from filename.
     // WO # covers the three prefixes the parser supports (PT/RM/PM).
     const WO_REGEX = /(PT|RM|PM)[-_]?\d+/i;

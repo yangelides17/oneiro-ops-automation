@@ -1181,6 +1181,16 @@ def main():
     try:
         while True:
             scan_once(service, folder_map, scan_inbox_id, processed, tmp_dir)
+            # Piggy-back: drain the Approved Docs folder on the same
+            # cadence. Apps Script's LockService skips overlapping runs,
+            # and the handler short-circuits cheaply (~150ms) when the
+            # folder is empty, so this is a near-no-op on idle ticks.
+            # Silent failure — Apps Script's 10-min time trigger is the
+            # belt-and-suspenders fallback.
+            try:
+                _apps_script_post('process_approved_documents', {})
+            except Exception as e:
+                log(f"⚠ approved-docs poke failed: {e}")
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
         log("\n👋  Watcher stopped.")
