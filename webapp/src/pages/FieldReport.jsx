@@ -227,12 +227,16 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
 }
 
 // ── Yes / No toggle ───────────────────────────────────────────
-function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No' }) {
+function YNToggle({ value, onChange, yesLabel='Yes', noLabel='No', disabled=false }) {
   return (
-    <div className="flex border border-slate-200 rounded-lg overflow-hidden">
+    <div className={`flex border border-slate-200 rounded-lg overflow-hidden
+                     ${disabled ? 'opacity-60' : ''}`}>
       {[{v:'no',l:noLabel,cls:'bg-red-500 text-white'},{v:'yes',l:yesLabel,cls:'bg-green-600 text-white'}].map(({v,l,cls})=>(
-        <button key={v} type="button" onClick={()=>onChange(v)}
+        <button key={v} type="button"
+          onClick={()=> { if (!disabled) onChange(v) }}
+          disabled={disabled}
           className={`flex-1 py-2.5 text-sm font-semibold border-l first:border-l-0 border-slate-200 transition-all
+            ${disabled ? 'cursor-not-allowed' : ''}
             ${value===v ? cls : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
           {l}
         </button>
@@ -746,6 +750,20 @@ export default function FieldReport() {
   // routed through saveField include preserve_completion=true while
   // edit mode is on so inline edits don't wipe Date Completed.
   const [editMode, setEditMode] = useState(false)
+  // Track marking-item IDs touched during the current edit session so
+  // the server can stamp Date Completed = production_date on them when
+  // the user checks "Include in production" + clicks save. Items NOT
+  // in this set keep whatever date they had before the edit.
+  const [touchedItemIds, setTouchedItemIds] = useState(() => new Set())
+  const markItemTouched = (itemId) => {
+    if (!editMode) return
+    setTouchedItemIds(prev => {
+      if (prev.has(itemId)) return prev
+      const next = new Set(prev)
+      next.add(itemId)
+      return next
+    })
+  }
   // Modal driving the three regen modes (data_only / replace_cfr / new_cfr).
   // null = closed; otherwise { mode, state: 'submitting'|'success'|'error', ... }
   const [editCompletedSubmission, setEditCompletedSubmission] = useState(null)
@@ -755,6 +773,15 @@ export default function FieldReport() {
   const [productionDate,      setProductionDate]      = useState(opToday())
 
   const selectedWO = wos.find(w => w.id === selectedWOId) ?? null
+  // Completed WO is loaded — the page opens in read-only mode with an
+  // Edit banner. Used to lock Date of Work, Issues/Notes, Add Marking,
+  // Photo picker, and the Completion toggle until/while editing.
+  const isCompletedWO = selectedWO && String(selectedWO.status).toLowerCase() === 'completed'
+  // For fields that are editable in edit mode but locked otherwise.
+  const lockedBecauseCompletedView = isCompletedWO && !editMode
+  // For fields that stay locked even in edit mode (Date of Work, Photos,
+  // Completion toggle — the edit-completed handler doesn't read them).
+  const lockedAlwaysForCompleted   = isCompletedWO
 
   // ── MMA waterblasting gate ──────────────────────────────────────
   // Only MMA WOs (water_blast_required === 'Yes - MMA') need the
@@ -778,6 +805,7 @@ export default function FieldReport() {
     setEditMode(false)
     setIncludeInProduction(false)
     setProductionDate(opToday())
+    setTouchedItemIds(new Set())
   }, [selectedWOId])
 
   const refreshWOs = async () => {
@@ -918,6 +946,11 @@ export default function FieldReport() {
       const body = editMode
         ? { ...patch, preserve_completion: true }
         : patch
+      // Track touched IDs so the edit-completed submit can stamp the
+      // production date on these specifically. Track on attempt so a
+      // failed PATCH still counts (the user clearly intended to change
+      // something on this row).
+      if (editMode) markItemTouched(itemId)
       const res = await fetch(`/api/marking-items/${encodeURIComponent(itemId)}`, {
         method:  'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -1267,6 +1300,7 @@ export default function FieldReport() {
         regen_mode:             mode,
         include_in_production:  !!includeInProduction,
         production_date:        includeInProduction ? productionDate : '',
+        touched_item_ids:       Array.from(touchedItemIds),
       }
       const res = await fetch(`/api/wo/${encodeURIComponent(selectedWOId)}/edit-completed`, {
         method:  'POST',
@@ -1396,13 +1430,19 @@ export default function FieldReport() {
           workType={inferredWorkType}
           wo_intersections={woIntersections}
           wo_betweens={woBetweens}
+          editCompletedMode={editMode}
           onClose={() => setFormModal(null)}
           onSaved={(savedItem) => {
             if (formModal.mode === 'add') {
               setMarkingItems(list => [...list, savedItem])
+              // Newly added items go through finalize on save (Pending →
+              // Completed with finalizeDate), so they don't need to be
+              // in touched_item_ids — but no harm tracking them either.
+              if (editMode) markItemTouched(savedItem.item_id)
             } else {
               setMarkingItems(list =>
                 list.map(i => i.item_id === savedItem.item_id ? savedItem : i))
+              if (editMode) markItemTouched(savedItem.item_id)
             }
             setFormModal(null)
             setRowError('')
@@ -1468,7 +1508,7 @@ export default function FieldReport() {
               </div>
               <button
                 type="button"
-                onClick={() => setEditMode(false)}
+                onClick={() => { setEditMode(false); setTouchedItemIds(new Set()) }}
                 className="text-xs font-bold px-3 py-1.5 rounded-lg
                            bg-white text-amber-800 border border-amber-300
                            hover:bg-amber-100"
@@ -1522,7 +1562,16 @@ export default function FieldReport() {
         <div className="card p-4 space-y-4">
           <p className="section-label">Work Details</p>
           <Field label="Date of Work" required>
-            <input type="date" value={workDate} onChange={e=>setWorkDate(e.target.value)} className="field-input" />
+            <input
+              type="date"
+              value={workDate}
+              onChange={e=>setWorkDate(e.target.value)}
+              disabled={lockedAlwaysForCompleted}
+              title={lockedAlwaysForCompleted
+                ? 'Completed WO — use the "Include in production for" date in the Update panel below to log a new production day.'
+                : undefined}
+              className={`field-input ${lockedAlwaysForCompleted ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
+            />
           </Field>
 
           {/* ── Marking Items ─────────────────────────────────── */}
@@ -1636,7 +1685,7 @@ export default function FieldReport() {
               )
             })}
 
-            {selectedWOId && (
+            {selectedWOId && !lockedBecauseCompletedView && (
               <button
                 type="button"
                 onClick={() => setFormModal({ mode: 'add', item: null })}
@@ -1648,19 +1697,33 @@ export default function FieldReport() {
           </div>
 
           <Field label="Issues / Notes">
-            <textarea value={issues} onChange={e=>setIssues(e.target.value)}
+            <textarea
+              value={issues}
+              onChange={e=>setIssues(e.target.value)}
               placeholder="Problems, delays, or anything admin should know…"
-              rows={3} className="field-input resize-none" />
+              rows={3}
+              readOnly={lockedBecauseCompletedView}
+              className={`field-input resize-none
+                ${lockedBecauseCompletedView ? 'bg-slate-100 text-slate-500 cursor-not-allowed' : ''}`}
+            />
           </Field>
         </div>
 
         {/* 3 · Photos */}
         <div className="card p-4 space-y-3">
           <p className="section-label">Site Photos</p>
-          {selectedWOId
-            ? <PhotoPicker onChange={setPhotoFiles} />
-            : <p className="text-sm text-slate-400 italic">Select a Work Order above to add photos.</p>
-          }
+          {!selectedWOId ? (
+            <p className="text-sm text-slate-400 italic">Select a Work Order above to add photos.</p>
+          ) : lockedAlwaysForCompleted ? (
+            <p className="text-sm text-slate-500 italic">
+              Photos can't be added via the edit flow.
+              {selectedWO?.folder_url
+                ? <> Use the <a href={selectedWO.folder_url} target="_blank" rel="noopener noreferrer" className="font-bold text-navy hover:underline">View WO 📁</a> link in WO Details to drop them into Drive directly.</>
+                : <> Drop them into the WO's Drive folder directly.</>}
+            </p>
+          ) : (
+            <PhotoPicker onChange={setPhotoFiles} />
+          )}
         </div>
 
         {/* 4 · Completion — sign-in (crew + signatures) is filed from
@@ -1668,8 +1731,21 @@ export default function FieldReport() {
         <div className="card p-4 space-y-3">
           <p className="section-label">Completion</p>
           <Field label="Is this Work Order complete?">
-            <YNToggle value={woComplete} onChange={setWoComplete}
-              noLabel="No — more work needed" yesLabel="Yes — WO Done ✓" />
+            {lockedAlwaysForCompleted ? (
+              <>
+                <YNToggle value="yes" onChange={() => {}}
+                  noLabel="No — more work needed" yesLabel="Yes — WO Done ✓"
+                  disabled />
+                <p className="text-[11px] text-slate-400 mt-1.5">
+                  Locked — this WO is already Completed. Use the
+                  Dashboard kebab → Change Status… to flip it back to
+                  In Progress or set it to Returned.
+                </p>
+              </>
+            ) : (
+              <YNToggle value={woComplete} onChange={setWoComplete}
+                noLabel="No — more work needed" yesLabel="Yes — WO Done ✓" />
+            )}
           </Field>
         </div>
 
@@ -1719,6 +1795,7 @@ export default function FieldReport() {
             if (editCompletedSubmission.state !== 'submitting') {
               if (editCompletedSubmission.state === 'success') {
                 setEditMode(false)
+                setTouchedItemIds(new Set())
               }
               setEditCompletedSubmission(null)
             }

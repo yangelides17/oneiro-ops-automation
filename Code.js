@@ -8139,21 +8139,68 @@ function handleEditCompletedWO_(body) {
   if (woRowIdx === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
   const woRow = woData[woRowIdx];
 
+  const asOfDate = String(d.as_of_date || '').trim();
+  const includeInProduction = !!d.include_in_production;
+  const productionDate = String(d.production_date || '').trim();
+  const touchedIds = Array.isArray(d.touched_item_ids)
+    ? d.touched_item_ids.map(x => String(x).trim()).filter(Boolean)
+    : [];
+
+  // finalizeDate drives Date Completed for items that get promoted
+  // Pending → Completed during this update (newly-added items always
+  // start Pending), the prefix on appended Issues lines, and the
+  // touched-already-Completed override below.
+  //
+  //   include_in_production checked → production_date (rework day)
+  //   else                          → WO's work_end / work_start
+  //                                   (original timeframe)
+  //
+  // Falls back to as_of_date / today if all WO date columns are blank.
+  const woWorkEnd   = _normalizeTrackerDate_(woRow[18]);
+  const woWorkStart = _normalizeTrackerDate_(woRow[17]);
+  const finalizeDate = (includeInProduction && productionDate)
+    ? productionDate
+    : (woWorkEnd || woWorkStart || asOfDate);
+
   // ── Recompute marking rollups (cols 19-21) from current sheet state.
   // No state-machine bump — completed WOs stay Completed regardless of
   // what the marking rows now look like. Status changes go through the
   // separate update_wo_status action.
-  const { data: markingData } = finalizeMarkingStatus_(ss, woId, _normalizeTrackerDate_(woRow[17]) || _normalizeTrackerDate_(woRow[16]));
+  const { data: markingData } = finalizeMarkingStatus_(ss, woId, finalizeDate);
+
+  // If include_in_production is checked, the admin is logging this work
+  // as production for production_date. Overwrite Date Completed on
+  // every touched, already-Completed item so they bucket into that day
+  // — finalize only handles the Pending → Completed transition; items
+  // already Completed kept their original date via preserve_completion.
+  // Items NOT in touched_ids are left alone (admin didn't touch them).
+  if (includeInProduction && productionDate && touchedIds.length > 0) {
+    const miSheet = ss.getSheetByName('Marking Items');
+    if (miSheet) {
+      const miData = markingData || miSheet.getDataRange().getValues();
+      const touchedSet = {};
+      touchedIds.forEach(id => { touchedSet[id] = true; });
+      for (let i = 1; i < miData.length; i++) {
+        const r = miData[i];
+        if (String(r[1] || '').trim() !== woId) continue;
+        if (!touchedSet[String(r[0] || '').trim()]) continue;
+        if (String(r[12] || '') !== 'Completed') continue;
+        miSheet.getRange(i + 1, 12).setValue(productionDate);
+        r[11] = productionDate;
+      }
+      SpreadsheetApp.flush();
+    }
+  }
   const rollups = computeMarkingRollups_(ss, woId, markingData);
 
-  // Optionally append new issues (with date prefix matching the
-  // existing submit pattern at line 8113-8118).
-  const asOfDate = String(d.as_of_date || '').trim();
+  // Append new issues with a date prefix consistent with finalizeDate
+  // so reading the Issues log later tells you when each note's work
+  // actually happened.
   const newIssuesText = String(d.issues || '').trim();
   const currentIssues = String(woRow[22] || '').trim();
   let issuesOut = currentIssues;
   if (newIssuesText) {
-    const prefix = asOfDate ? asOfDate + ': ' : '';
+    const prefix = finalizeDate ? finalizeDate + ': ' : '';
     issuesOut = currentIssues
       ? currentIssues + '\n' + prefix + newIssuesText
       : prefix + newIssuesText;
@@ -8180,8 +8227,8 @@ function handleEditCompletedWO_(body) {
   // Optionally log a new Work Day Log row so the work counts in
   // sign-in / production-log queues for the given production_date.
   let wdlAppended = false;
-  if (d.include_in_production && d.production_date) {
-    const prodDate = String(d.production_date).trim();
+  if (includeInProduction && productionDate) {
+    const prodDate = productionDate;
     const wdlSheet = _getOrCreateWorkDayLogSheet_(ss);
     appendRowWithProbing_(
       wdlSheet,

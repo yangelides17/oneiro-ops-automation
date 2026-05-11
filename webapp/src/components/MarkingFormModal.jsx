@@ -36,12 +36,19 @@ const DIRECTIONS = ['', 'N', 'E', 'S', 'W']
  *   workType         — 'MMA' | 'Thermo' | '' — drives layout fallback
  *   wo_intersections — string[] of distinct intersection names (in WO order)
  *   wo_betweens      — string[] of derived "X – Y" between-pairs
+ *   editCompletedMode — when true (admin editing a Completed WO),
+ *                       PATCH bodies include preserve_completion=true so
+ *                       the server doesn't reopen the row to Pending or
+ *                       clear Date Completed on field changes. The
+ *                       parent's edit-completed handler stamps the
+ *                       date based on the production-day toggle.
  *   onClose          — close without saving
  *   onSaved          — (updatedItem) => void   — called after a successful API call
  */
 export default function MarkingFormModal({
   mode, item, woId, workType,
   wo_intersections = [], wo_betweens = [],
+  editCompletedMode = false,
   onClose, onSaved,
 }) {
   const isEdit          = mode === 'edit'
@@ -119,10 +126,16 @@ export default function MarkingFormModal({
     try {
       let res
       if (isEdit) {
+        // editCompletedMode = the admin is editing a Completed WO; pass
+        // preserve_completion=true so the backend doesn't reopen the row
+        // to Pending or clear Date Completed on this change.
+        const patchBody = editCompletedMode
+          ? { ...payload, preserve_completion: true }
+          : payload
         res = await fetch(`/api/marking-items/${encodeURIComponent(item.item_id)}`, {
           method:  'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify(payload),
+          body:    JSON.stringify(patchBody),
         })
       } else {
         res = await fetch('/api/marking-items', {
