@@ -372,6 +372,76 @@ app.post('/api/waterblasting/:woId/confirm', async (req, res) => {
 })
 
 /**
+ * POST /api/wo/:woId/status
+ * Admin-driven WO status change from the Dashboard kebab. Bypasses the
+ * one-way state machine in handleSubmitFieldReport_; admin can set any
+ * status (including new "Returned" value). Audit row written to
+ * Automation Log on success.
+ *
+ * Body: { status: 'Received' | 'Dispatched' | 'In Progress' | 'Completed' | 'Returned' }
+ */
+app.post('/api/wo/:woId/status', async (req, res) => {
+  try {
+    const data = await callAppsScript('update_wo_status', {
+      wo_id:  req.params.woId,
+      status: String(req.body?.status || '').trim(),
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/wo/:woId/status error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * DELETE /api/wo/:woId
+ * Hard-deletes WO Tracker row + all Marking Items rows keyed to the WO.
+ * Preserves Work Day Log / Sign-In Data / Doc Lifecycle Log / Drive
+ * archive folder (audit trail). Logs to Automation Log. Returns
+ * { marking_items_deleted, work_day_log_preserved } so the UI can show
+ * a useful success toast.
+ */
+app.delete('/api/wo/:woId', async (req, res) => {
+  try {
+    const data = await callAppsScript('delete_wo', { wo_id: req.params.woId })
+    res.json(data)
+  } catch (err) {
+    console.error('DELETE /api/wo/:woId error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/wo/:woId/edit-completed
+ * Admin update to a Completed WO. Body:
+ *   {
+ *     as_of_date,
+ *     issues,
+ *     regen_mode: 'data_only' | 'replace_cfr' | 'new_cfr',
+ *     include_in_production: boolean,
+ *     production_date: 'YYYY-MM-DD'
+ *   }
+ * The marking-item edits themselves are already persisted via the
+ * normal /api/marking-items PATCH endpoint with `preserve_completion`.
+ */
+app.post('/api/wo/:woId/edit-completed', async (req, res) => {
+  try {
+    const data = await callAppsScript('edit_completed_wo', {
+      wo_id:                  req.params.woId,
+      as_of_date:             req.body?.as_of_date || '',
+      issues:                 req.body?.issues || '',
+      regen_mode:             req.body?.regen_mode || 'data_only',
+      include_in_production:  !!req.body?.include_in_production,
+      production_date:        req.body?.production_date || '',
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/wo/:woId/edit-completed error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/field-report/finalize
  * Triggers Sign-In + CFR JSON generation AFTER the submit returned
  * success. The client fires this as fire-and-forget so the user sees

@@ -11,6 +11,9 @@ import DocStatusTab from './DocStatusTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 import DocStatusChips from '../components/DocStatusChips'
 import GenerateDocModal from '../components/GenerateDocModal'
+import StatusPickerModal from '../components/StatusPickerModal'
+import DeleteWOModal from '../components/DeleteWOModal'
+import RowKebab from '../components/RowKebab'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 import { NavBadge } from '../App'
 
@@ -360,7 +363,7 @@ function FilterBar({ label, options, selected, onToggle, onClear }) {
 }
 
 // ── WO Table row ──────────────────────────────────────────────
-function WORow({ wo, flagged, onDocsChange }) {
+function WORow({ wo, flagged, onDocsChange, onChangeStatus, onDeleteWO }) {
   const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
     && wo.status.toLowerCase() !== 'completed'
 
@@ -447,6 +450,12 @@ function WORow({ wo, flagged, onDocsChange }) {
           <span className="text-slate-300 text-xs px-2 py-1" title="Folder not yet created">—</span>
         )}
       </td>
+      <td className="py-2.5 px-3 text-right">
+        <RowKebab items={[
+          { label: 'Change Status…', onClick: () => onChangeStatus?.(wo) },
+          { label: 'Delete WO…',     onClick: () => onDeleteWO?.(wo), danger: true },
+        ]} />
+      </td>
     </tr>
   )
 }
@@ -512,6 +521,9 @@ export default function Dashboard() {
   const [search,     setSearch]     = useState('')
   const [lastRefresh,setLastRefresh]= useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
+  // WO row kebab actions — `null` = closed; otherwise the WO object.
+  const [statusPickerWO, setStatusPickerWO] = useState(null)
+  const [deleteWO,       setDeleteWO]       = useState(null)
   // Pagination: how many WO rows to render at once. Mostly an
   // initial-render perf knob — the API still returns the full list in
   // one shot, so backend latency is unchanged. Reduces DOM nodes by
@@ -783,6 +795,8 @@ export default function Dashboard() {
           onShowAll={() => setVisibleCount(filteredWOs.length)}
           completedTodayLabel={COMPLETED_TODAY}
           onDocsChange={onDocsChange}
+          onChangeStatus={(wo) => setStatusPickerWO(wo)}
+          onDeleteWO={(wo) => setDeleteWO(wo)}
         />
       )}
 
@@ -790,6 +804,32 @@ export default function Dashboard() {
         <DownloadDocumentsModal
           contractors={contractors}
           onClose={() => setShowDownloadModal(false)}
+        />
+      )}
+
+      {statusPickerWO && (
+        <StatusPickerModal
+          wo={statusPickerWO}
+          onSaved={load}
+          onClose={() => setStatusPickerWO(null)}
+        />
+      )}
+
+      {deleteWO && (
+        <DeleteWOModal
+          wo={deleteWO}
+          onDeleted={(result) => {
+            // Optimistic: drop the row immediately so the dashboard
+            // reflects the delete without waiting for the refetch.
+            setData(prev => prev ? { ...prev, wos: prev.wos.filter(w => w.id !== deleteWO.id) } : prev)
+            // Then refresh to pick up updated stats / counts from the server.
+            load()
+            // Eslint/no-undef: the toast helper isn't present in Dashboard; we
+            // rely on the modal's own success state. Result counts (in
+            // `result`) are surfaced via console for now.
+            console.log('WO deleted:', result)
+          }}
+          onClose={() => setDeleteWO(null)}
         />
       )}
     </div>
@@ -810,6 +850,7 @@ function OperationsTabContent({
   filteredWOs,
   visibleCount, onShowMore, onShowAll,
   completedTodayLabel,
+  onChangeStatus, onDeleteWO,
   onDocsChange,
 }) {
   return (
@@ -939,7 +980,7 @@ function OperationsTabContent({
           <div className="space-y-2">
             <FilterBar
               label="Status"
-              options={['Received', 'Dispatched', 'In Progress', 'Completed', completedTodayLabel]}
+              options={['Received', 'Dispatched', 'In Progress', 'Completed', 'Returned', completedTodayLabel]}
               selected={statusFilt}
               onToggle={toggleStatus}
               onClear={clearStatus}
@@ -973,9 +1014,9 @@ function OperationsTabContent({
           <table className="w-full min-w-[820px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
-                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Drive'].map(h => (
+                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Drive', ''].map((h, i) => (
                   <th
-                    key={h}
+                    key={h || `col-${i}`}
                     className="py-2.5 px-3 text-left text-[10px] font-extrabold
                                uppercase tracking-wider text-slate-400"
                   >
@@ -987,7 +1028,7 @@ function OperationsTabContent({
             <tbody>
               {filteredWOs.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-12 text-center text-slate-400 text-sm">
+                  <td colSpan={11} className="py-12 text-center text-slate-400 text-sm">
                     No work orders match your filters.
                   </td>
                 </tr>
@@ -998,6 +1039,8 @@ function OperationsTabContent({
                     wo={wo}
                     flagged={attention.includes(wo.id)}
                     onDocsChange={onDocsChange}
+                    onChangeStatus={onChangeStatus}
+                    onDeleteWO={onDeleteWO}
                   />
                 ))
               )}

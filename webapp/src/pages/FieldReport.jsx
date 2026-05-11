@@ -259,9 +259,14 @@ function MarkingItemRow({
   item, selected, saving, bulkMode,
   onToggleSelect, onLocalChange, onCommit,
   onEdit, onDelete, onStartBulk,
+  forceUnlock = false,
 }) {
   const layout = pickLayout(item)
-  const locked = item.status === 'Completed'
+  // forceUnlock = the admin Completed-WO edit mode is on; ignore the
+  // per-row Completed lock so qty / direction / etc. can be edited
+  // inline. saveField on the parent passes preserve_completion=true
+  // while edit mode is on so this doesn't wipe Date Completed.
+  const locked = item.status === 'Completed' && !forceUnlock
 
   // text-base on mobile (16px) so iOS Safari doesn't auto-zoom the
   // viewport when a Qty / intersection / direction input is focused;
@@ -734,6 +739,20 @@ export default function FieldReport() {
   // sees the flipped value without waiting for the setWoComplete state
   // update to flush. Read once + reset inside doSubmit.
   const completeOverrideRef = useRef(null)
+  // Completed-WO edit mode. When the loaded WO is Completed, the page
+  // opens read-only with a banner. Clicking Edit flips this to true so
+  // marking-item rows unlock and the bottom of the form swaps in the
+  // Update panel (Data Only / Replace CFR / Save as New). PATCHes
+  // routed through saveField include preserve_completion=true while
+  // edit mode is on so inline edits don't wipe Date Completed.
+  const [editMode, setEditMode] = useState(false)
+  // Modal driving the three regen modes (data_only / replace_cfr / new_cfr).
+  // null = closed; otherwise { mode, state: 'submitting'|'success'|'error', ... }
+  const [editCompletedSubmission, setEditCompletedSubmission] = useState(null)
+  // Include-in-production checkbox + date. Defaults set per-mode at
+  // click time; toggling persists within the session.
+  const [includeInProduction, setIncludeInProduction] = useState(false)
+  const [productionDate,      setProductionDate]      = useState(opToday())
 
   const selectedWO = wos.find(w => w.id === selectedWOId) ?? null
 
@@ -753,6 +772,13 @@ export default function FieldReport() {
   // Reset the "unlock" state whenever the selected WO changes so the
   // locked pill is back by default on the next WO.
   useEffect(() => { setWbEditUnlocked(false) }, [selectedWOId])
+  // Reset edit mode + production-day defaults whenever the selected WO
+  // changes. The completed-WO edit panel state is scoped per-WO.
+  useEffect(() => {
+    setEditMode(false)
+    setIncludeInProduction(false)
+    setProductionDate(opToday())
+  }, [selectedWOId])
 
   const refreshWOs = async () => {
     const d = await fetch('/api/wos').then(r => r.json())
@@ -880,14 +906,22 @@ export default function FieldReport() {
   // Issue a PATCH for one field. On success, only merge back the fields
   // we explicitly patched plus status/date_completed (server-derived) —
   // so fields the user might still be typing into don't get clobbered.
+  //
+  // When edit mode is on (admin editing a Completed WO), include
+  // preserve_completion=true so the backend doesn't reopen the row to
+  // Pending + clear Date Completed on field changes. Keeps original
+  // day-bucketing intact for Production Log + Dashboard rollups.
   const saveField = async (itemId, patch) => {
     markSaving(itemId, true)
     setRowError('')
     try {
+      const body = editMode
+        ? { ...patch, preserve_completion: true }
+        : patch
       const res = await fetch(`/api/marking-items/${encodeURIComponent(itemId)}`, {
         method:  'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(patch),
+        body:    JSON.stringify(body),
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
@@ -1212,6 +1246,41 @@ export default function FieldReport() {
     setWoComplete('no'); setPhotoFiles([]); setFormError('')
   }
 
+  // ── Edit Completed WO submit ──────────────────────────────
+  // Three modes: data_only (no CFR regen), replace_cfr (regen + replace
+  // canonical WO doc), new_cfr (regen + archive as separate file with
+  // _Updated_<asOfDate> suffix).
+  async function submitEditCompleted(mode) {
+    if (!selectedWOId) return
+    // Flush any in-flight marking-item PATCHes before the server-side
+    // rollup recompute — same pattern as the main submit (waitForSaves).
+    if (typeof document !== 'undefined' && document.activeElement?.blur) {
+      document.activeElement.blur()
+    }
+    setEditCompletedSubmission({ state: 'submitting', mode })
+    await waitForSaves()
+    try {
+      const asOfDate = opToday()
+      const body = {
+        as_of_date:             asOfDate,
+        issues:                 issues.trim(),
+        regen_mode:             mode,
+        include_in_production:  !!includeInProduction,
+        production_date:        includeInProduction ? productionDate : '',
+      }
+      const res = await fetch(`/api/wo/${encodeURIComponent(selectedWOId)}/edit-completed`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      setEditCompletedSubmission({ state: 'success', mode, result: data })
+    } catch (err) {
+      setEditCompletedSubmission({ state: 'error', mode, message: err.message || 'Update failed' })
+    }
+  }
+
   // ── Success ───────────────────────────────────────────────
   if (submitted) return (
     <div className="max-w-lg mx-auto px-4 py-16 text-center">
@@ -1382,6 +1451,53 @@ export default function FieldReport() {
           {selectedWO && <WOPanel wo={selectedWO} />}
         </div>
 
+        {/* Completed-WO banner — view mode + edit mode states.
+            Shown only when the loaded WO has status === 'Completed'.
+            View mode: explainer + [Edit] button. Edit mode: banner
+            switches color + offers [Cancel]. */}
+        {selectedWO && String(selectedWO.status).toLowerCase() === 'completed' && (
+          editMode ? (
+            <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 flex items-start gap-3">
+              <span className="text-xl leading-none">✎</span>
+              <div className="flex-1 text-sm">
+                <p className="font-bold text-amber-900">Editing completed WO</p>
+                <p className="text-xs text-amber-800/80 mt-0.5">
+                  Marking-item changes save inline. Pick a Save mode at
+                  the bottom of the page to commit the update.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditMode(false)}
+                className="text-xs font-bold px-3 py-1.5 rounded-lg
+                           bg-white text-amber-800 border border-amber-300
+                           hover:bg-amber-100"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-green-200 bg-green-50 p-3 flex items-start gap-3">
+              <span className="text-xl leading-none">✓</span>
+              <div className="flex-1 text-sm">
+                <p className="font-bold text-green-900">This WO is completed</p>
+                <p className="text-xs text-green-800/80 mt-0.5">
+                  Marking items are read-only. Click Edit to fix a typo,
+                  regenerate the CFR, or save an updated CFR (punch order).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditMode(true)}
+                className="text-xs font-bold px-3 py-1.5 rounded-lg
+                           bg-navy text-white hover:opacity-90"
+              >
+                Edit
+              </button>
+            </div>
+          )
+        )}
+
         {/* 1b · Waterblasting Confirmation — MMA only */}
         {isMMAJob && (
           <WaterblastingCard
@@ -1514,6 +1630,7 @@ export default function FieldReport() {
                       label: `${it.category}${it.intersection ? ` — ${it.intersection} ${it.direction}` : ''}`
                     })}
                     onStartBulk={enterBulkMode}
+                    forceUnlock={editMode}
                   />
                 </div>
               )
@@ -1559,22 +1676,55 @@ export default function FieldReport() {
         </div>
         </fieldset>
 
-        {/* Submit */}
-        <button
-          type="submit"
-          disabled={submitting || wbGated}
-          title={wbGated ? 'Waterblasting must be confirmed before submitting this MMA work order.' : undefined}
-          className="btn-primary w-full text-base"
-        >
-          {submitting
-            ? (submitStep || 'Submitting…')
-            : wbGated
-              ? 'Waterblasting not confirmed'
-              : 'Submit Field Report'}
-        </button>
+        {/* Submit / Update panel — for completed WOs in edit mode, the
+            three-mode update panel replaces the normal submit button.
+            View mode on a completed WO hides everything (Edit button on
+            the banner is the only call-to-action). Active WOs always
+            show the regular Submit button. */}
+        {selectedWO && String(selectedWO.status).toLowerCase() === 'completed' ? (
+          editMode ? (
+            <UpdateCompletedWOPanel
+              includeInProduction={includeInProduction}
+              setIncludeInProduction={setIncludeInProduction}
+              productionDate={productionDate}
+              setProductionDate={setProductionDate}
+              submitting={!!editCompletedSubmission}
+              onMode={(mode) => submitEditCompleted(mode)}
+            />
+          ) : null
+        ) : (
+          <button
+            type="submit"
+            disabled={submitting || wbGated}
+            title={wbGated ? 'Waterblasting must be confirmed before submitting this MMA work order.' : undefined}
+            className="btn-primary w-full text-base"
+          >
+            {submitting
+              ? (submitStep || 'Submitting…')
+              : wbGated
+                ? 'Waterblasting not confirmed'
+                : 'Submit Field Report'}
+          </button>
+        )}
 
         <div className="h-8" />
       </form>
+
+      {/* Edit-completed-WO submission status modal */}
+      {editCompletedSubmission && (
+        <EditCompletedStatusModal
+          state={editCompletedSubmission}
+          onClose={() => {
+            // Only allow close on success or error.
+            if (editCompletedSubmission.state !== 'submitting') {
+              if (editCompletedSubmission.state === 'success') {
+                setEditMode(false)
+              }
+              setEditCompletedSubmission(null)
+            }
+          }}
+        />
+      )}
 
       {qtyConfirm && (
         <ConfirmModal
@@ -1685,6 +1835,177 @@ function WaterblastingCard({ confirmed, submitting, editUnlocked, onRequestToggl
           <span className="text-xs text-slate-500">Use the ⋮ menu to edit.</span>
         </div>
       )}
+    </div>
+  )
+}
+
+
+// ── Update-Completed-WO panel ────────────────────────────────
+// Three-button footer that replaces the normal Submit Field Report
+// button when the loaded WO is Completed and the admin has entered
+// edit mode. Each button maps to a regen_mode the backend understands.
+// The "Include in production" checkbox + date picker control whether
+// a Work Day Log row is appended for sign-in / Production Log coverage.
+function UpdateCompletedWOPanel({
+  includeInProduction, setIncludeInProduction,
+  productionDate, setProductionDate,
+  submitting, onMode,
+}) {
+  // Smart default the checkbox per-mode when the user picks one — but
+  // only if they haven't manually touched it. Keeps the Save-as-New
+  // flow ergonomic while letting power-users override.
+  const click = (mode) => {
+    if (!submitting) onMode(mode)
+  }
+
+  return (
+    <div className="card p-4 space-y-3">
+      <p className="section-label">Update Completed WO</p>
+
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={includeInProduction}
+          onChange={e => setIncludeInProduction(e.target.checked)}
+          className="w-4 h-4 accent-navy"
+        />
+        <span className="text-sm text-slate-700">Include this work in production for</span>
+        <input
+          type="date"
+          value={productionDate}
+          onChange={e => setProductionDate(e.target.value)}
+          disabled={!includeInProduction}
+          className="field-input text-sm py-1 px-2 max-w-[160px]"
+        />
+      </label>
+      <p className="text-[11px] text-slate-400 -mt-1.5 pl-6">
+        Checked: appends a Work Day Log row so the work counts in
+        Sign-In + Production Log queues for that day. Leave unchecked
+        for typo / data-only fixes.
+      </p>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={() => click('data_only')}
+          className="px-3 py-3 rounded-xl text-sm font-bold border
+                     bg-white text-slate-700 border-slate-200
+                     hover:border-navy/40 hover:bg-slate-50
+                     disabled:opacity-40 disabled:cursor-not-allowed
+                     leading-tight"
+        >
+          Save Data Only
+          <span className="block text-[10px] font-normal text-slate-400 mt-0.5">no CFR regen</span>
+        </button>
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={() => click('replace_cfr')}
+          className="px-3 py-3 rounded-xl text-sm font-bold border
+                     bg-navy/90 text-white border-navy
+                     hover:opacity-90
+                     disabled:opacity-40 disabled:cursor-not-allowed
+                     leading-tight"
+        >
+          Replace CFR
+          <span className="block text-[10px] font-normal opacity-80 mt-0.5">regen &amp; replace</span>
+        </button>
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={() => {
+            // Default-on the production checkbox for Save-as-New
+            // (punch-order rework is genuinely new work). User can
+            // still uncheck before clicking again.
+            if (!includeInProduction) setIncludeInProduction(true)
+            click('new_cfr')
+          }}
+          className="px-3 py-3 rounded-xl text-sm font-bold border
+                     bg-amber-500 text-white border-amber-500
+                     hover:bg-amber-600
+                     disabled:opacity-40 disabled:cursor-not-allowed
+                     leading-tight"
+        >
+          Save as New CFR
+          <span className="block text-[10px] font-normal opacity-90 mt-0.5">punch-order rework</span>
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
+// ── Edit-Completed submission status modal ───────────────────
+// Blocking modal that surfaces the result of an edit-completed submit.
+// `state.state`: 'submitting' | 'success' | 'error'. Backdrop click +
+// Escape are disabled while submitting.
+function EditCompletedStatusModal({ state, onClose }) {
+  if (!state) return null
+  const isSubmitting = state.state === 'submitting'
+  const isSuccess    = state.state === 'success'
+  const isError      = state.state === 'error'
+
+  const titleByMode = {
+    data_only:   'Saving data update…',
+    replace_cfr: 'Regenerating CFR (replace)…',
+    new_cfr:     'Generating new CFR (save as new)…',
+  }
+  const successByMode = {
+    data_only:   'Data update saved. CFR not regenerated.',
+    replace_cfr: 'New CFR queued — will replace the existing archived PDF after the next worker run + admin approval.',
+    new_cfr:     'New CFR queued with "_Updated" suffix — saved alongside the original after the next worker run + admin approval.',
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
+      onClick={() => !isSubmitting && onClose()}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 space-y-4"
+        onClick={e => e.stopPropagation()}
+      >
+        {isSubmitting && (
+          <>
+            <div className="w-10 h-10 mx-auto border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
+            <p className="text-center text-sm font-bold text-navy">{titleByMode[state.mode] || 'Submitting…'}</p>
+            <p className="text-center text-xs text-slate-500">Don't navigate away.</p>
+          </>
+        )}
+        {isSuccess && (
+          <>
+            <div className="text-4xl text-center">✅</div>
+            <p className="text-center text-base font-bold text-navy">Done</p>
+            <p className="text-center text-sm text-slate-600">{successByMode[state.mode]}</p>
+            {state.result?.wdl_appended && (
+              <p className="text-center text-xs text-slate-500">Production-day row appended.</p>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white hover:opacity-90"
+            >
+              Close
+            </button>
+          </>
+        )}
+        {isError && (
+          <>
+            <div className="text-4xl text-center">⚠️</div>
+            <p className="text-center text-base font-bold text-red-700">Update failed</p>
+            <p className="text-center text-sm text-slate-600 break-words">{state.message}</p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100 text-slate-700 hover:bg-slate-200"
+            >
+              Close
+            </button>
+          </>
+        )}
+      </div>
     </div>
   )
 }

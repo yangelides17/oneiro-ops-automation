@@ -1619,6 +1619,12 @@ function archiveDocument_(file, docType, woId, ss) {
       // (original scan pages + the freshly-rendered CFR page). They
       // REPLACE the prior WO doc in the archive folder — atomic swap so
       // there's never a window where the WO is missing.
+      //
+      // Exception: filenames containing `_Updated_<yyyy-mm-dd>_` come
+      // from the admin "save as new CFR" path (punch-order rework).
+      // Those archive ALONGSIDE the canonical WO doc — the original
+      // record stays put. Both files in the folder are full WO+CFR
+      // merges; only the CFR-page content differs.
       if (!woId) {
         return { success: false, reason: 'CFR has no WO # in filename' };
       }
@@ -1626,8 +1632,14 @@ function archiveDocument_(file, docType, woId, ss) {
       if (!woFolder) {
         return { success: false, reason: `Could not resolve WO folder for CFR ${woId} — is it missing from the Work Order Tracker?` };
       }
-      _replaceArchivedWODoc_(woFolder, file, woId);
-      Logger.log(`📁 Archived merged CFR → WO folder ${woId} (replaced prior WO doc)`);
+      const SAVE_AS_NEW_RX = /_Updated_\d{4}-\d{2}-\d{2}_FILLED\.pdf$/i;
+      if (SAVE_AS_NEW_RX.test(cleanName)) {
+        file.makeCopy(cleanName, woFolder);
+        Logger.log(`📁 Archived save-as-new CFR → WO folder ${woId} (preserved canonical WO doc)`);
+      } else {
+        _replaceArchivedWODoc_(woFolder, file, woId);
+        Logger.log(`📁 Archived merged CFR → WO folder ${woId} (replaced prior WO doc)`);
+      }
       return { success: true, doc_type: 'Field Report', wo_ids: [woId] };
 
     } else if (docType === 'Invoice') {
@@ -3219,6 +3231,12 @@ function doPost(e) {
       return handleGetPendingCounts_(body);
     } else if (action === 'get_doc_status_pending_count') {
       return handleGetDocStatusPendingCount_(body);
+    } else if (action === 'update_wo_status') {
+      return handleUpdateWOStatus_(body);
+    } else if (action === 'delete_wo') {
+      return handleDeleteWO_(body);
+    } else if (action === 'edit_completed_wo') {
+      return handleEditCompletedWO_(body);
     } else if (action === 'get_drive_file_bytes') {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
@@ -7756,7 +7774,14 @@ function handleUpdateMarkingItem_(body) {
   // already Pending, or if the patch didn't actually change any values
   // (e.g. user opened Edit modal and hit Confirm without touching
   // anything).
-  if (wasCompleted && anyFieldChanged) {
+  //
+  // EXCEPTION: the admin "edit completed WO" flow on the Field Report
+  // page passes `preserve_completion: true` so inline edits don't wipe
+  // Date Completed (which would re-bucket the work to a different day
+  // in Production Log + Dashboard rollups). Clearing qty to 0/blank
+  // still flips to Pending above — that's an explicit "this didn't
+  // get done" signal that overrides the preserve flag.
+  if (wasCompleted && anyFieldChanged && !d.preserve_completion) {
     sheet.getRange(rowNum, COL.status).setValue('Pending');
     sheet.getRange(rowNum, COL.date_completed).setValue('');
   }
@@ -7914,10 +7939,19 @@ function handleGetActiveWOs_() {
   const woSheet = ss.getSheetByName('Work Order Tracker');
   const allRows = woSheet.getDataRange().getValues();
 
-  const ORDER = { 'in progress': 0, 'dispatched': 1, 'received': 2 };
+  // Completed + Returned WOs are now returned too so the Field Report
+  // dropdown can open them (admin edit / re-generate CFR via the kebab
+  // on the WO Tracker). They sort to the bottom of the dropdown.
+  const ORDER = {
+    'in progress': 0,
+    'dispatched':  1,
+    'received':    2,
+    'completed':   3,
+    'returned':    4,
+  };
 
   const wos = allRows.slice(1)
-    .filter(r => r[0] && String(r[15]).toLowerCase() !== 'completed')
+    .filter(r => r[0])
     .map(r => ({
       id:                      String(r[0]),
       contractor:              String(r[1]),
@@ -7950,6 +7984,262 @@ function handleGetActiveWOs_() {
     });
 
   return jsonResponse_({ wos });
+}
+
+
+// ── action: update_wo_status ──────────────────────────────────
+//
+// Manual status change from the Dashboard kebab. Skips the one-way
+// Received → Dispatched → In Progress → Completed state machine so
+// admins can flip to any status (e.g. Returned for WOs handed back to
+// the prime). Audit row appended to Automation Log so the change is
+// traceable.
+const WO_STATUS_VALUES_ = ['Received', 'Dispatched', 'In Progress', 'Completed', 'Returned'];
+
+function handleUpdateWOStatus_(body) {
+  const d = body.data || {};
+  const woId   = String(d.wo_id || '').trim();
+  const status = String(d.status || '').trim();
+  if (!woId)   return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (!status) return jsonResponse_({ error: 'Missing status' }, 400);
+  if (WO_STATUS_VALUES_.indexOf(status) === -1) {
+    return jsonResponse_({ error: 'Invalid status: ' + status }, 400);
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Work Order Tracker');
+  const data = sheet.getDataRange().getValues();
+  let rowIdx = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === woId) { rowIdx = i; break; }
+  }
+  if (rowIdx === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+
+  const previousStatus = String(data[rowIdx][15] || '');
+  if (previousStatus === status) {
+    return jsonResponse_({ success: true, noop: true });
+  }
+  sheet.getRange(rowIdx + 1, 16).setValue(status);
+
+  const logSheet = ss.getSheetByName('Automation Log');
+  if (logSheet) {
+    logSheet.appendRow([
+      new Date(), 'WO Tracker', 'Status changed manually',
+      woId, `${previousStatus || '(blank)'} → ${status}`,
+      'Completed', '', 'No',
+    ]);
+  }
+  _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({ success: true, previous: previousStatus, status });
+}
+
+
+// ── action: delete_wo ─────────────────────────────────────────
+//
+// Hard-delete a WO from the Tracker + every Marking Items row keyed to
+// it. Preserves the audit trail elsewhere (Work Day Log, Sign-In Data,
+// Doc Lifecycle Log, Drive archive folder) so historical reporting
+// stays intact. Logs a row to Automation Log with what was removed +
+// preserved counts.
+function handleDeleteWO_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData = woSheet.getDataRange().getValues();
+  let woRowIdx = -1;
+  for (let i = 1; i < woData.length; i++) {
+    if (String(woData[i][0] || '').trim() === woId) { woRowIdx = i; break; }
+  }
+  if (woRowIdx === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+
+  // Delete Marking Items rows bottom-up so indices stay valid.
+  const miSheet = ss.getSheetByName('Marking Items');
+  let miDeleted = 0;
+  if (miSheet) {
+    const miData = miSheet.getDataRange().getValues();
+    for (let i = miData.length - 1; i >= 1; i--) {
+      if (String(miData[i][1] || '').trim() === woId) {
+        miSheet.deleteRow(i + 1);
+        miDeleted++;
+      }
+    }
+  }
+
+  // Count Work Day Log rows so the audit entry tells admin what's left
+  // behind (we don't delete them — payroll / time-card history).
+  let wdlCount = 0;
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (wdlSheet) {
+    const wdl = wdlSheet.getDataRange().getValues();
+    for (let i = 1; i < wdl.length; i++) {
+      if (String(wdl[i][1] || '').trim() === woId) wdlCount++;
+    }
+  }
+
+  // Drop the Tracker row last so a partial failure earlier doesn't
+  // orphan the WO row with no marking items.
+  woSheet.deleteRow(woRowIdx + 1);
+
+  const logSheet = ss.getSheetByName('Automation Log');
+  if (logSheet) {
+    logSheet.appendRow([
+      new Date(), 'WO Tracker', 'WO deleted',
+      woId,
+      `Removed Tracker row + ${miDeleted} Marking Items row(s). ` +
+      `${wdlCount} Work Day Log row(s) preserved. ` +
+      `Drive archive folder preserved.`,
+      'Completed', '', 'No',
+    ]);
+  }
+  _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({
+    success: true,
+    marking_items_deleted: miDeleted,
+    work_day_log_preserved: wdlCount,
+  });
+}
+
+
+// ── action: edit_completed_wo ─────────────────────────────────
+//
+// Admin-driven update to an already-Completed WO. Three CFR-handling
+// modes:
+//   data_only:    skip CFR JSON regen entirely (typo / silent fix)
+//   replace_cfr:  regen JSON with original filename — Python merges
+//                 new CFR into archived WO PDF; on approve the
+//                 canonical WO_<woId>.pdf is replaced
+//   new_cfr:      regen JSON with _Updated_<asOfDate> filename suffix
+//                 — Python produces a separate filled PDF; archive
+//                 saves alongside (canonical preserved)
+//
+// Marking items are assumed already-edited via the live PATCH endpoint
+// (with preserve_completion=true so original Date Completed stays put).
+// This handler just (re-)writes the rollups and queues the CFR JSON if
+// requested. Optionally appends a Work Day Log row so the punch-order
+// rework counts toward sign-in / production-log queues for a given date.
+function handleEditCompletedWO_(body) {
+  const d = body.data || {};
+  const woId  = String(d.wo_id || '').trim();
+  const mode  = String(d.regen_mode || 'data_only').trim();
+  if (!woId)  return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (['data_only', 'replace_cfr', 'new_cfr'].indexOf(mode) === -1) {
+    return jsonResponse_({ error: 'Invalid regen_mode: ' + mode }, 400);
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData = woSheet.getDataRange().getValues();
+  let woRowIdx = -1;
+  for (let i = 1; i < woData.length; i++) {
+    if (String(woData[i][0] || '').trim() === woId) { woRowIdx = i; break; }
+  }
+  if (woRowIdx === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+  const woRow = woData[woRowIdx];
+
+  // ── Recompute marking rollups (cols 19-21) from current sheet state.
+  // No state-machine bump — completed WOs stay Completed regardless of
+  // what the marking rows now look like. Status changes go through the
+  // separate update_wo_status action.
+  const { data: markingData } = finalizeMarkingStatus_(ss, woId, _normalizeTrackerDate_(woRow[17]) || _normalizeTrackerDate_(woRow[16]));
+  const rollups = computeMarkingRollups_(ss, woId, markingData);
+
+  // Optionally append new issues (with date prefix matching the
+  // existing submit pattern at line 8113-8118).
+  const asOfDate = String(d.as_of_date || '').trim();
+  const newIssuesText = String(d.issues || '').trim();
+  const currentIssues = String(woRow[22] || '').trim();
+  let issuesOut = currentIssues;
+  if (newIssuesText) {
+    const prefix = asOfDate ? asOfDate + ': ' : '';
+    issuesOut = currentIssues
+      ? currentIssues + '\n' + prefix + newIssuesText
+      : prefix + newIssuesText;
+  }
+
+  const woValues = [
+    String(woRow[15] || 'Completed'),   // 15 Status (unchanged)
+    _normalizeTrackerDate_(woRow[16]),  // 16 Dispatch (unchanged)
+    _normalizeTrackerDate_(woRow[17]),  // 17 Work Start (unchanged)
+    _normalizeTrackerDate_(woRow[18]),  // 18 Work End (unchanged)
+    rollups.marking_types,              // 19
+    rollups.quantity_completed,         // 20
+    rollups.paint_material,             // 21
+    issuesOut,                          // 22
+    String(woRow[23] || ''),            // 23 Photos? (unchanged)
+  ];
+  writeRowWithProbing_(woSheet, woRowIdx + 1, 16, woValues,
+    ['Status', 'Dispatch Date', 'Work Start Date', 'Work End Date',
+     'Marking Types', 'Quantity Completed', 'Paint/Material',
+     'Issues Reported', 'Photos Uploaded?'],
+    'WO Tracker (edit completed)'
+  );
+
+  // Optionally log a new Work Day Log row so the work counts in
+  // sign-in / production-log queues for the given production_date.
+  let wdlAppended = false;
+  if (d.include_in_production && d.production_date) {
+    const prodDate = String(d.production_date).trim();
+    const wdlSheet = _getOrCreateWorkDayLogSheet_(ss);
+    appendRowWithProbing_(
+      wdlSheet,
+      [
+        prodDate,                                                       // 0 Date
+        woId,                                                           // 1 WO#
+        String(woRow[1] || ''),                                         // 2 Contractor
+        String(woRow[2] || ''),                                         // 3 Contract #
+        String(woRow[3] || ''),                                         // 4 Borough
+        String(woRow[5] || ''),                                         // 5 Location
+        new Date(),                                                     // 6 Submitted At
+        'Pending',                                                      // 7 Status
+      ],
+      ['Date', 'Work Order #', 'Prime Contractor', 'Contract #',
+       'Borough', 'Location', 'Submitted At', 'Status'],
+      'Work Day Log (edit completed)'
+    );
+    wdlAppended = true;
+  }
+
+  // CFR JSON queue. data_only → no work here.
+  let cfrFilename = null;
+  if (mode === 'replace_cfr' || mode === 'new_cfr') {
+    const originalDate = _normalizeTrackerDate_(woRow[18]) || _normalizeTrackerDate_(woRow[17]) || asOfDate;
+    const filenameSuffix = mode === 'new_cfr' && asOfDate ? `_Updated_${asOfDate}` : '';
+    cfrFilename = `CFR_${woId}_${originalDate}${filenameSuffix}.json`;
+    // Build the `d` shape generateContractorFieldReportJson_ expects.
+    // For replace mode: install_to stays the original work-end date so
+    // the regenerated CFR mirrors the original timeline. For new_cfr:
+    // install_to advances to the punch-rework date.
+    const synthD = {
+      wo_id: woId,
+      date: (mode === 'new_cfr' && asOfDate) ? asOfDate : originalDate,
+      issues: newIssuesText || '',
+      photos_uploaded: String(woRow[23] || '').toLowerCase() === 'yes',
+    };
+    generateContractorFieldReportJson_(synthD, woRow, ss, '', { filename: cfrFilename });
+  }
+
+  // Audit
+  const logSheet = ss.getSheetByName('Automation Log');
+  if (logSheet) {
+    const note = `mode=${mode}` +
+      (wdlAppended ? `, WDL row appended for ${d.production_date}` : '') +
+      (cfrFilename ? `, CFR JSON queued: ${cfrFilename}` : '');
+    logSheet.appendRow([
+      new Date(), 'WO Tracker', 'Completed WO edited',
+      woId, note, 'Completed', '', 'No',
+    ]);
+  }
+
+  _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({
+    success: true,
+    mode,
+    wdl_appended: wdlAppended,
+    cfr_filename: cfrFilename,
+  });
 }
 
 
@@ -8419,7 +8709,7 @@ function aggregateMarkingItemsForCFR_(ss, woId) {
  * for this WO (includes the current submit's issues). Built by
  * handleSubmitFieldReport_ as newIssues.
  */
-function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
+function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues, opts) {
   const props          = PropertiesService.getScriptProperties();
   const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
   if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
@@ -8535,7 +8825,11 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues) {
   };
 
   const isoDate  = (d.date || '').slice(0, 10) || 'unknown';
-  const fileName = `CFR_${d.wo_id}_${isoDate}.json`;
+  // Default filename matches what handleFinalizeFieldReportDocs_ emits.
+  // Callers from the admin "edit completed WO" path pass a custom name
+  // — used for save-as-new mode to add a `_Updated_<date>` suffix so
+  // the regenerated PDF doesn't replace the canonical archived WO doc.
+  const fileName = (opts && opts.filename) ? opts.filename : `CFR_${d.wo_id}_${isoDate}.json`;
 
   // Overwrite any existing file with the same name (re-submit of the
   // completion day is idempotent — same payload, same filename).

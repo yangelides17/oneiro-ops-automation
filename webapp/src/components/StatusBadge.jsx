@@ -3,6 +3,7 @@ const STYLES = {
   'dispatched':  'bg-amber-50  text-amber-700  border-amber-200',
   'in progress': 'bg-orange-50 text-orange-700 border-orange-200',
   'completed':   'bg-green-50  text-green-700  border-green-200',
+  'returned':    'bg-purple-50 text-purple-700 border-purple-200',
 }
 
 export default function StatusBadge({ status }) {
