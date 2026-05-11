@@ -4941,6 +4941,25 @@ function archiveWOFile_(fileId, d) {
     file.makeCopy(file.getName(), woFolder);
     file.setTrashed(true);  // delete from Scan Inbox — archive is the single source of truth
 
+    // Cache the WO folder URL on the Tracker row (col 43 / 0-idx 42)
+    // so the dashboard + Field Report panel can render the "View WO"
+    // link without paying a Drive walk. getWOFolder_ has the same
+    // side-effect for downstream archives, but the scan-upload path
+    // bypasses it and historically left col 43 blank until a
+    // downstream doc was filed. Wrapped in try/catch — cache failure
+    // must never break the upload pipeline.
+    try {
+      const woSheet = ss.getSheetByName('Work Order Tracker');
+      ensureWoTrackerExtraCols_(woSheet);
+      const woData  = woSheet.getDataRange().getValues();
+      const rowIdx  = woData.findIndex(r => String(r[0] || '').trim() === d.work_order_id);
+      if (rowIdx > 0 && !woData[rowIdx][42]) {
+        woSheet.getRange(rowIdx + 1, 43).setValue(woFolder.getUrl());
+      }
+    } catch (e) {
+      Logger.log('⚠️ archiveWOFile_: failed to cache Archive Folder URL for ' + woId + ': ' + e.message);
+    }
+
     const pathNote = `${contractor}/${contractNum}${borough ? ' - ' + getBoroughName_(borough) : ''}/${d.work_order_id} - ${location}`;
     Logger.log('📁 WO PDF archived: ' + woId + ' → ' + pathNote);
     if (logSheet) logSheet.appendRow([
@@ -8586,6 +8605,15 @@ function _buildDashboardPayload_() {
     return v == null ? '' : String(v);
   };
 
+  // Lookup so the fallback Drive-walk path can write the resolved URL
+  // back to the WO row. The map below loses the original allRows index;
+  // this precomputes it so we can find the right row for the setValue.
+  const rowIdxByWoId = {};
+  for (let i = 1; i < allRows.length; i++) {
+    const id = String(allRows[i][0] || '').trim();
+    if (id) rowIdxByWoId[id] = i;
+  }
+
   const wos = allRows.slice(1)
     .filter(r => r[0])   // skip blank rows
     .map(r => {
@@ -8596,7 +8624,21 @@ function _buildDashboardPayload_() {
       let folderUrl = String(r[42] || '').trim() || null;
       if (!folderUrl && archiveRoot) {
         const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
-        if (folder) folderUrl = folder.getUrl();
+        if (folder) {
+          folderUrl = folder.getUrl();
+          // Self-heal: cache the URL on the row so we don't pay the
+          // ~150ms Drive walk again on the next dashboard refresh.
+          // Wrapped in try/catch — cache failure must never break the
+          // dashboard read.
+          try {
+            const rowIdx = rowIdxByWoId[woId];
+            if (rowIdx != null) {
+              woSheet.getRange(rowIdx + 1, 43).setValue(folderUrl);
+            }
+          } catch (e) {
+            Logger.log('⚠️ dashboard folder-url cache write failed for ' + woId + ': ' + e.message);
+          }
+        }
       }
       // Per-doc-type lifecycle flags. Only CFR + Invoice still live
       // on the WO row. PL/SI/CP moved to the Doc Lifecycle Log; their
