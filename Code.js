@@ -7965,6 +7965,35 @@ function handleGetActiveWOs_() {
  *   17  Work Start Date    21  Paint/Material Used
  *   18  Work End Date      22  Issues Reported
  */
+
+// Normalize whatever's in a Tracker date cell down to a YYYY-MM-DD
+// string. Handles:
+//   - Date objects (Sheets stores dates this way when a cell is typed
+//     to "Date" — typically because someone manually typed e.g. "5/5"
+//     and Sheets auto-coerced it).
+//   - "Tue May 05 2026 00:00:00 GMT-…" long-strings (the artifact of
+//     a previous submit that did `String(dateObject)` and persisted
+//     the result). The dayname/monthname/year regex anchors so we only
+//     touch strings that smell like Date.toString() output — anything
+//     else passes through.
+//   - Already-canonical YYYY-MM-DD strings — passed through verbatim.
+//   - Empty / falsy — returns ''.
+function _normalizeTrackerDate_(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  }
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if (/^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+\w{3}\s+\d{1,2}\s+\d{4}\b/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+  }
+  return s;
+}
+
 function handleSubmitFieldReport_(body) {
   const d = body.data || {};
 
@@ -8027,9 +8056,16 @@ function handleSubmitFieldReport_(body) {
 
   // Status: Received → Dispatched → In Progress → Complete
   const currentStatus    = String(woRow[15] || 'Received');
-  const currentDispatch  = woRow[16] ? String(woRow[16]) : '';
-  const currentWorkStart = woRow[17] ? String(woRow[17]) : '';
-  const currentWorkEnd   = woRow[18] ? String(woRow[18]) : '';
+  // Read existing date columns through a normalizer so a stale "Date
+  // object" cell (typical when someone manually typed a date in Sheets
+  // and Sheets auto-coerced it to a date type) doesn't get written
+  // back as "Tue May 05 2026 00:00:00 GMT-…". The normalizer accepts
+  // either a Date object or a long-format String, and emits YYYY-MM-DD.
+  // Self-healing: any row touched by a future Field Report submit
+  // gets its dispatch/work_start/work_end repaired in place.
+  const currentDispatch  = _normalizeTrackerDate_(woRow[16]);
+  const currentWorkStart = _normalizeTrackerDate_(woRow[17]);
+  const currentWorkEnd   = _normalizeTrackerDate_(woRow[18]);
   const currentIssues    = String(woRow[22] || '').trim();
 
   // Auto-derive dates from Date of Work when not already recorded.
