@@ -633,8 +633,10 @@ export default function DocStatusTab() {
   const [pendingItem, setPendingItem] = useState(null)
 
   // Push the pending count into the shared context so the Doc Status
-  // tab in Dashboard's TabStrip can show a badge. Only updates when
-  // this tab is active (since we only fetch when active).
+  // tab in Dashboard's TabStrip can show a badge. Sourced via useEffect
+  // on `data` (not from inside load) so the flip path — which mutates
+  // data optimistically + triggers a background refetch — also keeps
+  // the badge in sync.
   const { setCount } = usePendingCounts()
 
   const load = async (iso) => {
@@ -643,7 +645,6 @@ export default function DocStatusTab() {
     try {
       const d = await fetchDocStatus(iso)
       setData(d)
-      setCount('doc_status_pending', (d?.pending || []).length)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -651,6 +652,14 @@ export default function DocStatusTab() {
     }
   }
   useEffect(() => { load(monthIso) }, [monthIso])
+
+  // Keep the Doc Status nav badge in sync with whatever's currently in
+  // data.pending — covers load (mount + month change) AND the flip
+  // handler's background refetch.
+  useEffect(() => {
+    if (data == null) return
+    setCount('doc_status_pending', (data.pending || []).length)
+  }, [data, setCount])
 
   // Optimistic flip + revert on failure
   const flip = async (docId, flag, value) => {
