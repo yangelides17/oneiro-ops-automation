@@ -3203,6 +3203,8 @@ function doPost(e) {
       return handleListPendingApprovals_(body);
     } else if (action === 'get_pending_counts') {
       return handleGetPendingCounts_(body);
+    } else if (action === 'get_doc_status_pending_count') {
+      return handleGetDocStatusPendingCount_(body);
     } else if (action === 'get_drive_file_bytes') {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
@@ -3717,6 +3719,27 @@ function handleGetPendingCounts_(_body) {
     approved_docs_pending,
     signins_pending,
   });
+}
+
+
+// ── action: get_doc_status_pending_count ──────────────────────
+//
+// Heavier cousin of get_pending_counts split out so cold-start can
+// fetch it in parallel from the webapp without making the fast counts
+// wait. Builds the same payload _buildDocStatusPayload_ produces for
+// the current month and returns just the pending-list length. The
+// pending list itself is all-time (oldest first); the month arg only
+// scopes the calendar cells, which we discard.
+function handleGetDocStatusPendingCount_(_body) {
+  try {
+    const monthIso = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM');
+    const payload  = _buildDocStatusPayload_(monthIso);
+    const n = Array.isArray(payload && payload.pending) ? payload.pending.length : 0;
+    return jsonResponse_({ doc_status_pending: n });
+  } catch (e) {
+    Logger.log('get_doc_status_pending_count error: ' + e.message);
+    return jsonResponse_({ doc_status_pending: null, error: e.message });
+  }
 }
 
 

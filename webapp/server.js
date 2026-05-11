@@ -465,6 +465,22 @@ app.get('/api/pending-counts', async (_req, res) => {
 })
 
 /**
+ * GET /api/pending-counts/doc-status
+ * Heavier sibling of /api/pending-counts that builds the Doc Status
+ * payload to derive its pending count. Fired in parallel with the
+ * cheap counts so nav badges don't have to wait on it.
+ */
+app.get('/api/pending-counts/doc-status', async (_req, res) => {
+  try {
+    const data = await callAppsScript('get_doc_status_pending_count')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/pending-counts/doc-status error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/approvals/:fileId/pdf
  * Streams the raw PDF bytes for a pending-approval file. Apps Script
  * returns base64; we decode and send as application/pdf so react-pdf

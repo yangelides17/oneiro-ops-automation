@@ -126,15 +126,22 @@ function Header() {
   )
 }
 
-// Cold-start fetch: populate the three cheap nav-badge counts so a
-// fresh visitor on Field Report / Scan WO still sees pending work in
-// the nav. Pages with their own queue fetches will overwrite their
-// matching slot afterwards. No polling — counts refresh as the user
-// navigates between queue pages.
+// Cold-start fetches: populate all four nav-badge counts so a fresh
+// visitor on any page sees pending work in the nav. Two requests fire
+// in parallel:
+//   1. /api/pending-counts (fast, ~300 ms) — Approvals + Sign-In +
+//      Approved Docs counts. Drives the always-visible nav badges.
+//   2. /api/pending-counts/doc-status (slower, ~500 ms-1.5 s) — Doc
+//      Status pending count. Drives the Doc Status tab badge. Slow
+//      because it runs the same _buildDocStatusPayload_ the calendar
+//      uses; split out so the fast badges don't wait on it.
+// Pages with their own queue fetches will still overwrite their
+// matching slot afterwards — no polling.
 function ColdStartCounts() {
   const { setCount } = usePendingCounts()
   useEffect(() => {
     let cancelled = false
+
     fetch('/api/pending-counts')
       .then(r => r.ok ? r.json() : Promise.reject(r))
       .then(d => {
@@ -144,11 +151,23 @@ function ColdStartCounts() {
         if (d?.signins_pending       !== undefined) setCount('signins_pending',       d.signins_pending)
       })
       .catch(err => {
-        // Cold-start failure is non-fatal — pages with their own queue
-        // fetches still populate counts. Just log so we notice if the
-        // proxy is wedged.
         console.warn('cold-start /api/pending-counts failed:', err)
       })
+
+    fetch('/api/pending-counts/doc-status')
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then(d => {
+        if (cancelled) return
+        if (d?.doc_status_pending !== undefined) {
+          setCount('doc_status_pending', d.doc_status_pending)
+        }
+      })
+      .catch(err => {
+        // Non-fatal — the DocStatusTab will populate this slot when
+        // the user visits Dashboard, same as before.
+        console.warn('cold-start /api/pending-counts/doc-status failed:', err)
+      })
+
     return () => { cancelled = true }
   }, [setCount])
   return null
