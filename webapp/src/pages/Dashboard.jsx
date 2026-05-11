@@ -512,6 +512,12 @@ export default function Dashboard() {
   const [search,     setSearch]     = useState('')
   const [lastRefresh,setLastRefresh]= useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
+  // Pagination: how many WO rows to render at once. Mostly an
+  // initial-render perf knob — the API still returns the full list in
+  // one shot, so backend latency is unchanged. Reduces DOM nodes by
+  // ~10× on a typical Tracker, which keeps the table feeling snappy.
+  const WO_PAGE_SIZE = 20
+  const [visibleCount, setVisibleCount] = useState(WO_PAGE_SIZE)
 
   // Toggle / clear helpers for the multi-select filter Sets.
   // toggleX adds opt if missing, removes if present. clearX empties.
@@ -772,6 +778,9 @@ export default function Dashboard() {
           contractors={contractors}
           boroughs={boroughs}
           filteredWOs={filteredWOs}
+          visibleCount={visibleCount}
+          onShowMore={() => setVisibleCount(c => c + WO_PAGE_SIZE)}
+          onShowAll={() => setVisibleCount(filteredWOs.length)}
           completedTodayLabel={COMPLETED_TODAY}
           onDocsChange={onDocsChange}
         />
@@ -799,6 +808,7 @@ function OperationsTabContent({
   boroughFilt, toggleBorough, clearBorough,
   contractors, boroughs,
   filteredWOs,
+  visibleCount, onShowMore, onShowAll,
   completedTodayLabel,
   onDocsChange,
 }) {
@@ -951,7 +961,10 @@ function OperationsTabContent({
           </div>
 
           <p className="text-xs text-slate-400">
-            Showing {filteredWOs.length} of {data?.wos?.length ?? 0} work orders
+            Showing {Math.min(visibleCount, filteredWOs.length)} of {filteredWOs.length} work orders
+            {filteredWOs.length !== (data?.wos?.length ?? 0) && (
+              <> · {data?.wos?.length ?? 0} total</>
+            )}
           </p>
         </div>
 
@@ -979,7 +992,7 @@ function OperationsTabContent({
                   </td>
                 </tr>
               ) : (
-                filteredWOs.map(wo => (
+                filteredWOs.slice(0, visibleCount).map(wo => (
                   <WORow
                     key={wo.id}
                     wo={wo}
@@ -991,6 +1004,26 @@ function OperationsTabContent({
             </tbody>
           </table>
         </div>
+
+        {/* Expand footer — only render when there's more to reveal. */}
+        {filteredWOs.length > visibleCount && (
+          <div className="flex items-center justify-center gap-3 pt-3 text-sm">
+            <button
+              type="button"
+              onClick={onShowMore}
+              className="btn-outline text-xs px-4 py-1.5"
+            >
+              Show {Math.min(20, filteredWOs.length - visibleCount)} more
+            </button>
+            <button
+              type="button"
+              onClick={onShowAll}
+              className="text-xs font-semibold text-navy hover:underline"
+            >
+              Show all {filteredWOs.length}
+            </button>
+          </div>
+        )}
       </div>
     </>
   )
