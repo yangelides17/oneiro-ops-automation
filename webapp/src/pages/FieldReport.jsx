@@ -504,6 +504,23 @@ function WOPanel({ wo }) {
           <span className="text-sm text-slate-700 font-medium">{v}</span>
         </div>
       ))}
+      {/* Quick-access link to the WO's Drive folder — same destination
+          as the 📁 icon on the WO Tracker tab. Hidden if the folder URL
+          isn't cached on the row yet (Apps Script falls back to null). */}
+      {wo.folder_url && (
+        <div className="pt-1.5">
+          <a
+            href={wo.folder_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-navy
+                       hover:underline"
+          >
+            <span aria-hidden>📁</span>
+            View WO &amp; plan docs in Drive
+          </a>
+        </div>
+      )}
     </div>
   )
 }

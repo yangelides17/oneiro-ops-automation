@@ -7917,7 +7917,12 @@ function handleGetActiveWOs_() {
       water_blast_confirmed:   String(r[13] || ''),
       status:                  String(r[15]),
       dispatch_date:           String(r[16] || ''),
-      work_start_date:         String(r[17] || '')
+      work_start_date:         String(r[17] || ''),
+      // Drive folder URL — same source the WO Tracker uses for its
+      // 📁 link. Field Report page surfaces this as a "View WO in
+      // Drive" link so crew leads can pull up the scanned WO + plan
+      // docs without navigating away.
+      folder_url:              String(r[42] || '').trim() || null,
     }))
     .sort((a, b) => {
       const aO = ORDER[a.status.toLowerCase()] ?? 99;
@@ -8284,8 +8289,12 @@ function mapCategoryToCFR_(category) {
     'Bike Lane Arrow':    'Bike Lane Arrows',
     'Bike Lane Symbol':   'Bike Lane Symbols',
   };
-  // Grid-only categories — never in top table
-  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1, 'Stop Msg': 1 };
+  // Grid-only categories — no top-table cell in the CFR template for
+  // these. Stop Msg used to live here but the CFR has BOTH a top-table
+  // roll-up cell (page0_field23) AND a per-intersection grid cell, so
+  // it gets aggregated into the top_table dict and additionally split
+  // per-intersection in the grid loop below.
+  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1 };
 
   const c = String(category || '').trim();
   if (!c) return null;
