@@ -433,6 +433,9 @@ app.post('/api/wo/:woId/edit-completed', async (req, res) => {
       regen_mode:             req.body?.regen_mode || 'data_only',
       include_in_production:  !!req.body?.include_in_production,
       production_date:        req.body?.production_date || '',
+      marking_edits:          Array.isArray(req.body?.marking_edits)   ? req.body.marking_edits   : [],
+      marking_adds:           Array.isArray(req.body?.marking_adds)    ? req.body.marking_adds    : [],
+      marking_deletes:        Array.isArray(req.body?.marking_deletes) ? req.body.marking_deletes : [],
     })
     res.json(data)
   } catch (err) {

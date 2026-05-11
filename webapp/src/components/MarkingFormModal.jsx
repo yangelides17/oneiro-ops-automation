@@ -36,19 +36,25 @@ const DIRECTIONS = ['', 'N', 'E', 'S', 'W']
  *   workType         — 'MMA' | 'Thermo' | '' — drives layout fallback
  *   wo_intersections — string[] of distinct intersection names (in WO order)
  *   wo_betweens      — string[] of derived "X – Y" between-pairs
- *   editCompletedMode — when true (admin editing a Completed WO),
- *                       PATCH bodies include preserve_completion=true so
- *                       the server doesn't reopen the row to Pending or
- *                       clear Date Completed on field changes. The
- *                       parent's edit-completed handler stamps the
- *                       date based on the production-day toggle.
+ *   deferred         — when true (admin editing a Completed WO), the
+ *                       modal does NOT call the network. It builds the
+ *                       full item object client-side and returns it via
+ *                       onSaved. Parent buffers the change; everything
+ *                       flushes in one batched call on save mode click.
+ *                       Lets the user revert or abandon the edit session
+ *                       without leaving partial state on the server.
+ *   tempIdFactory    — () => string — used when `deferred` + add mode to
+ *                       mint a stable client-side ID like "_temp_3".
+ *                       Required when deferred=true & mode==='add'.
  *   onClose          — close without saving
  *   onSaved          — (updatedItem) => void   — called after a successful API call
+ *                       (or, in deferred mode, with the locally-built item)
  */
 export default function MarkingFormModal({
   mode, item, woId, workType,
   wo_intersections = [], wo_betweens = [],
-  editCompletedMode = false,
+  deferred = false,
+  tempIdFactory,
   onClose, onSaved,
 }) {
   const isEdit          = mode === 'edit'
@@ -124,18 +130,38 @@ export default function MarkingFormModal({
 
     setSaving(true)
     try {
+      // Deferred path: build the item object locally and return it via
+      // onSaved. No network call — the parent buffers the change in its
+      // markingItems state and flushes the diff to the server on save
+      // mode click. Cancel just discards.
+      if (deferred) {
+        if (isEdit) {
+          const merged = { ...item, ...payload }
+          onSaved?.(merged)
+        } else {
+          if (!tempIdFactory) throw new Error('Internal: tempIdFactory required for deferred add')
+          const newItem = {
+            item_id:        tempIdFactory(),
+            work_order_id:  woId,
+            work_type:      workType || '',
+            section:        'Manual',
+            ...payload,
+            date_completed: '',
+            status:         'Pending',
+            added_by:       'Manual',
+          }
+          onSaved?.(newItem)
+        }
+        setSaving(false)
+        return
+      }
+
       let res
       if (isEdit) {
-        // editCompletedMode = the admin is editing a Completed WO; pass
-        // preserve_completion=true so the backend doesn't reopen the row
-        // to Pending or clear Date Completed on this change.
-        const patchBody = editCompletedMode
-          ? { ...payload, preserve_completion: true }
-          : payload
         res = await fetch(`/api/marking-items/${encodeURIComponent(item.item_id)}`, {
           method:  'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify(patchBody),
+          body:    JSON.stringify(payload),
         })
       } else {
         res = await fetch('/api/marking-items', {

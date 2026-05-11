@@ -8142,12 +8142,147 @@ function handleEditCompletedWO_(body) {
   const asOfDate = String(d.as_of_date || '').trim();
   const includeInProduction = !!d.include_in_production;
   const productionDate = String(d.production_date || '').trim();
-  const touchedIds = Array.isArray(d.touched_item_ids)
-    ? d.touched_item_ids.map(x => String(x).trim()).filter(Boolean)
-    : [];
+
+  // ── Batched marking-item changes ─────────────────────────────
+  // Frontend buffers ALL marking edits while the admin is in edit mode
+  // (no live PATCHes). On save mode click, the buffer is shipped here
+  // as three lists. Apply in order: deletes → edits → adds. This keeps
+  // index shifts predictable and ensures every newly-added row picks
+  // up an ID after the deletes have happened.
+  const editsIn   = Array.isArray(d.marking_edits)   ? d.marking_edits   : [];
+  const addsIn    = Array.isArray(d.marking_adds)    ? d.marking_adds    : [];
+  const deletesIn = Array.isArray(d.marking_deletes) ? d.marking_deletes : [];
+
+  const miSheet = ss.getSheetByName('Marking Items');
+  if (!miSheet) return jsonResponse_({ error: 'Marking Items sheet missing' }, 500);
+
+  // Column indices (1-indexed for setValue):
+  //   E5 Category, F6 Intersection, G7 Direction, H8 Description,
+  //   I9 Quantity, J10 Unit, K11 Color/Material, L12 Date Completed,
+  //   M13 Status, O15 Notes.
+  const MI_COL = {
+    work_type: 3, section: 4, category: 5, intersection: 6, direction: 7,
+    description: 8, quantity: 9, unit: 10, color_material: 11,
+    date_completed: 12, status: 13, notes: 15,
+  };
+
+  // 1) DELETES — bottom-up so row indices stay stable. Defensive: skip
+  //    rows that don't belong to this WO.
+  const deletedIds = [];
+  if (deletesIn.length > 0) {
+    const deleteSet = {};
+    deletesIn.forEach(id => { deleteSet[String(id).trim()] = true; });
+    const miData = miSheet.getDataRange().getValues();
+    for (let i = miData.length - 1; i >= 1; i--) {
+      const itemId = String(miData[i][0] || '').trim();
+      if (!deleteSet[itemId]) continue;
+      if (String(miData[i][1] || '').trim() !== woId) continue;  // defensive
+      miSheet.deleteRow(i + 1);
+      deletedIds.push(itemId);
+    }
+    if (deletedIds.length) SpreadsheetApp.flush();
+  }
+
+  // 2) EDITS — per-field writes. Skipping the reopen-on-change rule
+  //    `handleUpdateMarkingItem_` applies in normal mode: in the
+  //    edit-completed context Date Completed semantics come from the
+  //    production toggle below, not from this loop.
+  const editedIds = [];
+  if (editsIn.length > 0) {
+    const miData = miSheet.getDataRange().getValues();
+    const rowByItemId = {};
+    for (let i = 1; i < miData.length; i++) {
+      const id = String(miData[i][0] || '').trim();
+      if (id && String(miData[i][1] || '').trim() === woId) {
+        rowByItemId[id] = i + 1;
+      }
+    }
+    editsIn.forEach(patch => {
+      const itemId = String(patch && patch.item_id || '').trim();
+      if (!itemId) return;
+      const sheetRow = rowByItemId[itemId];
+      if (!sheetRow) return;
+      // Write each changed column. Unit/category coupling (unitForCategory_)
+      // is enforced client-side via MarkingFormModal already.
+      ['work_type','section','category','intersection','direction',
+       'description','unit','color_material','notes'].forEach(key => {
+        if (patch[key] === undefined) return;
+        miSheet.getRange(sheetRow, MI_COL[key]).setValue(String(patch[key] || '').trim());
+      });
+      if (patch.quantity !== undefined) {
+        const q = parseFloat(patch.quantity);
+        const hasQty = !isNaN(q) && q > 0;
+        miSheet.getRange(sheetRow, MI_COL.quantity).setValue(hasQty ? q : '');
+        // Zeroing qty out IS an explicit "didn't get done" — fall back
+        // to the original revert-to-Pending behavior so rollups stay
+        // honest. preserve_completion has no effect on this branch.
+        if (!hasQty) {
+          miSheet.getRange(sheetRow, MI_COL.status).setValue('Pending');
+          miSheet.getRange(sheetRow, MI_COL.date_completed).setValue('');
+        }
+      }
+      editedIds.push(itemId);
+    });
+    if (editedIds.length) SpreadsheetApp.flush();
+  }
+
+  // 3) ADDS — append new rows. Status=Pending, Date Completed=blank;
+  //    `finalizeMarkingStatus_` below promotes them to Completed using
+  //    finalizeDate when Quantity > 0. New IDs continue the WO's
+  //    existing item-number sequence.
+  const addedIds = [];
+  if (addsIn.length > 0) {
+    const miData = miSheet.getDataRange().getValues();
+    let maxN = 0;
+    let woWorkTypeFromExisting = '';
+    for (let i = 1; i < miData.length; i++) {
+      const id = String(miData[i][0] || '');
+      if (id.indexOf(woId + '-') !== 0) continue;
+      if (!woWorkTypeFromExisting) woWorkTypeFromExisting = String(miData[i][2] || '');
+      const n = parseInt(id.split('-').pop(), 10);
+      if (!isNaN(n) && n > maxN) maxN = n;
+    }
+    const pad3 = (x) => String(x).padStart(3, '0');
+    const rows = addsIn.map((item, idx) => {
+      const qty    = parseFloat(item.quantity);
+      const hasQty = !isNaN(qty) && qty > 0;
+      const cat    = String(item.category || '').trim();
+      const lockedUnit = unitForCategory_(cat);
+      const finalUnit  = lockedUnit || String(item.unit || 'EA').trim();
+      const newId = `${woId}-${pad3(maxN + idx + 1)}`;
+      addedIds.push(newId);
+      return [
+        newId,                                            // A Item ID
+        woId,                                             // B Work Order #
+        String(item.work_type || woWorkTypeFromExisting || ''),  // C Work Type
+        String(item.section || 'Manual'),                 // D WO Section
+        cat,                                              // E Marking Type
+        String(item.intersection || '').trim(),           // F Intersection
+        String(item.direction || '').trim(),              // G Direction
+        String(item.description || '').trim(),            // H Description
+        hasQty ? qty : '',                                // I Quantity
+        finalUnit,                                        // J Unit
+        String(item.color_material || '').trim(),         // K Color/Material
+        '',                                               // L Date Completed (finalize fills in)
+        'Pending',                                        // M Status (finalize promotes if hasQty)
+        'Manual',                                         // N Added By
+        String(item.notes || '').trim(),                  // O Notes
+      ];
+    });
+    if (rows.length > 0) {
+      const startRow = miSheet.getLastRow() + 1;
+      miSheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  // Derive touchedIds for the production-date override below — edited
+  // existing items + newly-added items (the ones whose date should
+  // bucket into production_date if checked).
+  const touchedIds = editedIds.concat(addedIds);
 
   // finalizeDate drives Date Completed for items that get promoted
-  // Pending → Completed during this update (newly-added items always
+  // Pending → Completed during this update (newly-added items above
   // start Pending), the prefix on appended Issues lines, and the
   // touched-already-Completed override below.
   //
@@ -8172,24 +8307,22 @@ function handleEditCompletedWO_(body) {
   // as production for production_date. Overwrite Date Completed on
   // every touched, already-Completed item so they bucket into that day
   // — finalize only handles the Pending → Completed transition; items
-  // already Completed kept their original date via preserve_completion.
-  // Items NOT in touched_ids are left alone (admin didn't touch them).
+  // already Completed pre-edit kept their original date.
+  // Items NOT in touchedIds (= un-touched existing items) are left
+  // alone — admin didn't edit them, no reason to re-bucket.
   if (includeInProduction && productionDate && touchedIds.length > 0) {
-    const miSheet = ss.getSheetByName('Marking Items');
-    if (miSheet) {
-      const miData = markingData || miSheet.getDataRange().getValues();
-      const touchedSet = {};
-      touchedIds.forEach(id => { touchedSet[id] = true; });
-      for (let i = 1; i < miData.length; i++) {
-        const r = miData[i];
-        if (String(r[1] || '').trim() !== woId) continue;
-        if (!touchedSet[String(r[0] || '').trim()]) continue;
-        if (String(r[12] || '') !== 'Completed') continue;
-        miSheet.getRange(i + 1, 12).setValue(productionDate);
-        r[11] = productionDate;
-      }
-      SpreadsheetApp.flush();
+    const miData2 = markingData || miSheet.getDataRange().getValues();
+    const touchedSet = {};
+    touchedIds.forEach(id => { touchedSet[id] = true; });
+    for (let i = 1; i < miData2.length; i++) {
+      const r = miData2[i];
+      if (String(r[1] || '').trim() !== woId) continue;
+      if (!touchedSet[String(r[0] || '').trim()]) continue;
+      if (String(r[12] || '') !== 'Completed') continue;
+      miSheet.getRange(i + 1, 12).setValue(productionDate);
+      r[11] = productionDate;
     }
+    SpreadsheetApp.flush();
   }
   const rollups = computeMarkingRollups_(ss, woId, markingData);
 
@@ -8271,8 +8404,10 @@ function handleEditCompletedWO_(body) {
   // Audit
   const logSheet = ss.getSheetByName('Automation Log');
   if (logSheet) {
-    const note = `mode=${mode}` +
-      (wdlAppended ? `, WDL row appended for ${d.production_date}` : '') +
+    const note =
+      `mode=${mode}` +
+      `, marking_changes=edits:${editedIds.length}/adds:${addedIds.length}/deletes:${deletedIds.length}` +
+      (wdlAppended ? `, WDL row appended for ${productionDate}` : '') +
       (cfrFilename ? `, CFR JSON queued: ${cfrFilename}` : '');
     logSheet.appendRow([
       new Date(), 'WO Tracker', 'Completed WO edited',
@@ -8286,6 +8421,11 @@ function handleEditCompletedWO_(body) {
     mode,
     wdl_appended: wdlAppended,
     cfr_filename: cfrFilename,
+    marking_changes: {
+      edited:  editedIds.length,
+      added:   addedIds.length,
+      deleted: deletedIds.length,
+    },
   });
 }
 

@@ -125,7 +125,7 @@ function Field({ label, required, hint, children }) {
 // (or a placeholder), clicking opens a panel with a dedicated search
 // input above a scrollable list. No free-text on the trigger — picking
 // from the list is the only way to set the WO.
-function WOCombobox({ wos, selectedWOId, onSelect }) {
+function WOCombobox({ wos, selectedWOId, onSelect, disabled = false, disabledTitle = '' }) {
   const [open, setOpen]   = useState(false)
   const [query, setQuery] = useState('')
   const wrapRef   = useRef(null)
@@ -175,19 +175,26 @@ function WOCombobox({ wos, selectedWOId, onSelect }) {
           .includes(trimmed)
       )
 
+  // Force-close the panel any time the combobox becomes disabled (e.g.
+  // admin entered completed-WO edit mode while the dropdown was open).
+  useEffect(() => { if (disabled) setOpen(false) }, [disabled])
+
   return (
     <div ref={wrapRef} className="relative">
       <button
         type="button"
-        onClick={() => setOpen(o => !o)}
-        className="field-input w-full text-left flex items-center justify-between"
+        onClick={() => { if (!disabled) setOpen(o => !o) }}
+        disabled={disabled}
+        title={disabled ? disabledTitle : undefined}
+        className={`field-input w-full text-left flex items-center justify-between
+                    ${disabled ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
       >
-        <span className={selected ? 'text-slate-800 truncate' : 'text-slate-400'}>
+        <span className={selected ? (disabled ? 'truncate' : 'text-slate-800 truncate') : 'text-slate-400'}>
           {selected ? labelOf(selected) : '— Choose or search Work Order —'}
         </span>
         <span className="text-slate-400 text-xs ml-2 flex-shrink-0">▾</span>
       </button>
-      {open && (
+      {open && !disabled && (
         <div className="absolute z-30 mt-1 left-0 right-0 bg-white rounded-xl shadow-lg border border-slate-200 overflow-hidden">
           <div className="p-2 border-b border-slate-100">
             <input
@@ -744,26 +751,118 @@ export default function FieldReport() {
   // update to flush. Read once + reset inside doSubmit.
   const completeOverrideRef = useRef(null)
   // Completed-WO edit mode. When the loaded WO is Completed, the page
-  // opens read-only with a banner. Clicking Edit flips this to true so
-  // marking-item rows unlock and the bottom of the form swaps in the
-  // Update panel (Data Only / Replace CFR / Save as New). PATCHes
-  // routed through saveField include preserve_completion=true while
-  // edit mode is on so inline edits don't wipe Date Completed.
+  // opens read-only with a banner. Clicking Edit:
+  //   - snapshots the current marking items into `originalItems`
+  //   - flips editMode → true
+  //   - unlocks marking-item rows (forceUnlock) + the bottom Update panel
+  //
+  // In edit mode every inline edit / modal save / kebab delete BUFFERS
+  // client-side into the live `markingItems` state. NOTHING hits the
+  // server until the admin clicks one of the three save mode buttons
+  // (Save Data Only / Replace CFR / Save as New CFR). On Cancel — or
+  // a beforeunload abandonment — the diff is discarded and the WO is
+  // untouched on the server.
   const [editMode, setEditMode] = useState(false)
-  // Track marking-item IDs touched during the current edit session so
-  // the server can stamp Date Completed = production_date on them when
-  // the user checks "Include in production" + clicks save. Items NOT
-  // in this set keep whatever date they had before the edit.
-  const [touchedItemIds, setTouchedItemIds] = useState(() => new Set())
-  const markItemTouched = (itemId) => {
-    if (!editMode) return
-    setTouchedItemIds(prev => {
-      if (prev.has(itemId)) return prev
-      const next = new Set(prev)
-      next.add(itemId)
-      return next
-    })
+  const [originalItems, setOriginalItems] = useState(null)  // snapshot or null
+  // Used to mint client-side IDs for items created via "+ Add manually"
+  // in edit mode. Format: "_temp_<n>" — recognisable by both the diff
+  // computer and the server-side batched add logic. Real IDs come back
+  // after refetchMarkings post-save.
+  const tempIdCounterRef = useRef(0)
+  const nextTempId = () => `_temp_${++tempIdCounterRef.current}`
+
+  // Cancel-confirm modal for "Discard N changes?" — null = closed,
+  // otherwise { count }.
+  const [editCancelConfirm, setEditCancelConfirm] = useState(null)
+
+  // Build the { adds, edits, deletes } diff between the snapshot taken
+  // on Edit click and the live markingItems state.
+  //   adds:    items with _temp_ IDs (locally created)
+  //   edits:   real-IDed items whose comparable fields differ from snapshot
+  //   deletes: real-IDed items in snapshot but not in current
+  // Newly-added items deleted within the session disappear entirely
+  // (they never had a server-side row, so no DELETE call needed).
+  const computeBufferDiff = () => {
+    if (!originalItems) return { adds: [], edits: [], deletes: [] }
+    const origMap = new Map(originalItems.map(i => [i.item_id, i]))
+    const currMap = new Map(markingItems.map(i => [i.item_id, i]))
+    const FIELDS = ['category','intersection','direction','description',
+                    'quantity','unit','color_material','notes']
+    const eq = (a, b) => String(a ?? '') === String(b ?? '')
+    const adds = []
+    const edits = []
+    for (const item of markingItems) {
+      if (String(item.item_id || '').startsWith('_temp_')) {
+        adds.push(item)
+        continue
+      }
+      const orig = origMap.get(item.item_id)
+      if (!orig) continue   // server-created since snapshot — unusual; skip
+      let changed = false
+      const patch = { item_id: item.item_id }
+      for (const f of FIELDS) {
+        if (!eq(orig[f], item[f])) {
+          changed = true
+          patch[f] = item[f]
+        }
+      }
+      if (changed) edits.push(patch)
+    }
+    const deletes = []
+    for (const orig of originalItems) {
+      if (String(orig.item_id || '').startsWith('_temp_')) continue
+      if (!currMap.has(orig.item_id)) deletes.push(orig.item_id)
+    }
+    return { adds, edits, deletes }
   }
+  const hasBufferChanges = () => {
+    const d = computeBufferDiff()
+    return d.adds.length + d.edits.length + d.deletes.length > 0
+  }
+
+  // Enter Edit mode — snapshot the current items + reset temp counter.
+  const enterEditMode = () => {
+    setOriginalItems(markingItems.map(i => ({ ...i })))
+    tempIdCounterRef.current = 0
+    setEditMode(true)
+  }
+
+  // Exit Edit mode — discard buffer (markingItems reverts to snapshot
+  // if there's a snapshot; otherwise no-op).
+  const discardEditBuffer = () => {
+    if (originalItems) setMarkingItems(originalItems)
+    setOriginalItems(null)
+    setEditMode(false)
+    setEditCancelConfirm(null)
+  }
+
+  // Cancel handler — short-circuit confirm when nothing changed.
+  const onClickCancelEdit = () => {
+    const d = computeBufferDiff()
+    const n = d.adds.length + d.edits.length + d.deletes.length
+    if (n === 0) {
+      discardEditBuffer()
+    } else {
+      setEditCancelConfirm({ count: n })
+    }
+  }
+
+  // beforeunload guard while there are unsaved buffered changes. The
+  // browser shows its native "leave site?" dialog. We can't reliably
+  // fire async reverts here — that's the whole point of the deferred-
+  // PATCH design: there is no server state to revert. Just block the
+  // accidental tab-close so the admin doesn't lose work silently.
+  useEffect(() => {
+    if (!editMode) return
+    const handler = (e) => {
+      if (!hasBufferChanges()) return
+      e.preventDefault()
+      e.returnValue = ''  // legacy browsers
+      return ''
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [editMode, originalItems, markingItems])  // eslint-disable-line react-hooks/exhaustive-deps
   // Modal driving the three regen modes (data_only / replace_cfr / new_cfr).
   // null = closed; otherwise { mode, state: 'submitting'|'success'|'error', ... }
   const [editCompletedSubmission, setEditCompletedSubmission] = useState(null)
@@ -803,9 +902,9 @@ export default function FieldReport() {
   // changes. The completed-WO edit panel state is scoped per-WO.
   useEffect(() => {
     setEditMode(false)
+    setOriginalItems(null)
     setIncludeInProduction(false)
     setProductionDate(opToday())
-    setTouchedItemIds(new Set())
   }, [selectedWOId])
 
   const refreshWOs = async () => {
@@ -935,26 +1034,29 @@ export default function FieldReport() {
   // we explicitly patched plus status/date_completed (server-derived) —
   // so fields the user might still be typing into don't get clobbered.
   //
-  // When edit mode is on (admin editing a Completed WO), include
-  // preserve_completion=true so the backend doesn't reopen the row to
-  // Pending + clear Date Completed on field changes. Keeps original
-  // day-bucketing intact for Production Log + Dashboard rollups.
+  // Edit-completed mode buffers the change client-side instead of
+  // PATCHing. The whole diff (adds / edits / deletes) flushes in one
+  // server call when the admin clicks a save mode at the bottom of the
+  // form. Cancel or beforeunload throws the buffer away — nothing was
+  // ever persisted.
   const saveField = async (itemId, patch) => {
+    if (editMode) {
+      // Buffered path: just mutate local state. Validation that
+      // belongs to the inline UI (e.g. numeric-only filtering) already
+      // ran in onRowLocalChange before getting here.
+      setMarkingItems(list => list.map(i => {
+        if (i.item_id !== itemId) return i
+        return { ...i, ...patch }
+      }))
+      return
+    }
     markSaving(itemId, true)
     setRowError('')
     try {
-      const body = editMode
-        ? { ...patch, preserve_completion: true }
-        : patch
-      // Track touched IDs so the edit-completed submit can stamp the
-      // production date on these specifically. Track on attempt so a
-      // failed PATCH still counts (the user clearly intended to change
-      // something on this row).
-      if (editMode) markItemTouched(itemId)
       const res = await fetch(`/api/marking-items/${encodeURIComponent(itemId)}`, {
         method:  'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(body),
+        body:    JSON.stringify(patch),
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
@@ -1048,6 +1150,23 @@ export default function FieldReport() {
   // ── Delete (single or bulk) ───────────────────────────────────
   const doDelete = async (ids) => {
     if (!ids.length) return
+    // Edit-completed mode: buffer the delete client-side. If the item
+    // is a newly-added temp item, it disappears completely. If it's
+    // an existing-server-side item, it'll be DELETED in the batched
+    // save call. Cancel/abandon restores everything from snapshot.
+    if (editMode) {
+      const set = new Set(ids)
+      setMarkingItems(list => list.filter(i => !set.has(i.item_id)))
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        ids.forEach(id => next.delete(id))
+        if (bulkMode && next.size === 0) setBulkMode(false)
+        return next
+      })
+      setDeleteConfirm(null)
+      setRowError('')
+      return
+    }
     try {
       const res = await fetch('/api/marking-items', {
         method:  'DELETE',
@@ -1294,13 +1413,21 @@ export default function FieldReport() {
     await waitForSaves()
     try {
       const asOfDate = opToday()
+      // Flush the deferred buffer of marking-item changes. Everything
+      // the admin did in edit mode (inline edits, modal edits, manual
+      // adds, kebab deletes) is encoded here as a single batched diff
+      // — applied atomically(-ish) by the server in delete → edit →
+      // add order before the Tracker write + CFR queue.
+      const diff = computeBufferDiff()
       const body = {
         as_of_date:             asOfDate,
         issues:                 issues.trim(),
         regen_mode:             mode,
         include_in_production:  !!includeInProduction,
         production_date:        includeInProduction ? productionDate : '',
-        touched_item_ids:       Array.from(touchedItemIds),
+        marking_edits:          diff.edits,
+        marking_adds:           diff.adds,
+        marking_deletes:        diff.deletes,
       }
       const res = await fetch(`/api/wo/${encodeURIComponent(selectedWOId)}/edit-completed`, {
         method:  'POST',
@@ -1309,8 +1436,16 @@ export default function FieldReport() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      // Reconcile to server truth — picks up real item_ids for newly-
+      // added rows, drops any temp-IDed items that the server didn't
+      // accept, and covers any partial-failure scenarios.
+      await refetchMarkings()
       setEditCompletedSubmission({ state: 'success', mode, result: data })
     } catch (err) {
+      // Also reconcile on error so the user sees the actual current
+      // state of the WO (some changes may have applied before the
+      // failure) and can decide whether to retry.
+      try { await refetchMarkings() } catch {}
       setEditCompletedSubmission({ state: 'error', mode, message: err.message || 'Update failed' })
     }
   }
@@ -1430,19 +1565,15 @@ export default function FieldReport() {
           workType={inferredWorkType}
           wo_intersections={woIntersections}
           wo_betweens={woBetweens}
-          editCompletedMode={editMode}
+          deferred={editMode}
+          tempIdFactory={nextTempId}
           onClose={() => setFormModal(null)}
           onSaved={(savedItem) => {
             if (formModal.mode === 'add') {
               setMarkingItems(list => [...list, savedItem])
-              // Newly added items go through finalize on save (Pending →
-              // Completed with finalizeDate), so they don't need to be
-              // in touched_item_ids — but no harm tracking them either.
-              if (editMode) markItemTouched(savedItem.item_id)
             } else {
               setMarkingItems(list =>
                 list.map(i => i.item_id === savedItem.item_id ? savedItem : i))
-              if (editMode) markItemTouched(savedItem.item_id)
             }
             setFormModal(null)
             setRowError('')
@@ -1486,6 +1617,8 @@ export default function FieldReport() {
               wos={wos}
               selectedWOId={selectedWOId}
               onSelect={setSelectedWOId}
+              disabled={editMode}
+              disabledTitle="Cancel or save the current edit before switching work orders."
             />
           </Field>
           {selectedWO && <WOPanel wo={selectedWO} />}
@@ -1508,7 +1641,7 @@ export default function FieldReport() {
               </div>
               <button
                 type="button"
-                onClick={() => { setEditMode(false); setTouchedItemIds(new Set()) }}
+                onClick={onClickCancelEdit}
                 className="text-xs font-bold px-3 py-1.5 rounded-lg
                            bg-white text-amber-800 border border-amber-300
                            hover:bg-amber-100"
@@ -1528,7 +1661,7 @@ export default function FieldReport() {
               </div>
               <button
                 type="button"
-                onClick={() => setEditMode(true)}
+                onClick={enterEditMode}
                 className="text-xs font-bold px-3 py-1.5 rounded-lg
                            bg-navy text-white hover:opacity-90"
               >
@@ -1794,12 +1927,27 @@ export default function FieldReport() {
             // Only allow close on success or error.
             if (editCompletedSubmission.state !== 'submitting') {
               if (editCompletedSubmission.state === 'success') {
+                // Exit edit mode — buffer is now persisted server-side.
                 setEditMode(false)
-                setTouchedItemIds(new Set())
+                setOriginalItems(null)
               }
               setEditCompletedSubmission(null)
             }
           }}
+        />
+      )}
+
+      {/* "Discard N changes?" confirm — fires when admin clicks Cancel
+          in edit mode and there's an unsaved buffer. */}
+      {editCancelConfirm && (
+        <ConfirmModal
+          title={`Discard ${editCancelConfirm.count} unsaved change${editCancelConfirm.count === 1 ? '' : 's'}?`}
+          message="Your in-progress edits to this completed WO will be thrown away. The WO and its marking items return to their original state."
+          confirmLabel="Discard Changes"
+          cancelLabel="Keep Editing"
+          danger
+          onConfirm={discardEditBuffer}
+          onCancel={() => setEditCancelConfirm(null)}
         />
       )}
 
