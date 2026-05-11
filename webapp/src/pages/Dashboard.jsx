@@ -320,21 +320,37 @@ function StatCard({ label, value, sub, color }) {
 }
 
 // ── Filter bar ────────────────────────────────────────────────
+//
+// Multi-select pills: clicking a pill toggles it in the selected Set,
+// and clicking "All" clears the Set. Empty Set ≡ no filter (matches
+// every WO for that category). Pills combine within a category with
+// OR ("Received" + "In Progress" → either status passes) and across
+// categories with AND (status AND contractor AND borough).
 const ALL = 'All'
 
-function FilterBar({ label, options, value, onChange }) {
+function FilterBar({ label, options, selected, onToggle, onClear }) {
+  const allActive = selected.size === 0
+  const pillClass = (active) =>
+    `text-xs px-3 py-1 rounded-full border font-medium transition-all
+     ${active
+       ? 'bg-navy text-white border-navy'
+       : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'
+     }`
   return (
     <div className="flex items-center gap-2 flex-wrap">
       <span className="text-xs font-semibold text-slate-500">{label}</span>
-      {[ALL, ...options].map(opt => (
+      <button
+        key={ALL}
+        onClick={onClear}
+        className={pillClass(allActive)}
+      >
+        {ALL}
+      </button>
+      {options.map(opt => (
         <button
           key={opt}
-          onClick={() => onChange(opt)}
-          className={`text-xs px-3 py-1 rounded-full border font-medium transition-all
-            ${value === opt
-              ? 'bg-navy text-white border-navy'
-              : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'
-            }`}
+          onClick={() => onToggle(opt)}
+          className={pillClass(selected.has(opt))}
         >
           {opt}
         </button>
@@ -487,12 +503,32 @@ export default function Dashboard() {
   const [data,       setData]       = useState(null)
   const [loading,    setLoading]    = useState(true)
   const [error,      setError]      = useState(null)
-  const [statusFilt, setStatusFilt] = useState(ALL)
-  const [contFilt,   setContFilt]   = useState(ALL)
-  const [boroughFilt,setBoroughFilt]= useState(ALL)
+  // Multi-select filters: each is a Set<string> of currently-selected
+  // pill values. Empty Set = no filter applied (the "All" pill is the
+  // visual active state for empty).
+  const [statusFilt, setStatusFilt] = useState(() => new Set())
+  const [contFilt,   setContFilt]   = useState(() => new Set())
+  const [boroughFilt,setBoroughFilt]= useState(() => new Set())
   const [search,     setSearch]     = useState('')
   const [lastRefresh,setLastRefresh]= useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
+
+  // Toggle / clear helpers for the multi-select filter Sets.
+  // toggleX adds opt if missing, removes if present. clearX empties.
+  // A new Set is always returned so React sees a fresh reference and
+  // useMemo dependents recompute.
+  const makeToggle = (setter) => (opt) => setter(prev => {
+    const next = new Set(prev)
+    if (next.has(opt)) next.delete(opt)
+    else              next.add(opt)
+    return next
+  })
+  const toggleStatus  = makeToggle(setStatusFilt)
+  const toggleCont    = makeToggle(setContFilt)
+  const toggleBorough = makeToggle(setBoroughFilt)
+  const clearStatus   = () => setStatusFilt(new Set())
+  const clearCont     = () => setContFilt(new Set())
+  const clearBorough  = () => setBoroughFilt(new Set())
 
   const load = async () => {
     setLoading(true)
@@ -583,19 +619,27 @@ export default function Dashboard() {
     return `${y}-${m}-${dd}` === todayLocal
   }
 
-  // Filter + search WOs
+  // Filter + search WOs. Within a category: empty Set = no filter; a
+  // populated Set means the WO must match one of its values (OR).
+  // Across categories: AND. The Completed Today pseudo-status is a
+  // calendar predicate, not a real status string, so it has its own
+  // matcher inside the status OR-loop.
   const filteredWOs = useMemo(() => {
     if (!data?.wos) return []
     return data.wos.filter(wo => {
-      if (statusFilt !== ALL) {
-        if (statusFilt === COMPLETED_TODAY) {
-          if (!isCompletedTodayLocal(wo)) return false
-        } else if (wo.status !== statusFilt) {
-          return false
+      if (statusFilt.size > 0) {
+        let ok = false
+        for (const s of statusFilt) {
+          if (s === COMPLETED_TODAY) {
+            if (isCompletedTodayLocal(wo)) { ok = true; break }
+          } else if (wo.status === s) {
+            ok = true; break
+          }
         }
+        if (!ok) return false
       }
-      if (contFilt    !== ALL && wo.contractor !== contFilt)   return false
-      if (boroughFilt !== ALL && wo.borough    !== boroughFilt) return false
+      if (contFilt.size    > 0 && !contFilt.has(wo.contractor))   return false
+      if (boroughFilt.size > 0 && !boroughFilt.has(wo.borough))   return false
       if (search) {
         const q = search.toLowerCase()
         return (
@@ -717,11 +761,14 @@ export default function Dashboard() {
           search={search}
           setSearch={setSearch}
           statusFilt={statusFilt}
-          setStatusFilt={setStatusFilt}
+          toggleStatus={toggleStatus}
+          clearStatus={clearStatus}
           contFilt={contFilt}
-          setContFilt={setContFilt}
+          toggleCont={toggleCont}
+          clearCont={clearCont}
           boroughFilt={boroughFilt}
-          setBoroughFilt={setBoroughFilt}
+          toggleBorough={toggleBorough}
+          clearBorough={clearBorough}
           contractors={contractors}
           boroughs={boroughs}
           filteredWOs={filteredWOs}
@@ -747,9 +794,9 @@ export default function Dashboard() {
 function OperationsTabContent({
   stats, attention, chartData, data,
   search, setSearch,
-  statusFilt, setStatusFilt,
-  contFilt, setContFilt,
-  boroughFilt, setBoroughFilt,
+  statusFilt, toggleStatus, clearStatus,
+  contFilt, toggleCont, clearCont,
+  boroughFilt, toggleBorough, clearBorough,
   contractors, boroughs,
   filteredWOs,
   completedTodayLabel,
@@ -883,20 +930,23 @@ function OperationsTabContent({
             <FilterBar
               label="Status"
               options={['Received', 'Dispatched', 'In Progress', 'Completed', completedTodayLabel]}
-              value={statusFilt}
-              onChange={setStatusFilt}
+              selected={statusFilt}
+              onToggle={toggleStatus}
+              onClear={clearStatus}
             />
             <FilterBar
               label="Contractor"
               options={contractors}
-              value={contFilt}
-              onChange={setContFilt}
+              selected={contFilt}
+              onToggle={toggleCont}
+              onClear={clearCont}
             />
             <FilterBar
               label="Borough"
               options={boroughs}
-              value={boroughFilt}
-              onChange={setBoroughFilt}
+              selected={boroughFilt}
+              onToggle={toggleBorough}
+              onClear={clearBorough}
             />
           </div>
 
