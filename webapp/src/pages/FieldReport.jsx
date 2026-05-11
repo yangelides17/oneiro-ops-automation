@@ -516,8 +516,7 @@ function WOPanel({ wo }) {
             className="inline-flex items-center gap-1.5 text-xs font-bold text-navy
                        hover:underline"
           >
-            <span aria-hidden>📁</span>
-            View WO &amp; plan docs in Drive
+            View WO <span aria-hidden>📁</span>
           </a>
         </div>
       )}
