@@ -2221,6 +2221,13 @@ function _boroughArea_(borough) {
   return _NYC_BOROUGH_TO_AREA_[key] || (key ? `${key}, NY` : 'New York, NY');
 }
 
+// NYC bounding box (SW → NE corners) used as a viewport bias on every
+// geocode call. Google will *prefer* results inside this box but can
+// still return points outside it — `components=administrative_area:NY`
+// is the hard restriction that keeps us from drifting into NJ or CT.
+// Box covers all five boroughs with a small buffer.
+const _NYC_GEOCODE_BOUNDS_ = '40.477,-74.259|40.917,-73.700';
+
 // Single Google Geocoding API call. Returns { lat, lng } on success
 // (status === 'OK' and at least one result), null otherwise.
 function _geocodeOne_(addr) {
@@ -2228,8 +2235,13 @@ function _geocodeOne_(addr) {
   const key = props.getProperty('GOOGLE_MAPS_API_KEY');
   if (!key) throw new Error('GOOGLE_MAPS_API_KEY script property not set');
 
+  // `bounds` biases toward NYC viewport. `components` restricts to NY
+  // state — combined they kill the "5 AVE in Mt Vernon" / "MAIN ST,
+  // Long Island" matches that were causing wild cluster spreads.
   const url = 'https://maps.googleapis.com/maps/api/geocode/json'
     + '?address=' + encodeURIComponent(addr)
+    + '&bounds=' + encodeURIComponent(_NYC_GEOCODE_BOUNDS_)
+    + '&components=' + encodeURIComponent('country:US|administrative_area:NY')
     + '&region=us'
     + '&key=' + encodeURIComponent(key);
 
@@ -2320,26 +2332,43 @@ function geocodeWO_(d, ss) {
     Logger.log('⚠️ geocodeWO_ marking-items read failed for ' + wo + ': ' + e.message);
   }
 
-  const validationPoints = validationAddrs
-    .map(addr => _geocodeOne_(addr))
-    .filter(p => p);  // drop nulls
+  // Resolve each validation address to coords, keeping the address
+  // string so we can log diagnostics when the cluster check fails.
+  const validationResolved = validationAddrs.map(addr => ({
+    addr,
+    point: _geocodeOne_(addr),
+  })).filter(v => v.point);
 
   // Resolve
-  if (!primary && validationPoints.length === 0) {
+  if (!primary && validationResolved.length === 0) {
     return { warning: 'Geocoding failed: no results for any address candidate' };
   }
   if (!primary) {
     return { warning: 'Primary intersection unresolvable — admin must set coords manually' };
   }
 
-  // Cluster check against all successful validation pins.
-  let maxSpread = 0;
-  validationPoints.forEach(p => {
-    const dist = _haversineMiles_(primary, p);
-    if (dist > maxSpread) maxSpread = dist;
-  });
+  // Distances from primary, sorted ascending. With 3+ validation
+  // points we drop the single worst outlier — Google occasionally
+  // returns a wildly wrong match for ambiguous street names and we
+  // don't want one bad candidate vetoing an otherwise-tight cluster.
+  const distances = validationResolved
+    .map(v => ({ ...v, dist: _haversineMiles_(primary, v.point) }))
+    .sort((a, b) => a.dist - b.dist);
+  const considered = distances.length >= 3 ? distances.slice(0, -1) : distances;
+  const maxSpread = considered.reduce((m, v) => Math.max(m, v.dist), 0);
 
   if (maxSpread > 1.0) {
+    // Log every candidate (address + coords + dist) so the admin can
+    // see whether the WO data is wrong, the geocoder is mis-matching,
+    // or the WO genuinely spans > 1 mi and needs manual placement.
+    Logger.log(`⚠️ geocodeWO_ ${wo} cluster spread ${maxSpread.toFixed(2)}mi`);
+    Logger.log(`   primary: ${primaryAddr}`);
+    Logger.log(`            → ${primary.lat.toFixed(5)}, ${primary.lng.toFixed(5)}`);
+    distances.forEach(v => {
+      const flagged = considered.includes(v) ? '  ' : '✂ ';  // ✂ = dropped outlier
+      Logger.log(`   ${flagged}${v.dist.toFixed(2)}mi  ${v.addr}`);
+      Logger.log(`        → ${v.point.lat.toFixed(5)}, ${v.point.lng.toFixed(5)}`);
+    });
     return { warning: `Cluster spread ${maxSpread.toFixed(2)} miles between candidates — verify pin` };
   }
 
