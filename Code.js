@@ -6276,6 +6276,11 @@ function backfillArchiveFolderUrls() {
  */
 function backfillWOGeocode_batch1() { _backfillWOGeocode_(25); }
 function backfillWOGeocode_batch2() { _backfillWOGeocode_(25); }
+// Catch-all for any remaining unmapped WOs after the two fixed-size
+// batches. Safe to re-run — _backfillWOGeocode_ skips rows that
+// already have a Latitude. Cap of 100 keeps us well under the 6-minute
+// Apps Script execution limit (100 WOs × ~2s/each ≈ 3.5 min).
+function backfillWOGeocode_remaining() { _backfillWOGeocode_(100); }
 
 function _backfillWOGeocode_(limit) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
