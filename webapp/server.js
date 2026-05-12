@@ -445,6 +445,42 @@ app.post('/api/wo/:woId/edit-completed', async (req, res) => {
 })
 
 /**
+ * POST /api/wo/:woId/coordinates
+ * Admin manual lat/lng entry from the Nav tab — fixes flagged
+ * geocode warnings + provides an escape hatch when the geocoder
+ * picked the wrong intersection. Body: { lat, lng }.
+ */
+app.post('/api/wo/:woId/coordinates', async (req, res) => {
+  try {
+    const data = await callAppsScript('update_wo_coordinates', {
+      wo_id: req.params.woId,
+      lat:   req.body?.lat,
+      lng:   req.body?.lng,
+    })
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/wo/:woId/coordinates error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/wos/map
+ * Returns the active WO set (Received / Dispatched / In Progress) for
+ * the Nav tab map. Split into { mapped, unmapped } — unmapped are
+ * surfaced in the "Needs coords" panel.
+ */
+app.get('/api/wos/map', async (_req, res) => {
+  try {
+    const data = await callAppsScript('get_wo_map_data')
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/wos/map error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/field-report/finalize
  * Triggers Sign-In + CFR JSON generation AFTER the submit returned
  * success. The client fires this as fire-and-forget so the user sees

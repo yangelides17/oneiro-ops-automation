@@ -2192,6 +2192,202 @@ function findWOFolder_(archiveRoot, woId, ss, woRowsCache) {
   return woIt.next();
 }
 
+
+// ── Geocoding helpers ─────────────────────────────────────────
+//
+// Server-side geocoding via Google's Geocoding API. Runs at scan
+// intake (archiveWOFile_) and on demand from the backfill functions.
+// Coords (cols 46–47) + warning (col 48) + timestamp (col 49) drive
+// the Nav tab map.
+
+// Borough → state suffix nudges Google toward NYC results when the
+// query is ambiguous (e.g., "5 AVE" exists in multiple boroughs).
+const _NYC_BOROUGH_TO_AREA_ = {
+  'MN': 'Manhattan, New York, NY',
+  'BK': 'Brooklyn, NY',
+  'BX': 'Bronx, NY',
+  'QN': 'Queens, NY',
+  'SI': 'Staten Island, NY',
+  // Long forms (in case the Tracker has either)
+  'Manhattan':     'Manhattan, New York, NY',
+  'Brooklyn':      'Brooklyn, NY',
+  'Bronx':         'Bronx, NY',
+  'Queens':        'Queens, NY',
+  'Staten Island': 'Staten Island, NY',
+};
+
+function _boroughArea_(borough) {
+  const key = String(borough || '').trim();
+  return _NYC_BOROUGH_TO_AREA_[key] || (key ? `${key}, NY` : 'New York, NY');
+}
+
+// Single Google Geocoding API call. Returns { lat, lng } on success
+// (status === 'OK' and at least one result), null otherwise.
+function _geocodeOne_(addr) {
+  const props = PropertiesService.getScriptProperties();
+  const key = props.getProperty('GOOGLE_MAPS_API_KEY');
+  if (!key) throw new Error('GOOGLE_MAPS_API_KEY script property not set');
+
+  const url = 'https://maps.googleapis.com/maps/api/geocode/json'
+    + '?address=' + encodeURIComponent(addr)
+    + '&region=us'
+    + '&key=' + encodeURIComponent(key);
+
+  try {
+    const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    const code = resp.getResponseCode();
+    if (code !== 200) {
+      Logger.log('⚠️ _geocodeOne_ HTTP ' + code + ' for ' + addr);
+      return null;
+    }
+    const body = JSON.parse(resp.getContentText());
+    if (body.status === 'ZERO_RESULTS') return null;
+    if (body.status !== 'OK' || !Array.isArray(body.results) || body.results.length === 0) {
+      Logger.log('⚠️ _geocodeOne_ status=' + body.status + ' for ' + addr);
+      return null;
+    }
+    const loc = body.results[0].geometry && body.results[0].geometry.location;
+    if (!loc || typeof loc.lat !== 'number' || typeof loc.lng !== 'number') return null;
+    return { lat: loc.lat, lng: loc.lng };
+  } catch (e) {
+    Logger.log('⚠️ _geocodeOne_ error for ' + addr + ': ' + e.message);
+    return null;
+  }
+}
+
+// Great-circle distance in miles between two {lat, lng} points.
+function _haversineMiles_(a, b) {
+  if (!a || !b) return Infinity;
+  const R = 3958.8;  // Earth radius in miles
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+          + Math.sin(dLng / 2) * Math.sin(dLng / 2) * Math.cos(lat1) * Math.cos(lat2);
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// Orchestrates: build primary + validation queries, geocode them,
+// cluster-check, return one of:
+//   { lat, lng }           — confident pin, no warning
+//   { warning: '...' }     — could not produce a confident pin
+//
+// `d` shape (matches archiveWOFile_'s synthetic):
+//   { work_order_id, location, from_street, to_street, borough }
+function geocodeWO_(d, ss) {
+  const wo       = String(d.work_order_id || '').trim();
+  const location = String(d.location    || '').trim();
+  const from     = String(d.from_street || '').trim();
+  const to       = String(d.to_street   || '').trim();
+  const borough  = String(d.borough     || '').trim();
+  const area     = _boroughArea_(borough);
+
+  if (!location || !from) {
+    return { warning: 'Missing location or from_street — cannot geocode' };
+  }
+
+  // Primary: start of job
+  const primaryAddr = `${location} and ${from}, ${area}, USA`;
+  const primary = _geocodeOne_(primaryAddr);
+
+  // Validation queries — to_street + up to 3 distinct Marking Items
+  // intersections (the scan parser seeded these for grid items).
+  const validationAddrs = [];
+  if (to) validationAddrs.push(`${location} and ${to}, ${area}, USA`);
+
+  try {
+    const miSheet = ss.getSheetByName('Marking Items');
+    if (miSheet) {
+      const data = miSheet.getDataRange().getValues();
+      const seen = {};
+      const intersections = [];
+      for (let i = 1; i < data.length && intersections.length < 6; i++) {
+        if (String(data[i][1] || '').trim() !== wo) continue;
+        const intName = String(data[i][5] || '').trim();
+        if (!intName || seen[intName]) continue;
+        seen[intName] = true;
+        intersections.push(intName);
+      }
+      // Shuffle + take up to 3
+      intersections.sort(() => Math.random() - 0.5);
+      intersections.slice(0, 3).forEach(intName => {
+        validationAddrs.push(`${intName}, ${area}, USA`);
+      });
+    }
+  } catch (e) {
+    Logger.log('⚠️ geocodeWO_ marking-items read failed for ' + wo + ': ' + e.message);
+  }
+
+  const validationPoints = validationAddrs
+    .map(addr => _geocodeOne_(addr))
+    .filter(p => p);  // drop nulls
+
+  // Resolve
+  if (!primary && validationPoints.length === 0) {
+    return { warning: 'Geocoding failed: no results for any address candidate' };
+  }
+  if (!primary) {
+    return { warning: 'Primary intersection unresolvable — admin must set coords manually' };
+  }
+
+  // Cluster check against all successful validation pins.
+  let maxSpread = 0;
+  validationPoints.forEach(p => {
+    const dist = _haversineMiles_(primary, p);
+    if (dist > maxSpread) maxSpread = dist;
+  });
+
+  if (maxSpread > 1.0) {
+    return { warning: `Cluster spread ${maxSpread.toFixed(2)} miles between candidates — verify pin` };
+  }
+
+  return { lat: primary.lat, lng: primary.lng };
+}
+
+// Write the geocode result to the Tracker row + log warnings to
+// Automation Log. Idempotent — overwrites any prior values for that
+// WO. Wrapped in try/catch by callers so a geocoding failure never
+// breaks the scan-intake pipeline.
+function _persistGeocode_(ss, woId, result) {
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerExtraCols_(woSheet);
+  const data = woSheet.getDataRange().getValues();
+  let rowIdx = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === woId) { rowIdx = i; break; }
+  }
+  if (rowIdx === -1) {
+    Logger.log('⚠️ _persistGeocode_: WO not found in Tracker: ' + woId);
+    return;
+  }
+
+  const sheetRow = rowIdx + 1;
+  // Cols 46 (Latitude), 47 (Longitude), 48 (Geocode Warning), 49 (Geocoded At)
+  if (result.lat != null && result.lng != null) {
+    woSheet.getRange(sheetRow, 46).setValue(result.lat);
+    woSheet.getRange(sheetRow, 47).setValue(result.lng);
+    woSheet.getRange(sheetRow, 48).setValue('');
+  } else {
+    // Don't wipe an existing good pin on a re-attempt that returns
+    // only a warning — only update the warning column.
+    woSheet.getRange(sheetRow, 48).setValue(String(result.warning || ''));
+  }
+  woSheet.getRange(sheetRow, 49).setValue(new Date());
+
+  if (result.warning) {
+    const logSheet = ss.getSheetByName('Automation Log');
+    if (logSheet) {
+      logSheet.appendRow([
+        new Date(), 'Geocoder', 'Geocode warning',
+        woId, result.warning, 'Warning', '', 'No',
+      ]);
+    }
+  }
+}
+
+
 /**
  * Build a fast WO# → Location map from the Work Order Tracker. Used by
  * the WO-listing helpers below so multi-WO sign-in rows (where the WO#
@@ -3237,6 +3433,10 @@ function doPost(e) {
       return handleDeleteWO_(body);
     } else if (action === 'edit_completed_wo') {
       return handleEditCompletedWO_(body);
+    } else if (action === 'update_wo_coordinates') {
+      return handleUpdateWOCoordinates_(body);
+    } else if (action === 'get_wo_map_data') {
+      return handleGetWOMapData_(body);
     } else if (action === 'get_drive_file_bytes') {
       return handleGetDriveFileBytes_(body);
     } else if (action === 'approve_doc') {
@@ -4978,6 +5178,26 @@ function archiveWOFile_(fileId, d) {
       Logger.log('⚠️ archiveWOFile_: failed to cache Archive Folder URL for ' + woId + ': ' + e.message);
     }
 
+    // Geocode the WO and cache lat/lng to cols 46-49 so the Nav tab's
+    // map can render a pin for it. Smart cluster validation against
+    // up to 3 Marking-Items intersections; > 1 mile spread = no pin
+    // (admin can set manually via the Nav tab's Edit Coordinates flow).
+    // Wrapped in try/catch — geocoding failure is non-fatal to scan
+    // intake (the WO row is already written).
+    try {
+      const result = geocodeWO_(d, ss);
+      _persistGeocode_(ss, d.work_order_id, result);
+    } catch (e) {
+      Logger.log('⚠️ archiveWOFile_: geocoding failed for ' + woId + ': ' + e.message);
+      // Best-effort: still write a warning so admin sees something
+      // in the Tracker.
+      try {
+        _persistGeocode_(ss, d.work_order_id, {
+          warning: 'Geocoder threw: ' + (e.message || String(e))
+        });
+      } catch (_) { /* nothing left to do */ }
+    }
+
     const pathNote = `${contractor}/${contractNum}${borough ? ' - ' + getBoroughName_(borough) : ''}/${d.work_order_id} - ${location}`;
     Logger.log('📁 WO PDF archived: ' + woId + ' → ' + pathNote);
     if (logSheet) logSheet.appendRow([
@@ -5066,6 +5286,13 @@ function ensureWoTrackerExtraCols_(woSheet) {
     // Report Done? (0-idx 25) and Invoice Sent? (0-idx 29) stay put.
     'CFR Sent?',               // col 44 / 0-idx 43 — pairs with col 26/0-idx 25 Field Report Done?
     'Invoice Done?',           // col 45 / 0-idx 44 — pairs with col 30/0-idx 29 Invoice Sent?
+    // Geocoding pins — written by geocodeWO_ at scan intake or by
+    // backfillWOGeocode_batch* / manual update_wo_coordinates. Drives
+    // the Nav tab's map view.
+    'Latitude',                // col 46 / 0-idx 45 — pin lat (start of job)
+    'Longitude',               // col 47 / 0-idx 46 — pin lng
+    'Geocode Warning',         // col 48 / 0-idx 47 — non-empty when cluster check or API call failed
+    'Geocoded At',             // col 49 / 0-idx 48 — timestamp of last successful geocode (or last attempt)
   ];
   const START_COL = 36;
   const N = EXTRA_HEADERS.length;
@@ -5985,6 +6212,71 @@ function backfillArchiveFolderUrls() {
   }
   Logger.log('✅ backfillArchiveFolderUrls: filled=' + filled +
              ', missing=' + missing + ', alreadyHad=' + already);
+}
+
+
+/**
+ * One-shot backfill: geocodes existing WO Tracker rows that don't yet
+ * have lat/lng populated. Two batches because Apps Script's 6-min
+ * execution limit is generous but we'd rather be safe with the API's
+ * sequential geocoding calls (~1.5s each × 25 = ~38s).
+ *
+ * Usage: in the Apps Script editor, pick `backfillWOGeocode_batch1`
+ * from the function dropdown, hit Run. When it finishes, run
+ * `backfillWOGeocode_batch2` for the next batch. The shared
+ * `_backfillWOGeocode_` walks the Tracker top-down and processes only
+ * rows where Latitude (col 46) is currently blank — so re-running
+ * either batch is idempotent (already-geocoded rows are skipped).
+ */
+function backfillWOGeocode_batch1() { _backfillWOGeocode_(25); }
+function backfillWOGeocode_batch2() { _backfillWOGeocode_(25); }
+
+function _backfillWOGeocode_(limit) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerExtraCols_(woSheet);
+  const data = woSheet.getDataRange().getValues();
+
+  let processed = 0;
+  let succeeded = 0;
+  let warned    = 0;
+  for (let i = 1; i < data.length && processed < limit; i++) {
+    const r = data[i];
+    const woId = String(r[0] || '').trim();
+    if (!woId) continue;
+    // Skip rows that already have a Latitude — geocodeWO_ side of
+    // _persistGeocode_ leaves existing coords intact on warning, so
+    // any non-empty col 46 means we've successfully placed this WO.
+    if (r[45] !== '' && r[45] != null) continue;
+
+    const d = {
+      work_order_id: woId,
+      location:      String(r[5]  || ''),
+      from_street:   String(r[6]  || ''),
+      to_street:     String(r[7]  || ''),
+      borough:       String(r[3]  || ''),
+    };
+    try {
+      const result = geocodeWO_(d, ss);
+      _persistGeocode_(ss, woId, result);
+      if (result.lat != null) {
+        succeeded++;
+        Logger.log(`✅ ${woId} → ${result.lat.toFixed(5)}, ${result.lng.toFixed(5)}`);
+      } else {
+        warned++;
+        Logger.log(`⚠️ ${woId} → ${result.warning || 'no result'}`);
+      }
+    } catch (e) {
+      warned++;
+      Logger.log(`❌ ${woId} threw: ${e.message}`);
+      try {
+        _persistGeocode_(ss, woId, { warning: 'Backfill threw: ' + e.message });
+      } catch (_) { /* nothing left to do */ }
+    }
+    processed++;
+  }
+
+  Logger.log(`Backfill batch done: processed=${processed}, succeeded=${succeeded}, warned=${warned}`);
 }
 
 
@@ -8427,6 +8719,123 @@ function handleEditCompletedWO_(body) {
       deleted: deletedIds.length,
     },
   });
+}
+
+
+// ── action: update_wo_coordinates ─────────────────────────────
+//
+// Manual lat/lng entry from the Nav tab — used to fix flagged
+// geocode warnings and to give admins an escape hatch when Google's
+// geocoder picked the wrong intersection. Validates the values,
+// writes them to the Tracker, clears any existing warning, logs the
+// change. Idempotent.
+function handleUpdateWOCoordinates_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  const lat  = parseFloat(d.lat);
+  const lng  = parseFloat(d.lng);
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+  if (isNaN(lat) || lat < -90  || lat > 90)  return jsonResponse_({ error: 'Invalid lat (must be -90..90)' }, 400);
+  if (isNaN(lng) || lng < -180 || lng > 180) return jsonResponse_({ error: 'Invalid lng (must be -180..180)' }, 400);
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  ensureWoTrackerExtraCols_(woSheet);
+  const data = woSheet.getDataRange().getValues();
+  let rowIdx = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === woId) { rowIdx = i; break; }
+  }
+  if (rowIdx === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+
+  const sheetRow = rowIdx + 1;
+  woSheet.getRange(sheetRow, 46).setValue(lat);          // Latitude
+  woSheet.getRange(sheetRow, 47).setValue(lng);          // Longitude
+  woSheet.getRange(sheetRow, 48).setValue('');           // clear warning
+  woSheet.getRange(sheetRow, 49).setValue(new Date());   // Geocoded At
+
+  const logSheet = ss.getSheetByName('Automation Log');
+  if (logSheet) {
+    logSheet.appendRow([
+      new Date(), 'Geocoder', 'Coords set manually',
+      woId, `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      'Completed', '', 'No',
+    ]);
+  }
+
+  _invalidateCacheKeys_(['dashboard_v1']);
+  return jsonResponse_({ success: true, lat, lng });
+}
+
+
+// ── action: get_wo_map_data ───────────────────────────────────
+//
+// Returns active WOs (Received / Dispatched / In Progress) for the
+// Nav tab map. Two arrays: `mapped` (lat/lng populated) and
+// `unmapped` (coords missing — surfaced in the "Needs coords" panel
+// so admin can set them manually).
+function handleGetWOMapData_(_body) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData  = woSheet.getDataRange().getValues();
+
+  // Marking-items count per WO — same shape as _buildDashboardPayload_
+  // computes. Total + completed so the popover can show progress.
+  const miCounts = {};
+  const miSheet = ss.getSheetByName('Marking Items');
+  if (miSheet) {
+    const miData = miSheet.getDataRange().getValues();
+    for (let i = 1; i < miData.length; i++) {
+      const woId = String(miData[i][1] || '').trim();
+      if (!woId) continue;
+      const bucket = miCounts[woId] || (miCounts[woId] = { total: 0, completed: 0 });
+      bucket.total += 1;
+      if (String(miData[i][12] || '').toLowerCase() === 'completed') bucket.completed += 1;
+    }
+  }
+
+  const ACTIVE = { 'received': 1, 'dispatched': 1, 'in progress': 1 };
+
+  const mapped = [];
+  const unmapped = [];
+  for (let i = 1; i < woData.length; i++) {
+    const r = woData[i];
+    const woId = String(r[0] || '').trim();
+    if (!woId) continue;
+    const status = String(r[15] || '');
+    if (!ACTIVE[status.toLowerCase()]) continue;
+
+    const lat = r[45];
+    const lng = r[46];
+    const counts = miCounts[woId] || { total: 0, completed: 0 };
+
+    const base = {
+      wo_id:                  woId,
+      contractor:             String(r[1]  || ''),
+      contract_num:           String(r[2]  || ''),
+      borough:                String(r[3]  || ''),
+      location:               String(r[5]  || ''),
+      from_street:            String(r[6]  || ''),
+      to_street:              String(r[7]  || ''),
+      due_date:               r[8] instanceof Date
+                                 ? Utilities.formatDate(r[8], CONFIG.TIMEZONE, 'yyyy-MM-dd')
+                                 : String(r[8] || ''),
+      priority:               String(r[9]  || ''),
+      status:                 status,
+      folder_url:             String(r[42] || '').trim() || null,
+      geocode_warning:        String(r[47] || ''),
+      marking_item_count:     counts.total,
+      marking_completed_count: counts.completed,
+    };
+
+    if (typeof lat === 'number' && typeof lng === 'number' && !isNaN(lat) && !isNaN(lng)) {
+      mapped.push({ ...base, lat, lng });
+    } else {
+      unmapped.push({ ...base, lat: null, lng: null });
+    }
+  }
+
+  return jsonResponse_({ mapped, unmapped });
 }
 
 
