@@ -2304,28 +2304,45 @@ function geocodeWO_(d, ss) {
   const primaryAddr = `${location} and ${from}, ${area}, USA`;
   const primary = _geocodeOne_(primaryAddr);
 
-  // Validation queries — to_street + up to 3 distinct Marking Items
-  // intersections (the scan parser seeded these for grid items).
+  // Validation queries. Every query is a full intersection of the form
+  // "{location} and {crossStreet}" — the Tracker stores `location` as
+  // the single road work is being done on, so a cross-street alone
+  // ("13 AV") would geocode to a random point along that avenue.
+  //
+  // Sources:
+  //   1. `to_street`   — always tried if present.
+  //   2. Marking Items — `Intersection Grid` rows for this WO; col 5
+  //      holds the cross-street (one per intersection on the run).
+  //      Other WO Sections (Top Table / Manual) don't have meaningful
+  //      cross-streets and are skipped. Up to 3 distinct picks.
   const validationAddrs = [];
-  if (to) validationAddrs.push(`${location} and ${to}, ${area}, USA`);
+  const norm = (s) => String(s || '').trim().toUpperCase();
+  const seen = {};
+  if (from) seen[norm(from)] = true;  // primary already covers from_street
+  if (to) {
+    seen[norm(to)] = true;
+    validationAddrs.push(`${location} and ${to}, ${area}, USA`);
+  }
 
   try {
     const miSheet = ss.getSheetByName('Marking Items');
     if (miSheet) {
       const data = miSheet.getDataRange().getValues();
-      const seen = {};
       const intersections = [];
       for (let i = 1; i < data.length && intersections.length < 6; i++) {
         if (String(data[i][1] || '').trim() !== wo) continue;
-        const intName = String(data[i][5] || '').trim();
-        if (!intName || seen[intName]) continue;
-        seen[intName] = true;
-        intersections.push(intName);
+        if (String(data[i][4] || '').trim() !== 'Intersection Grid') continue;
+        const crossSt = String(data[i][5] || '').trim();
+        if (!crossSt) continue;
+        const key = norm(crossSt);
+        if (seen[key]) continue;
+        seen[key] = true;
+        intersections.push(crossSt);
       }
       // Shuffle + take up to 3
       intersections.sort(() => Math.random() - 0.5);
-      intersections.slice(0, 3).forEach(intName => {
-        validationAddrs.push(`${intName}, ${area}, USA`);
+      intersections.slice(0, 3).forEach(crossSt => {
+        validationAddrs.push(`${location} and ${crossSt}, ${area}, USA`);
       });
     }
   } catch (e) {
