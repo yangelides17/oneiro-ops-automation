@@ -382,7 +382,7 @@ function addDays(iso, n) {
 }
 
 function buildQbInvoice(payload, customerId) {
-  const lines = payload.lines.map(l => {
+  const itemLines = payload.lines.map(l => {
     const itemId = QB_ITEMS[l.group]
     if (!itemId) throw new Error(`QB_ITEMS["${l.group}"] not configured in qbItems.js`)
     return {
@@ -396,13 +396,49 @@ function buildQbInvoice(payload, customerId) {
       },
     }
   })
+
+  // ── WO info header (Path B) ─────────────────────────────────
+  // Single DescriptionOnly line at the top of the items table. The
+  // Description carries 5 fields separated by newlines — renders as
+  // a single tall row above the priced lines. Sits visually inside
+  // the line-items table so it's universally placed across every QB
+  // template, with no other column data attached.
+  const headerText = [
+    payload.wo_id        && `Work Order: ${payload.wo_id}`,
+    payload.contract_num && `Contract #: ${payload.contract_num}`,
+    payload.borough      && `Borough: ${payload.borough}`,
+    payload.location     && `Location: ${payload.location}`,
+    payload.work_start && payload.work_end &&
+      `Work Period: ${payload.work_start} – ${payload.work_end}`,
+  ].filter(Boolean).join('\n')
+  const headerRow = headerText
+    ? [{ Amount: 0, DetailType: 'DescriptionOnly', Description: headerText }]
+    : []
+
+  // ── Header tag in the custom field (Path A) ─────────────────
+  // QB caps CustomField StringValue at 31 chars + single line. We
+  // pack as much as fits: WO# · Contract# · Borough · Location.
+  // Truncates mid-field if over 31; the full breakdown is in the
+  // DescriptionOnly row above so no info is lost.
+  const customFieldValue = [
+    payload.wo_id,
+    payload.contract_num,
+    payload.borough,
+    payload.location,
+  ].filter(Boolean).join(' · ').slice(0, 31)
+
   return {
-    CustomerRef:  { value: String(customerId) },
-    TxnDate:      payload.work_end,
-    DueDate:      addDays(payload.work_end, 30),
-    PrivateNote:  `WO ${payload.wo_id} · ${payload.location}`,
-    CustomerMemo: { value: `Work Order ${payload.wo_id}` },
-    Line:         lines,
+    CustomerRef: { value: String(customerId) },
+    TxnDate:     payload.work_end,
+    DueDate:     addDays(payload.work_end, 30),
+    PrivateNote: `WO ${payload.wo_id} · ${payload.location}`,
+    CustomField: [{
+      DefinitionId: '1',
+      Name:         'invoice description',
+      Type:         'StringType',
+      StringValue:  customFieldValue,
+    }],
+    Line: [...headerRow, ...itemLines],
   }
 }
 

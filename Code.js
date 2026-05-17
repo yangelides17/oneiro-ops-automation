@@ -11365,16 +11365,17 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     if (bucket.items === 0 || bucket.qty <= 0) return;
     const rate = round4(bucket.revenue / bucket.qty);
 
-    // Description: comma-separated category breakdown, e.g.
-    // "4" Line: 100 LF · 12" Line: 200 LF (3.0× = 600 LF 4"-equiv)"
+    // Description: comma-separated raw category breakdown. No
+    // multiplier conversions ("X → Y LF 4"-equiv") and no per-item
+    // unit-count parentheticals — contractors know the unit chart
+    // and the line's Qty/Rate columns already carry the math. Format:
+    //   line4/line12:    "4" Line: 100 LF · 12" Line: 200 LF"
+    //   preformed/extr.: "Stop Msg: 2 EA · Combination Arrow: 1 EA"
+    //   color_surface:   "Bike Lane: 150 SF"
     const parts = Object.keys(bucket.breakdown).sort().map(cat => {
       const b = bucket.breakdown[cat];
-      const sameQty = Math.abs(b.raw_qty - b.equiv_qty) < 0.01;
       const unitOut = b.unit || (group === 'color_surface' ? 'SF' : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
-      if (sameQty) {
-        return `${cat}: ${round2(b.raw_qty)} ${unitOut}`;
-      }
-      return `${cat}: ${round2(b.raw_qty)} ${unitOut} → ${round2(b.equiv_qty)} ${_QB_UNIT_LABEL[group]}`;
+      return `${cat}: ${round2(b.raw_qty)} ${unitOut}`;
     });
     const description = parts.join(' · ');
 
