@@ -9304,17 +9304,37 @@ function aggregateMarkingItemsForCFR_(ss, woId) {
   });
 
   // ── Intersection grid: build per-intersection rows ──
-  // Preserve first-seen order via an index map.
+  // Only HVX Crosswalk / Stop Msg / Stop Line items land in the grid.
+  // "In between" picks from the Field Report's intersection combobox are
+  // stored in the same column as real intersections but formatted as
+  // "A – B" (en-dash, spaces) by FieldReport.jsx — they must be excluded
+  // so the CFR grid contains only true intersection rows.
+  // Preserve first-seen order via an index map. The row is only created
+  // after we've classified both the category and the destination column,
+  // so a top-table-only category (e.g. Lane Line) with an intersection
+  // attached can never produce an empty grid row that shifts the layout.
   const rowByIntersection = {};
   const order = [];
+  const isBetweenLocation = (s) => s.indexOf(' – ') !== -1;
 
   woItems.forEach(r => {
     const intersection = String(r[5] || '').trim();
-    if (!intersection) return;
+    if (!intersection || isBetweenLocation(intersection)) return;
     const category = String(r[4] || '').trim();
     const direction = String(r[6] || '').trim().toUpperCase();
     const qty = parseFloat(r[8]);
     if (isNaN(qty) || qty <= 0) return;
+
+    let colKey = null;
+    if (category === 'HVX Crosswalk' && ['N','E','S','W'].indexOf(direction) !== -1) {
+      colKey = direction.toLowerCase();
+    } else if (category === 'Stop Msg') {
+      colKey = 'stop_msg';
+    } else if (category === 'Stop Line') {
+      colKey = 'st_line';
+    }
+    if (!colKey) return;
+    // School Msg 8'/10': no source category → stays blank.
 
     if (!rowByIntersection[intersection]) {
       rowByIntersection[intersection] = {
@@ -9326,16 +9346,7 @@ function aggregateMarkingItemsForCFR_(ss, woId) {
       order.push(intersection);
     }
     const gridRow = rowByIntersection[intersection];
-
-    if (category === 'HVX Crosswalk' && ['N','E','S','W'].indexOf(direction) !== -1) {
-      const key = direction.toLowerCase();
-      gridRow[key] = (parseFloat(gridRow[key]) || 0) + qty;
-    } else if (category === 'Stop Msg') {
-      gridRow.stop_msg = (parseFloat(gridRow.stop_msg) || 0) + qty;
-    } else if (category === 'Stop Line') {
-      gridRow.st_line = (parseFloat(gridRow.st_line) || 0) + qty;
-    }
-    // School Msg 8'/10': no source category → stays blank.
+    gridRow[colKey] = (parseFloat(gridRow[colKey]) || 0) + qty;
   });
 
   out.grid = order.slice(0, 10).map(i => rowByIntersection[i]);
