@@ -2093,14 +2093,15 @@ if (process.env.NODE_ENV === 'production') {
 
 
 // ── Start ─────────────────────────────────────────────────────
-// QB Item IDs sanity-check. Only fails the boot when QB env vars are
-// present but qbItems.js still has placeholders — lets a dev run the
-// webapp without QB credentials configured.
+// QB Item IDs sanity-check. Logs loudly when QB env vars are present
+// but qbItems.js still has placeholders. Non-fatal: the rest of the
+// app boots normally and only the QB invoice endpoints will fail when
+// called (with the same clear error message). This lets us partially
+// configure QB without taking the whole dashboard down.
 try {
   assertQbItemsConfigured()
 } catch (err) {
-  console.error('❌ QB items misconfigured:', err.message)
-  process.exit(1)
+  console.error('⚠ QB items misconfigured (QB invoicing disabled):', err.message)
 }
 const qbCfg = qbConfigStatus()
 console.log(qbCfg.configured
