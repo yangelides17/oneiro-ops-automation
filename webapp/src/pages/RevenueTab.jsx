@@ -20,6 +20,7 @@ const PRESETS = [
   { id: '30d',    label: 'Last 30 days' },
   { id: 'mtd',    label: 'Month to date' },
   { id: 'last',   label: 'Last month' },
+  { id: 'season', label: 'Season to date' },
   { id: 'custom', label: 'Custom' },
 ]
 
@@ -49,8 +50,42 @@ function rangeForPreset(id, customStart, customEnd) {
     const lastMonthEnd   = new Date(today.getFullYear(), today.getMonth(),     0)
     return { start: isoOf(lastMonthStart), end: isoOf(lastMonthEnd) }
   }
+  if (id === 'season') {
+    // Striping season runs Jan 1 → today for this calendar year. Mirror
+    // of the ProductionTab "season" preset — keep both tabs in sync.
+    const start = new Date(today.getFullYear(), 0, 1)
+    return { start: isoOf(start), end: isoOf(today) }
+  }
   return { start: customStart || opToday(), end: customEnd || opToday() }
 }
+
+// ── Weekly bucketing for long-range daily charts ──────────────
+// Daily bars at >35 days start to crush — switch to weekly buckets
+// (week-start = Sunday) summing the supplied numeric fields. Returns
+// an array shaped like the input (same `date` field, summed values).
+function bucketByWeek(daily, numericFields) {
+  if (!daily || daily.length === 0) return []
+  const buckets = {}
+  const order = []
+  daily.forEach(d => {
+    const dt = new Date(d.date + 'T12:00:00')   // noon to dodge TZ DST edge
+    const sunday = new Date(dt)
+    sunday.setDate(dt.getDate() - dt.getDay())
+    const key = isoOf(sunday)
+    if (!buckets[key]) {
+      const seed = { date: key }
+      numericFields.forEach(f => { seed[f] = 0 })
+      buckets[key] = seed
+      order.push(key)
+    }
+    numericFields.forEach(f => {
+      buckets[key][f] = (buckets[key][f] || 0) + (Number(d[f]) || 0)
+    })
+  })
+  return order.map(k => buckets[k])
+}
+
+const WEEKLY_THRESHOLD = 35   // shared across both charts in this tab
 
 // ── Currency / percent formatters ─────────────────────────────
 const fmtUsd = (n) =>
@@ -139,17 +174,30 @@ function StatCard({ label, value, sub, color }) {
 
 // ── Charts ────────────────────────────────────────────────────
 function DailyRevenueChart({ daily }) {
-  const data = (daily || []).map(d => ({
+  const weekly = (daily?.length || 0) > WEEKLY_THRESHOLD
+  const source = weekly ? bucketByWeek(daily, ['revenue']) : (daily || [])
+  const data = source.map(d => ({
     date: d.date.slice(5),  // MM-DD only on the X axis
     revenue: d.revenue,
   }))
+  // Cap label density so a ~20-bar season chart doesn't shout 20 dates
+  // at the reader; recharts hides overflows via auto-thin, but forcing
+  // an interval guarantees readable spacing.
+  const xInterval = data.length > 14 ? Math.max(0, Math.floor(data.length / 12) - 1) : 0
   return (
     <div className="card p-4">
-      <p className="section-label">Daily Revenue</p>
+      <div className="flex items-baseline justify-between">
+        <p className="section-label">{weekly ? 'Weekly Revenue' : 'Daily Revenue'}</p>
+        {weekly && (
+          <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">
+            bucketed by week
+          </span>
+        )}
+      </div>
       <ResponsiveContainer width="100%" height={220}>
-        <BarChart data={data} barSize={data.length > 31 ? 6 : 16}>
+        <BarChart data={data} barSize={weekly ? 18 : (data.length > 31 ? 6 : 16)}>
           <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
-          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={xInterval} />
           <YAxis
             tick={{ fontSize: 10, fill: '#94a3b8' }}
             axisLine={false}
@@ -160,6 +208,7 @@ function DailyRevenueChart({ daily }) {
           <Tooltip
             contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
             formatter={(v) => fmtUsdSmall(v)}
+            labelFormatter={(l) => weekly ? `Week of ${l}` : l}
             cursor={{ fill: '#f1f5f9' }}
           />
           <Bar dataKey="revenue" radius={[4, 4, 0, 0]} fill="#1e40af" />
@@ -170,19 +219,33 @@ function DailyRevenueChart({ daily }) {
 }
 
 function GroupStackedChart({ daily }) {
+  const weekly = (daily?.length || 0) > WEEKLY_THRESHOLD
   // Recharts likes flat objects per X tick — flatten by_group out.
-  const data = (daily || []).map(d => {
-    const row = { date: d.date.slice(5) }
+  // For the weekly view we flatten first, then sum per pricing group.
+  const flat = (daily || []).map(d => {
+    const row = { date: d.date }
     PRICING_GROUPS.forEach(g => { row[g] = (d.by_group && d.by_group[g]) || 0 })
     return row
   })
+  const source = weekly ? bucketByWeek(flat, PRICING_GROUPS) : flat
+  const data = source.map(d => ({ ...d, date: d.date.slice(5) }))
+  const xInterval = data.length > 14 ? Math.max(0, Math.floor(data.length / 12) - 1) : 0
   return (
     <div className="card p-4">
-      <p className="section-label">Daily Revenue by Pricing Group</p>
+      <div className="flex items-baseline justify-between">
+        <p className="section-label">
+          {weekly ? 'Weekly Revenue by Pricing Group' : 'Daily Revenue by Pricing Group'}
+        </p>
+        {weekly && (
+          <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">
+            bucketed by week
+          </span>
+        )}
+      </div>
       <ResponsiveContainer width="100%" height={240}>
-        <BarChart data={data} barSize={data.length > 31 ? 6 : 16}>
+        <BarChart data={data} barSize={weekly ? 18 : (data.length > 31 ? 6 : 16)}>
           <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
-          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={xInterval} />
           <YAxis
             tick={{ fontSize: 10, fill: '#94a3b8' }}
             axisLine={false}
@@ -193,6 +256,7 @@ function GroupStackedChart({ daily }) {
           <Tooltip
             contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
             formatter={(v, name) => [fmtUsdSmall(v), PRICING_GROUP_LABEL[name] || name]}
+            labelFormatter={(l) => weekly ? `Week of ${l}` : l}
             cursor={{ fill: '#f1f5f9' }}
           />
           <Legend
@@ -371,7 +435,7 @@ function NeedsPricingPanel({ items }) {
 
 // ── Main ──────────────────────────────────────────────────────
 export default function RevenueTab() {
-  const [preset, setPreset]           = useState('30d')
+  const [preset, setPreset]           = useState('season')
   const [custom, setCustom]           = useState({ start: '', end: '' })
   const [data,    setData]            = useState(null)
   const [loading, setLoading]         = useState(true)

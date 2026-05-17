@@ -23,6 +23,34 @@ const isoOf = (d) => {
   return `${y}-${m}-${dd}`
 }
 
+// ── Weekly bucketing for long-range daily charts ──────────────
+// Daily bars at >35 days start to crush — switch to weekly buckets
+// (week-start = Sunday) summing the supplied numeric fields. Returns
+// an array shaped like the input (same `date` field, summed values).
+function bucketByWeek(daily, numericFields) {
+  if (!daily || daily.length === 0) return []
+  const buckets = {}
+  const order = []
+  daily.forEach(d => {
+    const dt = new Date(d.date + 'T12:00:00')   // noon to dodge TZ DST edge
+    const sunday = new Date(dt)
+    sunday.setDate(dt.getDate() - dt.getDay())
+    const key = isoOf(sunday)
+    if (!buckets[key]) {
+      const seed = { date: key }
+      numericFields.forEach(f => { seed[f] = 0 })
+      buckets[key] = seed
+      order.push(key)
+    }
+    numericFields.forEach(f => {
+      buckets[key][f] = (buckets[key][f] || 0) + (Number(d[f]) || 0)
+    })
+  })
+  return order.map(k => buckets[k])
+}
+
+const WEEKLY_THRESHOLD = 35
+
 function rangeForPreset(id, customStart, customEnd) {
   const today = new Date()
   if (id === '7d') {
@@ -136,19 +164,22 @@ function StatCard({ label, value, sub, color }) {
 
 // ── Daily chart for a single unit ─────────────────────────────
 function UnitDailyChart({ daily, unit, color }) {
-  const data = (daily || []).map(d => ({
-    date: d.date.slice(5),
-    qty:  d[unit] || 0,
-  }))
+  // Re-key the unit field to `qty` so bucketByWeek (which works off
+  // field names) can sum it without needing a per-unit special case.
+  const reKeyed = (daily || []).map(d => ({ date: d.date, qty: d[unit] || 0 }))
+  const weekly  = reKeyed.length > WEEKLY_THRESHOLD
+  const source  = weekly ? bucketByWeek(reKeyed, ['qty']) : reKeyed
+  const data    = source.map(d => ({ date: d.date.slice(5), qty: d.qty }))
   const total = data.reduce((s, r) => s + r.qty, 0)
   const meta = UNIT_META[unit] || { title: unit, short: unit }
+  const xInterval = data.length > 14 ? Math.max(0, Math.floor(data.length / 10) - 1) : 0
   return (
     <div className="card p-4">
       <div className="flex items-start justify-between mb-1 gap-2">
         <div>
           <p className="section-label leading-tight">{meta.title}</p>
           <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-0.5">
-            Daily · {unit}
+            {weekly ? 'Weekly' : 'Daily'} · {unit}
           </p>
         </div>
         <span className="text-xs text-slate-500 font-semibold whitespace-nowrap">
@@ -156,9 +187,9 @@ function UnitDailyChart({ daily, unit, color }) {
         </span>
       </div>
       <ResponsiveContainer width="100%" height={180}>
-        <BarChart data={data} barSize={data.length > 31 ? 5 : 12}>
+        <BarChart data={data} barSize={weekly ? 14 : (data.length > 31 ? 5 : 12)}>
           <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
-          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={xInterval} />
           <YAxis
             tick={{ fontSize: 10, fill: '#94a3b8' }}
             axisLine={false}
@@ -169,6 +200,7 @@ function UnitDailyChart({ daily, unit, color }) {
           <Tooltip
             contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
             formatter={(v) => [fmtNum(v) + ' ' + unit, unit]}
+            labelFormatter={(l) => weekly ? `Week of ${l}` : l}
             cursor={{ fill: '#f1f5f9' }}
           />
           <Bar dataKey="qty" radius={[3, 3, 0, 0]} fill={color} />
@@ -362,7 +394,7 @@ function TopWosTable({ topWos }) {
 
 // ── Main ──────────────────────────────────────────────────────
 export default function ProductionTab() {
-  const [preset, setPreset]           = useState('30d')
+  const [preset, setPreset]           = useState('season')
   const [custom, setCustom]           = useState({ start: '', end: '' })
   const [data,    setData]            = useState(null)
   const [loading, setLoading]         = useState(true)
