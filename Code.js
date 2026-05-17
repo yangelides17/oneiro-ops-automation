@@ -11474,6 +11474,43 @@ function setupQBInvoiceCol() {
 }
 
 
+/**
+ * One-shot bootstrap: pre-populate the QB customer cache so the
+ * webapp doesn't have to query QB by DisplayName (which often drifts
+ * from our shorter WO Tracker contractor strings — e.g. "Metro Express"
+ * in the Sheet vs. "Metro Express Services" in QB).
+ *
+ * Edit the mapping below with your real WO-Tracker-name → QB-Customer-ID
+ * pairs, then run this function once from the Apps Script editor.
+ * Re-running overwrites previous entries — safe and idempotent.
+ *
+ * Keys are case-insensitive and whitespace-normalized at lookup time
+ * (so "Metro Express", "metro express", "Metro  Express" all match).
+ */
+function setupQbCustomerCache() {
+  const MAPPING = {
+    // WO Tracker contractor string  →  QB Customer ID
+    'Metro Express': '10',
+    'Denville':      '217',
+    // Add more contractors here as customers are added in QB:
+    // 'Delan':      '<qb_id>',
+  };
+
+  const cache = {};
+  Object.entries(MAPPING).forEach(([name, id]) => {
+    const key = String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    cache[key] = String(id);
+  });
+
+  PropertiesService.getScriptProperties().setProperty(
+    'QB_CUSTOMER_ID_CACHE', JSON.stringify(cache)
+  );
+  Logger.log('✅ QB customer cache seeded with: ' +
+             Object.keys(cache).join(', ') +
+             ' (' + Object.keys(cache).length + ' entries)');
+}
+
+
 // ── QB token storage (rotating refresh token) ─────────────────────
 // QBO rotates the refresh token every 24–26 hours; the webapp must
 // write the rotated value back here immediately on every refresh.
