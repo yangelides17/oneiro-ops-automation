@@ -55,6 +55,68 @@ export function qbConfigStatus() {
   return { configured: missing.length === 0, missing, sandbox: BASE_URL.includes('sandbox') }
 }
 
+// ── Refresh-token encryption (AES-256-GCM) ────────────────────────
+// Intuit security requirement: store the OAuth refresh token encrypted
+// with a symmetric algorithm. We use AES-256-GCM with a per-encrypt
+// random 96-bit IV. The encrypted blob is what gets written to Apps
+// Script Properties — Apps Script never sees plaintext. Key lives in
+// the QB_TOKEN_ENCRYPTION_KEY env var (32 raw bytes, base64-encoded).
+//
+// Generate a key once with:
+//   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+// and add the output to webapp/.env and Railway env. Rotating the key
+// invalidates any stored token and forces a re-auth — fine, cheap.
+//
+// Storage layout (base64):
+//   bytes 0-11  : 96-bit IV
+//   bytes 12-27 : 128-bit auth tag
+//   bytes 28+   : ciphertext
+
+const ENC_PREFIX = 'enc:v1:'   // distinguishes encrypted blob from any
+                               // legacy plaintext that might exist
+
+function _getEncKey() {
+  const raw = process.env.QB_TOKEN_ENCRYPTION_KEY
+  if (!raw) {
+    throw new Error(
+      'QB_TOKEN_ENCRYPTION_KEY env var not set. Generate one with: ' +
+      'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"'
+    )
+  }
+  const key = Buffer.from(raw, 'base64')
+  if (key.length !== 32) {
+    throw new Error(`QB_TOKEN_ENCRYPTION_KEY must decode to 32 bytes (got ${key.length})`)
+  }
+  return key
+}
+
+function encryptToken(plaintext) {
+  const key = _getEncKey()
+  const iv  = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const ct = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return ENC_PREFIX + Buffer.concat([iv, tag, ct]).toString('base64')
+}
+
+function decryptToken(stored) {
+  if (!stored) return ''
+  // Tolerate any legacy plaintext (shouldn't exist since this lands
+  // before first auth, but defensive — and we explicitly mark our
+  // encrypted blobs with ENC_PREFIX so future versions can migrate).
+  if (typeof stored !== 'string' || !stored.startsWith(ENC_PREFIX)) {
+    return stored
+  }
+  const key = _getEncKey()
+  const data = Buffer.from(stored.slice(ENC_PREFIX.length), 'base64')
+  const iv  = data.subarray(0, 12)
+  const tag = data.subarray(12, 28)
+  const ct  = data.subarray(28)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
+  decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8')
+}
+
 // ── Apps Script proxy (token + customer cache live there) ─────────
 async function callAppsScript(action, data = null) {
   const url = process.env.APPS_SCRIPT_URL
@@ -123,7 +185,7 @@ export async function exchangeAuthCode(code, realmId) {
   if (!res.ok) throw new Error(`QB token exchange failed (${res.status}): ${JSON.stringify(json)}`)
   if (!json.refresh_token) throw new Error('QB token exchange did not return refresh_token')
 
-  await callAppsScript('set_qb_refresh_token', { token: json.refresh_token })
+  await callAppsScript('set_qb_refresh_token', { token: encryptToken(json.refresh_token) })
   _accessToken  = json.access_token
   _accessExpiry = Date.now() + (json.expires_in - 60) * 1000  // 60s safety margin
   console.log(`[QB] connect ok, refresh_hash=${_hashToken(json.refresh_token)}`)
@@ -137,8 +199,15 @@ async function refreshAccessToken() {
 
   _refreshing = (async () => {
     const cur = await callAppsScript('get_qb_refresh_token')
-    const oldToken = String(cur.token || '').trim()
-    if (!oldToken) throw new Error('QB_NOT_CONNECTED')
+    const stored = String(cur.token || '').trim()
+    if (!stored || stored === '__cleared__') throw new Error('QB_NOT_CONNECTED')
+    let oldToken
+    try {
+      oldToken = decryptToken(stored)
+    } catch (err) {
+      console.log(`[QB] refresh failed to decrypt stored token: ${err.message}`)
+      throw new Error('QB_NOT_CONNECTED')
+    }
     console.log(`[QB] refresh start, old_hash=${_hashToken(oldToken)}`)
 
     const body = new URLSearchParams({
@@ -169,7 +238,7 @@ async function refreshAccessToken() {
     // next call retries from scratch using the still-valid old
     // refresh token (Intuit only invalidates the old once you actually
     // use the new one). No silent invalidation possible.
-    await callAppsScript('set_qb_refresh_token', { token: newRefresh })
+    await callAppsScript('set_qb_refresh_token', { token: encryptToken(newRefresh) })
 
     _accessToken  = json.access_token
     _accessExpiry = Date.now() + (json.expires_in - 60) * 1000
@@ -317,7 +386,8 @@ export async function checkQbConnection() {
   }
   try {
     const refresh = await callAppsScript('get_qb_refresh_token')
-    if (!refresh || !refresh.token) {
+    const stored = String(refresh && refresh.token || '').trim()
+    if (!stored || stored === '__cleared__') {
       return { connected: false, reason: 'not_authorized', sandbox: cfg.sandbox }
     }
     // Cheap call: fetch CompanyInfo. Will trigger a refresh if needed.

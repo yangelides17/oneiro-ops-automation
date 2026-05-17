@@ -50,6 +50,61 @@ function useCrewMode() {
   return crewMode
 }
 
+// Hook: catch the ?qb=connected | ?qb=error&msg=... query params left
+// behind by the OAuth callback redirect. Surfaces a brief toast and
+// strips the params from the URL so a refresh doesn't re-show them.
+function useQbAuthResult() {
+  const [toast, setToast] = useState(null)  // { kind: 'success'|'error', text }
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams(window.location.search)
+    const qb = params.get('qb')
+    if (!qb) return
+
+    if (qb === 'connected') {
+      setToast({ kind: 'success', text: 'QuickBooks connected.' })
+    } else if (qb === 'error') {
+      setToast({ kind: 'error', text: 'QuickBooks connection failed: ' + (params.get('msg') || 'unknown error') })
+    }
+
+    // Strip qb + msg from URL
+    params.delete('qb')
+    params.delete('msg')
+    const qs = params.toString()
+    const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash
+    window.history.replaceState(null, '', clean)
+
+    // Auto-dismiss success after 5s; errors stick until manually dismissed
+    const t = setTimeout(() => setToast(prev => prev?.kind === 'success' ? null : prev), 5000)
+    return () => clearTimeout(t)
+  }, [])
+
+  return { toast, dismissToast: () => setToast(null) }
+}
+
+function QbAuthToast({ toast, onDismiss }) {
+  if (!toast) return null
+  const isError = toast.kind === 'error'
+  return (
+    <div className={`fixed top-4 right-4 z-50 max-w-sm rounded-xl shadow-lg p-4 flex items-start gap-3 ${
+      isError ? 'bg-red-50 border border-red-200' : 'bg-emerald-50 border border-emerald-200'
+    }`}>
+      <span className={`text-xl flex-shrink-0 leading-none ${isError ? 'text-red-500' : 'text-emerald-500'}`}>
+        {isError ? '✕' : '✓'}
+      </span>
+      <div className="flex-1 text-sm">
+        <p className={`font-bold ${isError ? 'text-red-800' : 'text-emerald-800'}`}>
+          {toast.text}
+        </p>
+      </div>
+      <button onClick={onDismiss}
+              className={`text-xs font-bold leading-none ${isError ? 'text-red-600 hover:text-red-800' : 'text-emerald-600 hover:text-emerald-800'}`}
+              aria-label="Dismiss">×</button>
+    </div>
+  )
+}
+
 const NAV_ITEMS = [
   { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null                },
   { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null                },
@@ -223,11 +278,13 @@ function ColdStartCounts() {
 
 export default function App() {
   const crewMode = useCrewMode()
+  const { toast, dismissToast } = useQbAuthResult()
   return (
     <PendingCountsProvider>
       {/* Skip the cold-start counts request entirely in crew mode —
           there are no nav badges to render, so the data isn't needed. */}
       {!crewMode && <ColdStartCounts />}
+      <QbAuthToast toast={toast} onDismiss={dismissToast} />
       <div className="min-h-screen flex flex-col">
         <Header crewMode={crewMode} />
         <main className="flex-1">

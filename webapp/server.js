@@ -37,6 +37,28 @@ const PORT = process.env.PORT || 3001
 app.use(cors())
 app.use(express.json({ limit: '5mb' }))
 
+// Disable HTTP TRACE explicitly — Intuit security requirement.
+// Express defaults to 404 on unrecognized methods, but an explicit
+// 405 makes the intent visible and traceable in logs.
+app.use((req, res, next) => {
+  if (req.method === 'TRACE') return res.status(405).send('Method Not Allowed')
+  next()
+})
+
+// Tighten cache-control on every /api/* response — Intuit security
+// requirement: SSL pages and pages with sensitive data must use
+// `no-cache, no-store` (not `private`) in the Cache-Control header.
+// Static files (legal pages, Vite-built React bundles with content-
+// hashed filenames) keep their default caching since they're public.
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+    res.set('Pragma', 'no-cache')
+    res.set('Expires', '0')
+  }
+  next()
+})
+
 // multer: stores uploads in memory, 15MB per file, 20 files max per request
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -1857,33 +1879,25 @@ app.get('/api/qb/auth-start', (req, res) => {
 /**
  * GET /api/qb/auth-callback?code=...&state=...&realmId=...
  * Intuit's redirect target after the user grants consent. Exchanges
- * the auth code for tokens and persists the refresh token via Apps
- * Script. Then renders a minimal success page.
+ * the auth code for tokens and persists the (encrypted) refresh
+ * token via Apps Script. Always responds with a 302 redirect (never
+ * HTML containing the code) so the OAuth code can't leak to third
+ * parties via Referer headers — Intuit security requirement.
  */
 app.get('/api/qb/auth-callback', async (req, res) => {
   const { code, realmId, error: oauthError } = req.query
   if (oauthError) {
-    return res.status(400).send(`QuickBooks authorization denied: ${oauthError}`)
+    return res.redirect(`/?qb=error&msg=${encodeURIComponent(String(oauthError))}`)
   }
   if (!code) {
-    return res.status(400).send('Missing authorization code from QuickBooks redirect')
+    return res.redirect('/?qb=error&msg=' + encodeURIComponent('Missing authorization code'))
   }
   try {
     await exchangeAuthCode(String(code), String(realmId || ''))
-    res.send(`
-      <html><head><title>QuickBooks Connected</title>
-      <style>body{font-family:system-ui;padding:40px;max-width:560px;margin:0 auto}
-      h1{color:#0f172a}.ok{color:#16a34a}a{color:#1e40af}</style></head>
-      <body>
-        <h1>✅ <span class="ok">QuickBooks Connected</span></h1>
-        <p>Refresh token persisted to the Sheet. Invoice generation is now available
-           on the WO Tracker tab.</p>
-        <p><a href="/">← Back to the app</a></p>
-      </body></html>
-    `)
+    res.redirect('/?qb=connected')
   } catch (err) {
     console.error('GET /api/qb/auth-callback error:', err.message)
-    res.status(500).send(`QuickBooks authorization failed: ${err.message}`)
+    res.redirect('/?qb=error&msg=' + encodeURIComponent(err.message))
   }
 })
 
