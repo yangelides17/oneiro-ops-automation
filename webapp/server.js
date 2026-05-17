@@ -1903,6 +1903,46 @@ app.get('/api/qb/status', async (_req, res) => {
 })
 
 /**
+ * GET /api/qb/disconnect
+ *
+ * Disconnect webhook. Intuit calls this when a QBO admin revokes our
+ * app from QBO → Apps → Connected Apps. Clears the stored refresh
+ * token so future requests fail closed (showing the disconnected
+ * banner) instead of trying to use a revoked grant.
+ *
+ * Intuit hits this as a plain GET with no signature, so anyone who
+ * knows the URL can clear the token. The worst case is an admin has
+ * to re-authorize — no data leak — so we accept the request as-is.
+ * Validates the optional realmId query param against our configured
+ * QB_REALM_ID when present, as a sanity check.
+ */
+app.get('/api/qb/disconnect', async (req, res) => {
+  const { realmId } = req.query
+  if (realmId && process.env.QB_REALM_ID && String(realmId) !== process.env.QB_REALM_ID) {
+    console.warn(`[QB] disconnect: realmId ${realmId} doesn't match QB_REALM_ID — ignoring`)
+    return res.status(400).send('Realm ID mismatch — refusing to clear token.')
+  }
+  try {
+    await callAppsScript('set_qb_refresh_token', { token: '__cleared__' })
+    console.log('[QB] disconnect: refresh token cleared')
+    res.send(`
+      <html><head><title>QuickBooks Disconnected</title>
+      <style>body{font-family:system-ui;padding:40px;max-width:560px;margin:0 auto}
+      h1{color:#0f172a}a{color:#1e40af}</style></head>
+      <body>
+        <h1>QuickBooks Disconnected</h1>
+        <p>Your QuickBooks Online account has been disconnected from the Oneiro
+           Operations Platform. To reconnect, an admin can visit
+           <a href="/api/qb/auth-start">/api/qb/auth-start</a> from the platform.</p>
+      </body></html>
+    `)
+  } catch (err) {
+    console.error('GET /api/qb/disconnect error:', err.message)
+    res.status(500).send(`Failed to clear QuickBooks token: ${err.message}`)
+  }
+})
+
+/**
  * POST /api/qb/invoice/:woId
  * Generates a QB invoice for one Work Order. Idempotent — if the WO
  * already has an invoice number recorded, returns the existing one
