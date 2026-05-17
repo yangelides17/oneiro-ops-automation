@@ -16,7 +16,7 @@ export const MARKING_CATEGORIES = [
   // Page 2 railroad
   'Railroad (RR)', 'Railroad (X)',
   // Page 2 arrows
-  'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
+  'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
   // Page 2 misc
   'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
   // Page 2 bike lane
@@ -70,6 +70,7 @@ export const CATEGORY_UNITS = {
   'L/R Arrow':           'EA',
   'Straight Arrow':      'EA',
   'Combination Arrow':   'EA',
+  'Combination Arrow (L/R)': 'EA',
   'Speed Hump Markings': 'EA',
   'Shark Teeth 12x18':   'EA',
   'Shark Teeth 24x36':   'EA',

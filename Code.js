@@ -308,7 +308,7 @@ function setupMarkingItems() {
     // Page 2 — railroad
     'Railroad (RR)', 'Railroad (X)',
     // Page 2 — arrows
-    'L/R Arrow', 'Straight Arrow', 'Combination Arrow',
+    'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
     // Page 2 — miscellaneous
     'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
     // Page 2 — bike lane
@@ -722,6 +722,10 @@ const PL_CATEGORY_MAP_ = {
   'L/R Arrow':           'Left & or Right Arrows',
   'Straight Arrow':      'Straight Arrow',
   'Combination Arrow':   'Combination Arrow',
+  // Combination Arrow (L/R) rolls up into the same PL row as
+  // Combination Arrow; aggregator at aggregateMarkingItemsForPL_ sums
+  // them naturally via the shared label.
+  'Combination Arrow (L/R)': 'Combination Arrow',
   'Speed Hump Markings': 'Speed Hump Marking',
   'Shark Teeth 24x36':   'Sharks Teeth 24" 36"',
   'Bike Lane Arrow':     'Bicycle Lane Arrow',
@@ -7187,6 +7191,7 @@ const CATEGORY_UNITS_ = {
   'L/R Arrow':           'EA',
   'Straight Arrow':      'EA',
   'Combination Arrow':   'EA',
+  'Combination Arrow (L/R)': 'EA',
   'Speed Hump Markings': 'EA',
   'Shark Teeth 12x18':   'EA',
   'Shark Teeth 24x36':   'EA',
@@ -7254,6 +7259,7 @@ const PRICING_GROUP_BY_CATEGORY_ = Object.freeze({
   'L/R Arrow':           'extruded',
   'Straight Arrow':      'extruded',
   'Combination Arrow':   'extruded',
+  'Combination Arrow (L/R)': 'extruded',
   'Speed Hump Markings': 'extruded',
   'Shark Teeth 12x18':   'extruded',
   'Shark Teeth 24x36':   'extruded',
@@ -7322,6 +7328,7 @@ const EXTRUDED_UNIT_COUNT_ = Object.freeze({
   'L/R Arrow':           1.00,
   'Straight Arrow':      0.81,
   'Combination Arrow':   1.65,
+  'Combination Arrow (L/R)': 1.74,
   'Speed Hump Markings': 0.78,
   'Shark Teeth 12x18':   0.05,
   'Shark Teeth 24x36':   0.19,
@@ -7329,7 +7336,14 @@ const EXTRUDED_UNIT_COUNT_ = Object.freeze({
 });
 
 const PREFORMED_UNIT_COUNT_ = Object.freeze({
-  'Bike Lane Symbol': 1.0,
+  'Bike Lane Symbol': 0.91,
+});
+
+// Line12-group multiplier. HVX Crosswalk is priced at the base 12"
+// rate; Stop Line is a 24" stripe and bills at 2× the base rate.
+const LINE12_MULTIPLIER_ = Object.freeze({
+  'HVX Crosswalk': 1.0,
+  'Stop Line':     2.0,
 });
 
 /**
@@ -7470,7 +7484,9 @@ function priceMarkingItem_(item, woMeta, rates) {
     case 'line12': {
       const base = rateRow.rates.line12;
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
-      return { revenue: qty * base, group, reason: null };
+      const mult = LINE12_MULTIPLIER_[cat];
+      if (mult == null) return { revenue: 0, group, reason: 'no_unit_count' };
+      return { revenue: qty * base * mult, group, reason: null };
     }
     case 'preformed': {
       const base  = rateRow.rates.preformed;
@@ -9261,6 +9277,7 @@ function mapCategoryToCFR_(category) {
     'L/R Arrow':          'L/R Arrows',
     'Straight Arrow':     'Straight Arrows',
     'Combination Arrow':  'Combination Arrows',
+    'Combination Arrow (L/R)': 'Combination Arrows',
     'Bike Lane Arrow':    'Bike Lane Arrows',
     'Bike Lane Symbol':   'Bike Lane Symbols',
   };

@@ -34,6 +34,7 @@ inside `Code.js`.
 | L/R Arrow              | EA   | L/R Arrows          | Left & or Right Arrows           |
 | Straight Arrow         | EA   | Straight Arrows     | Straight Arrow                   |
 | Combination Arrow      | EA   | Combination Arrows  | Combination Arrow                |
+| Combination Arrow (L/R)| EA   | Combination Arrows *(summed with Combination Arrow)* | Combination Arrow *(summed with Combination Arrow)* |
 | Speed Hump Markings    | EA   | Speed Hump Markings | Speed Hump Marking               |
 | Shark Teeth 24x36      | EA   | Shark Teeth 24x36   | Sharks Teeth 24" 36"             |
 | Bike Lane Arrow        | EA   | Bike Lane Arrows    | Bicycle Lane Arrow               |

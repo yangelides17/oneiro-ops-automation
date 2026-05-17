@@ -38,6 +38,7 @@ export const PRICING_GROUP_BY_CATEGORY = {
   'L/R Arrow':           'extruded',
   'Straight Arrow':      'extruded',
   'Combination Arrow':   'extruded',
+  'Combination Arrow (L/R)': 'extruded',
   'Speed Hump Markings': 'extruded',
   'Shark Teeth 12x18':   'extruded',
   'Shark Teeth 24x36':   'extruded',
@@ -57,6 +58,13 @@ export const PRICING_GROUP_BY_CATEGORY = {
   'Messages':            'unpriced',
   'Arrows':              'unpriced',
   'Rail Road X/Diamond': 'unpriced',
+}
+
+// Stop Line bills at 2× the 12" crosswalk/stop-line base rate (24" stripe).
+// HVX Crosswalk uses the base rate. Mirror of LINE12_MULTIPLIER_ in Code.js.
+export const LINE12_MULTIPLIER = {
+  'HVX Crosswalk': 1.0,
+  'Stop Line':     2.0,
 }
 
 // Width / 4 — standard across contractors per the user's pricing convention.
@@ -86,6 +94,7 @@ export const EXTRUDED_UNIT_COUNT = {
   'L/R Arrow':           1.00,
   'Straight Arrow':      0.81,
   'Combination Arrow':   1.65,
+  'Combination Arrow (L/R)': 1.74,
   'Speed Hump Markings': 0.78,
   'Shark Teeth 12x18':   0.05,
   'Shark Teeth 24x36':   0.19,
@@ -93,7 +102,7 @@ export const EXTRUDED_UNIT_COUNT = {
 }
 
 export const PREFORMED_UNIT_COUNT = {
-  'Bike Lane Symbol': 1.0,
+  'Bike Lane Symbol': 0.91,
 }
 
 export const PRICING_GROUP_LABEL = {
