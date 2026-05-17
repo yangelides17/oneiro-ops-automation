@@ -251,8 +251,15 @@ export default function App() {
             )}
           </Routes>
         </main>
-        <footer className="text-center text-slate-400 text-xs py-6">
-          Oneiro Collection LLC &mdash; Operations Platform
+        <footer className="text-center text-slate-400 text-xs py-6 space-y-1">
+          <div>Oneiro Collection LLC &mdash; Operations Platform</div>
+          <div>
+            <a href="/legal/privacy.html" target="_blank" rel="noopener noreferrer"
+               className="hover:text-slate-600 hover:underline">Privacy</a>
+            <span className="mx-2 text-slate-300">·</span>
+            <a href="/legal/eula.html" target="_blank" rel="noopener noreferrer"
+               className="hover:text-slate-600 hover:underline">Terms</a>
+          </div>
         </footer>
       </div>
     </PendingCountsProvider>
