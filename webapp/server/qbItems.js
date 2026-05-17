@@ -15,11 +15,11 @@
  */
 
 export const QB_ITEMS = Object.freeze({
-  line4:         '',  // 4" Line group
-  line12:        '',  // Crosswalk / Stop Line
-  preformed:     '',  // Preformed L&S
-  extruded:      '',  // Extruded L&S
-  color_surface: '',  // Color Surface
+  line4:         '148',  // 4" Extruded Thermo
+  line12:        '149',  // 12" Extruded Thermo (Crosswalks/Stop Lines)
+  preformed:     '150',  // Preformed L&S
+  extruded:      '151',  // Extruded L&S
+  color_surface: '152',  // Color Surface
 })
 
 export function assertQbItemsConfigured() {
