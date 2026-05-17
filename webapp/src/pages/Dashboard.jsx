@@ -15,6 +15,7 @@ import GenerateDocModal from '../components/GenerateDocModal'
 import StatusPickerModal from '../components/StatusPickerModal'
 import DeleteWOModal from '../components/DeleteWOModal'
 import RowKebab from '../components/RowKebab'
+import QBStatusBadge, { useQbStatus } from '../components/QBStatusBadge'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 import { NavBadge } from '../App'
 
@@ -363,8 +364,97 @@ function FilterBar({ label, options, selected, onToggle, onClear }) {
   )
 }
 
+// ── Invoice column cell ───────────────────────────────────────
+// One of: already-invoiced link · em-dash (WO not completed) · spinner
+// (in-flight) · error/Retry · "Generate" (disabled when QB not
+// connected). The button POSTs /api/qb/invoice/:wo_id and propagates
+// the result via onInvoiced so the parent can patch local state.
+function InvoiceCell({ wo, qbConnected, onInvoiced }) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  // 1) Already invoiced — show the doc # as a link to QB
+  if (wo.invoice_doc_number) {
+    return (
+      <a
+        href={wo.invoice_view_url || '#'}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`$${(wo.invoice_amount ?? 0).toLocaleString()} · ${wo.invoice_date || ''}`}
+        className="text-xs font-bold px-2 py-1 rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200"
+      >
+        #{wo.invoice_doc_number}
+      </a>
+    )
+  }
+
+  // 2) WO isn't Completed — not eligible
+  if (String(wo.status || '').toLowerCase() !== 'completed') {
+    return <span className="text-slate-300 text-xs px-2 py-1" title="Available once WO is Completed">—</span>
+  }
+
+  // 3) In flight
+  if (loading) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-slate-500">
+        <span className="w-3 h-3 border-2 border-slate-300 border-t-navy rounded-full animate-spin" />
+        Sending…
+      </span>
+    )
+  }
+
+  const doGenerate = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/qb/invoice/${encodeURIComponent(wo.id)}`, { method: 'POST' })
+      const data = await res.json().catch(() => ({ ok: false, error: 'Non-JSON response' }))
+      if (!data.ok) {
+        // needs_pricing list → surface a more helpful message
+        const detail = Array.isArray(data.needs_pricing) && data.needs_pricing.length > 0
+          ? ` (${data.needs_pricing.length} item${data.needs_pricing.length === 1 ? '' : 's'} need pricing)`
+          : ''
+        throw new Error((data.error || `HTTP ${res.status}`) + detail)
+      }
+      onInvoiced?.(wo.id, data)
+    } catch (e) {
+      setError(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 4) Error — show Retry with the message in a tooltip
+  if (error) {
+    return (
+      <button
+        onClick={doGenerate}
+        title={error}
+        className="text-xs font-bold px-2 py-1 rounded-lg bg-red-100 text-red-700 hover:bg-red-200"
+      >
+        Retry
+      </button>
+    )
+  }
+
+  // 5) Idle — Generate (disabled when QB disconnected)
+  return (
+    <button
+      onClick={doGenerate}
+      disabled={!qbConnected}
+      title={qbConnected ? 'Generate QuickBooks invoice' : 'QuickBooks not connected'}
+      className={`text-xs font-bold px-2 py-1 rounded-lg ${qbConnected
+        ? 'bg-navy text-white hover:bg-navy/80'
+        : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}
+    >
+      Generate
+    </button>
+  )
+}
+
+
 // ── WO Table row ──────────────────────────────────────────────
-function WORow({ wo, flagged, onDocsChange, onChangeStatus, onDeleteWO }) {
+function WORow({ wo, flagged, qbConnected, onDocsChange, onChangeStatus, onDeleteWO, onInvoiced }) {
   const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
     && wo.status.toLowerCase() !== 'completed'
 
@@ -434,6 +524,9 @@ function WORow({ wo, flagged, onDocsChange, onChangeStatus, onDeleteWO }) {
           docs={wo.docs}
           onChange={onDocsChange}
         />
+      </td>
+      <td className="py-2.5 px-3">
+        <InvoiceCell wo={wo} qbConnected={qbConnected} onInvoiced={onInvoiced} />
       </td>
       <td className="py-2.5 px-3">
         {wo.folder_url ? (
@@ -514,6 +607,8 @@ export default function Dashboard() {
   const [data,       setData]       = useState(null)
   const [loading,    setLoading]    = useState(true)
   const [error,      setError]      = useState(null)
+  // QB connection state for the Invoice column + disconnected banner.
+  const qbStatus = useQbStatus()
   // Multi-select filters: each is a Set<string> of currently-selected
   // pill values. Empty Set = no filter applied (the "All" pill is the
   // visual active state for empty).
@@ -573,6 +668,29 @@ export default function Dashboard() {
   // The Apps Script set_docs_sent action accepts both 'CFR' and
   // 'Field Report' as friendly names; we pass whichever the chip
   // sends through.
+  // Patch a WO row's invoice fields after a successful QB invoice POST
+  // so the InvoiceCell flips to the "already invoiced" link without a
+  // full dashboard refetch.
+  const onInvoiced = (woId, result) => {
+    setData(prev => {
+      if (!prev || !Array.isArray(prev.wos)) return prev
+      return {
+        ...prev,
+        wos: prev.wos.map(w => w.id === woId
+          ? {
+              ...w,
+              invoice_doc_number: result.doc_number,
+              qb_invoice_id:      result.qb_invoice_id,
+              invoice_view_url:   result.view_url,
+              invoice_amount:     result.amount,
+              invoice_date:       result.invoice_date || new Date().toISOString().slice(0, 10),
+            }
+          : w
+        ),
+      }
+    })
+  }
+
   const onDocsChange = async (woId, friendlyDocType, partial) => {
     // Map friendly doc_type → docs object key for the local update.
     const docKey = ({
@@ -802,6 +920,8 @@ export default function Dashboard() {
           onDocsChange={onDocsChange}
           onChangeStatus={(wo) => setStatusPickerWO(wo)}
           onDeleteWO={(wo) => setDeleteWO(wo)}
+          qbStatus={qbStatus}
+          onInvoiced={onInvoiced}
         />
       )}
 
@@ -857,6 +977,7 @@ function OperationsTabContent({
   completedTodayLabel,
   onChangeStatus, onDeleteWO,
   onDocsChange,
+  qbStatus, onInvoiced,
 }) {
   return (
     <>
@@ -1014,12 +1135,15 @@ function OperationsTabContent({
           </p>
         </div>
 
+        {/* QB disconnected banner — silent when connected */}
+        <QBStatusBadge status={qbStatus} />
+
         {/* Table — horizontally scrollable on mobile */}
         <div className="overflow-x-auto">
           <table className="w-full min-w-[820px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
-                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Drive', ''].map((h, i) => (
+                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Invoice', 'Drive', ''].map((h, i) => (
                   <th
                     key={h || `col-${i}`}
                     className="py-2.5 px-3 text-left text-[10px] font-extrabold
@@ -1033,7 +1157,7 @@ function OperationsTabContent({
             <tbody>
               {filteredWOs.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="py-12 text-center text-slate-400 text-sm">
+                  <td colSpan={12} className="py-12 text-center text-slate-400 text-sm">
                     No work orders match your filters.
                   </td>
                 </tr>
@@ -1043,9 +1167,11 @@ function OperationsTabContent({
                     key={wo.id}
                     wo={wo}
                     flagged={attention.includes(wo.id)}
+                    qbConnected={!!qbStatus?.connected}
                     onDocsChange={onDocsChange}
                     onChangeStatus={onChangeStatus}
                     onDeleteWO={onDeleteWO}
+                    onInvoiced={onInvoiced}
                   />
                 ))
               )}

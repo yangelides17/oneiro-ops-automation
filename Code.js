@@ -3534,6 +3534,18 @@ function doPost(e) {
       return handleGetDocStatusCalendar_(body);
     } else if (action === 'list_documents_for_batch') {
       return handleListDocumentsForBatch_(body);
+    } else if (action === 'get_qb_invoice_payload') {
+      return handleGetQbInvoicePayload_(body);
+    } else if (action === 'record_qb_invoice') {
+      return handleRecordQbInvoice_(body);
+    } else if (action === 'get_qb_refresh_token') {
+      return handleGetQbRefreshToken_();
+    } else if (action === 'set_qb_refresh_token') {
+      return handleSetQbRefreshToken_(body);
+    } else if (action === 'get_qb_customer_id') {
+      return handleGetQbCustomerId_(body);
+    } else if (action === 'set_qb_customer_id') {
+      return handleSetQbCustomerId_(body);
     } else {
       return jsonResponse_({ error: 'Unknown action: ' + action }, 400);
     }
@@ -9679,6 +9691,16 @@ function _buildDashboardPayload_() {
         markings_completed:  counts.completed,
         folder_url:          folderUrl,
         docs,
+        // QB invoice fields — populated by recordQbInvoice_ after a
+        // successful POST to QuickBooks Online. invoice_doc_number is
+        // the human-readable invoice # (QB DocNumber); qb_invoice_id is
+        // Intuit's internal Id used to build the view URL. The webapp
+        // decorates this payload with invoice_view_url before sending
+        // to React (since the base URL differs between sandbox + prod).
+        invoice_doc_number:  String(r[26] || '').trim(),
+        invoice_date:        fmtDate(r[27]),
+        invoice_amount:      r[28] !== '' && r[28] != null ? Number(r[28]) : null,
+        qb_invoice_id:       String(r[49] || '').trim(),
       };
     });
 
@@ -11150,4 +11172,406 @@ function resolveWOSubfolder_(wo_id, subfolderName, maxAttempts) {
     }
   }
   return { folder: null, error: (lastErr && lastErr.message) ? lastErr.message : String(lastErr) };
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// QUICKBOOKS ONLINE INVOICE INTEGRATION
+// ═══════════════════════════════════════════════════════════════
+//
+// The Apps Script side of the QB invoice flow. Owns:
+//   - aggregating per-WO revenue into the 5 pricing-group line items
+//     (qty × rate = amount, matching the QB invoice template columns)
+//   - persisting the rotating refresh token in Script Properties
+//   - caching contractor-name → QB Customer ID lookups
+//   - recording the QB invoice number + ID back onto the WO Tracker
+//
+// Webapp (Express server) owns the actual QB OAuth handshake and
+// outbound API calls. See webapp/src/server/qb.js.
+//
+// WO Tracker invoice columns (1-indexed):
+//   27 = Invoice #          (QB DocNumber)
+//   28 = Invoice Date
+//   29 = Invoice Amount
+//   30 = Invoice Sent?      (legacy; kept at "No" — QB now tracks)
+//   50 = QB Invoice ID      (Intuit's internal Id; for building view URL)
+
+// Per-group equivalent qty: convert each item's raw qty to the unit
+// the pricing group is denominated in. Returns null if the category
+// doesn't belong to this group or the multiplier is missing.
+function _qbEquivalentQty_(group, category, qty) {
+  if (qty == null || isNaN(qty)) return null;
+  if (group === 'line4') {
+    const m = LINE_WIDTH_MULTIPLIER_[category];
+    return m == null ? null : qty * m;
+  }
+  if (group === 'line12') {
+    const m = LINE12_MULTIPLIER_[category];
+    return m == null ? null : qty * m;
+  }
+  if (group === 'preformed') {
+    const u = PREFORMED_UNIT_COUNT_[category];
+    return u == null ? null : qty * u;
+  }
+  if (group === 'extruded') {
+    const u = EXTRUDED_UNIT_COUNT_[category];
+    return u == null ? null : qty * u;
+  }
+  if (group === 'color_surface') return qty;
+  return null;
+}
+
+const _QB_GROUP_ORDER = ['line4', 'line12', 'preformed', 'extruded', 'color_surface'];
+const _QB_GROUP_LABEL = Object.freeze({
+  line4:         '4" Line group',
+  line12:        'Crosswalk / Stop Line',
+  preformed:     'Preformed L&S',
+  extruded:      'Extruded L&S',
+  color_surface: 'Color Surface',
+});
+const _QB_UNIT_LABEL = Object.freeze({
+  line4:         'LF (4" equiv)',
+  line12:        'LF (12" equiv)',
+  preformed:     'Units',
+  extruded:      'Units',
+  color_surface: 'SF',
+});
+
+/**
+ * Aggregate one WO's Completed marking items into the QB invoice
+ * payload shape — one line per non-empty pricing group with
+ * { qty, rate, amount, description }. Math reconciles penny-perfect to
+ * priceMarkingItem_'s revenue numbers: per group,
+ *   amount  = Σ priceMarkingItem_(item).revenue
+ *   qty     = Σ item.qty × multiplier[item.category]
+ *   rate    = amount / qty   (= contract rate when uniform, weighted
+ *                              blend when items spanned a rate change)
+ *
+ * Returns:
+ *   {
+ *     wo_id, contractor, contract_num, borough, location,
+ *     work_start, work_end,
+ *     totals: { revenue, items },
+ *     lines:  [{ group, label, qty, unit_label, rate, amount, description }],
+ *     needs_pricing: [{ item_id, category, qty, unit, reason }]
+ *   }
+ *
+ * Empty groups are omitted. If `needs_pricing` is non-empty the caller
+ * should refuse to send the invoice until the underlying items are fixed.
+ */
+function aggregateRevenueByWoForQB_(ss, woId) {
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const miSheet = ss.getSheetByName('Marking Items');
+  if (!woSheet || !miSheet) {
+    throw new Error('Missing required sheets — Work Order Tracker or Marking Items');
+  }
+
+  // WO metadata
+  const woRows = woSheet.getDataRange().getValues();
+  const woRow  = woRows.slice(1).find(r => String(r[0] || '').trim() === String(woId).trim());
+  if (!woRow) throw new Error('WO not found in tracker: ' + woId);
+
+  const fmtDate = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : s;
+  };
+
+  const contractor   = String(woRow[1]  || '').trim();
+  const contractNum  = String(woRow[2]  || '').split('/')[0].trim();
+  const borough      = String(woRow[3]  || '').trim();
+  const location     = String(woRow[5]  || '').trim();
+  const workStartIso = fmtDate(woRow[17]);
+  const workEndIso   = fmtDate(woRow[18]) || workStartIso || Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+
+  // Marking items walk — collect per-group sums + per-category breakdown
+  const miData = miSheet.getDataRange().getValues();
+  const rates  = _loadContractPricing_(ss);
+  const woMeta = { contractor, contract_num: contractNum, borough };
+
+  // Per-group accumulators
+  const acc = {};
+  _QB_GROUP_ORDER.forEach(g => {
+    acc[g] = { revenue: 0, qty: 0, items: 0, breakdown: {} };
+    // breakdown[category] = { raw_qty, equiv_qty, unit }
+  });
+  const needsPricing = [];
+  let totalItems = 0;
+
+  for (let i = 1; i < miData.length; i++) {
+    const r = miData[i];
+    if (String(r[1] || '').trim() !== woId) continue;
+    if (String(r[12] || '').toLowerCase() !== 'completed') continue;
+    const qty = parseFloat(r[8]);
+    if (isNaN(qty) || qty <= 0) continue;
+
+    const item = {
+      item_id:        String(r[0] || '').trim(),
+      category:       String(r[4] || '').trim(),
+      quantity:       qty,
+      unit:           String(r[9] || '').trim(),
+      date_completed: fmtDate(r[11]),
+    };
+    const group = PRICING_GROUP_BY_CATEGORY_[item.category] || 'unpriced';
+    const priced = priceMarkingItem_(item, woMeta, rates);
+
+    if (priced.reason || group === 'unpriced') {
+      needsPricing.push({
+        item_id:  item.item_id,
+        category: item.category,
+        qty:      item.quantity,
+        unit:     item.unit,
+        reason:   priced.reason || 'unpriced_category',
+      });
+      continue;
+    }
+
+    const equivQty = _qbEquivalentQty_(group, item.category, qty);
+    if (equivQty == null) {
+      needsPricing.push({
+        item_id:  item.item_id,
+        category: item.category,
+        qty:      item.quantity,
+        unit:     item.unit,
+        reason:   'no_unit_count',
+      });
+      continue;
+    }
+
+    const bucket = acc[group];
+    bucket.revenue += priced.revenue;
+    bucket.qty     += equivQty;
+    bucket.items   += 1;
+    if (!bucket.breakdown[item.category]) {
+      bucket.breakdown[item.category] = { raw_qty: 0, equiv_qty: 0, unit: item.unit };
+    }
+    bucket.breakdown[item.category].raw_qty   += qty;
+    bucket.breakdown[item.category].equiv_qty += equivQty;
+    totalItems += 1;
+  }
+
+  // Build line items in fixed group order, skipping empty groups
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const round4 = (n) => Math.round(n * 10000) / 10000;
+
+  const lines = [];
+  let totalRevenue = 0;
+
+  _QB_GROUP_ORDER.forEach(group => {
+    const bucket = acc[group];
+    if (bucket.items === 0 || bucket.qty <= 0) return;
+    const rate = round4(bucket.revenue / bucket.qty);
+
+    // Description: comma-separated category breakdown, e.g.
+    // "4" Line: 100 LF · 12" Line: 200 LF (3.0× = 600 LF 4"-equiv)"
+    const parts = Object.keys(bucket.breakdown).sort().map(cat => {
+      const b = bucket.breakdown[cat];
+      const sameQty = Math.abs(b.raw_qty - b.equiv_qty) < 0.01;
+      const unitOut = b.unit || (group === 'color_surface' ? 'SF' : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
+      if (sameQty) {
+        return `${cat}: ${round2(b.raw_qty)} ${unitOut}`;
+      }
+      return `${cat}: ${round2(b.raw_qty)} ${unitOut} → ${round2(b.equiv_qty)} ${_QB_UNIT_LABEL[group]}`;
+    });
+    const description = parts.join(' · ');
+
+    lines.push({
+      group,
+      label:       _QB_GROUP_LABEL[group],
+      qty:         round2(bucket.qty),
+      unit_label:  _QB_UNIT_LABEL[group],
+      rate,
+      amount:      round2(bucket.revenue),
+      description,
+    });
+    totalRevenue += bucket.revenue;
+  });
+
+  return {
+    wo_id:         woId,
+    contractor,
+    contract_num:  contractNum,
+    borough,
+    location,
+    work_start:    workStartIso,
+    work_end:      workEndIso,
+    totals:        { revenue: round2(totalRevenue), items: totalItems },
+    lines,
+    needs_pricing: needsPricing,
+  };
+}
+
+
+/**
+ * Record a successfully-posted QB invoice on the WO Tracker.
+ *   col 27 = Invoice # (QB DocNumber)
+ *   col 28 = Invoice Date (today)
+ *   col 29 = Invoice Amount
+ *   col 50 = QB Invoice ID (Intuit internal id, for view URL)
+ *
+ * Refuses to overwrite an existing Invoice # — the webapp's pre-flight
+ * "already invoiced?" check should have caught this earlier, but the
+ * server-side guard prevents a race from silently double-billing.
+ */
+function recordQbInvoice_(ss, woId, data) {
+  const docNumber = String(data.doc_number || '').trim();
+  const qbId      = String(data.qb_invoice_id || '').trim();
+  const amount    = Number(data.amount);
+  if (!docNumber || !qbId || isNaN(amount)) {
+    throw new Error('recordQbInvoice_: doc_number, qb_invoice_id, and amount are required');
+  }
+
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) throw new Error('Work Order Tracker not found');
+
+  const data2d  = woSheet.getDataRange().getValues();
+  const rowIdx0 = data2d.slice(1).findIndex(r => String(r[0] || '').trim() === String(woId).trim());
+  if (rowIdx0 === -1) throw new Error('WO not found in tracker: ' + woId);
+  const rowNum = rowIdx0 + 2;  // +2 because: slice(1) drops header + sheets are 1-indexed
+
+  const existing = String(data2d[rowIdx0 + 1][26] || '').trim();
+  if (existing) {
+    throw new Error(`WO ${woId} already has Invoice # ${existing} — refusing to overwrite`);
+  }
+
+  const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  woSheet.getRange(rowNum, 27).setValue(docNumber);   // Invoice #
+  woSheet.getRange(rowNum, 28).setValue(today);       // Invoice Date
+  woSheet.getRange(rowNum, 29).setValue(amount);      // Invoice Amount
+  woSheet.getRange(rowNum, 50).setValue(qbId);        // QB Invoice ID
+
+  Logger.log(`✅ Recorded QB invoice ${docNumber} (id=${qbId}, $${amount}) on WO ${woId}`);
+  return { wo_id: woId, doc_number: docNumber, qb_invoice_id: qbId, amount, invoice_date: today };
+}
+
+
+/**
+ * One-shot bootstrap: add the "QB Invoice ID" column at WO Tracker
+ * col 50. Idempotent. Run from the Apps Script editor once when first
+ * deploying the QB integration. Avoids re-running setupAutomation
+ * (which has many side effects).
+ */
+function setupQBInvoiceCol() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) throw new Error('Work Order Tracker not found');
+
+  const COL = 50;
+  const HEADER = 'QB Invoice ID';
+  const current = String(woSheet.getRange(1, COL).getValue() || '').trim();
+  if (current === HEADER) {
+    Logger.log('↻ Col 50 already set to "QB Invoice ID"');
+    return;
+  }
+  if (current) {
+    throw new Error(`Col 50 already has header "${current}" — refusing to overwrite. Migrate manually first.`);
+  }
+  woSheet.getRange(1, COL).setValue(HEADER).setFontWeight('bold');
+  Logger.log('✅ Added "QB Invoice ID" header at WO Tracker col 50');
+}
+
+
+// ── QB token storage (rotating refresh token) ─────────────────────
+// QBO rotates the refresh token every 24–26 hours; the webapp must
+// write the rotated value back here immediately on every refresh.
+// Failing to do so means the next refresh will fail with invalid_grant.
+
+function _getQbRefreshToken_() {
+  return PropertiesService.getScriptProperties().getProperty('QB_REFRESH_TOKEN') || '';
+}
+function _setQbRefreshToken_(token) {
+  if (!token) throw new Error('Empty refresh token — refusing to clobber stored token');
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('QB_REFRESH_TOKEN',    String(token));
+  props.setProperty('QB_LAST_REFRESH_AT', new Date().toISOString());
+}
+
+
+// ── QB customer-name cache ────────────────────────────────────────
+// Map of "Display Name" → QB Customer ID, persisted as a JSON blob in
+// Script Properties. Avoids redundant QB customer-query API calls.
+
+function _normalizeCustomerName_(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+function _getQbCustomerCache_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('QB_CUSTOMER_ID_CACHE') || '{}';
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+function _setQbCustomerCache_(cache) {
+  PropertiesService.getScriptProperties().setProperty('QB_CUSTOMER_ID_CACHE', JSON.stringify(cache || {}));
+}
+
+
+// ── doPost handlers ──────────────────────────────────────────────
+
+function handleGetQbInvoicePayload_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'wo_id required' }, 400);
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Pre-flight: already invoiced?
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const rows    = woSheet.getDataRange().getValues();
+  const woRow   = rows.slice(1).find(r => String(r[0] || '').trim() === woId);
+  if (!woRow) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+  const existingDoc = String(woRow[26] || '').trim();
+  const existingQbId= String(woRow[49] || '').trim();
+  if (existingDoc) {
+    return jsonResponse_({
+      already_invoiced: true,
+      doc_number:       existingDoc,
+      qb_invoice_id:    existingQbId,
+      amount:           woRow[28] || '',
+      invoice_date:     woRow[27] || '',
+    });
+  }
+
+  const payload = aggregateRevenueByWoForQB_(ss, woId);
+  return jsonResponse_(payload);
+}
+
+function handleRecordQbInvoice_(body) {
+  const d = body.data || {};
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const result = recordQbInvoice_(ss, d.wo_id, d);
+  return jsonResponse_(result);
+}
+
+function handleGetQbRefreshToken_() {
+  return jsonResponse_({ token: _getQbRefreshToken_() });
+}
+
+function handleSetQbRefreshToken_(body) {
+  const d = body.data || {};
+  _setQbRefreshToken_(d.token);
+  return jsonResponse_({ ok: true });
+}
+
+function handleGetQbCustomerId_(body) {
+  const d = body.data || {};
+  const name = _normalizeCustomerName_(d.name);
+  if (!name) return jsonResponse_({ error: 'name required' }, 400);
+  const cache = _getQbCustomerCache_();
+  return jsonResponse_({ id: cache[name] || null });
+}
+
+function handleSetQbCustomerId_(body) {
+  const d = body.data || {};
+  const name = _normalizeCustomerName_(d.name);
+  const id   = String(d.id || '').trim();
+  if (!name || !id) return jsonResponse_({ error: 'name and id required' }, 400);
+  const cache = _getQbCustomerCache_();
+  cache[name] = id;
+  _setQbCustomerCache_(cache);
+  return jsonResponse_({ ok: true });
 }

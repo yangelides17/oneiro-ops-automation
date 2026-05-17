@@ -22,6 +22,13 @@ import archiver from 'archiver'
 import { fileURLToPath } from 'url'
 import 'dotenv/config'
 
+import {
+  qbConfigStatus, buildAuthorizeUrl, exchangeAuthCode,
+  findCustomerByName, createInvoiceForWO, checkQbConnection,
+  buildInvoiceViewUrl,
+} from './server/qb.js'
+import { assertQbItemsConfigured } from './server/qbItems.js'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
 const PORT = process.env.PORT || 3001
@@ -112,11 +119,18 @@ app.get('/api/wos', async (_req, res) => {
 
 /**
  * GET /api/dashboard
- * Returns full WO list + stats for the admin dashboard.
+ * Returns full WO list + stats for the admin dashboard. Decorates each
+ * WO row with `invoice_view_url` (built from `qb_invoice_id`) so the
+ * React side doesn't need to know about sandbox-vs-prod QBO base URLs.
  */
 app.get('/api/dashboard', async (_req, res) => {
   try {
     const data = await callAppsScript('get_dashboard_data')
+    if (Array.isArray(data?.wos)) {
+      for (const wo of data.wos) {
+        wo.invoice_view_url = buildInvoiceViewUrl(wo.qb_invoice_id)
+      }
+    }
     res.json(data)
   } catch (err) {
     console.error('GET /api/dashboard error:', err.message)
@@ -1815,6 +1829,155 @@ function buildBatchManifest(filters, listing) {
 }
 
 
+// ── QuickBooks Online integration routes ──────────────────────
+//
+// OAuth bootstrap is one-time per environment (or whenever the refresh
+// token chain breaks). See docs/quickbooks_integration.md for the user
+// setup flow.
+
+/**
+ * GET /api/qb/auth-start
+ * Kicks off the QBO OAuth 2.0 authorize-code flow. Admin clicks this
+ * once when first connecting, and again any time auth needs to be
+ * re-established (invalid_grant on refresh, etc.).
+ */
+app.get('/api/qb/auth-start', (req, res) => {
+  try {
+    // Lightweight state token — round-trips through Intuit, lets us
+    // confirm the callback came from a flow we initiated.
+    const state = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    const url = buildAuthorizeUrl(state)
+    res.redirect(url)
+  } catch (err) {
+    console.error('GET /api/qb/auth-start error:', err.message)
+    res.status(500).send(`Failed to start QuickBooks authorization: ${err.message}`)
+  }
+})
+
+/**
+ * GET /api/qb/auth-callback?code=...&state=...&realmId=...
+ * Intuit's redirect target after the user grants consent. Exchanges
+ * the auth code for tokens and persists the refresh token via Apps
+ * Script. Then renders a minimal success page.
+ */
+app.get('/api/qb/auth-callback', async (req, res) => {
+  const { code, realmId, error: oauthError } = req.query
+  if (oauthError) {
+    return res.status(400).send(`QuickBooks authorization denied: ${oauthError}`)
+  }
+  if (!code) {
+    return res.status(400).send('Missing authorization code from QuickBooks redirect')
+  }
+  try {
+    await exchangeAuthCode(String(code), String(realmId || ''))
+    res.send(`
+      <html><head><title>QuickBooks Connected</title>
+      <style>body{font-family:system-ui;padding:40px;max-width:560px;margin:0 auto}
+      h1{color:#0f172a}.ok{color:#16a34a}a{color:#1e40af}</style></head>
+      <body>
+        <h1>✅ <span class="ok">QuickBooks Connected</span></h1>
+        <p>Refresh token persisted to the Sheet. Invoice generation is now available
+           on the WO Tracker tab.</p>
+        <p><a href="/">← Back to the app</a></p>
+      </body></html>
+    `)
+  } catch (err) {
+    console.error('GET /api/qb/auth-callback error:', err.message)
+    res.status(500).send(`QuickBooks authorization failed: ${err.message}`)
+  }
+})
+
+/**
+ * GET /api/qb/status
+ * Reports the QB connection state. React polls this to decide whether
+ * to render the disconnected banner above the WO table.
+ */
+app.get('/api/qb/status', async (_req, res) => {
+  try {
+    const status = await checkQbConnection()
+    res.json(status)
+  } catch (err) {
+    console.error('GET /api/qb/status error:', err.message)
+    res.status(500).json({ connected: false, reason: 'error', error: err.message })
+  }
+})
+
+/**
+ * POST /api/qb/invoice/:woId
+ * Generates a QB invoice for one Work Order. Idempotent — if the WO
+ * already has an invoice number recorded, returns the existing one
+ * without creating a duplicate.
+ *
+ * Response:
+ *   { ok: true,  doc_number, qb_invoice_id, view_url, amount,
+ *                already_invoiced: false }
+ *   { ok: true,  doc_number, qb_invoice_id, view_url, amount,
+ *                already_invoiced: true   }
+ *   { ok: false, error, needs_pricing? }
+ */
+app.post('/api/qb/invoice/:woId', async (req, res) => {
+  const woId = req.params.woId
+  try {
+    // 1) Fetch payload from Apps Script. Pre-flight check for
+    //    "already invoiced" lives there — server-side guard against
+    //    double billing even if the React side races.
+    const payload = await callAppsScript('get_qb_invoice_payload', { wo_id: woId })
+
+    if (payload.already_invoiced) {
+      return res.json({
+        ok:               true,
+        already_invoiced: true,
+        doc_number:       payload.doc_number,
+        qb_invoice_id:    payload.qb_invoice_id,
+        view_url:         buildInvoiceViewUrl(payload.qb_invoice_id),
+        amount:           payload.amount,
+      })
+    }
+
+    if (Array.isArray(payload.needs_pricing) && payload.needs_pricing.length > 0) {
+      return res.status(400).json({
+        ok:    false,
+        error: 'Some marking items can\'t be priced — fix them before invoicing.',
+        needs_pricing: payload.needs_pricing,
+      })
+    }
+    if (!payload.lines || payload.lines.length === 0) {
+      return res.status(400).json({
+        ok:    false,
+        error: 'No priced marking items for this WO — nothing to invoice.',
+      })
+    }
+
+    // 2) Resolve customer (cache → query → error if missing)
+    const customer = await findCustomerByName(payload.contractor)
+
+    // 3) Create the invoice
+    const result = await createInvoiceForWO(payload, customer.id)
+
+    // 4) Record the result back on the WO Tracker
+    await callAppsScript('record_qb_invoice', {
+      wo_id:         woId,
+      doc_number:    result.doc_number,
+      qb_invoice_id: result.qb_invoice_id,
+      amount:        payload.totals.revenue,
+    })
+
+    res.json({
+      ok:               true,
+      already_invoiced: false,
+      doc_number:       result.doc_number,
+      qb_invoice_id:    result.qb_invoice_id,
+      view_url:         result.view_url,
+      amount:           payload.totals.revenue,
+    })
+  } catch (err) {
+    console.error(`POST /api/qb/invoice/${woId} error:`, err.message)
+    const status = err.message?.includes('QB_NOT_CONNECTED') ? 401 : 500
+    res.status(status).json({ ok: false, error: err.message })
+  }
+})
+
+
 // ── Static file serving (production only) ────────────────────
 if (process.env.NODE_ENV === 'production') {
   const distDir = path.join(__dirname, 'dist')
@@ -1830,6 +1993,20 @@ if (process.env.NODE_ENV === 'production') {
 
 
 // ── Start ─────────────────────────────────────────────────────
+// QB Item IDs sanity-check. Only fails the boot when QB env vars are
+// present but qbItems.js still has placeholders — lets a dev run the
+// webapp without QB credentials configured.
+try {
+  assertQbItemsConfigured()
+} catch (err) {
+  console.error('❌ QB items misconfigured:', err.message)
+  process.exit(1)
+}
+const qbCfg = qbConfigStatus()
+console.log(qbCfg.configured
+  ? `   QB:   configured (${qbCfg.sandbox ? 'sandbox' : 'production'})`
+  : `   QB:   disabled (missing env vars: ${qbCfg.missing.join(', ')})`)
+
 app.listen(PORT, () => {
   console.log(`🚀 Oneiro Ops web server running on port ${PORT}`)
   console.log(`   Mode: ${process.env.NODE_ENV || 'development'}`)
