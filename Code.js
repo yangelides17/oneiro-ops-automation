@@ -786,9 +786,14 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
     if (isNaN(qty) || qty <= 0) return;
     const unit     = String(r[9] || '').toUpperCase();
 
-    // MMA SF → Color Surface Treatment 1/2, not the grid
+    // MMA SF → Color Surface Treatment 1/2, not the grid.
+    // Bike Lane Green Bar joins the same SF rollup — it's a colored
+    // surface treatment by definition. Color/Material is optional in
+    // the UI but admins should set it to "Green" (or whatever specific
+    // shade) so the Color Surface Treatment 2 cell lists it.
     if (unit === 'SF' &&
-        (category === 'Bike Lane' || category === 'Bus Lane' || category === 'Pedestrian Space')) {
+        (category === 'Bike Lane' || category === 'Bus Lane' ||
+         category === 'Pedestrian Space' || category === 'Bike Lane Green Bar')) {
       sfSum += qty;
       const color = String(r[10] || '').trim();
       if (color && color.toLowerCase() !== 'n/a') colorsSet[color] = true;

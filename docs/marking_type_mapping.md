@@ -40,12 +40,12 @@ inside `Code.js`.
 | Bike Lane Arrow        | EA   | Bike Lane Arrows    | Bicycle Lane Arrow               |
 | Bike Lane Symbol       | EA   | Bike Lane Symbols   | Bicycle Lane Symbol              |
 
-## MMA SF categories — NOT in the grid; flow through Color Surface Treatment rows
+## SF categories — NOT in the grid; flow through Color Surface Treatment rows
 
 Aggregation rule:
 - **Color Surface Treatment 1** = sum of all Marking Items Quantity
   where Unit = `SF` for the WO (Bike Lane + Bus Lane + Pedestrian
-  Space, usually just one per WO).
+  Space + Bike Lane Green Bar).
 - **Color Surface Treatment 2** = distinct `Color/Material` values
   from those rows, comma-joined.
 
@@ -54,6 +54,14 @@ Aggregation rule:
 | Bike Lane              | SF   | (none)              | Color Surface Treatment 1 (SQFT sum) + 2 (color) |
 | Bus Lane               | SF   | (none)              | Color Surface Treatment 1 (SQFT sum) + 2 (color) |
 | Pedestrian Space       | SF   | (none)              | Color Surface Treatment 1 (SQFT sum) + 2 (color) |
+| Bike Lane Green Bar    | SF   | Bike Lane Green Bar | Color Surface Treatment 1 (SQFT sum) + 2 (color) |
+
+Bike Lane Green Bar is the only one of the four that also has a
+dedicated CFR top-table cell — it sums into both the CFR row and the
+PL Color Surface Treatment rollup. Admins should set Color/Material
+to "Green" (or the specific shade) so the PL Color Surface Treatment
+2 cell shows it; if the cell is blank the SF still rolls up correctly
+but no color is listed.
 
 ## Intentionally blank on the PL
 
@@ -89,7 +97,6 @@ wants them captured there, we add PL template rows in a follow-up
 and extend `PL_CATEGORY_MAP_`.
 
 - **Shark Teeth 12x18** (Marking Items, EA) — on CFR. No PL row.
-- **Bike Lane Green Bar** (Marking Items, EA) — on CFR. No PL row.
 
 ## Still open for ops-manager review ⚠️
 
