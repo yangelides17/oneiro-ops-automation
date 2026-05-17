@@ -6,7 +6,7 @@ import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
 import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
-  pickLayout, rowIsCompletable,
+  pickLayout, rowIsCompletable, rowRequiresColor,
 } from '../lib/markingCategories'
 import { parseQty }    from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
@@ -1338,6 +1338,23 @@ export default function FieldReport() {
       return
     }
     if (!workDate)      { raiseError('Please enter the date of work.'); return }
+    // MMA items must always carry a Color/Material value, even on a
+    // partial submit — the field is intrinsic to the item, not tied to
+    // completion. (rowIsCompletable already enforces this when WO is
+    // marked complete; this check covers partial submits too.)
+    const missingColor = markingItems.filter(i =>
+      rowRequiresColor(i) && !String(i.color_material || '').trim()
+    )
+    if (missingColor.length > 0) {
+      const labels = missingColor.slice(0, 6).map(i => `• ${i.category}`).join('\n')
+      const more = missingColor.length > 6 ? `\n…and ${missingColor.length - 6} more` : ''
+      raiseError(
+        `Color / Material is required for MMA items. ` +
+        `${missingColor.length} item${missingColor.length===1?'':'s'} ` +
+        `${missingColor.length===1?'is':'are'} missing it:\n\n${labels}${more}`
+      )
+      return
+    }
     // If the crew is declaring the WO complete, every Marking Item must
     // be completable (already Completed, or Pending with the required
     // fields filled in). Anything else is either missing a measurement

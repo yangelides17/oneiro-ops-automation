@@ -189,6 +189,10 @@ export default function MarkingFormModal({
       setError('Marking Type is required.')
       return
     }
+    if (layout === 'mma' && !form.color_material.trim()) {
+      setError('Color / Material is required for MMA items.')
+      return
+    }
     const parsedStr = parseQty(form.quantity)
     if (parsedStr !== form.quantity) {
       // Reflect the resolved number in the input so the modal message
@@ -279,7 +283,7 @@ export default function MarkingFormModal({
           )}
 
           {layout === 'mma' && (
-            <Field label="Color / Material">
+            <Field label="Color / Material" required>
               <input
                 type="text"
                 value={form.color_material}
