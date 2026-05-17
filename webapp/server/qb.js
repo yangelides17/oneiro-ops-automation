@@ -443,14 +443,16 @@ function buildQbInvoice(payload, customerId) {
 }
 
 export async function createInvoiceForWO(payload, customerId) {
-  // Deterministic RequestId — same WO + work-end + total dedupes at QB
-  // for accidental retries or double-clicks.
-  const requestId = crypto.createHash('sha256')
-    .update(`${payload.wo_id}|${payload.work_end}|${payload.totals.revenue}`)
-    .digest('hex').slice(0, 36)
-
+  // We intentionally do NOT pass a RequestId here. QB's idempotency
+  // record persists past invoice deletion — using a deterministic
+  // RequestId (e.g. sha256 of WO + work_end + total) means once we've
+  // created an invoice for a given WO, QB will keep handing back the
+  // SAME (potentially deleted) invoice ID forever. The React UI
+  // disables the Generate button during the in-flight request and the
+  // server doesn't auto-retry non-401 errors, so RequestId wasn't
+  // protecting us from anything that wasn't already covered.
   const invoice = buildQbInvoice(payload, customerId)
-  const result  = await qbFetch('POST', '/invoice', { body: invoice, requestId })
+  const result  = await qbFetch('POST', '/invoice', { body: invoice })
   const created = result && result.Invoice
   if (!created || !created.Id) {
     throw new Error('QB invoice POST returned no Invoice.Id: ' + JSON.stringify(result).slice(0, 300))
@@ -483,6 +485,34 @@ export async function checkQbConnection() {
       return { connected: false, reason: 'not_authorized', sandbox: cfg.sandbox }
     }
     return { connected: false, reason: 'error', error: msg, sandbox: cfg.sandbox }
+  }
+}
+
+// ── Verify a stored QB Invoice ID still exists ────────────────────
+// Used by the "already invoiced" auto-heal path: if an admin deletes
+// the invoice in QB without clearing the WO Tracker, this returns
+// false and the caller clears the sheet + creates a fresh one. Any
+// fetch error other than a clear "not found" is treated as "still
+// exists" — we'd rather skip an unnecessary re-create on a transient
+// glitch than create a duplicate.
+export async function qbInvoiceExists(qbInvoiceId) {
+  if (!qbInvoiceId) return false
+  try {
+    const json = await qbFetch('GET', `/invoice/${encodeURIComponent(qbInvoiceId)}`)
+    return !!(json && json.Invoice && json.Invoice.Id)
+  } catch (err) {
+    const msg = String(err && err.message || err)
+    // QB returns code 610 "Object Not Found" with HTTP 400 when an
+    // entity is gone. Some shapes also include "ObjectNotFound" or
+    // the literal substring "Object Not Found" in the Fault detail.
+    if (msg.includes('"code":"610"') ||
+        msg.includes('Object Not Found') ||
+        msg.includes('ObjectNotFound')) {
+      return false
+    }
+    // Anything else — log and assume still exists, so we don't dupe.
+    console.warn(`[QB] qbInvoiceExists ${qbInvoiceId} ambiguous: ${msg}`)
+    return true
   }
 }
 

@@ -3538,6 +3538,8 @@ function doPost(e) {
       return handleGetQbInvoicePayload_(body);
     } else if (action === 'record_qb_invoice') {
       return handleRecordQbInvoice_(body);
+    } else if (action === 'clear_qb_invoice') {
+      return handleClearQbInvoice_(body);
     } else if (action === 'get_qb_refresh_token') {
       return handleGetQbRefreshToken_();
     } else if (action === 'set_qb_refresh_token') {
@@ -11583,6 +11585,34 @@ function handleRecordQbInvoice_(body) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const result = recordQbInvoice_(ss, d.wo_id, d);
   return jsonResponse_(result);
+}
+
+/**
+ * Clear the recorded QB invoice fields on a WO Tracker row so the
+ * next invoice generation creates a fresh one. Called by the webapp
+ * after detecting that the QB-side invoice was deleted out from under
+ * us (auto-heal path).
+ *
+ * Wipes col 27 (Invoice #), 28 (Invoice Date), 29 (Invoice Amount),
+ * and 50 (QB Invoice ID). Leaves col 30 (Invoice Sent?) alone — it
+ * was a legacy flag and isn't part of the QB integration's state.
+ */
+function handleClearQbInvoice_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'wo_id required' }, 400);
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) return jsonResponse_({ error: 'Work Order Tracker not found' }, 404);
+  const rows = woSheet.getDataRange().getValues();
+  const rowIdx0 = rows.slice(1).findIndex(r => String(r[0] || '').trim() === woId);
+  if (rowIdx0 === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
+  const rowNum = rowIdx0 + 2;
+  // Clear cols 27, 28, 29 in one range; col 50 separately.
+  woSheet.getRange(rowNum, 27, 1, 3).clearContent();
+  woSheet.getRange(rowNum, 50).clearContent();
+  Logger.log(`✅ Cleared QB invoice fields on WO ${woId} (row ${rowNum})`);
+  return jsonResponse_({ ok: true, wo_id: woId });
 }
 
 function handleGetQbRefreshToken_() {

@@ -26,7 +26,7 @@ import 'dotenv/config'
 import {
   qbConfigStatus, buildAuthorizeUrl, exchangeAuthCode,
   findCustomerByName, createInvoiceForWO, checkQbConnection,
-  buildInvoiceViewUrl,
+  buildInvoiceViewUrl, qbInvoiceExists,
 } from './server/qb.js'
 import { assertQbItemsConfigured } from './server/qbItems.js'
 
@@ -2021,17 +2021,34 @@ app.post('/api/qb/invoice/:woId', async (req, res) => {
     // 1) Fetch payload from Apps Script. Pre-flight check for
     //    "already invoiced" lives there — server-side guard against
     //    double billing even if the React side races.
-    const payload = await callAppsScript('get_qb_invoice_payload', { wo_id: woId })
+    let payload = await callAppsScript('get_qb_invoice_payload', { wo_id: woId })
 
     if (payload.already_invoiced) {
-      return res.json({
-        ok:               true,
-        already_invoiced: true,
-        doc_number:       payload.doc_number,
-        qb_invoice_id:    payload.qb_invoice_id,
-        view_url:         buildInvoiceViewUrl(payload.qb_invoice_id),
-        amount:           payload.amount,
-      })
+      // Self-heal: an admin may have deleted the invoice in QB
+      // without clearing the WO Tracker. Verify the recorded invoice
+      // still exists; if not, clear the stale row and re-create.
+      const stillExists = await qbInvoiceExists(payload.qb_invoice_id)
+      if (stillExists) {
+        return res.json({
+          ok:               true,
+          already_invoiced: true,
+          doc_number:       payload.doc_number,
+          qb_invoice_id:    payload.qb_invoice_id,
+          view_url:         buildInvoiceViewUrl(payload.qb_invoice_id),
+          amount:           payload.amount,
+        })
+      }
+      console.warn(`[QB] WO ${woId} marked already-invoiced (#${payload.doc_number}, qb_id=${payload.qb_invoice_id}) but invoice is gone — clearing and re-generating`)
+      await callAppsScript('clear_qb_invoice', { wo_id: woId })
+      payload = await callAppsScript('get_qb_invoice_payload', { wo_id: woId })
+      if (payload.already_invoiced) {
+        // Defensive — shouldn't happen, but bail with a clear error
+        // instead of silently looping.
+        return res.status(500).json({
+          ok: false,
+          error: 'Failed to clear stale invoice record on WO Tracker — please clear cols 27–29 + 50 manually.',
+        })
+      }
     }
 
     if (Array.isArray(payload.needs_pricing) && payload.needs_pricing.length > 0) {
