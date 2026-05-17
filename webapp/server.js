@@ -19,6 +19,7 @@ import cors     from 'cors'
 import path     from 'path'
 import multer   from 'multer'
 import archiver from 'archiver'
+import crypto   from 'crypto'
 import { fileURLToPath } from 'url'
 import 'dotenv/config'
 
@@ -1857,18 +1858,50 @@ function buildBatchManifest(filters, listing) {
 // token chain breaks). See docs/quickbooks_integration.md for the user
 // setup flow.
 
+// ── OAuth CSRF state helpers ──────────────────────────────────
+//
+// Intuit security requirement: the `state` parameter passed through
+// the authorize → callback round-trip must be cryptographically random
+// and verified server-side, so an attacker can't trick the user into
+// completing an OAuth flow the user didn't initiate. We store the
+// state in a short-lived HttpOnly cookie set when /api/qb/auth-start
+// fires, and verify it matches the callback's `state` query param.
+//
+// 10-minute lifetime is long enough for any human OAuth flow and
+// short enough that stale states age out quickly.
+const QB_STATE_COOKIE = 'qb_oauth_state'
+const QB_STATE_TTL_MS = 10 * 60 * 1000
+
+function readCookie(req, name) {
+  const header = req.headers.cookie || ''
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=')
+    if (idx === -1) continue
+    const k = part.slice(0, idx).trim()
+    if (k === name) return decodeURIComponent(part.slice(idx + 1).trim())
+  }
+  return null
+}
+
 /**
  * GET /api/qb/auth-start
  * Kicks off the QBO OAuth 2.0 authorize-code flow. Admin clicks this
  * once when first connecting, and again any time auth needs to be
- * re-established (invalid_grant on refresh, etc.).
+ * re-established (invalid_grant on refresh, etc.). Generates a CSRF
+ * state token, parks it in an HttpOnly cookie, and includes the same
+ * value in the authorize URL — verified back on /api/qb/auth-callback.
  */
-app.get('/api/qb/auth-start', (req, res) => {
+app.get('/api/qb/auth-start', async (req, res) => {
   try {
-    // Lightweight state token — round-trips through Intuit, lets us
-    // confirm the callback came from a flow we initiated.
-    const state = Math.random().toString(36).slice(2) + Date.now().toString(36)
-    const url = buildAuthorizeUrl(state)
+    const state = crypto.randomBytes(24).toString('base64url')
+    res.cookie(QB_STATE_COOKIE, state, {
+      httpOnly: true,
+      secure:   process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge:   QB_STATE_TTL_MS,
+      path:     '/api/qb',
+    })
+    const url = await buildAuthorizeUrl(state)
     res.redirect(url)
   } catch (err) {
     console.error('GET /api/qb/auth-start error:', err.message)
@@ -1885,7 +1918,20 @@ app.get('/api/qb/auth-start', (req, res) => {
  * parties via Referer headers — Intuit security requirement.
  */
 app.get('/api/qb/auth-callback', async (req, res) => {
-  const { code, realmId, error: oauthError } = req.query
+  const { code, realmId, state, error: oauthError } = req.query
+  // Always clear the state cookie on callback, success or failure —
+  // single-use, prevents replay.
+  res.clearCookie(QB_STATE_COOKIE, { path: '/api/qb' })
+
+  // CSRF: verify the state echoed back matches the one we put in the
+  // HttpOnly cookie. timingSafeEqual to avoid a timing oracle.
+  const cookieState = readCookie(req, QB_STATE_COOKIE)
+  const queryState  = String(state || '')
+  if (!cookieState || !queryState || cookieState.length !== queryState.length ||
+      !crypto.timingSafeEqual(Buffer.from(cookieState), Buffer.from(queryState))) {
+    console.warn('[QB] auth-callback CSRF state mismatch — refusing')
+    return res.redirect('/?qb=error&msg=' + encodeURIComponent('CSRF state mismatch — please start the connection again'))
+  }
   if (oauthError) {
     return res.redirect(`/?qb=error&msg=${encodeURIComponent(String(oauthError))}`)
   }

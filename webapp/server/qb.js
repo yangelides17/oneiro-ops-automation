@@ -42,9 +42,43 @@ const QB_APP_BASE   = BASE_URL.includes('sandbox')
   ? 'https://app.sandbox.qbo.intuit.com'
   : 'https://app.qbo.intuit.com'
 
-const TOKEN_URL     = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer'
-const AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2'
-const SCOPE         = 'com.intuit.quickbooks.accounting'
+// Hardcoded fallbacks — used only if the OIDC discovery doc fetch
+// fails. The live values come from getOAuthEndpoints() below, which
+// consults Intuit's OpenID Connect discovery document so we always
+// use whatever endpoint URLs Intuit currently advertises.
+const FALLBACK_TOKEN_URL     = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer'
+const FALLBACK_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2'
+const DISCOVERY_URL          = 'https://developer.api.intuit.com/.well-known/openid_configuration/'
+const SCOPE                  = 'com.intuit.quickbooks.accounting'
+
+let _discoveryCache = null   // { authorization_endpoint, token_endpoint, revocation_endpoint }
+
+async function getOAuthEndpoints() {
+  if (_discoveryCache) return _discoveryCache
+  try {
+    const res = await fetch(DISCOVERY_URL, { headers: { 'Accept': 'application/json' } })
+    if (res.ok) {
+      const json = await res.json()
+      _discoveryCache = {
+        authorization_endpoint: json.authorization_endpoint || FALLBACK_AUTHORIZE_URL,
+        token_endpoint:         json.token_endpoint         || FALLBACK_TOKEN_URL,
+        revocation_endpoint:    json.revocation_endpoint    || null,
+      }
+      console.log('[QB] OIDC discovery loaded — auth=', _discoveryCache.authorization_endpoint,
+                  ' token=', _discoveryCache.token_endpoint)
+      return _discoveryCache
+    }
+    console.warn('[QB] discovery fetch returned non-OK:', res.status)
+  } catch (err) {
+    console.warn('[QB] discovery fetch failed:', err.message)
+  }
+  _discoveryCache = {
+    authorization_endpoint: FALLBACK_AUTHORIZE_URL,
+    token_endpoint:         FALLBACK_TOKEN_URL,
+    revocation_endpoint:    null,
+  }
+  return _discoveryCache
+}
 
 export function qbConfigStatus() {
   const missing = []
@@ -146,9 +180,10 @@ function _hashToken(t) {
 }
 
 // ── OAuth: authorize URL ──────────────────────────────────────────
-export function buildAuthorizeUrl(state) {
+export async function buildAuthorizeUrl(state) {
   const cfg = qbConfigStatus()
   if (!cfg.configured) throw new Error('QB env vars missing: ' + cfg.missing.join(', '))
+  const endpoints = await getOAuthEndpoints()
   const params = new URLSearchParams({
     client_id:     CLIENT_ID,
     response_type: 'code',
@@ -156,7 +191,7 @@ export function buildAuthorizeUrl(state) {
     redirect_uri:  REDIRECT_URI,
     state:         state,
   })
-  return `${AUTHORIZE_URL}?${params.toString()}`
+  return `${endpoints.authorization_endpoint}?${params.toString()}`
 }
 
 // ── OAuth: exchange authorization code for tokens (one-time per env) ─
@@ -167,12 +202,13 @@ export async function exchangeAuthCode(code, realmId) {
       `Authorize against the correct QBO company or fix the env var.`
     )
   }
+  const endpoints = await getOAuthEndpoints()
   const body = new URLSearchParams({
     grant_type:   'authorization_code',
     code,
     redirect_uri: REDIRECT_URI,
   })
-  const res = await fetch(TOKEN_URL, {
+  const res = await fetch(endpoints.token_endpoint, {
     method:  'POST',
     headers: {
       'Authorization': 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
@@ -210,11 +246,12 @@ async function refreshAccessToken() {
     }
     console.log(`[QB] refresh start, old_hash=${_hashToken(oldToken)}`)
 
+    const endpoints = await getOAuthEndpoints()
     const body = new URLSearchParams({
       grant_type:    'refresh_token',
       refresh_token: oldToken,
     })
-    const res = await fetch(TOKEN_URL, {
+    const res = await fetch(endpoints.token_endpoint, {
       method:  'POST',
       headers: {
         'Authorization': 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
