@@ -217,8 +217,12 @@ export async function exchangeAuthCode(code, realmId) {
     },
     body: body.toString(),
   })
+  const exchangeTid = res.headers.get('intuit_tid') || ''
   const json = await res.json()
-  if (!res.ok) throw new Error(`QB token exchange failed (${res.status}): ${JSON.stringify(json)}`)
+  if (!res.ok) {
+    console.error(`[QB] auth-code exchange failed status=${res.status} intuit_tid=${exchangeTid}`)
+    throw new Error(`QB token exchange failed (${res.status}) [intuit_tid=${exchangeTid}]: ${JSON.stringify(json)}`)
+  }
   if (!json.refresh_token) throw new Error('QB token exchange did not return refresh_token')
 
   await callAppsScript('set_qb_refresh_token', { token: encryptToken(json.refresh_token) })
@@ -260,9 +264,10 @@ async function refreshAccessToken() {
       },
       body: body.toString(),
     })
+    const tokenTid = res.headers.get('intuit_tid') || ''
     const json = await res.json()
     if (!res.ok) {
-      console.log(`[QB] refresh failed: ${res.status} ${JSON.stringify(json)}`)
+      console.log(`[QB] refresh failed: ${res.status} intuit_tid=${tokenTid} ${JSON.stringify(json)}`)
       // invalid_grant → admin must re-authorize
       throw new Error('QB_NOT_CONNECTED')
     }
@@ -325,13 +330,19 @@ async function qbFetch(method, path, { body, query, requestId } = {}) {
     token = await refreshAccessToken()
     res = await doFetch(token)
   }
+  // intuit_tid (Intuit Transaction ID) is in every QB API response
+  // header. Capture for log correlation + include in thrown errors so
+  // admins can hand it to Intuit support for fast root-cause lookup.
+  const intuitTid = res.headers.get('intuit_tid') || ''
   const text = await res.text()
   let json = null
   try { json = text ? JSON.parse(text) : null } catch (_) { /* leave null */ }
   if (!res.ok) {
     const fault = json && json.Fault ? JSON.stringify(json.Fault) : text.slice(0, 300)
-    throw new Error(`QB ${method} ${path} failed (${res.status}): ${fault}`)
+    console.error(`[QB] ${method} ${path} failed status=${res.status} intuit_tid=${intuitTid} fault=${fault}`)
+    throw new Error(`QB ${method} ${path} failed (${res.status}) [intuit_tid=${intuitTid}]: ${fault}`)
   }
+  console.log(`[QB] ${method} ${path} ok status=${res.status} intuit_tid=${intuitTid}`)
   return json
 }
 
