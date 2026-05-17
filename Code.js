@@ -7290,23 +7290,42 @@ const LINE_WIDTH_MULTIPLIER_ = Object.freeze({
 
 // Standard NYC DOT thermo unit table. `null` = unit count not yet
 // known — items will surface in the Needs Pricing bucket with
-// reason='no_unit_count' until the table arrives. Stop Msg is the
-// only confirmed value as of 2026-05-04.
+// reason='no_unit_count' until the table arrives.
+//
+// Message values are sums of the per-letter 8' Letters & Numbers unit
+// counts (S=0.37, T=0.25, O=0.39, P=0.34, etc.). Worked examples for
+// each message are shown alongside so a future edit can sanity-check
+// against the same DOT table.
+//   STOP   = S(0.37)+T(0.25)+O(0.39)+P(0.34)              = 1.35
+//   ONLY   = O(0.39)+N(0.46)+L(0.25)+Y(0.25)              = 1.35
+//   BUMP   = B(0.46)+U(0.36)+M(0.48)+P(0.34)              = 1.64
+//   BUS    = B(0.46)+U(0.36)+S(0.37)                      = 1.19
+//   20 MPH = 2(0.37)+0(0.39)+M(0.48)+P(0.34)+H(0.39)      = 1.97
+//   RR     = R(0.41)+R(0.41)                              = 0.82
+//   X      = X(0.31)                                      = 0.31
+// Symbol/arrow values come from the Symbols (Extruded) table:
+//   Turn Arrow            = 1.00   → mapped to 'L/R Arrow'
+//   Through (Straight)    = 0.81   → mapped to 'Straight Arrow'
+//   Combo Arrow           = 1.65   → mapped to 'Combination Arrow'
+//   Bicycle Facility Arr  = 0.29   → mapped to 'Bike Lane Arrow'
+//   Speed Hump Marking    = 0.78
+//   Sharks Teeth 12x18    = 0.05
+//   Sharks Teeth 24x36    = 0.19
 const EXTRUDED_UNIT_COUNT_ = Object.freeze({
   'Stop Msg':            1.35,
-  'Only Msg':            null,
-  'Bus Msg':             null,
-  'Bump Msg':            null,
-  '20 MPH Msg':          null,
-  'Railroad (RR)':       null,
-  'Railroad (X)':        null,
-  'L/R Arrow':           null,
-  'Straight Arrow':      null,
-  'Combination Arrow':   null,
-  'Speed Hump Markings': null,
-  'Shark Teeth 12x18':   null,
-  'Shark Teeth 24x36':   null,
-  'Bike Lane Arrow':     null,
+  'Only Msg':            1.35,
+  'Bus Msg':             1.19,
+  'Bump Msg':            1.64,
+  '20 MPH Msg':          1.97,
+  'Railroad (RR)':       0.82,
+  'Railroad (X)':        0.31,
+  'L/R Arrow':           1.00,
+  'Straight Arrow':      0.81,
+  'Combination Arrow':   1.65,
+  'Speed Hump Markings': 0.78,
+  'Shark Teeth 12x18':   0.05,
+  'Shark Teeth 24x36':   0.19,
+  'Bike Lane Arrow':     0.29,
 });
 
 const PREFORMED_UNIT_COUNT_ = Object.freeze({

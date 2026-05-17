@@ -73,22 +73,23 @@ export const LINE_WIDTH_MULTIPLIER = {
 
 // Standard NYC DOT thermo unit table. `null` = unit count not yet known —
 // item lands in the Needs Pricing bucket with reason='no_unit_count'
-// until the contractor unit table arrives.
+// until the contractor unit table arrives. Mirror of EXTRUDED_UNIT_COUNT_
+// in Code.js — see that block for the per-letter derivations.
 export const EXTRUDED_UNIT_COUNT = {
   'Stop Msg':            1.35,
-  'Only Msg':            null,
-  'Bus Msg':             null,
-  'Bump Msg':            null,
-  '20 MPH Msg':          null,
-  'Railroad (RR)':       null,
-  'Railroad (X)':        null,
-  'L/R Arrow':           null,
-  'Straight Arrow':      null,
-  'Combination Arrow':   null,
-  'Speed Hump Markings': null,
-  'Shark Teeth 12x18':   null,
-  'Shark Teeth 24x36':   null,
-  'Bike Lane Arrow':     null,
+  'Only Msg':            1.35,
+  'Bus Msg':             1.19,
+  'Bump Msg':            1.64,
+  '20 MPH Msg':          1.97,
+  'Railroad (RR)':       0.82,
+  'Railroad (X)':        0.31,
+  'L/R Arrow':           1.00,
+  'Straight Arrow':      0.81,
+  'Combination Arrow':   1.65,
+  'Speed Hump Markings': 0.78,
+  'Shark Teeth 12x18':   0.05,
+  'Shark Teeth 24x36':   0.19,
+  'Bike Lane Arrow':     0.29,
 }
 
 export const PREFORMED_UNIT_COUNT = {
