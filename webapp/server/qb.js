@@ -374,8 +374,39 @@ export async function findCustomerByName(name) {
   return { id, name: normalized }
 }
 
+// ── Sales Term lookup (Net 30) ────────────────────────────────────
+// Setting the term explicitly on the invoice payload is more reliable
+// than relying on QB to inherit it from the customer's default — when
+// EITHER SalesTermRef or DueDate is omitted, certain QBO configurations
+// just leave the term blank on the rendered invoice. We resolve "Net 30"
+// once per webapp process, cache the ID, and attach it to every
+// generated invoice. If the company has renamed/deleted the term, the
+// invoice ships without one (and QB might apply customer default).
+let _net30TermId    = null
+let _net30Resolved  = false
+
+async function getNet30TermId() {
+  if (_net30Resolved) return _net30TermId
+  try {
+    const json = await qbFetch('GET', '/query', {
+      query: { query: "SELECT Id, Name FROM Term WHERE Name = 'Net 30'" },
+    })
+    const term = (json && json.QueryResponse && json.QueryResponse.Term || [])[0]
+    if (term && term.Id) {
+      _net30TermId = String(term.Id)
+      console.log(`[QB] resolved Net 30 SalesTerm: id=${_net30TermId}`)
+    } else {
+      console.warn('[QB] no SalesTerm named "Net 30" found — invoices will fall back to whatever QB applies')
+    }
+  } catch (err) {
+    console.warn(`[QB] Net 30 lookup failed: ${err.message}`)
+  }
+  _net30Resolved = true
+  return _net30TermId
+}
+
 // ── Invoice creation ──────────────────────────────────────────────
-function buildQbInvoice(payload, customerId) {
+async function buildQbInvoice(payload, customerId) {
   const itemLines = payload.lines.map(l => {
     const itemId = QB_ITEMS[l.group]
     if (!itemId) throw new Error(`QB_ITEMS["${l.group}"] not configured in qbItems.js`)
@@ -409,16 +440,17 @@ function buildQbInvoice(payload, customerId) {
     ? [{ Amount: 0, DetailType: 'DescriptionOnly', Description: headerText }]
     : []
 
-  // Don't set DueDate or SalesTermRef on the payload — when either
-  // is provided, QB stops auto-inheriting the customer's default
-  // Term. Leaving both empty lets QB attach the customer's default
-  // (Net 30 for Metro + Denville, set manually in QB Customer
-  // settings) and compute the due date from it. The invoice will
-  // then show "Terms: Net 30" prominently.
+  // Explicitly attach the Net 30 SalesTerm so it renders on the
+  // invoice. We still leave DueDate unset — QB computes it from the
+  // term. If the lookup didn't find a "Net 30" term in this QB
+  // company, we omit SalesTermRef and let QB apply whatever default
+  // it can (typically the customer's default Term).
+  const termId = await getNet30TermId()
   return {
     CustomerRef: { value: String(customerId) },
     TxnDate:     payload.work_end,
     PrivateNote: `WO ${payload.wo_id} · ${payload.location}`,
+    ...(termId ? { SalesTermRef: { value: termId } } : {}),
     Line: [...headerRow, ...itemLines],
   }
 }
@@ -432,7 +464,7 @@ export async function createInvoiceForWO(payload, customerId) {
   // disables the Generate button during the in-flight request and the
   // server doesn't auto-retry non-401 errors, so RequestId wasn't
   // protecting us from anything that wasn't already covered.
-  const invoice = buildQbInvoice(payload, customerId)
+  const invoice = await buildQbInvoice(payload, customerId)
   const result  = await qbFetch('POST', '/invoice', { body: invoice })
   const created = result && result.Invoice
   if (!created || !created.Id) {

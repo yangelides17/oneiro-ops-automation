@@ -670,7 +670,8 @@ export default function Dashboard() {
   // sends through.
   // Patch a WO row's invoice fields after a successful QB invoice POST
   // so the InvoiceCell flips to the "already invoiced" link without a
-  // full dashboard refetch.
+  // full dashboard refetch. Also flip the Invoice doc chip's `done`
+  // bit to true so the INV chip turns amber in the same render.
   const onInvoiced = (woId, result) => {
     setData(prev => {
       if (!prev || !Array.isArray(prev.wos)) return prev
@@ -684,6 +685,10 @@ export default function Dashboard() {
               invoice_view_url:   result.view_url,
               invoice_amount:     result.amount,
               invoice_date:       result.invoice_date || new Date().toISOString().slice(0, 10),
+              docs: {
+                ...w.docs,
+                invoice: { ...(w.docs?.invoice || {}), done: true },
+              },
             }
           : w
         ),

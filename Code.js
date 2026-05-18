@@ -11444,6 +11444,7 @@ function recordQbInvoice_(ss, woId, data) {
   woSheet.getRange(rowNum, 27).setValue(docNumber);   // Invoice #
   woSheet.getRange(rowNum, 28).setValue(today);       // Invoice Date
   woSheet.getRange(rowNum, 29).setValue(amount);      // Invoice Amount
+  woSheet.getRange(rowNum, 45).setValue('Yes');       // Invoice Done? (1-idx col 45)
   woSheet.getRange(rowNum, 50).setValue(qbId);        // QB Invoice ID
 
   Logger.log(`✅ Recorded QB invoice ${docNumber} (id=${qbId}, $${amount}) on WO ${woId}`);
@@ -11608,8 +11609,11 @@ function handleClearQbInvoice_(body) {
   const rowIdx0 = rows.slice(1).findIndex(r => String(r[0] || '').trim() === woId);
   if (rowIdx0 === -1) return jsonResponse_({ error: 'WO not found: ' + woId }, 404);
   const rowNum = rowIdx0 + 2;
-  // Clear cols 27, 28, 29 in one range; col 50 separately.
+  // Clear cols 27, 28, 29 in one range; col 50 separately. Reset col 45
+  // (Invoice Done?) to "No" so the INV doc chip on the dashboard reverts
+  // to grey/not-done in lockstep.
   woSheet.getRange(rowNum, 27, 1, 3).clearContent();
+  woSheet.getRange(rowNum, 45).setValue('No');
   woSheet.getRange(rowNum, 50).clearContent();
   Logger.log(`✅ Cleared QB invoice fields on WO ${woId} (row ${rowNum})`);
   return jsonResponse_({ ok: true, wo_id: woId });
