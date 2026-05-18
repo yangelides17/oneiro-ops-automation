@@ -375,12 +375,6 @@ export async function findCustomerByName(name) {
 }
 
 // ── Invoice creation ──────────────────────────────────────────────
-function addDays(iso, n) {
-  const d = new Date(iso + 'T12:00:00')
-  d.setDate(d.getDate() + n)
-  return d.toISOString().slice(0, 10)
-}
-
 function buildQbInvoice(payload, customerId) {
   const itemLines = payload.lines.map(l => {
     const itemId = QB_ITEMS[l.group]
@@ -415,29 +409,16 @@ function buildQbInvoice(payload, customerId) {
     ? [{ Amount: 0, DetailType: 'DescriptionOnly', Description: headerText }]
     : []
 
-  // ── Header tag in the custom field (Path A) ─────────────────
-  // QB caps CustomField StringValue at 31 chars + single line. We
-  // pack as much as fits: WO# · Contract# · Borough · Location.
-  // Truncates mid-field if over 31; the full breakdown is in the
-  // DescriptionOnly row above so no info is lost.
-  const customFieldValue = [
-    payload.wo_id,
-    payload.contract_num,
-    payload.borough,
-    payload.location,
-  ].filter(Boolean).join(' · ').slice(0, 31)
-
+  // Don't set DueDate or SalesTermRef on the payload — when either
+  // is provided, QB stops auto-inheriting the customer's default
+  // Term. Leaving both empty lets QB attach the customer's default
+  // (Net 30 for Metro + Denville, set manually in QB Customer
+  // settings) and compute the due date from it. The invoice will
+  // then show "Terms: Net 30" prominently.
   return {
     CustomerRef: { value: String(customerId) },
     TxnDate:     payload.work_end,
-    DueDate:     addDays(payload.work_end, 30),
     PrivateNote: `WO ${payload.wo_id} · ${payload.location}`,
-    CustomField: [{
-      DefinitionId: '1',
-      Name:         'invoice description',
-      Type:         'StringType',
-      StringValue:  customFieldValue,
-    }],
     Line: [...headerRow, ...itemLines],
   }
 }
