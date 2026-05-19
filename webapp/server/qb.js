@@ -446,9 +446,14 @@ async function buildQbInvoice(payload, customerId) {
   // company, we omit SalesTermRef and let QB apply whatever default
   // it can (typically the customer's default Term).
   const termId = await getNet30TermId()
+  // Invoice date = the date this invoice is generated (NYC time), not
+  // the WO's work_end date. Crews often complete a WO days before
+  // billing goes out, and AR aging starts from the invoice date.
+  // The Work Period is still visible in the header description row.
+  const txnDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
   return {
     CustomerRef: { value: String(customerId) },
-    TxnDate:     payload.work_end,
+    TxnDate:     txnDate,
     PrivateNote: `WO ${payload.wo_id} · ${payload.location}`,
     ...(termId ? { SalesTermRef: { value: termId } } : {}),
     Line: [...headerRow, ...itemLines],
