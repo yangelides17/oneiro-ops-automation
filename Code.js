@@ -11289,17 +11289,15 @@ function aggregateRevenueByWoForQB_(ss, woId) {
   const workStartIso = fmtDate(woRow[17]);
   const workEndIso   = fmtDate(woRow[18]) || workStartIso || Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
 
-  // Marking items walk — collect per-group sums + per-category breakdown
+  // Marking items walk — collect per-category sums. Each marking item
+  // type becomes its own invoice line; multiple Marking Items rows of
+  // the same category combine into one line (raw qty + revenue summed).
   const miData = miSheet.getDataRange().getValues();
   const rates  = _loadContractPricing_(ss);
   const woMeta = { contractor, contract_num: contractNum, borough };
 
-  // Per-group accumulators
+  // Per-category accumulators: acc[category] = { group, raw_qty, unit, revenue }
   const acc = {};
-  _QB_GROUP_ORDER.forEach(g => {
-    acc[g] = { revenue: 0, qty: 0, items: 0, breakdown: {} };
-    // breakdown[category] = { raw_qty, equiv_qty, unit }
-  });
   const needsPricing = [];
   let totalItems = 0;
 
@@ -11331,6 +11329,10 @@ function aggregateRevenueByWoForQB_(ss, woId) {
       continue;
     }
 
+    // _qbEquivalentQty_ as a "is this category priceable for the QB
+    // line builder?" gate — returns null for categories without a
+    // known multiplier (e.g. Custom Msg in extruded). Still send to
+    // needs_pricing if so.
     const equivQty = _qbEquivalentQty_(group, item.category, qty);
     if (equivQty == null) {
       needsPricing.push({
@@ -11343,54 +11345,68 @@ function aggregateRevenueByWoForQB_(ss, woId) {
       continue;
     }
 
-    const bucket = acc[group];
-    bucket.revenue += priced.revenue;
-    bucket.qty     += equivQty;
-    bucket.items   += 1;
-    if (!bucket.breakdown[item.category]) {
-      bucket.breakdown[item.category] = { raw_qty: 0, equiv_qty: 0, unit: item.unit };
+    if (!acc[item.category]) {
+      acc[item.category] = { group, raw_qty: 0, unit: item.unit, revenue: 0 };
     }
-    bucket.breakdown[item.category].raw_qty   += qty;
-    bucket.breakdown[item.category].equiv_qty += equivQty;
+    acc[item.category].raw_qty += qty;
+    acc[item.category].revenue += priced.revenue;
     totalItems += 1;
   }
 
-  // Build line items in fixed group order, skipping empty groups
+  // Build line items: one per category, ordered by _QB_GROUP_ORDER
+  // (so all line4 rows precede line12, etc.) then alphabetic within
+  // each group.
   const round2 = (n) => Math.round(n * 100) / 100;
   const round4 = (n) => Math.round(n * 10000) / 10000;
 
   const lines = [];
   let totalRevenue = 0;
 
+  // Per-group unit-count tables for the L&S description parenthetical.
+  const _LS_UNIT_TABLE = {
+    preformed: PREFORMED_UNIT_COUNT_,
+    extruded:  EXTRUDED_UNIT_COUNT_,
+  };
+
   _QB_GROUP_ORDER.forEach(group => {
-    const bucket = acc[group];
-    if (bucket.items === 0 || bucket.qty <= 0) return;
-    const rate = round4(bucket.revenue / bucket.qty);
+    const cats = Object.keys(acc).filter(c => acc[c].group === group).sort();
+    cats.forEach(cat => {
+      const bucket = acc[cat];
+      if (bucket.raw_qty <= 0) return;
+      // rate × qty = amount on every row. Rate = revenue / raw_qty,
+      // which equals base × multiplier (line4 / line12 / L&S) or just
+      // base (color_surface) under uniform contracts. Blends if the
+      // contract rate changed mid-WO — same math priceMarkingItem_
+      // already produces, just decomposed at category granularity.
+      const rate = round4(bucket.revenue / bucket.raw_qty);
+      const unitOut = bucket.unit
+        || (group === 'color_surface' ? 'SF'
+           : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
 
-    // Description: comma-separated raw category breakdown. No
-    // multiplier conversions ("X → Y LF 4"-equiv") and no per-item
-    // unit-count parentheticals — contractors know the unit chart
-    // and the line's Qty/Rate columns already carry the math. Format:
-    //   line4/line12:    "4" Line: 100 LF · 12" Line: 200 LF"
-    //   preformed/extr.: "Stop Msg: 2 EA · Combination Arrow: 1 EA"
-    //   color_surface:   "Bike Lane: 150 SF"
-    const parts = Object.keys(bucket.breakdown).sort().map(cat => {
-      const b = bucket.breakdown[cat];
-      const unitOut = b.unit || (group === 'color_surface' ? 'SF' : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
-      return `${cat}: ${round2(b.raw_qty)} ${unitOut}`;
-    });
-    const description = parts.join(' · ');
+      // Description: bare category name on lines / color_surface;
+      // category + (unit_count Units) on L&S so the multiplier baked
+      // into the rate is self-documenting on the invoice.
+      let description = cat;
+      const lsTable = _LS_UNIT_TABLE[group];
+      if (lsTable) {
+        const unitCount = lsTable[cat];
+        if (unitCount != null) {
+          description = `${cat} (${unitCount} Units)`;
+        }
+      }
 
-    lines.push({
-      group,
-      label:       _QB_GROUP_LABEL[group],
-      qty:         round2(bucket.qty),
-      unit_label:  _QB_UNIT_LABEL[group],
-      rate,
-      amount:      round2(bucket.revenue),
-      description,
+      lines.push({
+        category:    cat,
+        group,
+        label:       _QB_GROUP_LABEL[group],
+        qty:         round2(bucket.raw_qty),
+        unit_label:  unitOut,
+        rate,
+        amount:      round2(bucket.revenue),
+        description,
+      });
+      totalRevenue += bucket.revenue;
     });
-    totalRevenue += bucket.revenue;
   });
 
   return {

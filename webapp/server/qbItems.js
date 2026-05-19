@@ -15,8 +15,8 @@
  */
 
 export const QB_ITEMS = Object.freeze({
-  line4:         '148',  // 4" Extruded Thermo
-  line12:        '149',  // 12" Extruded Thermo (Crosswalks/Stop Lines)
+  line4:         '148',  // Extruded Thermo Lines
+  line12:        '149',  // Extruded Thermo Crosswalks/Stop Lines
   preformed:     '150',  // Preformed L&S
   extruded:      '151',  // Extruded L&S
   color_surface: '152',  // Color Surface
