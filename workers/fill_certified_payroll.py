@@ -250,6 +250,12 @@ def build_field_map(data: dict) -> dict:
         f[f'Hourly Rate of Pay.{st_row}'] = str(worker.get('rate_st', ''))
         f[f'Hourly Rate of Pay.{ot_row}'] = str(worker.get('rate_ot', ''))
 
+        # Supplemental contributions (prevailing-wage fringe per hour).
+        # Single column on the form, indexed identically to the rate
+        # column — worker N's ST cell at row 2*(N-1), OT cell at 2*(N-1)+1.
+        f[f'HOURLY CONTRIBUTIONS TO BENEFIT FUNDS OR ACCOUNTSRow1.0.{st_row}'] = str(worker.get('supp_st', ''))
+        f[f'HOURLY CONTRIBUTIONS TO BENEFIT FUNDS OR ACCOUNTSRow1.0.{ot_row}'] = str(worker.get('supp_ot', ''))
+
         # Pay
         f[f'GROSS PAY THIS PROJECTRow{n}']        = str(worker.get('gross_pay', ''))
         f[f'Total Gross Pay.0.0.{wi}']             = str(worker.get('total_gross_pay', ''))

@@ -449,6 +449,67 @@ function setupContractPricing() {
 }
 
 
+/**
+ * Payroll Rates: prevailing-wage schedule keyed by employee
+ * classification with an effective-date column. Mirrors the Contract
+ * Pricing pattern — newest dated row whose Effective Date <= the
+ * payroll week-end date wins (see _resolvePayrollRate_).
+ *
+ * Seeded with the LP and SAT rates effective 2025-07-01. When the
+ * City publishes new rates, append a new row with the future
+ * Effective Date — no code changes needed.
+ *
+ * Idempotent: if the sheet already exists, leaves it alone (only
+ * reconciles headers). Safe to run anytime.
+ */
+function setupPayrollRates() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let sheet = ss.getSheetByName('Payroll Rates');
+  const createdNew = !sheet;
+  if (createdNew) sheet = ss.insertSheet('Payroll Rates');
+
+  const headers = [
+    'Classification', 'Effective Date',
+    'ST Rate ($/hr)', 'OT Rate ($/hr)',
+    'ST Supplemental ($/hr)', 'OT Supplemental ($/hr)',
+    'Notes'
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+
+  // Classification dropdown (LP/SAT) on col A.
+  const classRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['LP', 'SAT'], true)
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(2, 1, 999, 1).setDataValidation(classRule);
+
+  // Date validator on col B.
+  const dateRule = SpreadsheetApp.newDataValidation()
+    .requireDate()
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(2, 2, 999, 1).setDataValidation(dateRule);
+
+  if (createdNew) {
+    // Seed the current schedule (effective 2025-07-01, last day 2026-06-20).
+    // OT rate = 1.5 × ST rate per the prevailing-wage spec.
+    const seedDate = new Date(2025, 6, 1); // July is month index 6
+    sheet.getRange(2, 1, 2, headers.length).setValues([
+      ['LP',  seedDate, 46.00, 69.00, 21.17, 22.87, 'Line Person — schedule effective through 2026-06-20'],
+      ['SAT', seedDate, 40.00, 60.00, 21.17, 22.87, 'Striping Assistant — schedule effective through 2026-06-20'],
+    ]);
+    sheet.getRange(2, 2, 999, 1).setNumberFormat('yyyy-MM-dd');
+    sheet.getRange(2, 3, 999, 4).setNumberFormat('$#,##0.00');
+  }
+
+  Logger.log(createdNew
+    ? '✅ Payroll Rates sheet created + seeded with LP/SAT @ 2025-07-01'
+    : '↻ Payroll Rates schema reconciled');
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // 2. SCAN INBOX WATCHER — Detects new WO PDFs dropped in folder
 // ═══════════════════════════════════════════════════════════════
@@ -2610,21 +2671,33 @@ function validateSignInData(dateStr) {
  * rule the weekly payroll uses (Sat/Sun all OT; weekday >8 OT) so the
  * Total Gross Pay column matches the weekly column's math.
  *
- * signInData: full Daily Sign-In Data getValues() result (incl. header row).
- * empName:    employee name exactly as written in Sign-In Data col 6.
- * stRate, otRate: from Employee Registry for this employee.
- * weekEnd:    Date object marking end of the payroll week (YTD cutoff).
+ * Rates are resolved per pay-period week (Mon–Sun) using the week's
+ * end-date — so a YTD that straddles a rate-schedule boundary correctly
+ * applies old rates to weeks before and new rates to weeks after.
+ * Supplementals are paid the same hours as wages (ST hours pair with
+ * ST supp, OT hours pair with OT supp).
+ *
+ * signInData:   full Daily Sign-In Data getValues() (incl. header row).
+ * empName:      employee name as written in Sign-In Data col 6.
+ * classification: row's classification (LP/SAT/etc.) — used as the
+ *                rate-table key. Pulled from Sign-In Data col 7 when
+ *                that day's row is encountered; the *first* one we see
+ *                for the employee in this YTD window is what the caller
+ *                passes (typically the current week's classification).
+ * payrollRates: result of _loadPayrollRates_(ss). Empty array → 0.
+ * weekEnd:      Date object marking end of the payroll week (YTD cutoff).
  */
-function computeYtdGrossForEmployee_(signInData, empName, stRate, otRate, weekEnd) {
+function computeYtdGrossForEmployee_(signInData, empName, classification, payrollRates, weekEnd) {
   const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const target   = normName(empName);
   if (!target) return 0;
+  if (!Array.isArray(payrollRates) || payrollRates.length === 0) return 0;
 
   const yearStart = new Date(weekEnd.getFullYear(), 0, 1, 0, 0, 0);
 
   // Aggregate total hours by date for this employee (handles the case
   // where two sign-ins on the same day get combined before the OT rule).
-  const byDay = {};   // 'yyyy-MM-dd' → { hours, dow }
+  const byDay = {};   // 'yyyy-MM-dd' → { hours, dow, date }
   signInData.slice(1).forEach(row => {
     if (!row[0]) return;
     const rowDate = new Date(row[0]);
@@ -2634,23 +2707,41 @@ function computeYtdGrossForEmployee_(signInData, empName, stRate, otRate, weekEn
     const h = Number(row[10]) || 0;
     if (h <= 0) return;
     const key = Utilities.formatDate(rowDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-    if (!byDay[key]) byDay[key] = { hours: 0, dow: rowDate.getDay() };
+    if (!byDay[key]) byDay[key] = { hours: 0, dow: rowDate.getDay(), date: rowDate };
     byDay[key].hours += h;
   });
 
-  let totalST = 0;
-  let totalOT = 0;
-  Object.values(byDay).forEach(({ hours, dow }) => {
+  // Bucket days into Mon–Sun weeks so we can apply the rate effective on
+  // each week's end date. JS getDay(): Sun=0, Mon=1, ..., Sat=6.
+  const weekEndKey = (d) => {
+    // Days until upcoming Sunday (inclusive). For Sunday itself, 0.
+    const daysToSun = (7 - d.getDay()) % 7;
+    const we = new Date(d.getFullYear(), d.getMonth(), d.getDate() + daysToSun, 23, 59, 59);
+    return { key: Utilities.formatDate(we, CONFIG.TIMEZONE, 'yyyy-MM-dd'), date: we };
+  };
+
+  const byWeek = {}; // weekEndKey → { weekEnd: Date, st: number, ot: number }
+  Object.values(byDay).forEach(({ hours, dow, date }) => {
+    const { key, date: we } = weekEndKey(date);
+    if (!byWeek[key]) byWeek[key] = { weekEnd: we, st: 0, ot: 0 };
     if (dow === 0 || dow === 6) {
-      totalOT += hours;
+      byWeek[key].ot += hours;
     } else if (hours <= 8) {
-      totalST += hours;
+      byWeek[key].st += hours;
     } else {
-      totalST += 8;
-      totalOT += hours - 8;
+      byWeek[key].st += 8;
+      byWeek[key].ot += hours - 8;
     }
   });
-  return totalST * stRate + totalOT * otRate;
+
+  let ytd = 0;
+  Object.values(byWeek).forEach(({ weekEnd: we, st, ot }) => {
+    const rate = _resolvePayrollRate_(payrollRates, classification, we);
+    if (!rate) return; // No rate effective for this week — skip silently in YTD
+    ytd += st * ((rate.st_rate || 0) + (rate.st_supp || 0))
+         + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
+  });
+  return ytd;
 }
 
 
@@ -2672,6 +2763,26 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   const clSheet = ss.getSheetByName('Contract Lookup');
   const clData = clSheet.getDataRange().getValues();
   const cpSheet = ss.getSheetByName('Certified Payroll Tracker');
+
+  // Prevailing-wage rates by classification (LP/SAT/...) with
+  // effective-date semantics — single source of truth replacing the
+  // per-employee rate cols that used to live on Employee Registry.
+  const payrollRates = _loadPayrollRates_(ss);
+  if (payrollRates.length === 0) {
+    Logger.log('❌ Certified Payroll: Payroll Rates sheet is empty or missing. Run setupPayrollRates() first.');
+    return 0;
+  }
+
+  // CP Tracker had legacy "ER Fringe" / "EMP Fringe" headers in cols
+  // 25 / 26 (1-indexed). Those cells now carry ST/OT Supplemental
+  // values per the classification rate table — relabel idempotently
+  // so the sheet docs match what's written. Existing historical row
+  // values are left untouched; only the header row changes.
+  if (cpSheet) {
+    const headerRow = cpSheet.getRange(1, 1, 1, cpSheet.getLastColumn()).getValues()[0];
+    if (headerRow[24] === 'ER Fringe') cpSheet.getRange(1, 25).setValue('ST Supplemental');
+    if (headerRow[25] === 'EMP Fringe') cpSheet.getRange(1, 26).setValue('OT Supplemental');
+  }
   
   // Filter to this week's entries
   const weekEntries = data.slice(1).filter(row => {
@@ -2710,7 +2821,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   // Full classification names — add new codes here as needed
   const CLASSIFICATION_NAMES = {
     'LP':   'Line Person',
-    'SAT':  'Stripper Assistant',
+    'SAT':  'Striping Assistant',
     'OP':   'Operator',
     'LAB':  'Laborer',
     'FGL':  'Flagger',
@@ -2771,22 +2882,38 @@ function generateCertifiedPayroll(weekStartStr, opts) {
 
     // Write to Certified Payroll Tracker
     Object.entries(byEmployee).forEach(([empName, info]) => {
-      // Look up pay rates + address/SSN4 from Employee Registry by full name.
+      // Address + SSN4 still come from Employee Registry (personal info).
+      // Rates no longer do — they come from Payroll Rates keyed by
+      // classification + week-end date.
       const empRow = empByName[normName(empName)] || null;
       if (!empRow) {
-        Logger.log(`⚠️ Certified Payroll: no Employee Registry row matches ${JSON.stringify(empName)} — rates/address/SSN will be blank.`);
+        Logger.log(`⚠️ Certified Payroll: no Employee Registry row matches ${JSON.stringify(empName)} — address/SSN will be blank.`);
       }
-      const stRate    = empRow ? Number(empRow[6]) : 0;
-      const otRate    = empRow ? Number(empRow[7]) : 0;
-      const empFringe = empRow ? Number(empRow[9]) : 0;
-      const erFringe  = empRow ? Number(empRow[8]) : 0;
-      const empAddr   = empRow ? String(empRow[2] || '') : '';
-      const empSsn4   = empRow ? String(empRow[3] || '') : '';
+      const empAddr = empRow ? String(empRow[2] || '') : '';
+      const empSsn4 = empRow ? String(empRow[3] || '') : '';
+
+      // Per-week rate resolution: use the rate effective on this
+      // payroll week's end date (Sunday). Skip the worker (with a
+      // loud warning) if no rate row applies — happens when the
+      // sign-in row's classification (info.classification) isn't in
+      // the Payroll Rates table.
+      const rateRow = _resolvePayrollRate_(payrollRates, info.classification, weekEnd);
+      if (!rateRow) {
+        Logger.log(`⚠️ Certified Payroll: no Payroll Rates row for classification ${JSON.stringify(info.classification)} effective on or before ${weekEnd.toDateString()} — skipping ${empName}.`);
+        return;
+      }
+      const stRate = rateRow.st_rate || 0;
+      const otRate = rateRow.ot_rate || 0;
+      const stSupp = rateRow.st_supp || 0;
+      const otSupp = rateRow.ot_supp || 0;
 
       // YTD gross across all projects this year. Used to fill the
-      // "Total Gross Pay (All Work)" column on the certified payroll form.
-      // Applies the same day-of-week OT rule (Sat/Sun all OT; weekday >8 OT).
-      const ytdGross = computeYtdGrossForEmployee_(data, empName, stRate, otRate, weekEnd);
+      // "Total Gross Pay (All Work)" column on the certified payroll
+      // form. Resolves rates per-week so a YTD that straddles a rate
+      // schedule boundary stays accurate.
+      const ytdGross = computeYtdGrossForEmployee_(
+        data, empName, info.classification, payrollRates, weekEnd
+      );
 
       // OT rules: ALL hours on Saturday (6) and Sunday (0) are OT.
       // On Mon–Fri, hours over 8 in a single day are OT.
@@ -2814,7 +2941,10 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         }
       });
 
-      const grossPay = (totalST * stRate) + (totalOT * otRate);
+      // Gross pay = ST hours × (st_rate + st_supp) + OT hours × (ot_rate + ot_supp).
+      // Supplementals are paid per-hour-worked, ST hours always pair
+      // with ST supp, OT hours always pair with OT supp.
+      const grossPay = (totalST * (stRate + stSupp)) + (totalOT * (otRate + otSupp));
 
       cpSheet.appendRow([
         weekStart, weekEnd,
@@ -2831,7 +2961,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         totalST, totalOT,
         stRate, otRate, grossPay,
         '', '', '', // Total gross, withholdings, net — need payroll software data
-        erFringe, empFringe,
+        stSupp, otSupp,
         'Pending Verification', '', // Match status
         'No', ''   // Sent status
       ]);
@@ -2848,6 +2978,8 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         total_ot:        String(totalOT),
         rate_st:         stRate.toFixed(2),
         rate_ot:         otRate.toFixed(2),
+        supp_st:         stSupp.toFixed(2),
+        supp_ot:         otSupp.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
         total_gross_pay: ytdGross.toFixed(2),   // YTD across all projects
         net_pay:         '',
@@ -7446,6 +7578,84 @@ function _resolveRateRow_(rates, contractor, contractNum, borough, dateIso) {
   const blank = candidates.find(r => r.effective_date == null);
   return blank || null;
 }
+
+
+/**
+ * Load the Payroll Rates sheet into a simple list. Mirrors
+ * _loadContractPricing_'s shape: one parsed row per sheet row, with
+ * effective_date as a Date (or null when the cell is blank).
+ *
+ * Returns: [{
+ *   classification: 'LP'|'SAT',
+ *   effective_date: Date|null,
+ *   st_rate, ot_rate, st_supp, ot_supp: number,
+ *   notes: string,
+ * }]
+ */
+function _loadPayrollRates_(ss) {
+  const sheet = ss.getSheetByName('Payroll Rates');
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const classification = String(r[0] || '').trim().toUpperCase();
+    if (!classification) continue;
+    const effRaw = r[1];
+    let effDate = null;
+    if (effRaw instanceof Date && !isNaN(effRaw.getTime())) effDate = effRaw;
+    else if (typeof effRaw === 'string' && effRaw.trim()) {
+      const d = new Date(effRaw);
+      if (!isNaN(d.getTime())) effDate = d;
+    }
+    const num = (v) => {
+      if (v === '' || v == null) return null;
+      const n = Number(v);
+      return isNaN(n) ? null : n;
+    };
+    rows.push({
+      classification,
+      effective_date: effDate,
+      st_rate: num(r[2]),
+      ot_rate: num(r[3]),
+      st_supp: num(r[4]),
+      ot_supp: num(r[5]),
+      notes:   String(r[6] || '').trim(),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Pick the rate row that applies to a given classification on the
+ * supplied date (a payroll week-end date — per-week resolution).
+ * Dated rows beat blank-date rows when both could match. Returns null
+ * when nothing applies — caller should warn and skip the worker.
+ */
+function _resolvePayrollRate_(rates, classification, dateIso) {
+  if (!Array.isArray(rates) || rates.length === 0) return null;
+  const cls = String(classification || '').trim().toUpperCase();
+  if (!cls) return null;
+  const itemDate = (() => {
+    if (!dateIso) return null;
+    const d = (dateIso instanceof Date) ? dateIso : new Date(dateIso);
+    return isNaN(d.getTime()) ? null : d;
+  })();
+
+  const candidates = rates.filter(r => r.classification === cls);
+  if (candidates.length === 0) return null;
+
+  const dated = candidates.filter(r => r.effective_date != null);
+  const datedApplicable = (itemDate
+    ? dated.filter(r => r.effective_date.getTime() <= itemDate.getTime())
+    : dated.slice()
+  ).sort((a, b) => b.effective_date.getTime() - a.effective_date.getTime());
+  if (datedApplicable.length > 0) return datedApplicable[0];
+
+  const blank = candidates.find(r => r.effective_date == null);
+  return blank || null;
+}
+
 
 /**
  * Compute revenue for one Marking Item. Returns
