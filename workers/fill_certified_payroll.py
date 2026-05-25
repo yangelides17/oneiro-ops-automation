@@ -432,22 +432,94 @@ def _sync_checkbox_appearance_states(writer):
             a[NameObject('/AS')] = NameObject(target)
 
 
-def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> str:
-    """Fill template with data dict and write to output_path. Returns output path."""
-    if output_path is None:
-        week = data.get('week_ending', 'unknown').replace('/', '-')
-        output_path = f'Certified_Payroll_{week}_FILLED.pdf'
+WORKERS_PER_PAGE = 7   # template has 7 worker rows; chunks of 7 = pages
 
+
+def _build_page_indicator_overlay(page_size, page_num, total_pages):
+    """Draw 'Page X of Y' in the top-right corner of a transparent
+    overlay PDF that's later merged onto the filled template."""
+    from io import BytesIO as _BytesIO
+    from reportlab.pdfgen import canvas as _rl_canvas
+    page_w, page_h = page_size
+    buf = _BytesIO()
+    c = _rl_canvas.Canvas(buf, pagesize=page_size)
+    c.setFont('Helvetica-Bold', 10)
+    text = f'Page {page_num} of {total_pages}'
+    c.drawRightString(page_w - 30, page_h - 25, text)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
+def _suffix_widget_names(writer: PdfWriter, suffix: str) -> None:
+    """Append `suffix` to every widget annotation's /T (and /Parent /T
+    when the field's name lives there) on every page of `writer`, plus
+    every entry under /AcroForm/Fields. Used right before a multi-page
+    merge so each page's filled field values stay independent — without
+    this, pypdf's append step would dedupe fields by /T name, leaving
+    every page showing the LAST chunk's values.
+
+    Idempotent in the sense that values already filled (/V) and
+    appearance streams (/AP/N) are untouched — only the /T name changes.
+    """
+    from pypdf.generic import IndirectObject as _IndObj
+    from pypdf.generic import ArrayObject as _ArrObj
+
+    seen_field_objs = set()
+    def _resolve(o):
+        return o.get_object() if isinstance(o, _IndObj) else o
+
+    def _rename(obj):
+        ident = id(obj)
+        if ident in seen_field_objs:
+            return
+        seen_field_objs.add(ident)
+        t = obj.get('/T')
+        if t is not None:
+            obj[NameObject('/T')] = create_string_object(str(t) + suffix)
+        parent = obj.get('/Parent')
+        if parent is not None:
+            _rename(_resolve(parent))
+
+    for page in writer.pages:
+        annots = page.get('/Annots')
+        if not annots:
+            continue
+        for a in annots:
+            ann = _resolve(a)
+            if not isinstance(ann, DictionaryObject):
+                continue
+            if ann.get('/Subtype') != '/Widget':
+                continue
+            _rename(ann)
+
+    acro = writer._root_object.get('/AcroForm')
+    if acro is not None:
+        acro_obj = _resolve(acro)
+        fields = acro_obj.get('/Fields')
+        if fields is not None:
+            fields_obj = _resolve(fields)
+            if isinstance(fields_obj, _ArrObj):
+                for f in fields_obj:
+                    fobj = _resolve(f)
+                    if isinstance(fobj, DictionaryObject):
+                        _rename(fobj)
+
+
+def _fill_one_page(data: dict, template_path: str,
+                   page_num: int, total_pages: int) -> bytes:
+    """Render one Certified Payroll page (with up to WORKERS_PER_PAGE
+    workers filled, header / days / signatory identical across pages,
+    and a 'Page X of Y' overlay when total_pages > 1)."""
+    from io import BytesIO as _BytesIO
     reader = PdfReader(template_path)
     writer = PdfWriter()
     writer.append(reader)
 
     # pypdf 4.3.1 (our pinned version — see requirements.txt) crashes in
     # _update_field_annotation when the AcroForm /DR or /DR/Font is either
-    # missing or stored as a plain inline dict without .get_object().  New
-    # Certified Payroll templates authored in newer Acrobat versions hit
-    # this.  Normalize both entries to proper DictionaryObject instances
-    # before calling update_page_form_field_values.
+    # missing or stored as a plain inline dict without .get_object().
     _ensure_acroform_dr(writer)
 
     # Shrink font + widen day-column fields BEFORE filling so pypdf uses the
@@ -463,12 +535,60 @@ def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> 
 
     writer.update_page_form_field_values(writer.pages[0], build_field_map(data))
 
-    # Post-process: sync widget /AS to parent /V for every checkbox/radio
-    # so pdf.js + Drive preview render them correctly.
     _sync_checkbox_appearance_states(writer)
 
+    # Page X of Y overlay only when more than one page.
+    if total_pages > 1:
+        page = writer.pages[0]
+        mb   = page.mediabox
+        size = (float(mb.width), float(mb.height))
+        overlay_bytes = _build_page_indicator_overlay(size, page_num, total_pages)
+        page.merge_page(PdfReader(_BytesIO(overlay_bytes)).pages[0])
+
+    # Rename every field with a per-page suffix so the upcoming merge
+    # into the multi-page output doesn't collide /T names across pages
+    # (which would make all pages show the same values).
+    if total_pages > 1:
+        _suffix_widget_names(writer, f'_p{page_num}')
+
+    buf = _BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def fill(data: dict, template_path: str = TEMPLATE, output_path: str = None) -> str:
+    """Fill template with data dict and write to output_path. Returns
+    output path. When more than WORKERS_PER_PAGE workers, the result
+    is a multi-page PDF — one filled template page per chunk of 7
+    workers, with header / days / signatory carried across every page
+    and a 'Page X of Y' indicator in the top-right."""
+    from io import BytesIO as _BytesIO
+
+    if output_path is None:
+        week = data.get('week_ending', 'unknown').replace('/', '-')
+        output_path = f'Certified_Payroll_{week}_FILLED.pdf'
+
+    workers = list(data.get('workers') or [])
+    chunks = (
+        [workers[i:i + WORKERS_PER_PAGE] for i in range(0, len(workers), WORKERS_PER_PAGE)]
+        if workers else [[]]
+    )
+    total_pages = len(chunks)
+
+    final = PdfWriter()
+    for page_num, chunk in enumerate(chunks, start=1):
+        # Each page sees the same header / days / signatory but a
+        # different workers chunk. build_field_map already handles
+        # `workers[:7]` truncation internally, so passing exactly the
+        # chunk works cleanly.
+        page_data = {**data, 'workers': chunk}
+        page_bytes = _fill_one_page(
+            page_data, template_path, page_num, total_pages,
+        )
+        final.append(PdfReader(_BytesIO(page_bytes)))
+
     with open(output_path, 'wb') as fh:
-        writer.write(fh)
+        final.write(fh)
 
     # Regenerate /AP for every widget via PyMuPDF (mupdf renderer) and
     # set /NeedAppearances=false.  See workers/_appearances.py for why
