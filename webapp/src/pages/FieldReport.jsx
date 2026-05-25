@@ -691,6 +691,8 @@ export default function FieldReport() {
   const [workDate,      setWorkDate]       = useState(opToday())
   const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wo-markings/:woId
   const [markingsLoading, setMarkingsLoading] = useState(false)
+  const [crewChief,     setCrewChief]      = useState('')   // required — drives per-crew tagging
+  const [employees,     setEmployees]      = useState([])   // Employee Registry, for crew chief picker
   const [issues,        setIssues]         = useState('')
   const [woComplete,    setWoComplete]     = useState('no')
   const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
@@ -917,6 +919,17 @@ export default function FieldReport() {
     refreshWOs()
       .catch(e => setApiError(e.message))
       .finally(() => setLoading(false))
+  }, [])
+
+  // Load Employee Registry for the Crew Chief picker. Same endpoint
+  // SignIn.jsx hits — server returns { employees: [{ name }, ...] }.
+  // Best-effort; on failure the picker just renders empty and the user
+  // gets blocked at submit with a clear "pick a Crew Chief" error.
+  useEffect(() => {
+    fetch('/api/employees')
+      .then(r => r.json())
+      .then(d => setEmployees(Array.isArray(d.employees) ? d.employees : []))
+      .catch(err => console.warn('employees fetch failed:', err))
   }, [])
 
   // Deep-link from the Dashboard: /field-report?wo=RM-43282 pre-selects
@@ -1277,10 +1290,13 @@ export default function FieldReport() {
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
     // Sign-in (crew + signatures) lives on its own tab now — the field
-    // report only carries WO-level state.
+    // report only carries WO-level state + the Crew Chief identifier
+    // that threads through WDL → SI queue → DSID → PL for per-crew
+    // tracking on multi-crew shifts.
     const reportBody = {
       wo_id:       selectedWOId,
       date:        workDate,
+      crew_chief:  crewChief.trim(),
       wo_complete: woCompleteFinal,
       work_type:   inferredWorkType,
       issues:          issues.trim(),
@@ -1338,6 +1354,10 @@ export default function FieldReport() {
       return
     }
     if (!workDate)      { raiseError('Please enter the date of work.'); return }
+    if (!crewChief.trim()) {
+      raiseError('Please select a Crew Chief for this shift. Multiple crews on the same source job are tracked separately by chief.')
+      return
+    }
     // MMA items must always carry a Color/Material value, even on a
     // partial submit — the field is intrinsic to the item, not tied to
     // completion. (rowIsCompletable already enforces this when WO is
@@ -1411,7 +1431,7 @@ export default function FieldReport() {
     setSubmitted(null); setSelectedWOId(''); setWorkDate(opToday())
     setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
     setBulkMode(false); inFlightRef.current.clear()
-    setIssues(''); setRowError('')
+    setCrewChief(''); setIssues(''); setRowError('')
     setWoComplete('no'); setPhotoFiles([]); setFormError('')
   }
 
@@ -1722,6 +1742,23 @@ export default function FieldReport() {
                 : undefined}
               className={`field-input ${lockedAlwaysForCompleted ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
             />
+          </Field>
+
+          {/* Crew Chief — required. Drives per-crew tagging so multiple
+              crews on the same source job get separate queue cards / PLs.
+              Picker pulls from /api/employees (Employee Registry). */}
+          <Field label="Crew Chief" required hint="The crew lead for this shift. Used to attribute hours, production, and downstream documents to this specific crew.">
+            <select
+              value={crewChief}
+              onChange={e => setCrewChief(e.target.value)}
+              disabled={lockedAlwaysForCompleted}
+              className={`field-input ${lockedAlwaysForCompleted ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
+            >
+              <option value="">— Select crew chief —</option>
+              {employees.map(emp => (
+                <option key={emp.name} value={emp.name}>{emp.name}</option>
+              ))}
+            </select>
           </Field>
 
           {/* ── Marking Items ─────────────────────────────────── */}

@@ -310,6 +310,11 @@ function QueueCard({ entry, selected, onSelect }) {
       {entry.contractor && (
         <div className="text-[12px] text-slate-500 mt-0.5">{entry.contractor}</div>
       )}
+      {entry.crew_chief && (
+        <div className="text-[12px] text-slate-600 mt-0.5">
+          <span className="font-semibold">Crew:</span> {entry.crew_chief}
+        </div>
+      )}
       <div className="text-[12px] text-slate-700 mt-1.5">
         <span className="font-semibold">{entry.wos.length}</span>{' '}
         {entry.wos.length === 1 ? 'WO' : 'WOs'}
@@ -690,6 +695,10 @@ export default function SignIn() {
           contract_number: selected.contract_number,
           borough:         selected.borough,
           contractor:      selected.contractor,
+          // Crew chief tags this SI submission so DSID rows / filename
+          // / lifecycle ID all carry the crew identity. Comes from the
+          // queue card the user picked; blank for legacy entries.
+          crew_chief:      selected.crew_chief || '',
           project_name:    selected.project_name,
           contract_id:     selected.contract_id,
           wo_ids:          selected.wos.map(w => w.id),
@@ -1039,6 +1048,13 @@ export default function SignIn() {
                   Crew & Signatures ({draft.crew.length})
                 </p>
               </div>
+              {selected.crew_chief && (
+                <div className="rounded-lg bg-navy/5 border border-navy/10 px-3 py-2 text-[12px]">
+                  <span className="font-semibold text-navy">Crew Chief:</span>{' '}
+                  <span className="text-slate-700">{selected.crew_chief}</span>
+                  <span className="text-slate-500"> — this Sign-In is for this crew only. Add their crew members below.</span>
+                </div>
+              )}
               <div className="space-y-3">
                 {draft.crew.map((m, i) => (
                   <CrewRow

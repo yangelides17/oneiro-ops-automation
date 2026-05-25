@@ -258,6 +258,11 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
               <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
                 <div className="flex justify-between items-baseline">
                   <p className="font-semibold text-sm text-slate-800">{b.contractor}</p>
+                  {b.crew_chief && (
+                    <p className="text-[10px] text-slate-600">
+                      <span className="font-semibold">Crew:</span> {b.crew_chief}
+                    </p>
+                  )}
                   {contracts.length > 1 && (
                     <p className="text-[10px] text-slate-500">
                       {contracts.length} contracts
@@ -603,6 +608,9 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
                 {it.contract_num
                   ? <>{it.contractor} · <span className="font-mono">{it.contract_num}</span> · {it.borough}</>
                   : it.contractor}
+                {it.crew_chief && (
+                  <> · <span className="font-semibold text-slate-600">{it.crew_chief}</span></>
+                )}
               </p>
             </div>
             <div className="flex gap-1.5 flex-shrink-0 items-center">

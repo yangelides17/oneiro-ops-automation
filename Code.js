@@ -251,6 +251,13 @@ function setupTriggers_() {
 // flow back to WO Tracker cols 19-21.
 //
 // Run once from the custom menu after each schema change. Idempotent.
+//
+// For multi-crew support, run setupMultiCrewSchema() AFTER this to
+// add the Crew Chief column to both Marking Items (col 16) and Daily
+// Sign-In Data (col 13). Doing it as a separate step lets re-runs of
+// setupMarkingItems stay forward-compatible with existing crew-chief-
+// tagged data on prod (this function only sets headers + validations
+// for the original schema — it doesn't touch col 16).
 
 function setupMarkingItems() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
@@ -397,6 +404,60 @@ function setupMarkingItems() {
   } catch (_) {
     // No UI context (e.g. running from script editor without active sheet) — skip alert.
   }
+}
+
+
+/**
+ * One-shot, idempotent schema migration for multi-crew support. Adds a
+ * `Crew Chief` column to:
+ *   - Work Day Log         → col 8 (between "Field Report Submitted At"
+ *                                    and "Sign-In Status")
+ *   - Daily Sign-In Data   → col 13 (after "Overtime Hours")
+ *   - Marking Items        → col 16 (after "Notes")
+ *
+ * Run once from the Apps Script editor. Re-runs are safe (per-sheet
+ * check skips columns already present). Existing rows stay blank; the
+ * blank value is first-class throughout — legacy data behaves exactly
+ * like today, multi-crew tagging only kicks in for new submissions.
+ */
+function setupMultiCrewSchema() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const HEADER = 'Crew Chief';
+  const log = [];
+
+  const addColumn = (sheetName, insertBeforeCol1) => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      log.push(`⚠️ ${sheetName}: sheet missing — skip`);
+      return;
+    }
+    const lastCol = sheet.getLastColumn();
+    const headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    if (headerRow.indexOf(HEADER) !== -1) {
+      log.push(`↻ ${sheetName}: Crew Chief already present — skip`);
+      return;
+    }
+    sheet.insertColumnBefore(insertBeforeCol1);
+    sheet.getRange(1, insertBeforeCol1).setValue(HEADER).setFontWeight('bold');
+    log.push(`✅ ${sheetName}: inserted Crew Chief at col ${insertBeforeCol1}`);
+  };
+
+  // WDL: insert at col 8 (existing col 8 "Sign-In Status" shifts to col 9).
+  addColumn('Work Day Log', 8);
+
+  // Daily Sign-In Data: insert at col 13 (after Overtime Hours at col 12).
+  // The sheet may already have admin/review cols past 12 — insertColumnBefore
+  // shifts them right, which is what we want.
+  addColumn('Daily Sign-In Data', 13);
+
+  // Marking Items: insert at col 16 (after Notes at col 15).
+  addColumn('Marking Items', 16);
+
+  Logger.log('🚀 setupMultiCrewSchema():\n  ' + log.join('\n  '));
+
+  try {
+    SpreadsheetApp.getUi().alert('Multi-crew schema:\n\n' + log.join('\n'));
+  } catch (_) { /* no UI context */ }
 }
 
 
@@ -808,7 +869,7 @@ const PL_CATEGORY_MAP_ = {
  * Categories not in PL_CATEGORY_MAP_ are ignored (except HVX Crosswalk,
  * Stop Line, and the MMA SF trio, which have their own paths).
  */
-function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
+function aggregateMarkingItemsForPL_(ss, woId, targetDateIso, crewChief) {
   const out = { markings: {}, sqft: '', paint: '' };
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return out;
@@ -816,11 +877,11 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return out;
 
-  // Col indices (15-col Marking Items schema):
+  // Col indices (post-multi-crew schema):
   //   1 WO#, 4 Marking Type, 5 Intersection, 6 Direction,
   //   8 Quantity, 9 Unit, 10 Color/Material,
   //  11 Date Completed (set by finalizeMarkingStatus_ at FR submit),
-  //  12 Status
+  //  12 Status, 15 Crew Chief (tagged at completion time)
   const tgt = String(targetDateIso || '').slice(0, 10);
   const matchesDate = (cell) => {
     if (!tgt) return true;          // no target date filter (legacy callers)
@@ -829,10 +890,19 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso) {
     }
     return String(cell || '').slice(0, 10) === tgt;
   };
+  // Strict equality on chief: blank crewChief matches only blank-tagged
+  // (legacy) items; populated crewChief matches only items tagged by
+  // that crew. Per-crew PLs see only their own portion of a WO that was
+  // worked across multiple shifts on the same day.
+  const chiefFilter = String(crewChief || '').trim();
+  const matchesChief = (cell) => {
+    return String(cell || '').trim() === chiefFilter;
+  };
   const woItems = data.slice(1).filter(r =>
     String(r[1]  || '').trim() === woId &&
     String(r[12] || '').toLowerCase() === 'completed' &&
-    matchesDate(r[11])
+    matchesDate(r[11]) &&
+    matchesChief(r[15])
   );
   if (woItems.length === 0) return out;
 
@@ -918,17 +988,33 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
     return [];
   }
 
-  // ── Group every WO with sign-in activity today by contractor ──
-  // (no longer filters on status / Work End Date — an ongoing
-  //  multi-day WO appears on each day's log it had crew presence)
-  const wosByContractor = {};
+  // ── Group every sign-in row by (contractor, crew_chief) ───────
+  // Each DSID row carries its own crew chief at col 12 (post-multi-crew
+  // schema). One WO can appear under MULTIPLE chiefs on the same date
+  // when two crews handed off shifts on it — each chief gets its own
+  // PL bucket showing only that crew's portion of the WO via the
+  // chief-filtered Marking Items aggregation.
+  //
+  // Blank chief is a first-class value: legacy DSID rows (pre-migration)
+  // group into a `(contractor, '')` bucket that produces today's
+  // single-crew PL filename / doc_id / first-LP fallback chief.
+  const byContractorChief = {};
   Object.entries(byWorkOrder).forEach(([woId, entries]) => {
     const woRow = woData.find(r => String(r[0]) === String(woId));
     if (!woRow) return;
     const contractor = String(woRow[1] || '').trim();
     if (!contractor) return;
-    if (!wosByContractor[contractor]) wosByContractor[contractor] = {};
-    wosByContractor[contractor][woId] = entries;
+    entries.forEach(row => {
+      const chief = String(row[12] || '').trim();
+      const key = contractor + '|||' + chief;
+      if (!byContractorChief[key]) {
+        byContractorChief[key] = { contractor, chief, wos: {} };
+      }
+      if (!byContractorChief[key].wos[woId]) {
+        byContractorChief[key].wos[woId] = [];
+      }
+      byContractorChief[key].wos[woId].push(row);
+    });
   });
 
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
@@ -938,16 +1024,20 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
 
   const generated = [];
 
-  enabled.forEach(contractor => {
-    const wosForContractor = wosByContractor[contractor];
-    if (!wosForContractor || Object.keys(wosForContractor).length === 0) {
-      Logger.log(`No WOs for ${contractor} on ${targetDayStr} — skipping their Production Log.`);
+  const buckets = Object.values(byContractorChief).filter(b => enabled.includes(b.contractor));
+  if (buckets.length === 0) {
+    Logger.log(`No enabled-contractor sign-ins on ${targetDayStr} — no Production Logs generated.`);
+    return generated;
+  }
+
+  buckets.forEach(({ contractor, chief, wos: wosForBucket }) => {
+    if (!wosForBucket || Object.keys(wosForBucket).length === 0) {
       return;
     }
 
-    // Crew is derived from THIS contractor's WO sign-in rows only.
+    // Crew is derived from THIS (contractor, chief) bucket's rows only.
     const relevantEntries = [];
-    Object.values(wosForContractor).forEach(rows => relevantEntries.push(...rows));
+    Object.values(wosForBucket).forEach(rows => relevantEntries.push(...rows));
 
     const employees = {};
     relevantEntries.forEach(row => {
@@ -973,7 +1063,7 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
     });
 
     // ── Per-WO payload ────────────────────────────────────────
-    const workOrdersJson = Object.entries(wosForContractor).map(([woId, entries]) => {
+    const workOrdersJson = Object.entries(wosForBucket).map(([woId, entries]) => {
       const woRow    = woData.find(r => String(r[0]) === String(woId));
       const borough  = woRow ? String(woRow[3]).toUpperCase() : '';
       const location = woRow ? String(woRow[5]).toUpperCase()
@@ -981,8 +1071,9 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
       const status   = woRow ? String(woRow[15] || '').trim().toLowerCase() : '';
 
       // Marking-item LF totals filtered to items completed ON targetDate
-      // (so a multi-day WO doesn't replay yesterday's LF on today's log).
-      const agg = aggregateMarkingItemsForPL_(ss, woId, targetDayStr);
+      // AND tagged with this bucket's crew chief (so two crews handing
+      // off a WO on the same day each see only their own portion).
+      const agg = aggregateMarkingItemsForPL_(ss, woId, targetDayStr, chief);
 
       return {
         wo_number:    String(woId),
@@ -998,9 +1089,15 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
     });
 
     const sortedNames = Object.keys(employees);
-    const crewChiefName = sortedNames.find(n => employees[n].classification === 'LP')
-                       || sortedNames[0];
+    // Prefer the explicit crew chief from the bucket; fall back to the
+    // "first LP" heuristic only when chief is blank (legacy data).
+    const crewChiefName = chief && employees[chief]
+      ? chief
+      : (chief
+          ? chief  // chief set but didn't sign in himself — still show as chief on form
+          : (sortedNames.find(n => employees[n].classification === 'LP') || sortedNames[0]));
     const crewMemberNames = sortedNames.filter(n => n !== crewChiefName);
+    const chiefTimes = employees[crewChiefName] || { timeIn: '', timeOut: '' };
 
     const logJson = {
       _type:             'production_log',
@@ -1018,8 +1115,8 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
       },
       crew_chief: crewChiefName ? {
         name:     crewChiefName,
-        time_in:  employees[crewChiefName].timeIn,
-        time_out: employees[crewChiefName].timeOut,
+        time_in:  chiefTimes.timeIn,
+        time_out: chiefTimes.timeOut,
       } : { name: '', time_in: '', time_out: '' },
       crew: crewMemberNames.map(n => ({
         name:     n,
@@ -1029,12 +1126,15 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
       work_orders: workOrdersJson,
     };
 
-    // Filename includes a contractor slug so each contractor's daily
-    // log is a distinct file in the Production Logs folder; the
-    // archive routing parses the slug back to contractor name to know
-    // which contractor's WO folders to file the PDF in.
+    // Filename includes a contractor slug + (when this bucket carries a
+    // crew chief) a chief slug. The archive parser uses both to route
+    // the file into the right contractor folder; the chief slug
+    // disambiguates two crews from the same contractor working the
+    // same source job on the same day. Blank chief → no slug → matches
+    // today's legacy filename so existing parsers keep working.
     const slug = contractor.replace(/\s+/g, '_');
-    const jsonFileName = `Production_Log_${targetDayStr}_${slug}.json`;
+    const chiefSlug = chief ? '_chief-' + chief.replace(/[^A-Za-z0-9]/g, '') : '';
+    const jsonFileName = `Production_Log_${targetDayStr}_${slug}${chiefSlug}.json`;
     const jsonFile = subFolder.createFile(
       jsonFileName, JSON.stringify(logJson, null, 2), MimeType.PLAIN_TEXT);
     generated.push(jsonFile);
@@ -1042,7 +1142,7 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
     if (logSheet) {
       logSheet.appendRow([
         new Date(), 'Production Log Generator', 'Daily trigger',
-        `${Object.keys(wosForContractor).length} WO(s) for ${contractor} on ${dateFormatted}`,
+        `${Object.keys(wosForBucket).length} WO(s) for ${contractor}${chief ? ' (' + chief + ')' : ''} on ${dateFormatted}`,
         jsonFileName, 'Generated',
         '', 'Yes — review in Approvals tab',
       ]);
@@ -1730,18 +1830,22 @@ function archiveDocument_(file, docType, woId, ss) {
       return { success: true, doc_type: 'Invoice', wo_ids: [woId] };
 
     } else if (docType === 'Sign-In') {
-      // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_<ContractorSlug>][_MANUAL].pdf.
+      // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_<ContractorSlug>][_chief-<ChiefSlug>][_MANUAL].pdf.
       // We look up every WO that worked that contract on that day and copy
       // the same PDF into each WO folder (same pattern as Production Logs).
-      // Optional <ContractorSlug> after the date appears when a billing
-      // remap split the file by sub-prime — used to pick the right
-      // contractor folder when multiple primes worked the same source job.
-      const newPat = cleanName.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_([A-Za-z0-9]+))?/);
+      // Optional <ContractorSlug> appears when a billing remap split the
+      // file by sub-prime; optional `_chief-<ChiefSlug>` appears when
+      // multiple crews from the same prime worked the same source job.
+      // Both are used to route the file to the right lifecycle row.
+      const newPat = cleanName.match(
+        /^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_(?!chief-)([A-Za-z0-9]+))?(?:_chief-([A-Za-z0-9]+))?/
+      );
       if (newPat) {
-        const [, contractNum, borough, dateStr, fileContractorSlug] = newPat;
+        const [, contractNum, borough, dateStr, fileContractorSlug, fileChiefSlug] = newPat;
         const slugMatches = (co) => String(co || '').replace(/[^A-Za-z0-9]/g, '') === fileContractorSlug;
         const isSuffixMarker = fileContractorSlug === 'MANUAL' || fileContractorSlug === 'FILLED';
         const useFileContractor = fileContractorSlug && !isSuffixMarker;
+        const crewChief = fileChiefSlug || '';
         const logDate = new Date(dateStr + 'T12:00:00');
         const wosByContract = getWOsForDate_(logDate, ss);
         const matchKey = Object.keys(wosByContract).find(k => {
@@ -1770,19 +1874,21 @@ function archiveDocument_(file, docType, woId, ss) {
           const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
           file.makeCopy(cleanName, woFolder);
         });
-        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum} + master + ${wos.length} WO folder(s)`);
+        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum}${crewChief ? ' (' + crewChief + ')' : ''} + master + ${wos.length} WO folder(s)`);
 
-        // Doc Lifecycle Log: upsert SI row with done=true. Sent stays
-        // blank — Sign-Ins ride out with the Certified Payroll, and we
-        // don't track SI Sent independently.
+        // Doc Lifecycle Log: upsert SI row with done=true. Crew chief
+        // (from filename slug) routes to the correct pending row when
+        // multiple crews share the same source job. Blank chief matches
+        // legacy single-crew rows.
         try {
           _upsertDocLifecycleRow_(ss, {
-            doc_id:       _docLifecycleId_('Sign-In', dateStr, contractNum, borough),
+            doc_id:       _docLifecycleId_('Sign-In', dateStr, contractNum, borough, crewChief),
             doc_type:     'Sign-In',
             anchor:       dateStr,
             contractor:   contractor,
             contract_num: contractNum,
             borough:      borough,
+            crew_chief:   crewChief,
             wo_ids:       wos.map(w => w.id),
             done:         true,
             file_id:      masterCopy.getId(),
@@ -1807,23 +1913,28 @@ function archiveDocument_(file, docType, woId, ss) {
 
     } else if (docType === 'Production Log') {
       // Filename patterns:
-      //   New (per-contractor):  Production_Log_<YYYY-MM-DD>_<Contractor_Slug>_FILLED.pdf
-      //   Legacy (single combined): Production_Log_<YYYY-MM-DD>_FILLED.pdf
+      //   New (per-contractor):       Production_Log_<YYYY-MM-DD>_<Contractor_Slug>_FILLED.pdf
+      //   Multi-crew (per-chief):     Production_Log_<YYYY-MM-DD>_<Contractor_Slug>_chief-<ChiefSlug>_FILLED.pdf
+      //   Legacy (single combined):   Production_Log_<YYYY-MM-DD>_FILLED.pdf
       const dateMatch = cleanName.match(/(\d{4}-\d{2}-\d{2})/);
       if (!dateMatch) {
         return { success: false, reason: 'Could not parse date from Production Log filename' };
       }
       const logDate = new Date(dateMatch[1] + 'T12:00:00');
 
-      // Pull contractor slug between the date and "_FILLED" (or end).
-      // Empty string means legacy filename → file under every contractor
-      // that had work that day (old behavior).
-      const contractorSlug = (() => {
+      // Pull contractor slug + optional chief slug between the date and
+      // "_FILLED" (or end). Empty contractor = legacy filename → file
+      // under every contractor that had work that day. Empty chief =
+      // single-crew (legacy) behavior.
+      const slugs = (() => {
         const m = cleanName.match(
-          /Production_Log_\d{4}-\d{2}-\d{2}_(.+?)(?:_FILLED)?\.pdf$/);
-        return m ? m[1] : '';
+          /Production_Log_\d{4}-\d{2}-\d{2}_(.+?)(?:_chief-([A-Za-z0-9]+))?(?:_FILLED)?\.pdf$/);
+        return m
+          ? { contractor: m[1] || '', chief: m[2] || '' }
+          : { contractor: '', chief: '' };
       })();
-      const contractorTarget = contractorSlug.replace(/_/g, ' ').trim();
+      const contractorTarget = slugs.contractor.replace(/_/g, ' ').trim();
+      const crewChief = slugs.chief;
 
       // Group WOs worked that day by contractor/contract/borough
       const wosByContract = getWOsForDate_(logDate, ss);
@@ -1862,18 +1973,19 @@ function archiveDocument_(file, docType, woId, ss) {
           file.makeCopy(cleanName, woFolder);
           allCoveredWoIds.push(wo.id);
         });
-        Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
+        Logger.log(`📁 Archived Production Log → ${contractor}/${contractNum}${crewChief ? ' (' + crewChief + ')' : ''} + ${wos.length} WO folder(s)`);
       });
 
-      // Doc Lifecycle Log: ONE row per (date, contractor) since the PL
-      // file is per-contractor-per-day. wo_ids spans every (contract,
-      // borough) covered by the file.
+      // Doc Lifecycle Log: ONE row per (date, contractor, crew_chief).
+      // Multi-crew shifts give each chief their own pending row, and
+      // each PL file flips its row Done independently.
       try {
         _upsertDocLifecycleRow_(ss, {
-          doc_id:     _plDocId_(plAnchorIso, plContractor),
+          doc_id:     _plDocId_(plAnchorIso, plContractor, crewChief),
           doc_type:   'Production Log',
           anchor:     plAnchorIso,
           contractor: plContractor,
+          crew_chief: crewChief,
           // contract_num + borough deliberately blank — PL spans contracts.
           wo_ids:     allCoveredWoIds,
           done:       true,
@@ -2008,18 +2120,19 @@ function _getOrCreateWorkDayLogSheet_(ss) {
   sheet = ss.insertSheet('Work Day Log');
   const headers = [
     'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
-    'Location', 'Field Report Submitted At', 'Sign-In Status'
+    'Location', 'Field Report Submitted At', 'Crew Chief', 'Sign-In Status'
   ];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
   sheet.setFrozenRows(1);
 
-  // Status dropdown — keeps human-edited corrections sane
+  // Status dropdown — keeps human-edited corrections sane. Status moved
+  // to col 9 (1-idx) when Crew Chief was inserted at col 8.
   const statusRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(['Pending', 'Submitted', 'Skipped'], true)
     .setAllowInvalid(false)
     .build();
-  sheet.getRange(2, 8, 1000, 1).setDataValidation(statusRule);
+  sheet.getRange(2, 9, 1000, 1).setDataValidation(statusRule);
 
   return sheet;
 }
@@ -4649,23 +4762,27 @@ function handleListSignInQueue_(body) {
 
   const groups = new Map();
   data.slice(1).forEach(row => {
-    if (String(row[7] || '').trim() !== 'Pending') return;
+    // WDL post-multi-crew schema:
+    //   0 Date, 1 WO#, 2 Contractor, 3 Contract#, 4 Borough, 5 Location,
+    //   6 FR Submitted At, 7 Crew Chief, 8 Sign-In Status.
+    if (String(row[8] || '').trim() !== 'Pending') return;
     const dateStr     = toIsoDate(row[0]);
     const woId        = String(row[1] || '').trim();
     const contractor  = String(row[2] || '').trim();
     const contractNum = String(row[3] || '').split('/')[0].trim();
     const borough     = String(row[4] || '').trim();
     const location    = String(row[5] || '').trim();
+    const crewChief   = String(row[7] || '').trim();
     if (!dateStr || !woId || !contractNum || !borough) return;
 
-    // Key includes contractor so a (date, contract, borough) worked by
-    // two different primes produces two queue entries — one per prime.
-    // Each SI submission is per-contractor (body carries one contractor),
-    // so combining primes' WOs into one queue card would either mis-attribute
-    // hours or silently drop one prime's WOs. Matters most for the
-    // sub-prime billing remap case (Brooklyn handled by both Metro and
-    // Denville), but the per-contractor split is correct in general.
-    const key = `${dateStr}|${contractor}|${contractNum}|${borough}`;
+    // Key includes contractor AND crew chief. Per the multi-crew model,
+    // each crew (identified by chief) gets its own queue card → its own
+    // SI submission → its own filename/lifecycle row. Without the chief
+    // in the key, two crews on the same source job would collapse into
+    // one card and one prime's WOs would silently merge with the other's.
+    // Blank chief is a first-class value (legacy single-crew rows) and
+    // groups with itself just like a named chief would.
+    const key = `${dateStr}|${contractor}|${contractNum}|${borough}|${crewChief}`;
     if (!groups.has(key)) {
       const lookup = lookupContract(contractNum, borough);
       groups.set(key, {
@@ -4674,6 +4791,7 @@ function handleListSignInQueue_(body) {
         contract_number: contractNum,
         borough:         borough,
         contractor:      contractor,
+        crew_chief:      crewChief,
         contract_id:     lookup.contract_id,
         project_name:    lookup.project_name,
         wos:             [],
@@ -4748,6 +4866,10 @@ function handleSubmitSignIn_(body) {
   if (!Array.isArray(d.crew) || d.crew.length === 0) {
     return jsonResponse_({ error: 'At least one crew member is required' }, 400);
   }
+  // Crew chief comes from the queue card the user picked. Required at
+  // FR submit; here we accept blank to keep legacy queue cards (no
+  // chief) working — blank chief is the legacy single-crew default.
+  const crewChief = String(d.crew_chief || '').trim();
   const source = String(d.source || 'generated');
   if (source !== 'generated' && source !== 'uploaded') {
     return jsonResponse_({ error: 'source must be "generated" or "uploaded"' }, 400);
@@ -4858,7 +4980,8 @@ function handleSubmitSignIn_(body) {
         _fmt24to12_(member.time_in),                  //  8  Time In  (h:mm AM/PM)
         _fmt24to12_(member.time_out),                 //  9  Time Out (h:mm AM/PM)
         hours,                                        // 10  Hours Worked
-        overtime                                      // 11  Overtime Hours
+        overtime,                                     // 11  Overtime Hours
+        crewChief                                     // 12  Crew Chief (per-crew tagging)
       ];
     });
 
@@ -4867,16 +4990,18 @@ function handleSubmitSignIn_(body) {
       crewRows,
       ['Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
        'Location', 'Employee Name', 'Classification', 'Time In', 'Time Out',
-       'Hours Worked', 'Overtime Hours'],
+       'Hours Worked', 'Overtime Hours', 'Crew Chief'],
       'Daily Sign-In Data'
     );
 
     // ── Mark Work Day Log rows for these WOs as Submitted ─────────
-    // Match by (WO# in this submission, Status='Pending'). We DO NOT
-    // filter by date because the user may have kebab-overridden the
-    // shift start date, OR opDay may have shifted the effective date
-    // away from the FR's recorded date. Either way, the user has
-    // confirmed work was done on these WOs — clear the queue.
+    // Match by (WO# in this submission, Status='Pending', Crew Chief).
+    // Filtering by crew chief is critical for multi-crew days: Crew A's
+    // submit must not clear Crew B's queue card on the same source job.
+    // We DO NOT filter by date because the user may have kebab-overridden
+    // the shift start date, OR opDay may have shifted the effective date
+    // away from the FR's recorded date. WDL post-multi-crew schema:
+    //   7 Crew Chief, 8 Sign-In Status.
     step = 'Work Day Log update';
     const wdlSheet = ss.getSheetByName('Work Day Log');
     if (wdlSheet) {
@@ -4885,8 +5010,9 @@ function handleSubmitSignIn_(body) {
       for (let i = 1; i < wdlData.length; i++) {
         const row = wdlData[i];
         if (!woSet.has(String(row[1] || '').trim())) continue;
-        if (String(row[7] || '').trim() !== 'Pending') continue;
-        wdlSheet.getRange(i + 1, 8).setValue('Submitted');
+        if (String(row[8] || '').trim() !== 'Pending') continue;
+        if (String(row[7] || '').trim() !== crewChief) continue;
+        wdlSheet.getRange(i + 1, 9).setValue('Submitted');
       }
     }
 
@@ -4900,16 +5026,23 @@ function handleSubmitSignIn_(body) {
 
     const isoDate = String(effectiveDate).slice(0, 10);
     // Filename keeps RAW (contract, borough) so the archive parser
-    // matches WO Tracker. When a billing remap applies for this
-    // (contract, borough, contractor), append a contractor slug to
-    // disambiguate from another sub-prime's SI on the same source job
-    // — without the slug the second submit would clobber the first.
+    // matches WO Tracker. Two suffixes can append after the date:
+    //   - `_<ContractorSlug>` when the sub-prime billing remap applies
+    //     (Brooklyn → Manhattan/Queens) — disambiguates two primes
+    //     submitting against the same source job.
+    //   - `_chief-<ChiefSlug>` when this submission carries a crew chief
+    //     — disambiguates two crews from the SAME prime submitting
+    //     against the same source job on the same day.
+    // Blank chief omits the suffix entirely → legacy filenames preserved.
     const _siRemapApplies = _hasBillingRemap_(d.contract_number, d.borough) &&
       _billingRemap_(d.contract_number, d.borough, d.contractor).borough !== String(d.borough || '').trim();
     const _siContractorSlug = _siRemapApplies
       ? '_' + String(d.contractor || '').replace(/[^A-Za-z0-9]/g, '')
       : '';
-    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}${_siContractorSlug}`;
+    const _siChiefSlug = crewChief
+      ? '_chief-' + crewChief.replace(/[^A-Za-z0-9]/g, '')
+      : '';
+    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}${_siContractorSlug}${_siChiefSlug}`;
 
     let writtenName;
 
@@ -4988,6 +5121,7 @@ function handleSubmitSignIn_(body) {
         address:            primeAddress,
         agency:             'NYCDOT',
         project_name:       projectName,
+        crew_chief:         crewChief,
         wo_ids:             woListNorm,
         locations:          locations,
         wo_label:           woLabel,
@@ -5781,13 +5915,19 @@ const _DOC_TYPE_PREFIX_ = Object.freeze({
   'Sign-In':           'SI',
   'Certified Payroll': 'CP',
 });
-function _docLifecycleId_(docType, anchorIso, contractNum, borough) {
+function _docLifecycleId_(docType, anchorIso, contractNum, borough, crewChief) {
   const prefix = _DOC_TYPE_PREFIX_[docType];
   if (!prefix) return '';
   // Strip any '/EXT' suffix from contract number (matches the rest of
   // the codebase — see split('/')[0] in archiveDocument_ etc.).
   const cn = String(contractNum || '').split('/')[0].trim();
-  return prefix + '_' + String(anchorIso).trim() + '_' + cn + '_' + String(borough).trim();
+  const base = prefix + '_' + String(anchorIso).trim() + '_' + cn + '_' + String(borough).trim();
+  // Optional per-crew suffix. When two crews work the same source job
+  // on the same day, each gets its own lifecycle row → Doc Status shows
+  // both pending entries. Blank chief omits the suffix → matches legacy
+  // doc IDs so already-archived rows keep matching.
+  const chiefSlug = String(crewChief || '').replace(/[^A-Za-z0-9]/g, '');
+  return chiefSlug ? (base + '_chief-' + chiefSlug) : base;
 }
 
 /**
@@ -6022,9 +6162,20 @@ function _scanWorkDayLogForDate_(ss, dateIso) {
  *                                       contractNum:'84125MBTP701', borough:'BK' }
  */
 function _parseDocLifecycleId_(docId) {
-  const m = String(docId || '').match(/^(PL|SI|CP)_(\d{4}-\d{2}-\d{2})_(.+)_([A-Z]{1,2})$/);
+  // Trailing `_chief-<slug>` is optional — present on multi-crew rows,
+  // absent on legacy and CP rows. Capture and return so callers can
+  // route by crew.
+  const m = String(docId || '').match(
+    /^(PL|SI|CP)_(\d{4}-\d{2}-\d{2})_(.+)_([A-Z]{1,2})(?:_chief-([A-Za-z0-9]+))?$/
+  );
   if (!m) return null;
-  return { prefix: m[1], anchor: m[2], contractNum: m[3], borough: m[4] };
+  return {
+    prefix:      m[1],
+    anchor:      m[2],
+    contractNum: m[3],
+    borough:     m[4],
+    crew_chief:  m[5] || '',
+  };
 }
 
 /**
@@ -6035,28 +6186,42 @@ function _parseDocLifecycleId_(docId) {
  *
  *   _plDocId_('2026-05-08', 'Metro Express') → 'PL_2026-05-08_Metro_Express'
  */
-function _plDocId_(anchorIso, contractor) {
+function _plDocId_(anchorIso, contractor, crewChief) {
   const slug = String(contractor || '').trim().replace(/\s+/g, '_');
-  return 'PL_' + String(anchorIso).trim() + '_' + slug;
+  const base = 'PL_' + String(anchorIso).trim() + '_' + slug;
+  // Optional per-crew suffix. Multi-crew shifts get one PL per chief.
+  // Blank chief omits the suffix → matches legacy doc IDs.
+  const chiefSlug = String(crewChief || '').replace(/[^A-Za-z0-9]/g, '');
+  return chiefSlug ? (base + '_chief-' + chiefSlug) : base;
 }
 
 /**
- * Inverse of _plDocId_. Returns null on malformed input.
+ * Inverse of _plDocId_. Returns null on malformed input. Optional
+ * trailing `_chief-<slug>` is captured separately so the contractor
+ * name doesn't accidentally pick up the suffix.
  *
- *   "PL_2026-05-08_Metro_Express" → { anchor:'2026-05-08', contractor:'Metro Express' }
+ *   "PL_2026-05-08_Metro_Express" → { anchor:'2026-05-08', contractor:'Metro Express', crew_chief:'' }
+ *   "PL_2026-05-08_Metro_Express_chief-BobSmith" → { …, crew_chief:'BobSmith' }
  */
 function _parsePLDocId_(docId) {
-  const m = String(docId || '').match(/^PL_(\d{4}-\d{2}-\d{2})_(.+)$/);
+  const s = String(docId || '');
+  const chiefMatch = s.match(/^(PL_\d{4}-\d{2}-\d{2}_.+)_chief-([A-Za-z0-9]+)$/);
+  const base = chiefMatch ? chiefMatch[1] : s;
+  const crewChief = chiefMatch ? chiefMatch[2] : '';
+  const m = base.match(/^PL_(\d{4}-\d{2}-\d{2})_(.+)$/);
   if (!m) return null;
-  return { anchor: m[1], contractor: m[2].replace(/_/g, ' ') };
+  return { anchor: m[1], contractor: m[2].replace(/_/g, ' '), crew_chief: crewChief };
 }
 
 /**
  * Detector: is this an OLD-format PL doc_id (PL_<date>_<cn>_<bor>)?
  * Used by the migration to distinguish stale rows from new-format rows.
+ * Strips optional `_chief-<slug>` before matching so multi-crew variants
+ * of the old format are also flagged for migration.
  */
 function _isOldFormatPLDocId_(docId) {
-  return /^PL_\d{4}-\d{2}-\d{2}_.+_[A-Z]{1,2}$/.test(String(docId || ''));
+  const stripped = String(docId || '').replace(/_chief-[A-Za-z0-9]+$/, '');
+  return /^PL_\d{4}-\d{2}-\d{2}_.+_[A-Z]{1,2}$/.test(stripped);
 }
 
 /**
@@ -6235,26 +6400,35 @@ function backfillDocLifecycleLog() {
     const contractor  = String(r[2] || '').trim();
     const contractNum = String(r[3] || '').split('/')[0].trim();
     const borough     = String(r[4] || '').trim();
+    // WDL post-multi-crew schema: col 7 = Crew Chief. Blank for legacy
+    // rows (pre-migration); groups with itself per the fallback rules.
+    const crewChief   = String(r[7] || '').trim();
     if (!woId || !contractor || !contractNum || !borough) continue;
 
-    const siKey = dateIso + '|' + contractor + '|' + contractNum + '|' + borough;
+    // SI key includes crew chief so two crews on the same source job
+    // produce two separate pending SI lifecycle rows (Doc Status shows
+    // each as its own card).
+    const siKey = dateIso + '|' + contractor + '|' + contractNum + '|' + borough + '|' + crewChief;
     if (!siGroups[siKey]) {
       siGroups[siKey] = {
-        anchor: dateIso, contractor, contractNum, borough, wo_ids: new Set(),
+        anchor: dateIso, contractor, contractNum, borough, crewChief, wo_ids: new Set(),
       };
     }
     siGroups[siKey].wo_ids.add(woId);
 
-    const plKey = dateIso + '|' + contractor;
+    // PL key includes chief so a contractor running two crews on the
+    // same date produces two separate pending PL lifecycle rows.
+    const plKey = dateIso + '|' + contractor + '|' + crewChief;
     if (!plGroups[plKey]) {
       plGroups[plKey] = {
-        anchor: dateIso, contractor, wo_ids: new Set(),
+        anchor: dateIso, contractor, crewChief, wo_ids: new Set(),
       };
     }
     plGroups[plKey].wo_ids.add(woId);
 
-    // Week tuple uses Sunday anchor of the day's date. Contractor stored
-    // for backfill purposes — matches what archiveDocument_'s CP branch does.
+    // Week tuple uses Sunday anchor of the day's date. CP stays single-
+    // crew per (week, contract, borough) by design — workers are
+    // reported per (employee, classification), not per crew.
     const wkStart = weekStartIsoFor(new Date(dateIso + 'T12:00:00'));
     const weekKey = wkStart + '|' + contractNum + '|' + borough;
     if (!weekTuples[weekKey]) {
@@ -6268,11 +6442,12 @@ function backfillDocLifecycleLog() {
   let plInserted = 0, siInserted = 0, cpInserted = 0, skipped = 0;
 
   Object.values(plGroups).forEach(g => {
-    const plId = _plDocId_(g.anchor, g.contractor);
+    const plId = _plDocId_(g.anchor, g.contractor, g.crewChief);
     if (!existingById[plId]) {
       _upsertDocLifecycleRow_(ss, {
         doc_id: plId, doc_type: 'Production Log', anchor: g.anchor,
         contractor: g.contractor,
+        crew_chief: g.crewChief,
         wo_ids: Array.from(g.wo_ids),
       });
       plInserted++;
@@ -6280,11 +6455,12 @@ function backfillDocLifecycleLog() {
   });
 
   Object.values(siGroups).forEach(g => {
-    const siId = _docLifecycleId_('Sign-In', g.anchor, g.contractNum, g.borough);
+    const siId = _docLifecycleId_('Sign-In', g.anchor, g.contractNum, g.borough, g.crewChief);
     if (!existingById[siId]) {
       _upsertDocLifecycleRow_(ss, {
         doc_id: siId, doc_type: 'Sign-In', anchor: g.anchor,
         contractor: g.contractor, contract_num: g.contractNum, borough: g.borough,
+        crew_chief: g.crewChief,
         wo_ids: Array.from(g.wo_ids),
       });
       siInserted++;
@@ -8689,12 +8865,18 @@ function handleDeleteMarkingItems_(body) {
  * Day 2, any rows already marked Completed on Day 1 must keep their
  * Day 1 Date Completed — otherwise the audit trail gets rewritten.
  */
-function finalizeMarkingStatus_(ss, woId, dateOfWork) {
+function finalizeMarkingStatus_(ss, woId, dateOfWork, crewChief) {
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return { touched: 0, data: null };
 
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return { touched: 0, data };
+
+  // Crew Chief lives at col 16 (1-idx) / 15 (0-idx) — see setupMultiCrewSchema.
+  // When promoting Pending → Completed, tag the row with this submission's
+  // chief so per-crew production aggregation (multi-shift handoff on the
+  // same WO) can attribute each item to whoever finished it.
+  const chief = String(crewChief || '').trim();
 
   let touched = 0;
   data.forEach((r, idx) => {
@@ -8713,11 +8895,13 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork) {
       if (currentStatus !== 'Completed') {
         sheet.getRange(rowNum, 13).setValue('Completed');
         sheet.getRange(rowNum, 12).setValue(dateOfWork);
+        if (chief) sheet.getRange(rowNum, 16).setValue(chief);
         // Keep the in-memory copy in sync so downstream rollup readers
         // don't have to re-fetch the sheet.
         r[12] = 'Completed';
         r[11] = dateOfWork;
-        touched += 2;
+        if (chief) r[15] = chief;
+        touched += chief ? 3 : 2;
       }
     } else {
       // qty empty/0 — row cannot be Completed. Revert to Pending and
@@ -9462,9 +9646,16 @@ function handleSubmitFieldReport_(body) {
 
   if (!d.wo_id) return jsonResponse_({ error: 'Missing wo_id' }, 400);
   if (!d.date)  return jsonResponse_({ error: 'Missing date' }, 400);
-  // Crew is no longer captured here — sign-in lives in its own tab and is
-  // batched per (date, contract). The Field Report just records what was
-  // worked on the WO and queues a Work Day Log row for sign-in followup.
+  // Crew roster lives on the Sign-In tab. The Field Report captures the
+  // Crew Chief name as a per-shift crew identifier — threaded through
+  // WDL, Marking Items completion, DSID, and the Sign-In queue grouping
+  // so multiple crews from the same contractor on the same source job
+  // produce separate queue cards / PLs. Required to support multi-crew
+  // dispatch and multi-shift handoffs on the same WO.
+  const crewChief = String(d.crew_chief || '').trim();
+  if (!crewChief) {
+    return jsonResponse_({ error: 'Missing crew_chief — pick the Crew Chief before submitting.' }, 400);
+  }
 
   // Operational-day correction. If the client sent calendar-today (the
   // default) but submission is happening before the cutoff hour (e.g.
@@ -9569,7 +9760,7 @@ function handleSubmitFieldReport_(body) {
   //      crew formally confirms the day's work.)
   //  (2) Recompute WO Tracker cols 19-21 rollups from final sheet state.
   step = 'marking finalize status';
-  const { touched: nFinalized, data: markingData } = finalizeMarkingStatus_(ss, d.wo_id, d.date);
+  const { touched: nFinalized, data: markingData } = finalizeMarkingStatus_(ss, d.wo_id, d.date, crewChief);
 
   step = 'marking rollup';
   // Reuse the values finalizeMarkingStatus_ already read (with its
@@ -9621,11 +9812,12 @@ function handleSubmitFieldReport_(body) {
       String(woRow[3] || ''),              // 4 Borough
       String(woRow[5] || ''),              // 5 Location
       new Date(),                          // 6 Field Report Submitted At
-      'Pending'                            // 7 Sign-In Status
+      crewChief,                           // 7 Crew Chief
+      'Pending'                            // 8 Sign-In Status
     ],
     [
       'Date', 'Work Order #', 'Prime Contractor', 'Contract #', 'Borough',
-      'Location', 'Field Report Submitted At', 'Sign-In Status'
+      'Location', 'Field Report Submitted At', 'Crew Chief', 'Sign-In Status'
     ],
     'Work Day Log'
   );
@@ -11267,10 +11459,17 @@ function _buildDocStatusPayload_(monthIso) {
   );
 
   // Walk Work Day Log → group at TWO granularities:
-  //   contractorDays[dateIso|contractor] = contractor-level shell (one per PL)
-  //     .contracts[cn|bor] = per-(contract, borough) sub-entry (one per SI)
+  //   contractorDays[dateIso|contractor|crewChief] = per-crew PL shell
+  //     .contracts[cn|bor] = per-(contract, borough) sub-entry (one per SI within this crew)
   //   weekTuples[weekStart|cn|bor] = per-(week, contract, borough) (one per CP)
-  // WDL columns (0-idx): 0=Date, 1=WO, 2=Contractor, 3=Contract#, 4=Borough.
+  //
+  // Multi-crew: a contractor running two crews on the same date gets
+  // TWO contractorDays entries (one per chief) → two PLs, each with
+  // their own contracts list. CP stays single-crew per (week, contract,
+  // borough) by design.
+  //
+  // WDL columns (0-idx): 0=Date, 1=WO, 2=Contractor, 3=Contract#,
+  // 4=Borough, 7=Crew Chief (blank for legacy / single-crew rows).
   const contractorDays = {};
   const weekTuples = {};
 
@@ -11282,12 +11481,13 @@ function _buildDocStatusPayload_(monthIso) {
     const contractor  = String(r[2] || '').trim();
     const contractNum = String(r[3] || '').split('/')[0].trim();
     const borough     = String(r[4] || '').trim();
+    const crewChief   = String(r[7] || '').trim();
     if (!woId || !contractor || !contractNum || !borough) continue;
 
-    const cdKey = dateIso + '|' + contractor;
+    const cdKey = dateIso + '|' + contractor + '|' + crewChief;
     if (!contractorDays[cdKey]) {
       contractorDays[cdKey] = {
-        date: dateIso, contractor,
+        date: dateIso, contractor, crew_chief: crewChief,
         wo_ids: new Set(),
         contracts: {},
       };
@@ -11323,14 +11523,15 @@ function _buildDocStatusPayload_(monthIso) {
   Object.values(contractorDays).forEach(cd => {
     if (cd.date < monthStart || cd.date > monthEnd) return;
     const plRequired = PL_ENABLED.has(cd.contractor);
-    const plId = _plDocId_(cd.date, cd.contractor);
+    const plId = _plDocId_(cd.date, cd.contractor, cd.crew_chief);
     const pl = logById[plId];
     const contractsArr = Object.values(cd.contracts).map(c => {
-      const siId = _docLifecycleId_('Sign-In', cd.date, c.contract_num, c.borough);
+      const siId = _docLifecycleId_('Sign-In', cd.date, c.contract_num, c.borough, cd.crew_chief);
       const si = logById[siId];
       return {
         contract_num: c.contract_num,
         borough:      c.borough,
+        crew_chief:   cd.crew_chief,
         wo_ids:       Array.from(c.wo_ids).sort(),
         si: si
           ? { doc_id: si.doc_id, done: si.done }
@@ -11340,6 +11541,7 @@ function _buildDocStatusPayload_(monthIso) {
 
     const bdRow = {
       contractor:  cd.contractor,
+      crew_chief:  cd.crew_chief,
       pl_required: plRequired,
       wo_ids:      Array.from(cd.wo_ids).sort(),
       pl: plRequired
@@ -11423,6 +11625,7 @@ function _buildDocStatusPayload_(monthIso) {
       kind,
       anchor,
       contractor:   g.contractor,
+      crew_chief:   g.crew_chief || '',
       contract_num: g.contract_num,
       borough:      g.borough,
       missing,
@@ -11431,31 +11634,33 @@ function _buildDocStatusPayload_(monthIso) {
       age_days:     ageDays,
     });
   };
-  // Day-kind pending. SI is per-(contract, borough), PL is per-contractor.
-  // SI items first within a date (sign-ins must be done before a PL can
-  // be generated), then the contractor's PL Done, then PL Sent.
+  // Day-kind pending. SI is per (contract, borough, crew_chief); PL is
+  // per (contractor, crew_chief). Multi-crew shifts produce one SI and
+  // one PL pending row per crew so Doc Status surfaces both.
   Object.values(contractorDays).forEach(cd => {
-    // SI per (contract, borough)
+    // SI per (contract, borough) within this crew
     Object.values(cd.contracts).forEach(c => {
-      const siId = _docLifecycleId_('Sign-In', cd.date, c.contract_num, c.borough);
+      const siId = _docLifecycleId_('Sign-In', cd.date, c.contract_num, c.borough, cd.crew_chief);
       const si = logById[siId];
       if (!si || !si.done) {
         pushPending({
           contractor:   cd.contractor,
+          crew_chief:   cd.crew_chief,
           contract_num: c.contract_num,
           borough:      c.borough,
           wo_ids:       c.wo_ids,
         }, 'day', cd.date, siId, ['SI Done']);
       }
     });
-    // PL per contractor — only for contractors in CONFIG.PRODUCTION_LOG_CONTRACTORS.
+    // PL per (contractor, crew) — only for contractors in CONFIG.PRODUCTION_LOG_CONTRACTORS.
     if (PL_ENABLED.has(cd.contractor)) {
-      const plId = _plDocId_(cd.date, cd.contractor);
+      const plId = _plDocId_(cd.date, cd.contractor, cd.crew_chief);
       const pl = logById[plId];
       const plDone = pl && pl.done;
       const plSent = pl && pl.sent;
       const cdProxy = {
         contractor:   cd.contractor,
+        crew_chief:   cd.crew_chief,
         contract_num: '',                  // PL spans contracts — none singular
         borough:      '',
         wo_ids:       cd.wo_ids,
