@@ -281,6 +281,24 @@ app.post('/api/field-report', async (req, res) => {
 })
 
 /**
+ * POST /api/field-report/check-shift-attribution
+ * Pre-submit gate: warns the FR form when a Crew Chief appears to
+ * still be wrapping up last night's overnight shift but the date
+ * picker is set to today. Returns { should_confirm, prior_date,
+ * reason }. The form shows a soft-warn modal on should_confirm:true.
+ * Body: { crew_chief, work_date: 'YYYY-MM-DD' }
+ */
+app.post('/api/field-report/check-shift-attribution', async (req, res) => {
+  try {
+    const data = await callAppsScript('check_fr_shift_attribution', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/field-report/check-shift-attribution error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/tools/daily-documents
  * Runs the daily-document generator. Body: { date?: 'YYYY-MM-DD' }.
  * Empty/missing date → today.  Replaces the "Generate Daily Documents"

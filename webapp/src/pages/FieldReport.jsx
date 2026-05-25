@@ -752,6 +752,13 @@ export default function FieldReport() {
   // sees the flipped value without waiting for the setWoComplete state
   // update to flush. Read once + reset inside doSubmit.
   const completeOverrideRef = useRef(null)
+  // Soft-warn modal when a Crew Chief is likely wrapping up last night's
+  // shift but the form's date is set to today. shape: { priorDate, todayDate } | null
+  const [shiftAttribModal, setShiftAttribModal] = useState(null)
+  // Refs let doSubmit re-enter (after the modal closes) with the
+  // user-picked date and skip the check loop. Both consume-once.
+  const submitDateOverrideRef = useRef(null)
+  const skipShiftAttribCheckRef = useRef(false)
   // Completed-WO edit mode. When the loaded WO is Completed, the page
   // opens read-only with a banner. Clicking Edit:
   //   - snapshots the current marking items into `originalItems`
@@ -1227,6 +1234,38 @@ export default function FieldReport() {
     completeOverrideRef.current = null
     const woCompleteFinal = completeOverride !== null ? completeOverride : (woComplete === 'yes')
 
+    // Pre-flight: shift-attribution check. If the chief seems to be
+    // wrapping up last night's overnight shift but workDate is today,
+    // open a soft-warn modal and bail. The modal's pick handler sets
+    // submitDateOverrideRef + skipShiftAttribCheckRef and re-calls
+    // doSubmit, so the second pass uses the chosen date and skips the
+    // check. Both refs are consumed on read.
+    const dateOverride = submitDateOverrideRef.current
+    submitDateOverrideRef.current = null
+    const skipShiftCheck = skipShiftAttribCheckRef.current
+    skipShiftAttribCheckRef.current = false
+    const effDate = dateOverride || workDate
+
+    if (!skipShiftCheck && crewChief.trim()) {
+      try {
+        const res = await fetch('/api/field-report/check-shift-attribution', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ crew_chief: crewChief.trim(), work_date: effDate }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (data && data.should_confirm && data.prior_date) {
+          setShiftAttribModal({ priorDate: data.prior_date, todayDate: effDate })
+          setSubmitting(false)
+          return
+        }
+      } catch (err) {
+        // Network/server hiccup — fail open. Better to submit with the
+        // user's intended date than to block them on a soft warning.
+        console.warn('shift-attribution check failed:', err)
+      }
+    }
+
     // Step 0 — make sure any focused input flushes its save, then wait
     // for all in-flight PATCHes to land so finalize/rollup on the server
     // read the freshest Marking Items state.
@@ -1295,7 +1334,7 @@ export default function FieldReport() {
     // tracking on multi-crew shifts.
     const reportBody = {
       wo_id:       selectedWOId,
-      date:        workDate,
+      date:        effDate,
       crew_chief:  crewChief.trim(),
       wo_complete: woCompleteFinal,
       work_type:   inferredWorkType,
@@ -1547,6 +1586,68 @@ export default function FieldReport() {
       {/* "All marking items look complete — flip the WO Complete toggle?"
           suggestion modal. Three buttons because cancel ≠ submit-as-is ≠
           mark-complete-and-submit. */}
+      {shiftAttribModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
+          onClick={() => setShiftAttribModal(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-3xl text-center">🌙</div>
+            <div className="text-center space-y-1.5">
+              <h2 className="text-lg font-black text-navy">Is this for last night's shift?</h2>
+              <p className="text-slate-500 text-sm leading-relaxed">
+                <span className="font-semibold text-slate-700">{crewChief}</span> filed
+                Field Reports dated{' '}
+                <span className="font-mono text-slate-700">{shiftAttribModal.priorDate}</span>{' '}
+                in the overnight window. This new report is set to{' '}
+                <span className="font-mono text-slate-700">{shiftAttribModal.todayDate}</span>{' '}
+                — pick the shift it actually covers.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                onClick={() => {
+                  const priorDate = shiftAttribModal.priorDate
+                  setShiftAttribModal(null)
+                  setWorkDate(priorDate)
+                  submitDateOverrideRef.current = priorDate
+                  skipShiftAttribCheckRef.current = true
+                  doSubmit()
+                }}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white
+                           hover:opacity-90 active:opacity-80 transition-all"
+              >
+                Last night's shift ({shiftAttribModal.priorDate})
+              </button>
+              <button
+                onClick={() => {
+                  const todayDate = shiftAttribModal.todayDate
+                  setShiftAttribModal(null)
+                  submitDateOverrideRef.current = todayDate
+                  skipShiftAttribCheckRef.current = true
+                  doSubmit()
+                }}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-amber-500 text-white
+                           hover:bg-amber-600 active:opacity-80 transition-all"
+              >
+                Today's shift ({shiftAttribModal.todayDate})
+              </button>
+              <button
+                onClick={() => setShiftAttribModal(null)}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
+                           text-slate-600 hover:bg-slate-200 transition-all"
+              >
+                Go Back
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showCompleteSuggestModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"

@@ -3774,6 +3774,8 @@ function doPost(e) {
       return handleGetActiveWOs_();
     } else if (action === 'submit_field_report') {
       return handleSubmitFieldReport_(body);
+    } else if (action === 'check_fr_shift_attribution') {
+      return handleCheckFrShiftAttribution_(body);
     } else if (action === 'finalize_field_report_docs') {
       return handleFinalizeFieldReportDocs_(body);
     } else if (action === 'get_dashboard_data') {
@@ -9640,6 +9642,103 @@ function _normalizeTrackerDate_(v) {
   }
   return s;
 }
+
+/**
+ * Pre-submit gate for the Field Report form: warn the user when a
+ * Crew Chief appears to still be wrapping up last night's overnight
+ * shift but the form's date is set to today.
+ *
+ * The overnight-shift cutoff (CONFIG.OPERATIONAL_DAY_CUTOFF_HOUR = 5)
+ * auto-buckets pre-5am submits to yesterday's operational day. But a
+ * chief who finishes a night shift and submits at 7am sees the form
+ * default to today's calendar date — silently mis-attributing the
+ * shift to a day that the crew didn't actually work.
+ *
+ * This handler detects the at-risk window:
+ *   - work_date == calendar today (NYC)
+ *   - submit time is between cutoff (5am) and cutoff + 4hr (9am)
+ *   - chief has at least one WDL row dated yesterday whose FR Submitted
+ *     At timestamp is later than yesterday 11pm (i.e. the row was
+ *     filed in the late-evening / overnight window characteristic of
+ *     an overnight crew, NOT a day-shift end-of-day submit).
+ *
+ * Returns { should_confirm, prior_date, reason }. The webapp shows a
+ * soft-warn modal asking the user to pick last-night vs today; the
+ * decision is the user's, this handler only flags.
+ *
+ * body.data = { crew_chief, work_date: 'YYYY-MM-DD' }
+ */
+function handleCheckFrShiftAttribution_(body) {
+  const d         = body.data || {};
+  const crewChief = String(d.crew_chief || '').trim();
+  const workDate  = String(d.work_date  || '').trim();
+  const noop = { should_confirm: false, prior_date: null, reason: '' };
+
+  if (!crewChief || !workDate) return jsonResponse_(noop);
+
+  const now = new Date();
+  const calendarToday = Utilities.formatDate(now, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  if (workDate !== calendarToday) return jsonResponse_(noop);
+
+  // Window: from cutoff (5am NYC) to cutoff + 4hr (9am NYC). Before
+  // cutoff, opDay correction already buckets the submit to yesterday
+  // — no warning needed. After 9am, the chief is almost certainly
+  // starting a new day; warning would be noise.
+  const cutoffHour = CONFIG.OPERATIONAL_DAY_CUTOFF_HOUR || 5;
+  const nyHourStr  = Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH');
+  const nyHour     = parseInt(nyHourStr, 10);
+  if (isNaN(nyHour) || nyHour < cutoffHour || nyHour >= (cutoffHour + 4)) {
+    return jsonResponse_(noop);
+  }
+
+  // Yesterday in NYC calendar terms.
+  const todayParts = calendarToday.split('-').map(Number);
+  const yDate = new Date(todayParts[0], todayParts[1] - 1, todayParts[2] - 1);
+  const yesterdayIso = Utilities.formatDate(yDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+
+  // Threshold: yesterday 23:00 NYC (the late-evening / overnight
+  // signal). Anything submitted before this on yesterday is most
+  // likely a day-shift end-of-shift filing, not a night shift.
+  const threshold = new Date(yDate.getFullYear(), yDate.getMonth(), yDate.getDate(), 23, 0, 0);
+
+  const wdlSheet = ss => ss.getSheetByName('Work Day Log');
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = wdlSheet(ss);
+  if (!sheet) return jsonResponse_(noop);
+
+  const data = sheet.getDataRange().getValues();
+  // WDL post-multi-crew schema:
+  //   0 Date, 2 Contractor, 3 Contract#, 4 Borough,
+  //   6 FR Submitted At, 7 Crew Chief, 8 Sign-In Status.
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  const chiefNorm = crewChief.toLowerCase();
+
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (ymd(r[0]) !== yesterdayIso) continue;
+    const rowChief = String(r[7] || '').trim().toLowerCase();
+    if (rowChief !== chiefNorm) continue;
+    const submittedAt = r[6];
+    if (!(submittedAt instanceof Date)) continue;
+    if (submittedAt.getTime() >= threshold.getTime()) {
+      return jsonResponse_({
+        should_confirm: true,
+        prior_date:     yesterdayIso,
+        reason:         `${crewChief} filed FRs dated ${yesterdayIso} late evening / overnight — likely an overnight shift still being wrapped up.`,
+      });
+    }
+  }
+
+  return jsonResponse_(noop);
+}
+
 
 function handleSubmitFieldReport_(body) {
   const d = body.data || {};
