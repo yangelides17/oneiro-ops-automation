@@ -2970,8 +2970,13 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         ot_hours:        otHours,
         total_st:        String(totalST),
         total_ot:        String(totalOT),
-        rate_st:         stRate.toFixed(2),
-        rate_ot:         otRate.toFixed(2),
+        // "Hourly Rate of Pay" on the form folds the supplemental
+        // (fringe) rate into the cash rate per NYC convention — total
+        // prevailing-wage rate per hour. The "Hourly Contributions to
+        // Benefit Funds or Accounts" column still shows the supp
+        // breakdown via supp_st / supp_ot below.
+        rate_st:         (stRate + stSupp).toFixed(2),
+        rate_ot:         (otRate + otSupp).toFixed(2),
         supp_st:         stSupp.toFixed(2),
         supp_ot:         otSupp.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
@@ -2994,7 +2999,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     // principal signature + name + title + today's date via pdf-lib.
     const cpJson = {
       _type:                 'certified_payroll',
-      payroll_number:        '',
+      payroll_number:        String(_payrollWeekNumber_(weekStart)),
       week_ending:           weekEndFormatted,
       employer:              CONFIG.EMPLOYER,
       prime_contractor:      CONFIG.SIGNATORY.name,
@@ -7695,6 +7700,36 @@ function _resolvePayrollRate_(rates, classification, dateIso) {
 
   const blank = candidates.find(r => r.effective_date == null);
   return blank || null;
+}
+
+
+/**
+ * Payroll week number per the rule "the Mon–Sun week containing Jan 1
+ * is week 1, the next week is week 2, …". A week that straddles year-
+ * end belongs to whichever year's Jan 1 it contains — so the week
+ * Mon Dec 28, 2026 – Sun Jan 3, 2027 is week 1 of 2027, not week 53
+ * of 2026.
+ *
+ * Implementation: try the *next* year's Jan 1 first (handles late-Dec
+ * weeks whose Sunday falls in the new year), then the current year's.
+ * Whichever year's "week 1 Monday" is the latest one not after
+ * weekStart owns this week.
+ */
+function _payrollWeekNumber_(weekStart) {
+  const tryYear = (Y) => {
+    const jan1 = new Date(Y, 0, 1);
+    const dow  = jan1.getDay();         // 0=Sun … 6=Sat
+    const back = (dow === 0) ? 6 : (dow - 1);
+    const w1Mon = new Date(Y, 0, 1 - back);
+    if (w1Mon.getTime() > weekStart.getTime()) return null;
+    return Math.floor((weekStart.getTime() - w1Mon.getTime()) / 86400000 / 7) + 1;
+  };
+  const Y = weekStart.getFullYear();
+  const next = tryYear(Y + 1);
+  if (next != null) return next;
+  const cur = tryYear(Y);
+  if (cur != null) return cur;
+  return 1;
 }
 
 
