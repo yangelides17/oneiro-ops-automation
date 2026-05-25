@@ -10277,12 +10277,18 @@ function _buildRevenuePayload_(startIso, endIso) {
     if (result.reason !== null) {
       unpricedCount += 1;
       needsPricing.push({
-        wo_id:    woId,
-        item_id:  item.item_id,
-        category: item.category,
-        qty:      Number(item.quantity) || 0,
-        unit:     item.unit,
-        reason:   result.reason,
+        wo_id:        woId,
+        item_id:      item.item_id,
+        category:     item.category,
+        qty:          Number(item.quantity) || 0,
+        unit:         item.unit,
+        reason:       result.reason,
+        // Contractor / contract / borough are what the pricing lookup
+        // actually used (i.e. post-billing-remap when applicable) so
+        // the user can find the right row to add in Contract Pricing.
+        contractor:   meta.contractor,
+        contract_num: meta.contract_num,
+        borough:      meta.borough,
       });
       continue;
     }

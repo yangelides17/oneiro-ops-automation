@@ -394,10 +394,10 @@ function NeedsPricingPanel({ items }) {
                 {NEEDS_PRICING_REASON_LABEL[reason] || reason} ({byReason[reason].length})
               </p>
               <div className="overflow-x-auto bg-white rounded-lg border border-amber-200">
-                <table className="w-full min-w-[480px] text-xs">
+                <table className="w-full min-w-[720px] text-xs">
                   <thead>
                     <tr className="border-b border-slate-100 bg-slate-50">
-                      {['WO #', 'Item ID', 'Category', 'Qty', 'Unit'].map(h => (
+                      {['WO #', 'Contractor', 'Contract #', 'Borough', 'Item ID', 'Category', 'Qty', 'Unit'].map(h => (
                         <th key={h} className="py-2 px-3 text-left font-extrabold
                                                uppercase tracking-wider text-slate-400">
                           {h}
@@ -416,6 +416,9 @@ function NeedsPricingPanel({ items }) {
                             {it.wo_id}
                           </Link>
                         </td>
+                        <td className="py-1.5 px-3 text-slate-700">{it.contractor || '—'}</td>
+                        <td className="py-1.5 px-3 font-mono text-slate-600">{it.contract_num || '—'}</td>
+                        <td className="py-1.5 px-3 text-slate-600">{it.borough || '—'}</td>
                         <td className="py-1.5 px-3 font-mono text-slate-500">{it.item_id}</td>
                         <td className="py-1.5 px-3 text-slate-700">{it.category}</td>
                         <td className="py-1.5 px-3 text-slate-600">{it.qty}</td>
