@@ -33,20 +33,18 @@ async function fetchDashboard() {
 // pre-cutoff (default 4 AM) submissions bucket back to yesterday's
 // shift, matching how the Apps Script side writes Daily Sign-In Data.
 const isoToday = () => opToday()
-// Monday on-or-before the given local-date ISO string. Sun → 6 days
-// back; Mon → 0; otherwise day-1 back.  Operates on parsed local Date
-// so DST transitions don't skew by an hour.
-function mondayOnOrBefore(isoYmd) {
+// Sunday on-or-before the given local-date ISO string. Sun → 0; Mon → 1
+// back; …; Sat → 6 back. Operates on parsed local Date so DST
+// transitions don't skew by an hour. Payroll weeks are Sun–Sat.
+function sundayOnOrBefore(isoYmd) {
   const [y, m, d] = isoYmd.split('-').map(Number)
   const dt = new Date(y, m-1, d)
-  const dow = dt.getDay()   // 0=Sun, 1=Mon, ..., 6=Sat
-  const delta = dow === 0 ? -6 : 1 - dow
-  dt.setDate(dt.getDate() + delta)
+  dt.setDate(dt.getDate() - dt.getDay())
   return [dt.getFullYear(), String(dt.getMonth()+1).padStart(2,'0'), String(dt.getDate()).padStart(2,'0')].join('-')
 }
-const thisWeekMondayIso = () => mondayOnOrBefore(isoToday())
-const lastWeekMondayIso = () => {
-  const [y, m, d] = thisWeekMondayIso().split('-').map(Number)
+const thisWeekSundayIso = () => sundayOnOrBefore(isoToday())
+const lastWeekSundayIso = () => {
+  const [y, m, d] = thisWeekSundayIso().split('-').map(Number)
   const dt = new Date(y, m-1, d); dt.setDate(dt.getDate() - 7)
   return [dt.getFullYear(), String(dt.getMonth()+1).padStart(2,'0'), String(dt.getDate()).padStart(2,'0')].join('-')
 }
@@ -158,7 +156,7 @@ function ToolsMenu() {
       description: (
         <span>
           <span className="block font-semibold text-slate-700">Week of {prettyDate(isoWeekStart)}</span>
-          <span className="block mt-1">One Certified Payroll JSON per contract+borough that had sign-in activity in this Monday–Sunday week.</span>
+          <span className="block mt-1">One Certified Payroll JSON per contract+borough that had sign-in activity in this Sunday–Saturday week.</span>
         </span>
       ),
       onConfirm: async () => {
@@ -183,16 +181,16 @@ function ToolsMenu() {
     setPicker(kind)
     setOpen(false)
     // Sensible defaults for each picker.
-    setPickerVal(kind === 'daily' ? isoToday() : thisWeekMondayIso())
+    setPickerVal(kind === 'daily' ? isoToday() : thisWeekSundayIso())
   }
 
   function submitPicker() {
     if (!pickerVal) return
     if (picker === 'daily') runDailyDocs(pickerVal)
     else if (picker === 'cert') {
-      // Snap the chosen date to the Monday of that week so the
+      // Snap the chosen date to the Sunday of that week so the
       // generator always receives a valid week-start.
-      runCertPayroll(mondayOnOrBefore(pickerVal))
+      runCertPayroll(sundayOnOrBefore(pickerVal))
     }
   }
 
@@ -227,11 +225,11 @@ function ToolsMenu() {
           <p className="px-3 pt-1 pb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
             Generate Certified Payroll
           </p>
-          <button className="tools-item" onClick={() => runCertPayroll(thisWeekMondayIso())}>
-            This week (week of {prettyDate(thisWeekMondayIso())})
+          <button className="tools-item" onClick={() => runCertPayroll(thisWeekSundayIso())}>
+            This week (week of {prettyDate(thisWeekSundayIso())})
           </button>
-          <button className="tools-item" onClick={() => runCertPayroll(lastWeekMondayIso())}>
-            Last week (week of {prettyDate(lastWeekMondayIso())})
+          <button className="tools-item" onClick={() => runCertPayroll(lastWeekSundayIso())}>
+            Last week (week of {prettyDate(lastWeekSundayIso())})
           </button>
           <button className="tools-item" onClick={() => openPicker('cert')}>
             Custom week…
@@ -264,7 +262,7 @@ function ToolsMenu() {
             <p className="text-xs text-slate-500 leading-snug">
               {picker === 'daily'
                 ? 'Generates Sign-In Log, Production Log, and Contractor Field Reports for every work order with crew activity on this date.'
-                : `We'll run certified payroll for the Monday-Sunday week containing the date you pick. Chosen date snaps to its week's Monday automatically.`}
+                : `We'll run certified payroll for the Sunday-Saturday week containing the date you pick. Chosen date snaps to its week's Sunday automatically.`}
             </p>
             <input
               type="date"
@@ -274,7 +272,7 @@ function ToolsMenu() {
             />
             {picker === 'cert' && pickerVal && (
               <p className="text-[11px] text-slate-500">
-                Will run for week of <span className="font-mono">{prettyDate(mondayOnOrBefore(pickerVal))}</span>
+                Will run for week of <span className="font-mono">{prettyDate(sundayOnOrBefore(pickerVal))}</span>
               </p>
             )}
             <div className="flex gap-2 pt-1">

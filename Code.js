@@ -2663,7 +2663,7 @@ function validateSignInData(dateStr) {
  * Generate certified payroll data for a given week.
  * Groups hours by Contract ID and creates separate entries per contract.
  * 
- * @param {string} weekStartStr - Monday date in MM/DD/YYYY format
+ * @param {string} weekStartStr - Sunday date in MM/DD/YYYY format
  */
 /**
  * YTD gross pay for an employee across ALL projects, up to and
@@ -2674,7 +2674,7 @@ function validateSignInData(dateStr) {
  * hand-edits a row's OT contribution (e.g. correcting historical
  * cross-contract rows the old per-shift logic mis-split).
  *
- * Rates are resolved per pay-period week (Mon–Sun) using the week's
+ * Rates are resolved per pay-period week (Sun–Sat) using the week's
  * end-date — so a YTD that straddles a rate-schedule boundary correctly
  * applies old rates to weeks before and new rates to weeks after.
  * Supplementals are paid the same hours as wages (ST hours pair with
@@ -2698,12 +2698,12 @@ function computeYtdGrossForEmployee_(signInData, empName, classification, payrol
 
   const yearStart = new Date(weekEnd.getFullYear(), 0, 1, 0, 0, 0);
 
-  // Bucket rows into Mon–Sun weeks so we can apply the rate effective on
+  // Bucket rows into Sun–Sat weeks so we can apply the rate effective on
   // each week's end date. JS getDay(): Sun=0, Mon=1, ..., Sat=6.
   const weekEndKey = (d) => {
-    // Days until upcoming Sunday (inclusive). For Sunday itself, 0.
-    const daysToSun = (7 - d.getDay()) % 7;
-    const we = new Date(d.getFullYear(), d.getMonth(), d.getDate() + daysToSun, 23, 59, 59);
+    // Days until upcoming Saturday (inclusive). For Saturday itself, 0.
+    const daysToSat = 6 - d.getDay();
+    const we = new Date(d.getFullYear(), d.getMonth(), d.getDate() + daysToSat, 23, 59, 59);
     return { key: Utilities.formatDate(we, CONFIG.TIMEZONE, 'yyyy-MM-dd'), date: we };
   };
 
@@ -3016,9 +3016,9 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     const cpFolder = getOrCreateSubfolder_(
       DriveApp.getFolderById(cpProps.getProperty('NEEDS_REVIEW_ID')), 'Certified Payroll'
     );
-    // Filename uses the week START date (Monday) — reads naturally as
-    // "week of 2026-04-20" and matches the semantic in the archive code.
-    // The form still prints "WEEK ENDING DATE" (Sunday) in its header
+    // Filename uses the week START date (Sunday) — reads naturally as
+    // "week of 2026-04-19" and matches the semantic in the archive code.
+    // The form still prints "WEEK ENDING DATE" (Saturday) in its header
     // because that's the standard payroll convention on the form itself.
     const cpJsonName = `Certified_Payroll_${contractNum}_${borough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
     cpFolder.createFile(cpJsonName, JSON.stringify(cpJson, null, 2), MimeType.PLAIN_TEXT);
@@ -3195,7 +3195,7 @@ function validateSignInToday() {
 
 function promptCertifiedPayroll() {
   const ui = SpreadsheetApp.getUi();
-  const response = ui.prompt('Enter week start date (Monday, MM/DD/YYYY):');
+  const response = ui.prompt('Enter week start date (Sunday, MM/DD/YYYY):');
   if (response.getSelectedButton() === ui.Button.OK) {
     const count = generateCertifiedPayroll(response.getResponseText());
     if (count > 0) {
@@ -6931,7 +6931,7 @@ function handleProcessApprovedDocuments_(body) {
 
 /**
  * Trigger the certified-payroll generator for a given week-start
- * (Monday, MM/DD/YYYY).  Webapp Dashboard "Tools" menu surface.
+ * (Sunday, MM/DD/YYYY).  Webapp Dashboard "Tools" menu surface.
  *
  * body.data = { week_start: 'MM/DD/YYYY' }
  *
@@ -7704,25 +7704,25 @@ function _resolvePayrollRate_(rates, classification, dateIso) {
 
 
 /**
- * Payroll week number per the rule "the Mon–Sun week containing Jan 1
+ * Payroll week number per the rule "the Sun–Sat week containing Jan 1
  * is week 1, the next week is week 2, …". A week that straddles year-
  * end belongs to whichever year's Jan 1 it contains — so the week
- * Mon Dec 28, 2026 – Sun Jan 3, 2027 is week 1 of 2027, not week 53
+ * Sun Dec 27, 2026 – Sat Jan 2, 2027 is week 1 of 2027, not week 53
  * of 2026.
  *
  * Implementation: try the *next* year's Jan 1 first (handles late-Dec
- * weeks whose Sunday falls in the new year), then the current year's.
- * Whichever year's "week 1 Monday" is the latest one not after
+ * weeks whose Saturday falls in the new year), then the current year's.
+ * Whichever year's "week 1 Sunday" is the latest one not after
  * weekStart owns this week.
  */
 function _payrollWeekNumber_(weekStart) {
   const tryYear = (Y) => {
     const jan1 = new Date(Y, 0, 1);
     const dow  = jan1.getDay();         // 0=Sun … 6=Sat
-    const back = (dow === 0) ? 6 : (dow - 1);
-    const w1Mon = new Date(Y, 0, 1 - back);
-    if (w1Mon.getTime() > weekStart.getTime()) return null;
-    return Math.floor((weekStart.getTime() - w1Mon.getTime()) / 86400000 / 7) + 1;
+    // Days back to the Sunday of Jan 1's Sun–Sat week.
+    const w1Sun = new Date(Y, 0, 1 - dow);
+    if (w1Sun.getTime() > weekStart.getTime()) return null;
+    return Math.floor((weekStart.getTime() - w1Sun.getTime()) / 86400000 / 7) + 1;
   };
   const Y = weekStart.getFullYear();
   const next = tryYear(Y + 1);
