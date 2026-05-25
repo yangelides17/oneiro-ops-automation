@@ -1166,16 +1166,20 @@ function generateInvoice_(woId, entries, woData, ss) {
   if (!woRow) return;
   
   const contractor = woRow[1];
-  const contractNum = woRow[2];
-  const borough = woRow[3];
+  // Apply billing remap so sub-prime work on a contract they didn't
+  // win is billed under their own contract. Source WO Tracker stays
+  // raw — only the invoice content + AR row + rate lookup shift.
+  const _invMapped = _billingRemap_(woRow[2], woRow[3], contractor);
+  const contractNum = _invMapped.contractNum;
+  const borough = _invMapped.borough;
   const location = woRow[5];
   const sqft = Number(entries[0][12]) || 0;
-  
+
   // Look up rate from Contract Lookup
   const clSheet = ss.getSheetByName('Contract Lookup');
   const clData = clSheet.getDataRange().getValues();
-  const contractRow = clData.find(r => 
-    String(r[0]).includes(String(contractNum).split('/')[0]) && 
+  const contractRow = clData.find(r =>
+    String(r[0]).includes(String(contractNum).split('/')[0]) &&
     String(r[1]) === String(borough)
   );
   const rate = contractRow ? Number(contractRow[6]) : 3.40; // Default rate
@@ -1726,22 +1730,30 @@ function archiveDocument_(file, docType, woId, ss) {
       return { success: true, doc_type: 'Invoice', wo_ids: [woId] };
 
     } else if (docType === 'Sign-In') {
-      // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
+      // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_<ContractorSlug>][_MANUAL].pdf.
       // We look up every WO that worked that contract on that day and copy
       // the same PDF into each WO folder (same pattern as Production Logs).
-      const newPat = cleanName.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
+      // Optional <ContractorSlug> after the date appears when a billing
+      // remap split the file by sub-prime — used to pick the right
+      // contractor folder when multiple primes worked the same source job.
+      const newPat = cleanName.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_([A-Za-z0-9]+))?/);
       if (newPat) {
-        const [, contractNum, borough, dateStr] = newPat;
+        const [, contractNum, borough, dateStr, fileContractorSlug] = newPat;
+        const slugMatches = (co) => String(co || '').replace(/[^A-Za-z0-9]/g, '') === fileContractorSlug;
+        const isSuffixMarker = fileContractorSlug === 'MANUAL' || fileContractorSlug === 'FILLED';
+        const useFileContractor = fileContractorSlug && !isSuffixMarker;
         const logDate = new Date(dateStr + 'T12:00:00');
         const wosByContract = getWOsForDate_(logDate, ss);
         const matchKey = Object.keys(wosByContract).find(k => {
           const parts = k.split('|');
-          return parts[1] === contractNum && parts[2] === borough;
+          if (parts[1] !== contractNum || parts[2] !== borough) return false;
+          if (useFileContractor && !slugMatches(parts[0])) return false;
+          return true;
         });
         if (!matchKey) {
           return {
             success: false,
-            reason: `No WOs found in Daily Sign-In Data for ${contractNum}/${borough} on ${dateStr} — sign-in submitted before any matching Work Day Log row?`
+            reason: `No WOs found in Daily Sign-In Data for ${contractNum}/${borough}${useFileContractor ? ' (' + fileContractorSlug + ')' : ''} on ${dateStr} — sign-in submitted before any matching Work Day Log row?`
           };
         }
         const [contractor] = matchKey.split('|');
@@ -1873,15 +1885,29 @@ function archiveDocument_(file, docType, woId, ss) {
       return { success: true, doc_type: 'Production Log', wo_ids: allCoveredWoIds };
 
     } else if (docType === 'Certified Payroll') {
-      // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD.txt
-      const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/);
+      // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD[_<ContractorSlug>][_FILLED].pdf
+      // Optional <ContractorSlug> after the date appears when a billing
+      // remap split the CP by sub-prime — used to pick the right
+      // contractor folder when multiple primes worked the same source job.
+      const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_([A-Za-z0-9]+))?/);
       if (!match) {
         return { success: false, reason: 'Could not parse contract info from Certified Payroll filename' };
       }
-      const [, contractNum, borough, weekStartStr] = match;
+      const [, contractNum, borough, weekStartStr, fileContractorSlug] = match;
+      const _cpIsSuffixMarker = fileContractorSlug === 'FILLED' || fileContractorSlug === 'MANUAL';
+      const _cpUseFileContractor = fileContractorSlug && !_cpIsSuffixMarker;
+      const _cpSlugMatches = (co) => String(co || '').replace(/[^A-Za-z0-9]/g, '') === fileContractorSlug;
       const weekStart = new Date(weekStartStr + 'T12:00:00');
       const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
-      let contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
+      let contractor = '';
+      if (_cpUseFileContractor) {
+        // Narrow to the WOs matching the filename's contractor slug —
+        // when both primes worked the same source job, picking the
+        // first wo's contractor would archive to the wrong folder.
+        const filtered = wos.filter(w => _cpSlugMatches(w.contractor));
+        if (filtered.length > 0) contractor = filtered[0].contractor || '';
+      }
+      if (!contractor) contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
       if (!contractor) {
         const clSheet = ss.getSheetByName('Contract Lookup');
         const clRow = clSheet
@@ -2819,17 +2845,41 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   };
   const classificationName = code => CLASSIFICATION_NAMES[String(code).trim().toUpperCase()] || String(code).trim();
 
-  // For each contract group, generate certified payroll entries
-  Object.entries(byContract).forEach(([key, entries]) => {
-    const [contractNum, borough] = key.split('|');
-    
-    // Look up Contract ID from lookup table
-    const clRow = clData.find(r => 
+  // For each contract group, generate certified payroll entries.
+  //
+  // Sub-prime billing remap: when a (raw contract, borough) has a
+  // remap rule (sub-prime work on a contract the prime didn't win),
+  // split this bucket by contractor so each sub-prime gets their own
+  // CP billed under their own contract. Without remap, the bucket
+  // runs once for all contractors combined (existing behavior — one
+  // CP per (contract, borough)).
+  let cpSubBucketsGenerated = 0;
+  Object.entries(byContract).forEach(([key, rawEntries]) => {
+    const [rawContractNum, rawBorough] = key.split('|');
+
+    const subBuckets = _hasBillingRemap_(rawContractNum, rawBorough)
+      ? Object.entries(rawEntries.reduce((acc, r) => {
+          const co = String(r[2] || '').trim();
+          (acc[co] = acc[co] || []).push(r);
+          return acc;
+        }, {})).map(([contractor, entries]) => {
+          const m = _billingRemap_(rawContractNum, rawBorough, contractor);
+          return { contractor, contractNum: m.contractNum, borough: m.borough, entries };
+        })
+      : [{ contractor: null, contractNum: rawContractNum, borough: rawBorough, entries: rawEntries }];
+
+  subBuckets.forEach(({ contractor: bucketContractor, contractNum, borough, entries }) => {
+    cpSubBucketsGenerated++;
+
+    // Look up Contract ID from lookup table (uses MAPPED contract+borough
+    // when remap applied, so the right contract's registration/project
+    // populate the form).
+    const clRow = clData.find(r =>
       String(r[0]).includes(contractNum) && String(r[1]) === borough
     );
     const contractId = clRow ? clRow[3] : '⚠️ MISSING — CHECK LOOKUP TABLE';
     const projectName = clRow ? clRow[4] : '';
-    
+
     // Group by employee. Track ST and OT contributions separately
     // per day from cols 10 (Hours) and 11 (Overtime) — handleSubmitSignIn_
     // is the authority on the per-row OT split (it does the cross-
@@ -3020,15 +3070,27 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     // "week of 2026-04-19" and matches the semantic in the archive code.
     // The form still prints "WEEK ENDING DATE" (Saturday) in its header
     // because that's the standard payroll convention on the form itself.
-    const cpJsonName = `Certified_Payroll_${contractNum}_${borough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
+    //
+    // Filename keeps RAW (contract, borough) so archive parsers still
+    // match against WO Tracker (also raw). When a split happened
+    // (sub-prime billing remap), append a contractor slug to
+    // disambiguate the two PDFs that share the same raw key — without
+    // the slug they'd collide in Drive and one would clobber the other.
+    const _cpRawContract = bucketContractor ? rawContractNum : contractNum;
+    const _cpRawBorough  = bucketContractor ? rawBorough     : borough;
+    const _cpContractorSlug = bucketContractor
+      ? '_' + bucketContractor.replace(/[^A-Za-z0-9]/g, '')
+      : '';
+    const cpJsonName = `Certified_Payroll_${_cpRawContract}_${_cpRawBorough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}${_cpContractorSlug}.json`;
     cpFolder.createFile(cpJsonName, JSON.stringify(cpJson, null, 2), MimeType.PLAIN_TEXT);
     Logger.log(`✅ Certified payroll JSON exported: ${cpJsonName}`);
     // ─────────────────────────────────────────────────────────────────────────
 
-    Logger.log(`✅ Certified payroll entries created for ${contractNum}/${borough}: ${Object.keys(byEmployee).length} employees`);
+    Logger.log(`✅ Certified payroll entries created for ${contractNum}/${borough}${bucketContractor ? ' (' + bucketContractor + ')' : ''}: ${Object.keys(byEmployee).length} employees`);
+  });
   });
 
-  const contractCount = Object.keys(byContract).length;
+  const contractCount = cpSubBucketsGenerated;
 
   // Flag for human review
   const logSheet = ss.getSheetByName('Automation Log');
@@ -3994,9 +4056,14 @@ function _approvalSubtitleFromFilename_(docType, filename) {
   }
   if (docType === 'certified_payroll') {
     // e.g. "Certified_Payroll_84125MBTP701_BK_2026-04-21_FILLED.pdf"
-    // Pull contract + borough + date if we can; otherwise fall back.
-    const m = s.match(/Certified_Payroll_(\w+)_(\w+)_(\d{4}-\d{2}-\d{2})/);
-    if (m) return `${m[1]}-${m[2]} · ${m[3]}`;
+    // Or with billing-remap split: "..._2026-04-21_MetroExpress_FILLED.pdf"
+    const m = s.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_([A-Za-z0-9]+))?/);
+    if (m) {
+      const [, cn, bor, date, suffix] = m;
+      const isMarker = suffix === 'FILLED' || suffix === 'MANUAL';
+      const tag = (suffix && !isMarker) ? ` (${suffix})` : '';
+      return `${cn}-${bor}${tag} · ${date}`;
+    }
     return s.replace(/\.pdf$/i, '');
   }
   return s.replace(/\.pdf$/i, '');
@@ -4803,7 +4870,17 @@ function handleSubmitSignIn_(body) {
     const signInFolder = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
 
     const isoDate = String(effectiveDate).slice(0, 10);
-    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}`;
+    // Filename keeps RAW (contract, borough) so the archive parser
+    // matches WO Tracker. When a billing remap applies for this
+    // (contract, borough, contractor), append a contractor slug to
+    // disambiguate from another sub-prime's SI on the same source job
+    // — without the slug the second submit would clobber the first.
+    const _siRemapApplies = _hasBillingRemap_(d.contract_number, d.borough) &&
+      _billingRemap_(d.contract_number, d.borough, d.contractor).borough !== String(d.borough || '').trim();
+    const _siContractorSlug = _siRemapApplies
+      ? '_' + String(d.contractor || '').replace(/[^A-Za-z0-9]/g, '')
+      : '';
+    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}${_siContractorSlug}`;
 
     let writtenName;
 
@@ -4842,10 +4919,18 @@ function handleSubmitSignIn_(body) {
         Logger.log(`⚠️ Contractor Contacts lookup failed: ${err}`);
       }
 
-      const boroughName = getBoroughName_(d.borough);
+      // Apply billing remap for the PDF content: sub-prime work on a
+      // contract they didn't win shows the billed-under contract here.
+      // Filename / Daily Sign-In Data row stay raw so the archive cron
+      // matches WO Tracker (also raw) and the source job stays one
+      // folder.
+      const _siMapped = _billingRemap_(d.contract_number, d.borough, d.contractor);
+      const siContractNum = _siMapped.contractNum;
+      const siBorough = _siMapped.borough;
+      const boroughName = getBoroughName_(siBorough);
       const contractLabel = boroughName
-        ? `${d.contract_number} - ${boroughName}`
-        : d.contract_number;
+        ? `${siContractNum} - ${boroughName}`
+        : siContractNum;
 
       // Pre-formatted display string for the "Work Order #" cell on the
       // sign-in template — saves the filler from having to format it.
@@ -7700,6 +7785,47 @@ function _resolvePayrollRate_(rates, classification, dateIso) {
 
   const blank = candidates.find(r => r.effective_date == null);
   return blank || null;
+}
+
+
+// ─── Billing remap (sub-prime work) ─────────────────────────────
+// When a sub-prime is performing work on a contract they did NOT win
+// (because the original prime is failing to perform), the work is
+// billed under a contract the sub-prime DID win. Source data (WO
+// Tracker, Daily Sign-In Data, Work Day Log) keeps the raw source
+// contract+borough; billing-doc generation applies this remap so the
+// Invoice / Sign-In Sheet / Certified Payroll content (and the
+// Invoices & AR / CP Tracker rows) reflect the billing identity.
+//
+// Drive archive folders and Doc Lifecycle keys stay keyed by RAW so
+// source-job artifacts (CFR, Production Log) co-locate with the
+// billing docs in one folder per source job.
+//
+// Bandaid for now — if this becomes routine, lift into a sheet tab + UI.
+const _BILLING_REMAP_ = [
+  { contractNum: '84125MBTP701', borough: 'Brooklyn', contractor: 'Metro Express',
+    bill_as: { contractNum: '84125MBTP701', borough: 'Manhattan' } },
+  { contractNum: '84125MBTP701', borough: 'Brooklyn', contractor: 'Denville',
+    bill_as: { contractNum: '84125MBTP701', borough: 'Queens' } },
+];
+
+function _billingRemap_(contractNum, borough, contractor) {
+  const cn = String(contractNum || '').trim();
+  const br = String(borough || '').trim();
+  const co = String(contractor || '').trim();
+  const hit = _BILLING_REMAP_.find(r =>
+    r.contractNum === cn && r.borough === br && r.contractor === co);
+  return hit ? { ...hit.bill_as } : { contractNum: cn, borough: br };
+}
+
+// True when at least one remap rule targets this (raw contract, borough).
+// Used by the CP generator to decide whether to split a bucket by
+// contractor (each sub-prime gets their own CP billed under their own
+// contract). Clean buckets just produce one CP as before.
+function _hasBillingRemap_(contractNum, borough) {
+  const cn = String(contractNum || '').trim();
+  const br = String(borough || '').trim();
+  return _BILLING_REMAP_.some(r => r.contractNum === cn && r.borough === br);
 }
 
 
@@ -11570,9 +11696,19 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     return m ? m[1] : s;
   };
 
-  const contractor   = String(woRow[1]  || '').trim();
-  const contractNum  = String(woRow[2]  || '').split('/')[0].trim();
-  const borough      = String(woRow[3]  || '').trim();
+  const contractor      = String(woRow[1]  || '').trim();
+  // Apply billing remap so sub-prime work on a contract they didn't
+  // win is priced against — and posted to — the contract they DID win.
+  // Pricing reads Contract Pricing keyed by (contractor, contract_num,
+  // borough); the remapped tuple is the one that has rates for this
+  // contractor.
+  const _qbMapped = _billingRemap_(
+    String(woRow[2] || '').split('/')[0].trim(),
+    String(woRow[3] || '').trim(),
+    contractor
+  );
+  const contractNum  = _qbMapped.contractNum;
+  const borough      = _qbMapped.borough;
   const location     = String(woRow[5]  || '').trim();
   const workStartIso = fmtDate(woRow[17]);
   const workEndIso   = fmtDate(woRow[18]) || workStartIso || Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
