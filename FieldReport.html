@@ -718,15 +718,9 @@ function addCrewRow() {
         <input type="time" id="co-${idx}" onchange="calcHours(${idx})">
       </div>
     </div>
-    <div class="row-2 mt-10">
-      <div class="field">
-        <label class="field-label">Reg. Hours</label>
-        <input type="number" id="ch-${idx}" step="0.25" readonly placeholder="—">
-      </div>
-      <div class="field">
-        <label class="field-label">OT Hours</label>
-        <input type="number" id="ct-${idx}" step="0.25" readonly placeholder="—">
-      </div>
+    <div class="field mt-10">
+      <label class="field-label">Hours</label>
+      <input type="number" id="ch-${idx}" step="0.25" readonly placeholder="—">
     </div>`;
   document.getElementById('crew-rows').appendChild(el);
 }
@@ -746,14 +740,10 @@ function calcHours(idx) {
   const mins = (oH * 60 + oM) - (iH * 60 + iM);
   if (mins <= 0) {
     document.getElementById('ch-' + idx).value = '';
-    document.getElementById('ct-' + idx).value = '';
     return;
   }
 
-  const hrs = mins / 60;
-  const ot  = Math.max(0, hrs - 8);
-  document.getElementById('ch-' + idx).value = hrs.toFixed(2);
-  document.getElementById('ct-' + idx).value = ot > 0 ? ot.toFixed(2) : '0.00';
+  document.getElementById('ch-' + idx).value = (mins / 60).toFixed(2);
 }
 
 function collectCrew() {
@@ -766,14 +756,12 @@ function collectCrew() {
     const tIn    = document.getElementById('ci-' + i)?.value || '';
     const tOut   = document.getElementById('co-' + i)?.value || '';
     const hrs    = parseFloat(document.getElementById('ch-' + i)?.value) || 0;
-    const ot     = parseFloat(document.getElementById('ct-' + i)?.value) || 0;
     members.push({
       name:           name,
       classification: cls,
       time_in:        fmt24to12(tIn),
       time_out:       fmt24to12(tOut),
-      hours:          hrs,
-      overtime:       ot
+      hours:          hrs
     });
   });
   return members;

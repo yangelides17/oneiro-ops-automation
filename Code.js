@@ -2667,9 +2667,12 @@ function validateSignInData(dateStr) {
  */
 /**
  * YTD gross pay for an employee across ALL projects, up to and
- * including the payroll week end date. Applies the same day-of-week OT
- * rule the weekly payroll uses (Sat/Sun all OT; weekday >8 OT) so the
- * Total Gross Pay column matches the weekly column's math.
+ * including the payroll week end date. Trusts the per-row col 11
+ * (Overtime Hours) written by handleSubmitSignIn_, which already
+ * applies the day-of-week OT rule with same-day cross-group lookback.
+ * Deriving OT here would silently disagree with col 11 if anyone
+ * hand-edits a row's OT contribution (e.g. correcting historical
+ * cross-contract rows the old per-shift logic mis-split).
  *
  * Rates are resolved per pay-period week (Mon–Sun) using the week's
  * end-date — so a YTD that straddles a rate-schedule boundary correctly
@@ -2695,23 +2698,7 @@ function computeYtdGrossForEmployee_(signInData, empName, classification, payrol
 
   const yearStart = new Date(weekEnd.getFullYear(), 0, 1, 0, 0, 0);
 
-  // Aggregate total hours by date for this employee (handles the case
-  // where two sign-ins on the same day get combined before the OT rule).
-  const byDay = {};   // 'yyyy-MM-dd' → { hours, dow, date }
-  signInData.slice(1).forEach(row => {
-    if (!row[0]) return;
-    const rowDate = new Date(row[0]);
-    if (isNaN(rowDate.getTime())) return;
-    if (rowDate < yearStart || rowDate > weekEnd) return;
-    if (normName(row[6]) !== target) return;
-    const h = Number(row[10]) || 0;
-    if (h <= 0) return;
-    const key = Utilities.formatDate(rowDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-    if (!byDay[key]) byDay[key] = { hours: 0, dow: rowDate.getDay(), date: rowDate };
-    byDay[key].hours += h;
-  });
-
-  // Bucket days into Mon–Sun weeks so we can apply the rate effective on
+  // Bucket rows into Mon–Sun weeks so we can apply the rate effective on
   // each week's end date. JS getDay(): Sun=0, Mon=1, ..., Sat=6.
   const weekEndKey = (d) => {
     // Days until upcoming Sunday (inclusive). For Sunday itself, 0.
@@ -2721,17 +2708,20 @@ function computeYtdGrossForEmployee_(signInData, empName, classification, payrol
   };
 
   const byWeek = {}; // weekEndKey → { weekEnd: Date, st: number, ot: number }
-  Object.values(byDay).forEach(({ hours, dow, date }) => {
-    const { key, date: we } = weekEndKey(date);
+  signInData.slice(1).forEach(row => {
+    if (!row[0]) return;
+    const rowDate = new Date(row[0]);
+    if (isNaN(rowDate.getTime())) return;
+    if (rowDate < yearStart || rowDate > weekEnd) return;
+    if (normName(row[6]) !== target) return;
+    const hours = Number(row[10]) || 0;
+    if (hours <= 0) return;
+    const ot = Number(row[11]) || 0;
+    const st = Math.max(0, hours - ot);
+    const { key, date: we } = weekEndKey(rowDate);
     if (!byWeek[key]) byWeek[key] = { weekEnd: we, st: 0, ot: 0 };
-    if (dow === 0 || dow === 6) {
-      byWeek[key].ot += hours;
-    } else if (hours <= 8) {
-      byWeek[key].st += hours;
-    } else {
-      byWeek[key].st += 8;
-      byWeek[key].ot += hours - 8;
-    }
+    byWeek[key].st += st;
+    byWeek[key].ot += ot;
   });
 
   let ytd = 0;
@@ -9223,7 +9213,9 @@ function handleGetWOMapData_(_body) {
  *   paint_material      — string
  *   issues          — string (appended to existing issues with date prefix)
  *   photos_uploaded — boolean
- *   crew            — [{name, classification, time_in, time_out, hours, overtime}]
+ *   crew            — [{name, classification, time_in, time_out, hours}]
+ *                     (currently ignored by the server — sign-in lives in
+ *                     its own tab and writes Daily Sign-In Data directly)
  *
  * Daily Sign-In Data columns (0-indexed, 18 total):
  *   0  Date                8  Time In           16  Admin Reviewed?
