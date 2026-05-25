@@ -7809,11 +7809,16 @@ function _resolvePayrollRate_(rates, classification, dateIso) {
 // billing docs in one folder per source job.
 //
 // Bandaid for now — if this becomes routine, lift into a sheet tab + UI.
+// Borough values are stored as abbreviations everywhere in source data
+// (WO Tracker, Daily Sign-In Data, Work Day Log, Contract Pricing,
+// Contract Lookup) — see getBoroughName_ for the conversion table.
+// Match those abbreviations exactly here, otherwise the remap silently
+// no-ops and the bandaid does nothing.
 const _BILLING_REMAP_ = [
-  { contractNum: '84125MBTP701', borough: 'Brooklyn', contractor: 'Metro Express',
-    bill_as: { contractNum: '84125MBTP701', borough: 'Manhattan' } },
-  { contractNum: '84125MBTP701', borough: 'Brooklyn', contractor: 'Denville',
-    bill_as: { contractNum: '84125MBTP701', borough: 'Queens' } },
+  { contractNum: '84125MBTP701', borough: 'BK', contractor: 'Metro Express',
+    bill_as: { contractNum: '84125MBTP701', borough: 'M' } },
+  { contractNum: '84125MBTP701', borough: 'BK', contractor: 'Denville',
+    bill_as: { contractNum: '84125MBTP701', borough: 'QU' } },
 ];
 
 function _billingRemap_(contractNum, borough, contractor) {
