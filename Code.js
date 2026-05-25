@@ -2840,15 +2840,25 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     const contractId = clRow ? clRow[3] : '⚠️ MISSING — CHECK LOOKUP TABLE';
     const projectName = clRow ? clRow[4] : '';
     
-    // Group by employee
+    // Group by employee. Track ST and OT contributions separately
+    // per day from cols 10 (Hours) and 11 (Overtime) — handleSubmitSignIn_
+    // is the authority on the per-row OT split (it does the cross-
+    // group same-day lookback so OT lands on whichever row pushed
+    // the daily total over 8). Deriving OT here from per-contract
+    // aggregated hours would miss that, since two contracts on the
+    // same day live in separate byContract buckets.
     const byEmployee = {};
     entries.forEach(row => {
       const emp = row[6];
-      if (!byEmployee[emp]) byEmployee[emp] = { days: {}, classification: row[7], totalHours: 0 };
-      
+      if (!byEmployee[emp]) byEmployee[emp] = { days: {}, stByDay: {}, otByDay: {}, classification: row[7], totalHours: 0 };
+
       const dayOfWeek = new Date(row[0]).getDay(); // 0=Sun, 1=Mon...6=Sat
       const hours = Number(row[10]) || 0;
-      byEmployee[emp].days[dayOfWeek] = (byEmployee[emp].days[dayOfWeek] || 0) + hours;
+      const ot    = Number(row[11]) || 0;
+      const st    = Math.max(0, hours - ot);
+      byEmployee[emp].days[dayOfWeek]     = (byEmployee[emp].days[dayOfWeek]     || 0) + hours;
+      byEmployee[emp].stByDay[dayOfWeek]  = (byEmployee[emp].stByDay[dayOfWeek]  || 0) + st;
+      byEmployee[emp].otByDay[dayOfWeek]  = (byEmployee[emp].otByDay[dayOfWeek]  || 0) + ot;
       byEmployee[emp].totalHours += hours;
     });
     
@@ -2915,31 +2925,25 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         data, empName, info.classification, payrollRates, weekEnd
       );
 
-      // OT rules: ALL hours on Saturday (6) and Sunday (0) are OT.
-      // On Mon–Fri, hours over 8 in a single day are OT.
+      // Sum this contract's per-day ST/OT from the col-10/col-11 split
+      // already computed at submission time. Weekend (all OT) and
+      // >8/day rules are enforced upstream in handleSubmitSignIn_;
+      // here we just total what's in the rows for this contract.
       let totalST = 0;
       let totalOT = 0;
       const stHours = ['0','0','0','0','0','0','0'];
       const otHours = ['0','0','0','0','0','0','0'];
 
-      Object.entries(info.days).forEach(([dayOfWeek, dayHours]) => {
-        const dow = Number(dayOfWeek);
-        const fi  = jsDayToFormDay[dow];
-        if (dow === 0 || dow === 6) {
-          totalOT += dayHours;
-          otHours[fi] = String(dayHours);
-        } else {
-          if (dayHours <= 8) {
-            totalST += dayHours;
-            stHours[fi] = String(dayHours);
-          } else {
-            totalST += 8;
-            totalOT += dayHours - 8;
-            stHours[fi] = '8';
-            otHours[fi] = String(dayHours - 8);
-          }
-        }
-      });
+      for (let dow = 0; dow < 7; dow++) {
+        const st = info.stByDay[dow] || 0;
+        const ot = info.otByDay[dow] || 0;
+        if (st === 0 && ot === 0) continue;
+        const fi = jsDayToFormDay[dow];
+        if (st > 0) stHours[fi] = String(st);
+        if (ot > 0) otHours[fi] = String(ot);
+        totalST += st;
+        totalOT += ot;
+      }
 
       // Gross pay = ST hours × (st_rate + st_supp) + OT hours × (ot_rate + ot_supp).
       // Supplementals are paid per-hour-worked, ST hours always pair
@@ -4701,9 +4705,56 @@ function handleSubmitSignIn_(body) {
     });
     const displayLocation = allLocations.filter(Boolean).join('; ');
 
+    // ── Per-row OT split with same-day lookback ───────────────────
+    // OT col reflects each row's *contribution* to the daily 8-hour
+    // ST allowance. A worker may have rows on this date from an
+    // earlier Sign-In Group (different contract/borough/contractor)
+    // OR appear twice in this same submission. Both cases must feed
+    // the OT split so the second row carries the OT once the daily
+    // total crosses 8. Without this, two independent 4-hour shifts
+    // would each record 0 OT despite totaling 8+; cf. the multi-
+    // group bug where 6h + 3.75h split as 9.75 ST / 0 OT instead of
+    // 8 ST / 1.75 OT.
+    const normNameKey = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const normDateKey = v => {
+      if (!v) return '';
+      if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+      const s = String(v);
+      const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+      const dt = new Date(s);
+      return isNaN(dt.getTime()) ? s : Utilities.formatDate(dt, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    };
+    const todayKey = normDateKey(effectiveDate);
+    const priorHoursByEmp = {};
+    const signInData = signInSheet.getDataRange().getValues();
+    for (let i = 1; i < signInData.length; i++) {
+      const row = signInData[i];
+      if (normDateKey(row[0]) !== todayKey) continue;
+      const n = normNameKey(row[6]);
+      if (!n) continue;
+      priorHoursByEmp[n] = (priorHoursByEmp[n] || 0) + (Number(row[10]) || 0);
+    }
+
     const crewRows = d.crew.map(member => {
-      const hours    = parseFloat(member.hours) || 0;
-      const overtime = isWeekend ? hours : Math.max(0, hours - 8);
+      const hours   = parseFloat(member.hours) || 0;
+      const nameKey = normNameKey(member.name);
+      const prior   = priorHoursByEmp[nameKey] || 0;
+
+      let overtime;
+      if (isWeekend) {
+        overtime = hours;
+      } else {
+        const combinedST = Math.min(prior + hours, 8);
+        const priorST    = Math.min(prior, 8);
+        const newST      = combinedST - priorST;
+        overtime         = Math.max(0, hours - newST);
+      }
+
+      // Roll forward so a duplicate of this employee later in the
+      // same submission picks up these hours as "prior".
+      priorHoursByEmp[nameKey] = prior + hours;
+
       return [
         effectiveDate,                                //  0  Date (shift START, opDay-derived)
         woListStr,                                    //  1  Work Order # (comma-list)
