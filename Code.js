@@ -4636,7 +4636,14 @@ function handleListSignInQueue_(body) {
     const location    = String(row[5] || '').trim();
     if (!dateStr || !woId || !contractNum || !borough) return;
 
-    const key = `${dateStr}|${contractNum}|${borough}`;
+    // Key includes contractor so a (date, contract, borough) worked by
+    // two different primes produces two queue entries — one per prime.
+    // Each SI submission is per-contractor (body carries one contractor),
+    // so combining primes' WOs into one queue card would either mis-attribute
+    // hours or silently drop one prime's WOs. Matters most for the
+    // sub-prime billing remap case (Brooklyn handled by both Metro and
+    // Denville), but the per-contractor split is correct in general.
+    const key = `${dateStr}|${contractor}|${contractNum}|${borough}`;
     if (!groups.has(key)) {
       const lookup = lookupContract(contractNum, borough);
       groups.set(key, {
@@ -10195,15 +10202,26 @@ function _buildRevenuePayload_(startIso, endIso) {
   }
 
   // ── WO metadata index (woId → { contractor, contract_num, borough, location })
+  // Apply billing remap so the dashboard's pricing lookup matches what
+  // QB will actually invoice — sub-prime work on a contract they didn't
+  // win prices under their own contract. Without this, those items would
+  // hit an unpriced fallback whenever the raw (Brooklyn) pricing rows
+  // are absent and silently undercount revenue.
   const woRows = woSheet.getDataRange().getValues();
   const woById = {};
   for (let i = 1; i < woRows.length; i++) {
     const id = String(woRows[i][0] || '').trim();
     if (!id) continue;
+    const contractor = String(woRows[i][1] || '').trim();
+    const _revMapped = _billingRemap_(
+      String(woRows[i][2] || '').split('/')[0].trim(),
+      String(woRows[i][3] || '').trim(),
+      contractor
+    );
     woById[id] = {
-      contractor:   String(woRows[i][1] || '').trim(),
-      contract_num: String(woRows[i][2] || '').split('/')[0].trim(),
-      borough:      String(woRows[i][3] || '').trim(),
+      contractor,
+      contract_num: _revMapped.contractNum,
+      borough:      _revMapped.borough,
       location:     String(woRows[i][5] || '').trim(),
     };
   }
