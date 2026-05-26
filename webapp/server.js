@@ -60,10 +60,10 @@ app.use((req, res, next) => {
   next()
 })
 
-// multer: stores uploads in memory, 15MB per file, 20 files max per request
+// multer: stores uploads in memory, 20MB per file, 20 files max per request
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024, files: 20 }
+  limits: { fileSize: 20 * 1024 * 1024, files: 20 }
 })
 
 

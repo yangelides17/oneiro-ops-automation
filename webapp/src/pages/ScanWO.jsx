@@ -27,7 +27,7 @@ async function convertHeicToJpeg(file) {
 }
 
 const PREVIEWABLE_IMAGE = /^image\/(jpeg|png)$/i
-const MAX_FILE_MB       = 15
+const MAX_FILE_MB       = 20
 const ACCEPTED_MIMES    = 'application/pdf,image/jpeg,image/png,image/heic,image/heif,image/tiff'
 const POLL_INTERVAL_MS  = 10_000
 
