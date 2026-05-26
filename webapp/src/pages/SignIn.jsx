@@ -933,18 +933,26 @@ export default function SignIn() {
                   <p className="text-sm text-slate-700">{selected.project_name}</p>
                 </div>
               )}
-              <div>
-                <span className="field-label">Work Orders ({selected.wos.length})</span>
-                <ul className="text-sm text-slate-700 space-y-0.5 mt-0.5">
-                  {selected.wos.map(w => (
-                    <li key={w.id} className="flex gap-2">
-                      <span className="font-mono font-semibold">{w.id}</span>
-                      {w.location && (
-                        <span className="text-slate-500">— {w.location}</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <span className="field-label">Work Orders ({selected.wos.length})</span>
+                  <ul className="text-sm text-slate-700 space-y-0.5 mt-0.5">
+                    {selected.wos.map(w => (
+                      <li key={w.id} className="flex gap-2">
+                        <span className="font-mono font-semibold">{w.id}</span>
+                        {w.location && (
+                          <span className="text-slate-500">— {w.location}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                {selected.crew_chief && (
+                  <div>
+                    <span className="field-label">Crew Chief</span>
+                    <p className="text-sm font-semibold text-navy">{selected.crew_chief}</p>
+                  </div>
+                )}
               </div>
             </div>
 
