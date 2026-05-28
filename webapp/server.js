@@ -1306,6 +1306,52 @@ app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
 })
 
 /**
+ * GET /api/wo-photos/:woId
+ * Lists the photos currently in the WO's Drive Photos/ folder so the
+ * Field Report page can render a "previously taken" gallery.
+ */
+app.get('/api/wo-photos/:woId', async (req, res) => {
+  try {
+    const data = await callAppsScript('list_wo_photos', { wo_id: req.params.woId })
+    res.json(data)
+  } catch (err) {
+    console.error('GET /api/wo-photos error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * DELETE /api/wo-photos/:fileId
+ * Trashes a photo from Drive when the user removes it from the gallery.
+ * Reuses the existing `trash_file` Apps Script action.
+ */
+app.delete('/api/wo-photos/:fileId', async (req, res) => {
+  try {
+    const data = await callAppsScript('trash_file', { file_id: req.params.fileId })
+    res.json(data)
+  } catch (err) {
+    console.error('DELETE /api/wo-photos error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/reverse-geocode
+ * Reverse-geocodes a lat/lng via Apps Script's built-in Maps service.
+ * Used by the photo watermark pipeline.
+ * Body: { lat, lng }
+ */
+app.post('/api/reverse-geocode', async (req, res) => {
+  try {
+    const data = await callAppsScript('reverse_geocode', req.body)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/reverse-geocode error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/upload-signature
  * Uploads a crew member's digital signature PNG to Drive.
  * Body (JSON):

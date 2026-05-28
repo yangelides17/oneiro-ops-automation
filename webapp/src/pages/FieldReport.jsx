@@ -11,6 +11,7 @@ import {
 import { parseQty }    from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
 import { opToday } from '../lib/dateOps'
+import { usePhotoUploadQueue } from '../lib/photoUploadQueue'
 
 const SECTION_HEADERS = {
   'Top Table':          'WO Top Table',
@@ -31,7 +32,7 @@ const SECTION_HEADERS = {
 // iPhones ship HEIC by default. Browsers can't decode HEIC for
 // <img> preview or canvas, so we convert to JPEG the moment a file
 // is picked. The converted File is what flows through the rest of
-// the pipeline (preview + compressImage + upload), so no other code
+// the pipeline (preview + watermark + compress + upload), so no other code
 // needs to know HEIC exists. heic2any is dynamically imported so
 // the 180 KB WASM payload only loads when a HEIC actually appears.
 function isHeic(file) {
@@ -58,54 +59,8 @@ async function convertHeicToJpeg(file) {
   }
 }
 
-// ── Image compression helper ──────────────────────────────────
-// Phone JPEGs land at 3-10 MB straight from the camera. Shipping those
-// raw through the Apps Script proxy is the single biggest source of
-// submit-time latency. We resize to 2048px long-edge and re-encode at
-// JPEG q=0.85 before upload. Typical output is 300-600 KB with no
-// visible quality loss. Non-JPEG/PNG inputs (or already-small files)
-// pass through untouched.
-const COMPRESS_MAX_EDGE = 2048
-const COMPRESS_QUALITY  = 0.85
-const COMPRESS_SKIP_BELOW_BYTES = 500 * 1024   // <500 KB — not worth recompressing
-async function compressImage(file) {
-  const type = String(file?.type || '').toLowerCase()
-  if (!file) return file
-  // Only attempt to compress JPEG/PNG (HEIC etc. need a library we don't ship)
-  if (type !== 'image/jpeg' && type !== 'image/png') return file
-  if (file.size <= COMPRESS_SKIP_BELOW_BYTES) return file
-
-  let bitmap
-  try {
-    bitmap = await createImageBitmap(file)
-  } catch {
-    return file  // can't decode — fall back to original
-  }
-
-  const { width, height } = bitmap
-  const longEdge = Math.max(width, height)
-  const scale = longEdge > COMPRESS_MAX_EDGE ? COMPRESS_MAX_EDGE / longEdge : 1
-  const w = Math.round(width * scale)
-  const h = Math.round(height * scale)
-
-  const canvas = typeof OffscreenCanvas !== 'undefined'
-    ? new OffscreenCanvas(w, h)
-    : Object.assign(document.createElement('canvas'), { width: w, height: h })
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return file
-  ctx.drawImage(bitmap, 0, 0, w, h)
-  bitmap.close?.()
-
-  // Prefer canvas.convertToBlob (OffscreenCanvas) for async; fall back to toBlob
-  const blob = canvas.convertToBlob
-    ? await canvas.convertToBlob({ type: 'image/jpeg', quality: COMPRESS_QUALITY })
-    : await new Promise(r => canvas.toBlob(r, 'image/jpeg', COMPRESS_QUALITY))
-  if (!blob || blob.size >= file.size) return file   // compression made it larger somehow
-
-  // Give the blob a filename so the server sees a sensible name
-  const baseName = (file.name || 'photo').replace(/\.(png|jpg|jpeg|heic|heif|webp)$/i, '')
-  return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' })
-}
+// Image compression now lives inside usePhotoUploadQueue —
+// compressed-on-upload (post-watermark for captures, raw for library).
 
 
 // ── Field wrapper ─────────────────────────────────────────────
@@ -540,141 +495,160 @@ function WOPanel({ wo }) {
   )
 }
 
-// ── Photo picker (upload happens on submit) ───────────────────
-// Items tracked per-photo:
-//   { id, name, status: 'processing'|'ready'|'error', file, previewUrl, error }
-// HEIC files get converted to JPEG the moment they're picked so the
-// preview works and the submit-time compression can run against a
-// format the browser knows how to decode.
-function PhotoPicker({ onChange }) {
-  const fileRef = useRef(null)
-  const [items, setItems] = useState([])
+// ── Photo capture + gallery ───────────────────────────────────
+// Driven entirely by usePhotoUploadQueue. Two capture buttons:
+//   Take Photo   — opens camera (capture="environment") AND fires
+//                  navigator.geolocation in parallel. The captured file
+//                  flows through HEIC convert → addCapture(file, geo) →
+//                  watermark + Drive upload pipeline.
+//   From Library — multi-select, accepts any image. HEIC converts.
+//                  Skips watermark (timestamp/location would be wrong).
+//
+// Gallery renders every item the queue knows about: historic (already
+// on Drive), in-flight (watermarking/uploading), and uploaded-this-
+// session — sorted newest first. Delete on any item routes through a
+// confirmation modal owned by the parent.
+function PhotoCaptureGallery({ queue, onRequestDelete }) {
+  const cameraRef  = useRef(null)
+  const libraryRef = useRef(null)
 
-  // Emit the final file list to the parent whenever items change.
-  // Errored items are omitted — the user can see them in the UI and
-  // decide to retry or remove. Processing items still emit their
-  // original file so the parent "has" something; the submit flow
-  // blocks on processing state via a separate signal below.
-  useEffect(() => {
-    onChange(items
-      .filter(i => i.status !== 'error')
-      .map(i => i.file))
-  }, [items])   // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Clean up object URLs on unmount so we don't leak blobs
-  useEffect(() => () => {
-    items.forEach(i => { if (i.previewUrl) URL.revokeObjectURL(i.previewUrl) })
-  }, [])   // eslint-disable-line react-hooks/exhaustive-deps
-
-  const addFiles = (e) => {
-    const added = Array.from(e.target.files || [])
-    e.target.value = ''
-    if (added.length === 0) return
-
-    const newItems = added.map(f => ({
-      id:         `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      name:       f.name || 'photo',
-      status:     isHeic(f) ? 'processing' : 'ready',
-      file:       f,
-      previewUrl: isHeic(f) ? null : URL.createObjectURL(f),
-      error:      null,
-    }))
-    setItems(prev => [...prev, ...newItems])
-
-    // Convert HEICs in the background — non-HEICs are already 'ready'
-    newItems.forEach(item => {
-      if (item.status === 'ready') return
-      convertHeicToJpeg(item.file).then(processed => {
-        const converted   = processed !== item.file
-        const previewUrl  = URL.createObjectURL(processed)
-        setItems(prev => prev.map(p => p.id === item.id
-          ? { ...p, file: processed, previewUrl, status: converted ? 'ready' : 'error',
-              error: converted ? null : 'Couldn\u2019t convert HEIC — preview unavailable' }
-          : p))
-      }).catch(err => {
-        setItems(prev => prev.map(p => p.id === item.id
-          ? { ...p, status: 'error', error: err?.message || 'Failed to prepare photo' }
-          : p))
-      })
-    })
-  }
-
-  const remove = (id) => setItems(prev => {
-    const target = prev.find(p => p.id === id)
-    if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl)
-    return prev.filter(p => p.id !== id)
+  const acquireGeo = () => new Promise(resolve => {
+    if (!navigator.geolocation) { resolve(null); return }
+    let settled = false
+    const done = (v) => { if (!settled) { settled = true; resolve(v) } }
+    navigator.geolocation.getCurrentPosition(
+      pos => done({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy }),
+      ()  => done(null),
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+    )
+    setTimeout(() => done(null), 9000)
   })
 
-  const processingCount = items.filter(i => i.status === 'processing').length
-  const readyCount      = items.filter(i => i.status === 'ready').length
-  const errorCount      = items.filter(i => i.status === 'error').length
+  const onCaptureChange = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const geo = await acquireGeo()
+    const prepared = isHeic(file) ? await convertHeicToJpeg(file) : file
+    queue.addCapture(prepared, geo)
+  }
+
+  const onLibraryChange = async (e) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = ''
+    if (files.length === 0) return
+    const prepared = await Promise.all(files.map(f =>
+      isHeic(f) ? convertHeicToJpeg(f) : Promise.resolve(f)
+    ))
+    queue.addLibrary(prepared)
+  }
 
   return (
     <div className="space-y-3">
-      {/* Drop zone */}
-      <div onClick={()=>fileRef.current?.click()}
-        className="border-2 border-dashed border-slate-200 rounded-xl p-5 text-center cursor-pointer
-                   hover:border-navy/40 hover:bg-slate-50 transition-all select-none">
-        <p className="text-2xl mb-1">📷</p>
-        <p className="text-sm font-semibold text-slate-600">Tap to select photos</p>
-        <p className="text-xs text-slate-400 mt-0.5">JPEG, PNG, HEIC — up to 15 MB each</p>
-        <input ref={fileRef} type="file" multiple accept="image/*" className="hidden" onChange={addFiles} />
+      <div className="grid grid-cols-2 gap-2">
+        <button type="button"
+          onClick={() => cameraRef.current?.click()}
+          className="flex flex-col items-center justify-center gap-1 py-4
+                     bg-navy text-white rounded-xl font-semibold text-sm
+                     hover:bg-navy/90 active:bg-navy/80 transition-colors">
+          <span className="text-2xl leading-none">📷</span>
+          Take Photo
+        </button>
+        <button type="button"
+          onClick={() => libraryRef.current?.click()}
+          className="flex flex-col items-center justify-center gap-1 py-4
+                     bg-white text-navy rounded-xl font-semibold text-sm
+                     border-2 border-navy/15 hover:border-navy/40 active:bg-slate-50 transition-colors">
+          <span className="text-2xl leading-none">🖼️</span>
+          From Library
+        </button>
+        <input ref={cameraRef}  type="file" accept="image/*" capture="environment"
+               className="hidden" onChange={onCaptureChange} />
+        <input ref={libraryRef} type="file" accept="image/*" multiple
+               className="hidden" onChange={onLibraryChange} />
       </div>
+      <p className="text-[11px] text-slate-400">
+        Live photos get a date/time/location stamp. All photos save to Drive automatically.
+      </p>
 
-      {/* Thumbnails */}
-      {items.length > 0 && (
-        <>
-          <div className="flex flex-wrap gap-2">
-            {items.map(item => (
-              <div key={item.id} className="relative group">
-                {item.status === 'ready' && item.previewUrl && (
-                  <img src={item.previewUrl} alt={item.name}
-                    className="w-16 h-16 object-cover rounded-lg border border-slate-200" />
-                )}
-                {item.status === 'processing' && (
-                  <div className="w-16 h-16 rounded-lg border border-slate-200 bg-slate-50
-                                  flex flex-col items-center justify-center gap-0.5">
-                    <div className="w-4 h-4 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
-                    <span className="text-[8px] text-slate-400 uppercase tracking-wider">HEIC</span>
-                  </div>
-                )}
-                {item.status === 'error' && (
-                  <div className="w-16 h-16 rounded-lg border border-red-200 bg-red-50
-                                  flex items-center justify-center text-red-500 text-lg font-bold"
-                       title={item.error || 'Error'}>!</div>
-                )}
-                <button type="button" onClick={()=>remove(item.id)}
-                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full
-                             text-xs font-bold flex items-center justify-center
-                             opacity-0 group-hover:opacity-100 transition-opacity">×</button>
-              </div>
-            ))}
-          </div>
-          <p className="text-[11px] font-semibold flex flex-wrap gap-x-3 gap-y-1">
-            {readyCount > 0 && (
-              <span className="text-green-700">
-                ✓ {readyCount} ready
-              </span>
-            )}
-            {processingCount > 0 && (
-              <span className="text-slate-500">
-                Preparing {processingCount}…
-              </span>
-            )}
-            {errorCount > 0 && (
-              <span className="text-red-600">
-                ✕ {errorCount} couldn&apos;t prepare
-              </span>
-            )}
-          </p>
-        </>
-      )}
-
-      {items.length === 0 && (
-        <p className="text-[11px] text-slate-400">
-          Photos upload to Drive automatically when you submit the report.
+      {queue.historicLoading && (
+        <p className="text-[12px] text-slate-500 flex items-center gap-2">
+          <span className="w-3 h-3 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
+          Loading photos…
         </p>
       )}
+      {queue.historicError && (
+        <p className="text-[12px] text-amber-700">{queue.historicError}</p>
+      )}
+
+      {queue.items.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {queue.items.map(item => (
+            <PhotoThumb key={item.id} item={item}
+              onDelete={() => onRequestDelete(item)}
+              onRetry={() => queue.retryOne(item.id)} />
+          ))}
+        </div>
+      ) : !queue.historicLoading && (
+        <p className="text-[11px] text-slate-400">No photos yet for this WO.</p>
+      )}
+
+      {(queue.uploadedCount > 0 || queue.pendingCount > 0 || queue.errorCount > 0) && (
+        <p className="text-[11px] font-semibold flex flex-wrap gap-x-3 gap-y-1">
+          {queue.uploadedCount > 0 && (
+            <span className="text-green-700">✓ {queue.uploadedCount} on Drive</span>
+          )}
+          {queue.pendingCount > 0 && (
+            <span className="text-slate-500">Uploading {queue.pendingCount}…</span>
+          )}
+          {queue.errorCount > 0 && (
+            <span className="text-red-600">✕ {queue.errorCount} failed</span>
+          )}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function PhotoThumb({ item, onDelete, onRetry }) {
+  const src = item.previewUrl
+    || (item.thumbnail_b64 ? `data:${item.mime || 'image/jpeg'};base64,${item.thumbnail_b64}` : null)
+  const inFlight = item.status === 'pending'
+    || item.status === 'geocoding'
+    || item.status === 'watermarking'
+    || item.status === 'uploading'
+  return (
+    <div className="relative group">
+      {src ? (
+        <img src={src} alt={item.filename || 'photo'}
+          className={`w-16 h-16 object-cover rounded-lg border ${
+            item.status === 'error' ? 'border-red-300' : 'border-slate-200'
+          } ${inFlight ? 'opacity-60' : ''}`} />
+      ) : (
+        <div className="w-16 h-16 rounded-lg border border-slate-200 bg-slate-50" />
+      )}
+      {inFlight && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="w-5 h-5 border-2 border-white border-t-navy rounded-full animate-spin
+                          bg-white/40 shadow" />
+        </div>
+      )}
+      {item.status === 'uploaded' && item.source !== 'historic' && (
+        <div className="absolute bottom-0.5 right-0.5 w-4 h-4 rounded-full bg-green-600
+                        text-white text-[9px] flex items-center justify-center font-bold shadow">✓</div>
+      )}
+      {item.status === 'error' && (
+        <button type="button" onClick={onRetry}
+          title={item.error || 'Retry'}
+          className="absolute inset-x-0 bottom-0 bg-red-600 text-white text-[9px]
+                     font-semibold rounded-b-lg py-0.5 hover:bg-red-700">
+          Retry
+        </button>
+      )}
+      <button type="button" onClick={onDelete}
+        className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full
+                   text-xs font-bold flex items-center justify-center shadow
+                   opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity">×</button>
     </div>
   )
 }
@@ -695,7 +669,12 @@ export default function FieldReport() {
   const [employees,     setEmployees]      = useState([])   // Employee Registry, for crew chief picker
   const [issues,        setIssues]         = useState('')
   const [woComplete,    setWoComplete]     = useState('no')
-  const [photoFiles,    setPhotoFiles]     = useState([])   // File objects, uploaded on submit
+  // Photos no longer live in component state — usePhotoUploadQueue owns
+  // the IndexedDB-backed list. Captures + library imports stream to
+  // Drive on add (not on submit), so submit-time work shrinks to a
+  // "wait until queue.pendingCount === 0" check.
+  const photoQueue = usePhotoUploadQueue(selectedWOId)
+  const [photoDeleteConfirm, setPhotoDeleteConfirm] = useState(null)  // {item} or null
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -1148,6 +1127,27 @@ export default function FieldReport() {
     }
   }
 
+  // Wait for every queued photo to reach 'uploaded'. Reads the queue's
+  // latest counts via the ref the hook exposes so we always see the
+  // post-tick state (state-via-closure would be stale). Returns 0 on
+  // clean drain, or the number of photos that flipped to 'error' so
+  // the caller can surface a precise message.
+  const photoQueueRef = useRef(photoQueue)
+  useEffect(() => { photoQueueRef.current = photoQueue }, [photoQueue])
+  const waitForPhotoQueue = async () => {
+    // Soft cap: 5 minutes. Lets even a slow EDGE connection finish a
+    // batch of 10 compressed photos; anything beyond that, the user is
+    // better off cancelling and checking signal.
+    const deadline = Date.now() + 5 * 60 * 1000
+    while (Date.now() < deadline) {
+      const q = photoQueueRef.current
+      if (q.errorCount > 0) return q.errorCount
+      if (q.pendingCount === 0) return 0
+      await new Promise(r => setTimeout(r, 250))
+    }
+    return photoQueueRef.current.pendingCount
+  }
+
   // ── Selection / bulk helpers ──────────────────────────────────
   const toggleSelect = (id, on) => {
     setSelectedIds(prev => {
@@ -1275,56 +1275,29 @@ export default function FieldReport() {
     }
     await waitForSaves()
 
-    // Step 1 — compress + upload photos in parallel. Any upload error
-    // blocks the submit; we surface it to the user instead of silently
-    // proceeding. Compression typically cuts each photo from 3-10 MB
-    // down to 300-600 KB.
-    // Block if a HEIC is still being converted in PhotoPicker —
-    // otherwise we'd ship the raw HEIC up through the proxy.
-    if (photoFiles.some(f => isHeic(f))) {
+    // Step 1 — photos. Captures + library imports already stream to
+    // Drive on add (see usePhotoUploadQueue), so submit just has to
+    // wait for every item to reach status='uploaded'. Errored items
+    // block submit entirely — the user has to retry or delete them.
+    // The queue keeps draining in the background even while we wait,
+    // so this stall is bounded by whatever network speed remains.
+    if (photoQueue.errorCount > 0) {
       setSubmitStep('')
-      raiseError('HEIC photos are still being prepared. Wait a moment and try again.')
+      raiseError(`${photoQueue.errorCount} photo${photoQueue.errorCount === 1 ? ' is' : 's are'} stuck uploading. Tap Retry on the thumbnail or remove them, then submit again.`)
       setSubmitting(false)
       return
     }
-    let photosUploaded = false
-    if (photoFiles.length > 0) {
-      setSubmitStep(`Preparing ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'}…`)
-      let compressed
-      try {
-        compressed = await Promise.all(photoFiles.map(compressImage))
-      } catch (err) {
+    if (photoQueue.pendingCount > 0) {
+      setSubmitStep(`Waiting on ${photoQueue.pendingCount} photo${photoQueue.pendingCount === 1 ? '' : 's'} to finish uploading…`)
+      const stalled = await waitForPhotoQueue()
+      if (stalled) {
         setSubmitStep('')
-        raiseError('Couldn\u2019t prepare photos for upload. Try again.')
+        raiseError(`${stalled} photo${stalled === 1 ? ' is' : 's are'} stuck uploading. Tap Retry on the thumbnail or remove them, then submit again.`)
         setSubmitting(false)
         return
       }
-
-      setSubmitStep(`Uploading ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'}…`)
-      const results = await Promise.all(compressed.map(async (file) => {
-        const form = new FormData()
-        form.append('photo', file)
-        form.append('wo_id', selectedWOId)
-        try {
-          const res  = await fetch('/api/upload-photo', { method: 'POST', body: form })
-          const data = await res.json().catch(() => ({}))
-          if (!res.ok || data.error) return { ok: false, err: data.error || `HTTP ${res.status}` }
-          return { ok: true }
-        } catch (err) {
-          return { ok: false, err: err?.message || 'Network error' }
-        }
-      }))
-
-      const failures = results.filter(r => !r.ok)
-      if (failures.length > 0) {
-        setSubmitStep('')
-        const detail = failures[0].err ? ` (${failures[0].err})` : ''
-        raiseError(`${failures.length} of ${photoFiles.length} photo${photoFiles.length === 1 ? '' : 's'} failed to upload${detail}. Fix and try again.`)
-        setSubmitting(false)
-        return
-      }
-      photosUploaded = true
     }
+    const photosUploaded = photoQueue.uploadedCount > 0
 
     // Step 2 — submit field report
     setSubmitStep('Submitting report…')
@@ -1352,7 +1325,7 @@ export default function FieldReport() {
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      setSubmitted({ wo_id:data.wo_id, status:data.status, photos:photoFiles.length })
+      setSubmitted({ wo_id:data.wo_id, status:data.status, photos:photoQueue.uploadedCount })
 
       // Refresh the WO dropdown so a just-completed WO drops out without
       // the user having to hard-reload. Apps Script updates the Tracker
@@ -1447,8 +1420,13 @@ export default function FieldReport() {
       setShowCompleteSuggestModal(true)
       return
     }
-    // Guard: no photos selected
-    if (photoFiles.length===0) { setShowPhotoModal(true); return }
+    // Guard: no photos on Drive yet (live + library uploads land in the
+    // queue's uploadedCount). If photos are still mid-pipeline we let
+    // doSubmit handle the wait, since "no photos" really means "the user
+    // didn't add any" — not "the photos haven't finished".
+    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0) {
+      setShowPhotoModal(true); return
+    }
     doSubmit()
   }
 
@@ -1456,7 +1434,9 @@ export default function FieldReport() {
   // photo guard still fires after the user resolves the suggestion.
   function continueAfterCompleteSuggest() {
     setShowCompleteSuggestModal(false)
-    if (photoFiles.length === 0) { setShowPhotoModal(true); return }
+    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0) {
+      setShowPhotoModal(true); return
+    }
     doSubmit()
   }
   function markCompleteAndSubmit() {
@@ -1471,7 +1451,8 @@ export default function FieldReport() {
     setMarkingItems([]); setSelectedIds(new Set()); setRowSaving(new Set())
     setBulkMode(false); inFlightRef.current.clear()
     setCrewChief(''); setIssues(''); setRowError('')
-    setWoComplete('no'); setPhotoFiles([]); setFormError('')
+    setWoComplete('no'); setFormError('')
+    // photoQueue clears itself when selectedWOId flips back to '' above.
   }
 
   // ── Edit Completed WO submit ──────────────────────────────
@@ -1580,6 +1561,30 @@ export default function FieldReport() {
           danger
           onConfirm={()=>{ setShowPhotoModal(false); doSubmit() }}
           onCancel={()=>setShowPhotoModal(false)}
+        />
+      )}
+
+      {/* Photo delete confirmation — applies to both uploaded (Drive
+          trash) and still-queued (IndexedDB only) photos. */}
+      {photoDeleteConfirm && (
+        <ConfirmModal
+          title="Delete this photo?"
+          message={photoDeleteConfirm.item.drive_file_id
+            ? 'This will remove the photo from Drive. Field crews and admins will no longer see it on the WO.'
+            : 'This photo hasn’t finished uploading. Removing it now will discard it.'}
+          confirmLabel="Delete Photo"
+          cancelLabel="Keep"
+          danger
+          onConfirm={async () => {
+            const item = photoDeleteConfirm.item
+            setPhotoDeleteConfirm(null)
+            try {
+              await photoQueue.deleteOne(item.id)
+            } catch (err) {
+              raiseError('Couldn’t delete photo: ' + (err?.message || 'unknown error'))
+            }
+          }}
+          onCancel={() => setPhotoDeleteConfirm(null)}
         />
       )}
 
@@ -2010,7 +2015,10 @@ export default function FieldReport() {
                 : <> Drop them into the WO's Drive folder directly.</>}
             </p>
           ) : (
-            <PhotoPicker onChange={setPhotoFiles} />
+            <PhotoCaptureGallery
+              queue={photoQueue}
+              onRequestDelete={(item) => setPhotoDeleteConfirm({ item })}
+            />
           )}
         </div>
 

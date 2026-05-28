@@ -3786,6 +3786,10 @@ function doPost(e) {
       return handleGetProductionData_(body);
     } else if (action === 'upload_photo') {
       return handleUploadPhoto_(body);
+    } else if (action === 'list_wo_photos') {
+      return handleListWOPhotos_(body);
+    } else if (action === 'reverse_geocode') {
+      return handleReverseGeocode_(body);
     } else if (action === 'upload_signature') {
       return handleUploadSignature_(body);
     } else if (action === 'get_marking_items') {
@@ -11843,6 +11847,106 @@ function handleUploadPhoto_(body) {
 
   Logger.log('📸 Photo uploaded for WO ' + wo_id + ': ' + filename);
   return jsonResponse_({ success: true, file_id: file.getId(), file_url: file.getUrl() });
+}
+
+
+// ── action: list_wo_photos ────────────────────────────────────
+
+/**
+ * Returns every photo currently in the WO's Photos/ Drive folder so the
+ * Field Report page can render a "previously taken" gallery alongside
+ * the live picker. Thumbnail bytes are inlined as base64 so the client
+ * doesn't have to chase per-file URLs (Drive thumbnails behind auth are
+ * a pain for an unauthenticated webapp tab).
+ *
+ * body.data: { wo_id }
+ * response: { photos: [{ file_id, name, url, thumbnail_b64, mime, created_at }] }
+ */
+function handleListWOPhotos_(body) {
+  const d = body.data || {};
+  const woId = String(d.wo_id || '').trim();
+  if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
+
+  const { folder, error } = resolveWOSubfolder_(woId, 'Photos');
+  if (!folder) {
+    // Soft-fail: a WO that has never had a photo uploaded simply has no
+    // folder. Return an empty list so the UI renders a clean empty state.
+    Logger.log('list_wo_photos: no Photos folder for ' + woId + ' (' + error + ')');
+    return jsonResponse_({ photos: [] });
+  }
+
+  const out = [];
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const mime = f.getMimeType() || '';
+    if (mime.indexOf('image/') !== 0) continue;
+    let thumb = '';
+    try {
+      const blob = f.getThumbnail();
+      if (blob) thumb = Utilities.base64Encode(blob.getBytes());
+    } catch (e) {
+      // Drive sometimes refuses thumbnails for very fresh uploads — UI
+      // falls back to the file URL, no need to fail the whole listing.
+    }
+    out.push({
+      file_id:       f.getId(),
+      name:          f.getName(),
+      url:           f.getUrl(),
+      thumbnail_b64: thumb,
+      mime:          mime,
+      created_at:    f.getDateCreated().toISOString(),
+    });
+  }
+  out.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
+  return jsonResponse_({ photos: out });
+}
+
+
+// ── action: reverse_geocode ───────────────────────────────────
+
+/**
+ * Reverse-geocodes a lat/lng into a structured address using Apps
+ * Script's built-in Maps service (no API key needed). Feeds the photo
+ * watermark on the Field Report capture path.
+ *
+ * body.data: { lat, lng }
+ * response: { address, city, state, zip, country } or { error }
+ */
+function handleReverseGeocode_(body) {
+  const d = body.data || {};
+  const lat = Number(d.lat);
+  const lng = Number(d.lng);
+  if (!isFinite(lat) || !isFinite(lng)) {
+    return jsonResponse_({ error: 'Missing or invalid lat/lng' }, 400);
+  }
+  try {
+    const res = Maps.newGeocoder().reverseGeocode(lat, lng);
+    const first = res && res.results && res.results[0];
+    if (!first) return jsonResponse_({ error: 'No address found' });
+    const out = { address: '', city: '', state: '', zip: '', country: '' };
+    // Build street address from the parts we have so blank slots don't
+    // leave stray spaces (e.g. "  South Ave" when street_number is missing).
+    let streetNum = '', route = '';
+    (first.address_components || []).forEach(c => {
+      const types = c.types || [];
+      if (types.indexOf('street_number') !== -1) streetNum = c.long_name;
+      else if (types.indexOf('route') !== -1) route = c.long_name;
+      else if (types.indexOf('locality') !== -1) out.city = c.long_name;
+      else if (!out.city && types.indexOf('sublocality') !== -1) out.city = c.long_name;
+      else if (types.indexOf('administrative_area_level_1') !== -1) out.state = c.short_name;
+      else if (types.indexOf('postal_code') !== -1) out.zip = c.long_name;
+      else if (types.indexOf('country') !== -1) out.country = c.long_name;
+    });
+    out.address = [streetNum, route].filter(Boolean).join(' ').trim();
+    if (!out.address && first.formatted_address) {
+      out.address = String(first.formatted_address).split(',')[0].trim();
+    }
+    return jsonResponse_(out);
+  } catch (err) {
+    Logger.log('reverse_geocode error: ' + (err && err.message || err));
+    return jsonResponse_({ error: String(err && err.message || err) });
+  }
 }
 
 
