@@ -4787,16 +4787,23 @@ function handleListSignInQueue_(body) {
     const key = `${dateStr}|${contractor}|${contractNum}|${borough}|${crewChief}`;
     if (!groups.has(key)) {
       const lookup = lookupContract(contractNum, borough);
+      // Billing remap: the sign-in sheet the user signs is labeled with
+      // the billing identity (e.g. Denville/BK billed as QU). Source data
+      // stays raw — we just surface the remapped tuple alongside it so
+      // the queue UI matches what gets printed on the doc.
+      const billed = _billingRemap_(contractNum, borough, contractor);
       groups.set(key, {
-        queue_id:        key,
-        date:            dateStr,
-        contract_number: contractNum,
-        borough:         borough,
-        contractor:      contractor,
-        crew_chief:      crewChief,
-        contract_id:     lookup.contract_id,
-        project_name:    lookup.project_name,
-        wos:             [],
+        queue_id:             key,
+        date:                 dateStr,
+        contract_number:      contractNum,
+        borough:              borough,
+        bill_contract_number: billed.contractNum,
+        bill_borough:         billed.borough,
+        contractor:           contractor,
+        crew_chief:           crewChief,
+        contract_id:          lookup.contract_id,
+        project_name:         lookup.project_name,
+        wos:                  [],
       });
     }
     const grp = groups.get(key);

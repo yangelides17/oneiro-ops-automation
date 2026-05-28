@@ -305,7 +305,7 @@ function QueueCard({ entry, selected, onSelect }) {
         {prettyQueueDate(entry.date)}
       </div>
       <div className="text-sm font-semibold text-navy">
-        {entry.contract_number} · {entry.borough}
+        {entry.bill_contract_number || entry.contract_number} · {entry.bill_borough || entry.borough}
       </div>
       {entry.contractor && (
         <div className="text-[12px] text-slate-500 mt-0.5">{entry.contractor}</div>
@@ -916,7 +916,7 @@ export default function SignIn() {
                 <div>
                   <span className="field-label">Contract</span>
                   <p className="font-semibold text-navy">
-                    {selected.contract_number} · {selected.borough}
+                    {selected.bill_contract_number || selected.contract_number} · {selected.bill_borough || selected.borough}
                   </p>
                   {selected.contract_id && (
                     <p className="text-[11px] text-slate-400">{selected.contract_id}</p>
