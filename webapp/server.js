@@ -1287,20 +1287,29 @@ app.get('/api/scan-uploads-today', async (_req, res) => {
  *   photo  — image file
  */
 app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
+  // Timing: most photo-upload slowness is "where is the second spent".
+  // Log each leg so Railway logs show it: total = encode + AS round-trip.
+  const t0 = Date.now()
   try {
     if (!req.file)        return res.status(400).json({ error: 'No file attached' })
     if (!req.body.wo_id)  return res.status(400).json({ error: 'wo_id is required' })
 
+    const sizeKB = (req.file.size / 1024).toFixed(0)
     const base64 = req.file.buffer.toString('base64')
+    const t1 = Date.now()
     const data   = await callAppsScript('upload_photo', {
       wo_id:     req.body.wo_id,
       filename:  req.file.originalname,
       mime_type: req.file.mimetype,
       data:      base64
     })
-    res.json(data)
+    const t2 = Date.now()
+    console.log(`[upload-photo] wo=${req.body.wo_id} size=${sizeKB}KB ` +
+                `encode=${t1 - t0}ms appsScript=${t2 - t1}ms total=${t2 - t0}ms`)
+    res.set('Server-Timing', `encode;dur=${t1 - t0}, appsScript;dur=${t2 - t1}, total;dur=${t2 - t0}`)
+    res.json({ ...(data || {}), _server_ms: t2 - t0, _appsScript_ms: t2 - t1 })
   } catch (err) {
-    console.error('POST /api/upload-photo error:', err.message)
+    console.error(`POST /api/upload-photo error after ${Date.now() - t0}ms:`, err.message)
     res.status(500).json({ error: err.message })
   }
 })

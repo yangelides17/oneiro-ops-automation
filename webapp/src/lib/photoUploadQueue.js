@@ -269,15 +269,28 @@ export function usePhotoUploadQueue(woId) {
       // bytes we want on Drive.
       if (!fresh() || !liveBlob) return
       patch(item.id, { status: 'uploading' })
+      const tCompress = performance.now()
       const toShip = await compressForUpload(liveBlob)
+      const compressMs = Math.round(performance.now() - tCompress)
+      const tUpload = performance.now()
       const res = await uploadToDrive(toShip, woId)
+      const uploadMs = Math.round(performance.now() - tUpload)
       // Clear the queue row first — if we crash before the state patch
       // we'd rather lose the thumbnail than ship the photo twice.
       await pendingPhotosDB.delete(item.id).catch(() => {})
+      // Stash the timing breakdown on the item so the UI can render
+      // "23.4s · server 18.2s" beside the thumbnail without DevTools.
       patch(item.id, {
         status:         'uploaded',
         drive_file_id:  res.file_id,
         drive_file_url: res.file_url,
+        timing: {
+          shipSizeKB:    Math.round((toShip?.size || 0) / 1024),
+          compressMs,
+          uploadMs,
+          serverMs:      res._server_ms,
+          appsScriptMs:  res._appsScript_ms,
+        },
       })
     } catch (err) {
       patch(initial.id, { status: 'error', error: err?.message || 'Upload failed' })

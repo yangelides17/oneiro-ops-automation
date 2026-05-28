@@ -11828,6 +11828,7 @@ function _buildDocStatusPayload_(monthIso) {
  */
 function handleUploadPhoto_(body) {
   // Express proxy wraps the payload under body.data
+  const t0 = Date.now();
   const d = body.data || {};
   const { wo_id, filename, mime_type, data } = d;
   if (!wo_id || !filename || !data) {
@@ -11835,6 +11836,7 @@ function handleUploadPhoto_(body) {
   }
 
   const { folder: photosFolder, error: folderErr } = resolveWOSubfolder_(wo_id, 'Photos');
+  const tFolder = Date.now();
   if (!photosFolder) {
     _logAutomation_('Photo Upload', 'WO archive folder unreachable', wo_id,
       `filename=${filename} | error=${folderErr}`, 'Error', 'Yes');
@@ -11844,11 +11846,22 @@ function handleUploadPhoto_(body) {
   }
 
   const bytes = Utilities.base64Decode(data);
+  const tDecode = Date.now();
   const blob  = Utilities.newBlob(bytes, mime_type || 'image/jpeg', filename);
   const file  = photosFolder.createFile(blob);
+  const tCreate = Date.now();
 
-  Logger.log('📸 Photo uploaded for WO ' + wo_id + ': ' + filename);
-  return jsonResponse_({ success: true, file_id: file.getId(), file_url: file.getUrl() });
+  Logger.log('📸 Photo uploaded for WO ' + wo_id + ': ' + filename +
+             ' | folder=' + (tFolder - t0) + 'ms decode=' + (tDecode - tFolder) + 'ms' +
+             ' create=' + (tCreate - tDecode) + 'ms total=' + (tCreate - t0) + 'ms' +
+             ' size=' + Math.round(bytes.length / 1024) + 'KB');
+  return jsonResponse_({
+    success: true,
+    file_id: file.getId(),
+    file_url: file.getUrl(),
+    _timing: { folder_ms: tFolder - t0, decode_ms: tDecode - tFolder,
+               create_ms: tCreate - tDecode, total_ms: tCreate - t0 },
+  });
 }
 
 
