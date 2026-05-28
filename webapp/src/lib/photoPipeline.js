@@ -89,25 +89,50 @@ export function formatWatermarkAddress(geo) {
 //
 // ctx: { timestamp: Date, addressLines: string[], lat: number, lng: number }
 export async function watermarkImage(file, ctx) {
-  if (!file) return file
+  if (!file) { console.warn('[watermark] no file'); return file }
   const type = String(file?.type || '').toLowerCase()
-  if (type !== 'image/jpeg' && type !== 'image/png') return file
-
-  let bitmap
-  try {
-    bitmap = await createImageBitmap(file)
-  } catch {
+  if (type !== 'image/jpeg' && type !== 'image/png') {
+    console.warn('[watermark] unsupported type', type, '— returning original')
     return file
   }
-  const { width: w, height: h } = bitmap
+
+  // Decode the source image. Try createImageBitmap first because it's
+  // the fastest path. iOS Safari has historical bugs decoding camera
+  // JPEGs (some EXIF-orientation cases throw), so fall back to a plain
+  // HTMLImageElement load — that path is universally supported.
+  let drawable, w, h, closeBitmap
+  try {
+    const bitmap = await createImageBitmap(file)
+    drawable = bitmap; w = bitmap.width; h = bitmap.height
+    closeBitmap = () => bitmap.close?.()
+  } catch (err) {
+    console.warn('[watermark] createImageBitmap failed, falling back to <img>', err?.message || err)
+    try {
+      const { img, url } = await loadImageElement(file)
+      drawable = img; w = img.naturalWidth; h = img.naturalHeight
+      closeBitmap = () => URL.revokeObjectURL(url)
+    } catch (err2) {
+      console.warn('[watermark] <img> fallback also failed — returning original', err2?.message || err2)
+      return file
+    }
+  }
+  if (!w || !h) {
+    console.warn('[watermark] decoded image has zero dimensions — returning original', { w, h })
+    closeBitmap?.()
+    return file
+  }
 
   const canvas = typeof OffscreenCanvas !== 'undefined'
     ? new OffscreenCanvas(w, h)
     : Object.assign(document.createElement('canvas'), { width: w, height: h })
   const c = canvas.getContext('2d')
-  if (!c) { bitmap.close?.(); return file }
-  c.drawImage(bitmap, 0, 0, w, h)
-  bitmap.close?.()
+  if (!c) {
+    console.warn('[watermark] no 2d context — returning original')
+    closeBitmap?.()
+    return file
+  }
+  c.drawImage(drawable, 0, 0, w, h)
+  closeBitmap?.()
 
   // Compose the text lines.
   const lines = []
@@ -119,8 +144,10 @@ export async function watermarkImage(file, ctx) {
     lines.push(`${ctx.lat.toFixed(6)}, ${ctx.lng.toFixed(6)}`)
   }
   if (lines.length === 0) {
+    console.warn('[watermark] no text lines to draw — returning original', ctx)
     return file
   }
+  console.log('[watermark] drawing', lines.length, 'lines on', w, 'x', h)
 
   // Sizing — tuned against the reference screenshot. Long edge ~ 4000 px
   // → ~64 px font; short edge ~ 1500 px → ~24 px. Linear scale keeps the
@@ -160,6 +187,19 @@ export async function watermarkImage(file, ctx) {
 
   const baseName = (file.name || 'photo').replace(/\.(png|jpg|jpeg|heic|heif|webp)$/i, '')
   return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' })
+}
+
+// Fallback decode path for browsers that can't createImageBitmap a
+// camera JPEG (some iOS Safari versions). Returns the loaded image
+// plus the temporary object URL so the caller can revoke it.
+function loadImageElement(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload  = () => resolve({ img, url })
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('image load failed')) }
+    img.src = url
+  })
 }
 
 // "May 28, 2026 at 3:55:02 PM" — matches the DOT reference exactly.

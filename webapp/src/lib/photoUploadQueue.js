@@ -53,26 +53,71 @@ async function compressForUpload(file) {
   return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' })
 }
 
-async function reverseGeocode(lat, lng) {
+// Bounded fetch — every external call gets a hard timeout. Apps Script's
+// proxied responses can stall indefinitely on a cold spreadsheet read or
+// a flaky Maps service call, and the user's first symptom is "the photo
+// just hangs there". Better to fail fast and let the retry path / kick
+// loop handle it.
+async function fetchWithTimeout(input, init, timeoutMs) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
-    const res = await fetch('/api/reverse-geocode', {
+    return await fetch(input, { ...(init || {}), signal: ctrl.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function reverseGeocode(lat, lng) {
+  const t0 = performance.now()
+  try {
+    // 6s: a healthy Apps Script Maps.newGeocoder round-trip is 1-2s.
+    // Anything past 6s is a cold-start or a stuck service — we'd
+    // rather watermark with just coords than hold up the upload.
+    const res = await fetchWithTimeout('/api/reverse-geocode', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ lat, lng }),
-    })
+    }, 6000)
     const data = await res.json().catch(() => null)
+    console.log(`[photo] reverse-geocode ${(performance.now() - t0).toFixed(0)}ms`,
+      data?.error ? `error=${data.error}` : 'ok')
     if (!data || data.error) return null
     return data
-  } catch { return null }
+  } catch (err) {
+    console.warn(`[photo] reverse-geocode FAILED ${(performance.now() - t0).toFixed(0)}ms`,
+      err?.message || err)
+    return null
+  }
 }
 
 async function uploadToDrive(file, wo_id) {
+  const t0 = performance.now()
   const form = new FormData()
   form.append('photo', file)
   form.append('wo_id', wo_id)
-  const res = await fetch('/api/upload-photo', { method: 'POST', body: form })
+  // 90s: covers a slow 1-2MB JPEG over a marginal LTE connection plus
+  // the Apps Script side (folder resolve + base64 decode + Drive
+  // create). Past 90s, it's almost always stuck — abort and let the
+  // user retry. The blob stays in IndexedDB so retry is cheap.
+  let res
+  try {
+    res = await fetchWithTimeout('/api/upload-photo', { method: 'POST', body: form }, 90000)
+  } catch (err) {
+    const ms = (performance.now() - t0).toFixed(0)
+    console.warn(`[photo] upload FAILED ${ms}ms size=${file.size}`, err?.message || err)
+    if (err?.name === 'AbortError') {
+      throw new Error('Upload stalled after 90s — tap Retry')
+    }
+    throw err
+  }
   const data = await res.json().catch(() => ({}))
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+  const ms = (performance.now() - t0).toFixed(0)
+  if (!res.ok || data.error) {
+    console.warn(`[photo] upload HTTP ${res.status} ${ms}ms size=${file.size}`, data?.error)
+    throw new Error(data.error || `HTTP ${res.status}`)
+  }
+  console.log(`[photo] upload ok ${ms}ms size=${file.size}`)
   return data   // { success, file_id, file_url }
 }
 
@@ -177,21 +222,30 @@ export function usePhotoUploadQueue(woId) {
       // Phase A: capture-source needs reverse-geocode + watermark first.
       let item = fresh()
       if (!item) return
+      // Track the blob locally — Phase B must NOT re-read from itemsRef
+      // because React updates the ref through a useEffect that hasn't
+      // fired yet (`patch` schedules a render; the ref-sync runs only
+      // after commit). Reading from itemsRef here returned the original
+      // pre-watermark blob, which is why Drive received un-watermarked
+      // photos while the in-memory preview correctly showed the overlay.
+      let liveBlob = item.blob
       if (item.source === 'capture' && !item.watermark_applied) {
         patch(item.id, { status: 'geocoding' })
         let geoData = null
         if (item.geo && isFinite(item.geo.lat) && isFinite(item.geo.lng)) {
           geoData = await reverseGeocode(item.geo.lat, item.geo.lng)
         }
-        item = fresh()
-        if (!item) return
+        if (!fresh()) return
         patch(item.id, { status: 'watermarking' })
-        const watermarked = await watermarkImage(item.blob, {
+        const tWm = performance.now()
+        const watermarked = await watermarkImage(liveBlob, {
           timestamp: item.captured_at ? new Date(item.captured_at) : new Date(),
           addressLines: formatWatermarkAddress(geoData),
           lat: item.geo?.lat,
           lng: item.geo?.lng,
         })
+        console.log(`[photo] watermark ${(performance.now() - tWm).toFixed(0)}ms in=${liveBlob?.size} out=${watermarked?.size}`)
+        liveBlob = watermarked
         // Persist watermarked blob so a crash doesn't lose the overlay.
         await pendingPhotosDB.put({
           id:                item.id,
@@ -209,11 +263,13 @@ export function usePhotoUploadQueue(woId) {
         patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true })
       }
 
-      // Phase B: upload to Drive. Compress en route.
-      item = fresh()
-      if (!item || !item.blob) return
+      // Phase B: upload to Drive. Uses liveBlob (the local var) so we
+      // never race with React's state flush — even if itemsRef still
+      // points at the pre-watermark blob, liveBlob is definitively the
+      // bytes we want on Drive.
+      if (!fresh() || !liveBlob) return
       patch(item.id, { status: 'uploading' })
-      const toShip = await compressForUpload(item.blob)
+      const toShip = await compressForUpload(liveBlob)
       const res = await uploadToDrive(toShip, woId)
       // Clear the queue row first — if we crash before the state patch
       // we'd rather lose the thumbnail than ship the photo twice.
