@@ -1321,6 +1321,26 @@ app.get('/api/wo-photos/:woId', async (req, res) => {
 })
 
 /**
+ * GET /api/wo-photos/:fileId/content
+ * Streams the raw bytes of a Drive photo back as image/*. The webapp
+ * lightbox uses this to render historic photos at full size — their
+ * list_wo_photos thumbnail is only 220x220 and unreadable for review.
+ */
+app.get('/api/wo-photos/:fileId/content', async (req, res) => {
+  try {
+    const data = await callAppsScript('get_wo_photo_content', { file_id: req.params.fileId })
+    if (data.error) return res.status(500).json({ error: data.error })
+    const buf = Buffer.from(data.data || '', 'base64')
+    res.set('Content-Type', data.mime || 'image/jpeg')
+    res.set('Cache-Control', 'private, max-age=3600')
+    res.send(buf)
+  } catch (err) {
+    console.error('GET /api/wo-photos/:fileId/content error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * DELETE /api/wo-photos/:fileId
  * Trashes a photo from Drive when the user removes it from the gallery.
  * Reuses the existing `trash_file` Apps Script action.

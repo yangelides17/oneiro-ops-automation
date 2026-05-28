@@ -3788,6 +3788,8 @@ function doPost(e) {
       return handleUploadPhoto_(body);
     } else if (action === 'list_wo_photos') {
       return handleListWOPhotos_(body);
+    } else if (action === 'get_wo_photo_content') {
+      return handleGetWOPhotoContent_(body);
     } else if (action === 'reverse_geocode') {
       return handleReverseGeocode_(body);
     } else if (action === 'upload_signature') {
@@ -11900,6 +11902,34 @@ function handleListWOPhotos_(body) {
   }
   out.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
   return jsonResponse_({ photos: out });
+}
+
+
+// ── action: get_wo_photo_content ──────────────────────────────
+
+/**
+ * Returns the raw bytes of a Drive photo so the webapp lightbox can
+ * show a full-size view. Historic photos only come back from
+ * list_wo_photos as 220x220 thumbnails (free Drive thumbnail) — that
+ * is unreadable for "what did I take a picture of" review.
+ *
+ * body.data: { file_id }
+ * response: { data: <base64>, mime } or { error }
+ */
+function handleGetWOPhotoContent_(body) {
+  const d = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+  try {
+    const file = DriveApp.getFileById(fileId);
+    const blob = file.getBlob();
+    return jsonResponse_({
+      data: Utilities.base64Encode(blob.getBytes()),
+      mime: file.getMimeType() || 'image/jpeg',
+    });
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
 }
 
 

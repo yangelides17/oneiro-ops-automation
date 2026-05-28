@@ -508,7 +508,7 @@ function WOPanel({ wo }) {
 // on Drive), in-flight (watermarking/uploading), and uploaded-this-
 // session — sorted newest first. Delete on any item routes through a
 // confirmation modal owned by the parent.
-function PhotoCaptureGallery({ queue, onRequestDelete }) {
+function PhotoCaptureGallery({ queue, onRequestDelete, onRequestPreview }) {
   const cameraRef  = useRef(null)
   const libraryRef = useRef(null)
 
@@ -586,7 +586,8 @@ function PhotoCaptureGallery({ queue, onRequestDelete }) {
           {queue.items.map(item => (
             <PhotoThumb key={item.id} item={item}
               onDelete={() => onRequestDelete(item)}
-              onRetry={() => queue.retryOne(item.id)} />
+              onRetry={() => queue.retryOne(item.id)}
+              onOpen={() => onRequestPreview(item)} />
           ))}
         </div>
       ) : !queue.historicLoading && (
@@ -610,45 +611,105 @@ function PhotoCaptureGallery({ queue, onRequestDelete }) {
   )
 }
 
-function PhotoThumb({ item, onDelete, onRetry }) {
+function PhotoThumb({ item, onDelete, onRetry, onOpen }) {
   const src = item.previewUrl
     || (item.thumbnail_b64 ? `data:${item.mime || 'image/jpeg'};base64,${item.thumbnail_b64}` : null)
   const inFlight = item.status === 'pending'
     || item.status === 'geocoding'
     || item.status === 'watermarking'
     || item.status === 'uploading'
+  const canOpen = item.status === 'uploaded' || (!inFlight && src)
   return (
     <div className="relative group">
-      {src ? (
-        <img src={src} alt={item.filename || 'photo'}
-          className={`w-16 h-16 object-cover rounded-lg border ${
-            item.status === 'error' ? 'border-red-300' : 'border-slate-200'
-          } ${inFlight ? 'opacity-60' : ''}`} />
-      ) : (
-        <div className="w-16 h-16 rounded-lg border border-slate-200 bg-slate-50" />
-      )}
+      <button type="button"
+        onClick={canOpen ? onOpen : undefined}
+        disabled={!canOpen}
+        className={`block w-16 h-16 rounded-lg overflow-hidden border
+          ${item.status === 'error' ? 'border-red-300' : 'border-slate-200'}
+          ${canOpen ? 'cursor-zoom-in hover:ring-2 hover:ring-navy/40' : 'cursor-default'}
+          ${inFlight ? 'opacity-60' : ''}`}>
+        {src ? (
+          <img src={src} alt={item.filename || 'photo'}
+            className="w-full h-full object-cover" />
+        ) : (
+          <div className="w-full h-full bg-slate-50" />
+        )}
+      </button>
       {inFlight && (
-        <div className="absolute inset-0 flex items-center justify-center">
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="w-5 h-5 border-2 border-white border-t-navy rounded-full animate-spin
                           bg-white/40 shadow" />
         </div>
       )}
       {item.status === 'uploaded' && item.source !== 'historic' && (
         <div className="absolute bottom-0.5 right-0.5 w-4 h-4 rounded-full bg-green-600
-                        text-white text-[9px] flex items-center justify-center font-bold shadow">✓</div>
+                        text-white text-[9px] flex items-center justify-center font-bold shadow pointer-events-none">✓</div>
       )}
       {item.status === 'error' && (
-        <button type="button" onClick={onRetry}
+        <button type="button" onClick={(e) => { e.stopPropagation(); onRetry() }}
           title={item.error || 'Retry'}
           className="absolute inset-x-0 bottom-0 bg-red-600 text-white text-[9px]
                      font-semibold rounded-b-lg py-0.5 hover:bg-red-700">
           Retry
         </button>
       )}
-      <button type="button" onClick={onDelete}
+      <button type="button" onClick={(e) => { e.stopPropagation(); onDelete() }}
         className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full
                    text-xs font-bold flex items-center justify-center shadow
                    opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity">×</button>
+    </div>
+  )
+}
+
+// Full-size lightbox. Routes the source two ways:
+//   • Session items (previewUrl set)  → use the object URL → zero fetch.
+//   • Historic items (drive_file_id)  → /api/wo-photos/:fileId/content
+//     which proxies the Drive bytes back through Express.
+// Click backdrop or Esc closes. Outer container handles the keyboard
+// listener so the rest of the page doesn't get hijacked.
+function PhotoLightbox({ item, onClose }) {
+  const src = item.previewUrl
+    ? item.previewUrl
+    : item.drive_file_id
+      ? `/api/wo-photos/${encodeURIComponent(item.drive_file_id)}/content`
+      : null
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const capturedLabel = item.captured_at
+    ? new Date(item.captured_at).toLocaleString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric',
+        hour: 'numeric', minute: '2-digit',
+      })
+    : null
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.85)' }}
+      onClick={onClose}>
+      <button type="button"
+        onClick={onClose}
+        className="absolute top-4 right-4 w-9 h-9 rounded-full bg-white/15 text-white
+                   text-lg font-bold flex items-center justify-center hover:bg-white/25">×</button>
+      {src ? (
+        <img src={src} alt={item.filename || 'photo'}
+          onClick={(e) => e.stopPropagation()}
+          className="max-h-[85vh] max-w-[95vw] object-contain rounded shadow-2xl" />
+      ) : (
+        <div className="text-white text-sm">No preview available.</div>
+      )}
+      <div className="mt-3 text-white text-[12px] text-center space-y-0.5 px-2"
+        onClick={(e) => e.stopPropagation()}>
+        <div>{item.filename || 'photo'}</div>
+        {capturedLabel && <div className="text-white/60">{capturedLabel}</div>}
+        {item.drive_file_url && (
+          <a href={item.drive_file_url} target="_blank" rel="noopener noreferrer"
+            className="inline-block mt-1 text-white/80 hover:text-white underline">
+            Open in Drive ↗
+          </a>
+        )}
+      </div>
     </div>
   )
 }
@@ -675,6 +736,7 @@ export default function FieldReport() {
   // "wait until queue.pendingCount === 0" check.
   const photoQueue = usePhotoUploadQueue(selectedWOId)
   const [photoDeleteConfirm, setPhotoDeleteConfirm] = useState(null)  // {item} or null
+  const [photoLightbox, setPhotoLightbox] = useState(null)            // item or null
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -1564,6 +1626,11 @@ export default function FieldReport() {
         />
       )}
 
+      {/* Full-size photo preview */}
+      {photoLightbox && (
+        <PhotoLightbox item={photoLightbox} onClose={() => setPhotoLightbox(null)} />
+      )}
+
       {/* Photo delete confirmation — applies to both uploaded (Drive
           trash) and still-queued (IndexedDB only) photos. */}
       {photoDeleteConfirm && (
@@ -2018,6 +2085,7 @@ export default function FieldReport() {
             <PhotoCaptureGallery
               queue={photoQueue}
               onRequestDelete={(item) => setPhotoDeleteConfirm({ item })}
+              onRequestPreview={(item) => setPhotoLightbox(item)}
             />
           )}
         </div>
