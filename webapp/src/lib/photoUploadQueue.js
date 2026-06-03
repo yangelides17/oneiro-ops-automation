@@ -214,14 +214,25 @@ export function usePhotoUploadQueue(woId) {
     if (!initial || !initial.id) return
     if (inFlightRef.current.has(initial.id)) return
     inFlightRef.current.add(initial.id)
+    console.log('[photo] kick() entered for', initial.id, 'source=' + initial.source)
     try {
-      // Always read the freshest copy of the item — earlier state may
-      // have been patched while we were waiting in line.
-      const fresh = () => itemsRef.current.find(i => i.id === initial.id)
+      // fresh() lags React state by one commit + one useEffect tick
+      // (itemsRef is synced inside an effect, not synchronously with
+      // setItems). The very first kick scheduled by addCapture runs in
+      // a microtask BEFORE React commits, so fresh() returns undefined.
+      // Falling back to `initial` removes the race — the item arg is
+      // a complete snapshot at call time. Later fresh() calls inside
+      // the pipeline work correctly because each patch() above has
+      // already triggered a render + sync.
+      const fresh = () => itemsRef.current.find(i => i.id === initial.id) || initial
 
       // Phase A: capture-source needs reverse-geocode + watermark first.
       let item = fresh()
-      if (!item) return
+      if (!item) { console.warn('[photo] kick: bail, no item for', initial.id); return }
+      const itemsRefHadIt = !!itemsRef.current.find(i => i.id === initial.id)
+      if (!itemsRefHadIt) {
+        console.log('[photo] kick: itemsRef stale, using initial fallback for', initial.id)
+      }
       const tStart = performance.now()
       // Live-update timing on the item so the panel can render the
       // breakdown step-by-step, not just at completion. Without this
@@ -256,7 +267,11 @@ export function usePhotoUploadQueue(woId) {
           geoData = await reverseGeocode(item.geo.lat, item.geo.lng)
         }
         stampStep('geocodeMs', performance.now() - tGeo)
-        if (!fresh()) return
+        // Deletion guard. cancelOne removes the id from inFlightRef AND
+        // from items. We can't rely on `fresh()` being undefined now
+        // that it falls back to `initial` — instead read inFlightRef
+        // which is authoritative.
+        if (!inFlightRef.current.has(initial.id)) return
         patch(item.id, { status: 'watermarking' })
         beginStep('watermark')
         const tWm = performance.now()
@@ -328,7 +343,7 @@ export function usePhotoUploadQueue(woId) {
       // never race with React's state flush — even if itemsRef still
       // points at the pre-watermark blob, liveBlob is definitively the
       // bytes we want on Drive.
-      if (!fresh() || !liveBlob) return
+      if (!inFlightRef.current.has(initial.id) || !liveBlob) return
       patch(item.id, { status: 'uploading' })
       beginStep('upload')
       const tUpload = performance.now()
