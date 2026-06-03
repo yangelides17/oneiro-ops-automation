@@ -617,33 +617,84 @@ function PhotoCaptureGallery({ queue, onRequestDelete, onRequestPreview }) {
 }
 
 function PhotoTimingPanel({ items }) {
-  const timed = items.filter(i => i.timing && i.status === 'uploaded')
-  if (timed.length === 0) return null
-  // Show the most-recently-uploaded item's breakdown.
-  const last = timed[0]
-  const t = last.timing
-  const total = t.totalMs != null ? t.totalMs : ((t.compressMs || 0) + (t.uploadMs || 0))
+  // Find the most relevant item to show:
+  //   1. an in-progress item with timing (live debug) — highest priority
+  //   2. otherwise the most recent error
+  //   3. otherwise the most recent uploaded item
+  const live = items.find(i => i.timing && i.status !== 'uploaded' && i.status !== 'error')
+  const err  = items.find(i => i.timing && i.status === 'error')
+  const done = items.find(i => i.timing && i.status === 'uploaded')
+  const target = live || err || done
+  if (!target) return null
+  return <PhotoTimingRow item={target} />
+}
+
+function PhotoTimingRow({ item }) {
+  // Tick every 500 ms while the item is in-progress so the "current
+  // step elapsed" line keeps updating without DevTools.
+  const [, setTick] = useState(0)
+  const inProgress = item.status !== 'uploaded' && item.status !== 'error'
+  useEffect(() => {
+    if (!inProgress) return
+    const id = setInterval(() => setTick(t => t + 1), 500)
+    return () => clearInterval(id)
+  }, [inProgress])
+
+  const t = item.timing || {}
   const fmt = (ms) => ms == null ? '—' : `${ms} ms`
+  const totalElapsed = t.startedAt ? Date.now() - t.startedAt : (t.totalMs || 0)
+  const stepElapsed = (inProgress && t.currentStepStartedAt)
+    ? Date.now() - t.currentStepStartedAt
+    : null
+
+  const summary = item.status === 'uploaded'
+    ? `Last upload: ${(totalElapsed / 1000).toFixed(1)}s`
+    : item.status === 'error'
+      ? `Failed after ${(totalElapsed / 1000).toFixed(1)}s — ${item.error || 'unknown'}`
+      : `Stuck on: ${t.currentStep || item.status} · ${(stepElapsed / 1000).toFixed(1)}s in step · ${(totalElapsed / 1000).toFixed(1)}s total`
+
+  const summaryClass = item.status === 'uploaded'
+    ? 'text-slate-600'
+    : item.status === 'error'
+      ? 'text-red-700'
+      : 'text-amber-700'
+
   return (
-    <details className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2 py-1.5">
-      <summary className="cursor-pointer font-semibold text-slate-600">
-        Last upload: {(total / 1000).toFixed(1)}s
-        <span className="text-slate-400"> · {t.shipSizeKB} KB</span>
+    <details open={inProgress || item.status === 'error'}
+      className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2 py-1.5">
+      <summary className={`cursor-pointer font-semibold ${summaryClass}`}>
+        {summary}
+        {t.shipSizeKB != null && <span className="text-slate-400"> · {t.shipSizeKB} KB</span>}
       </summary>
       <div className="mt-1 space-y-0.5 font-mono">
-        <div>geocode (Apps Script): {fmt(t.geocodeMs)}</div>
-        <div>watermark (canvas): {fmt(t.watermarkMs)}</div>
-        <div>IDB write (post-watermark): {fmt(t.dbWriteMs)}</div>
-        <div>upload (round-trip): {fmt(t.uploadMs)}</div>
-        {t.serverMs != null && <div>  ↳ server total: {fmt(t.serverMs)}</div>}
-        {t.appsScriptMs != null && <div>  ↳ Apps Script: {fmt(t.appsScriptMs)}</div>}
-        <div>IDB delete: {fmt(t.dbDeleteMs)}</div>
+        <Step label="geocode (Apps Script)"    value={t.geocodeMs}     current={t.currentStep === 'geocode'}    stepElapsed={stepElapsed} />
+        <Step label="compress (library only)"  value={t.compressMs}    current={t.currentStep === 'compress'}   stepElapsed={stepElapsed} />
+        <Step label="watermark (canvas)"       value={t.watermarkMs}   current={t.currentStep === 'watermark'}  stepElapsed={stepElapsed} />
+        <Step label="IDB write"                value={t.dbWriteMs}     current={t.currentStep === 'idb-write'}  stepElapsed={stepElapsed} />
+        <Step label="upload (round-trip)"      value={t.uploadMs}      current={t.currentStep === 'upload'}     stepElapsed={stepElapsed} />
+        {t.serverMs != null && <div className="ml-3 text-slate-400">  ↳ server total: {fmt(t.serverMs)}</div>}
+        {t.appsScriptMs != null && <div className="ml-3 text-slate-400">  ↳ Apps Script: {fmt(t.appsScriptMs)}</div>}
+        <Step label="IDB delete"               value={t.dbDeleteMs}    current={t.currentStep === 'idb-delete'} stepElapsed={stepElapsed} />
         <div className="text-slate-400 pt-1">
-          ship size: {t.shipSizeKB} KB · total kick→done: {(total / 1000).toFixed(1)}s
+          total kick → now: {(totalElapsed / 1000).toFixed(1)}s
         </div>
       </div>
     </details>
   )
+}
+
+function Step({ label, value, current, stepElapsed }) {
+  if (current) {
+    return (
+      <div className="text-amber-700 font-semibold">
+        {label}: running… {stepElapsed != null ? `${(stepElapsed / 1000).toFixed(1)}s` : ''}
+      </div>
+    )
+  }
+  if (value != null) {
+    return <div>{label}: {value} ms</div>
+  }
+  return <div className="text-slate-300">{label}: —</div>
 }
 
 function PhotoThumb({ item, onDelete, onRetry, onOpen }) {
@@ -1681,7 +1732,14 @@ export default function FieldReport() {
             const item = photoDeleteConfirm.item
             setPhotoDeleteConfirm(null)
             try {
-              await photoQueue.deleteOne(item.id)
+              if (item.drive_file_id) {
+                await photoQueue.deleteOne(item.id)
+              } else {
+                // In-flight cancel — doesn't hit Drive (nothing to trash)
+                // and forcibly clears inFlightRef so a zombie kick can't
+                // hold the slot.
+                await photoQueue.cancelOne(item.id)
+              }
             } catch (err) {
               raiseError('Couldn’t delete photo: ' + (err?.message || 'unknown error'))
             }

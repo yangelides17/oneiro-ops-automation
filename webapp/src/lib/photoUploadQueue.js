@@ -223,7 +223,23 @@ export function usePhotoUploadQueue(woId) {
       let item = fresh()
       if (!item) return
       const tStart = performance.now()
-      const timing = {}
+      // Live-update timing on the item so the panel can render the
+      // breakdown step-by-step, not just at completion. Without this
+      // a stuck upload shows nothing useful in the UI until it times
+      // out — defeating the whole point of having timing instrumentation.
+      const timing = { startedAt: Date.now() }
+      const stampStep = (key, ms, extra) => {
+        timing[key] = Math.round(ms)
+        timing.currentStep = null
+        if (extra) Object.assign(timing, extra)
+        patch(item.id, { timing: { ...timing } })
+      }
+      const beginStep = (label) => {
+        timing.currentStep = label
+        timing.currentStepStartedAt = Date.now()
+        patch(item.id, { timing: { ...timing } })
+        console.log(`[photo] → ${label} (t+${Math.round(performance.now() - tStart)}ms)`)
+      }
       // Track the blob locally — Phase B must NOT re-read from itemsRef
       // because React updates the ref through a useEffect that hasn't
       // fired yet (`patch` schedules a render; the ref-sync runs only
@@ -234,13 +250,15 @@ export function usePhotoUploadQueue(woId) {
       if (item.source === 'capture' && !item.watermark_applied) {
         patch(item.id, { status: 'geocoding' })
         let geoData = null
+        beginStep('geocode')
         const tGeo = performance.now()
         if (item.geo && isFinite(item.geo.lat) && isFinite(item.geo.lng)) {
           geoData = await reverseGeocode(item.geo.lat, item.geo.lng)
         }
-        timing.geocodeMs = Math.round(performance.now() - tGeo)
+        stampStep('geocodeMs', performance.now() - tGeo)
         if (!fresh()) return
         patch(item.id, { status: 'watermarking' })
+        beginStep('watermark')
         const tWm = performance.now()
         // watermarkImage now does scale + watermark + encode at q=0.85
         // in ONE canvas pass, producing an upload-ready blob. There is
@@ -252,7 +270,9 @@ export function usePhotoUploadQueue(woId) {
           lat: item.geo?.lat,
           lng: item.geo?.lng,
         })
-        timing.watermarkMs = Math.round(performance.now() - tWm)
+        stampStep('watermarkMs', performance.now() - tWm, {
+          shipSizeKB: Math.round((watermarked?.size || 0) / 1024),
+        })
         console.log(`[photo] watermark ${timing.watermarkMs}ms in=${liveBlob?.size} out=${watermarked?.size}`)
         liveBlob = watermarked
         // ONE IndexedDB write per photo, post-watermark. The old code
@@ -261,6 +281,7 @@ export function usePhotoUploadQueue(woId) {
         // 5-20 sec. We accept that a page-reload during the ~500 ms
         // watermark window loses the photo — much better than a 5-30
         // sec per-photo penalty on every capture.
+        beginStep('idb-write')
         const tDb = performance.now()
         await pendingPhotosDB.put({
           id:                item.id,
@@ -273,17 +294,21 @@ export function usePhotoUploadQueue(woId) {
           geo:               item.geo,
           watermark_applied: true,
         })
-        timing.dbWriteMs = Math.round(performance.now() - tDb)
+        stampStep('dbWriteMs', performance.now() - tDb)
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
         const previewUrl = URL.createObjectURL(watermarked)
-        patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true })
+        patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true, timing: { ...timing } })
       } else if (item.source === 'library') {
         // Library imports — no watermark, still need to compress before
         // upload (camera-roll JPEGs are 3-5 MB raw) and land in
         // IndexedDB so a mid-upload reload recovers them.
+        beginStep('compress')
         const tCompress = performance.now()
         liveBlob = await compressForUpload(liveBlob)
-        timing.compressMs = Math.round(performance.now() - tCompress)
+        stampStep('compressMs', performance.now() - tCompress, {
+          shipSizeKB: Math.round((liveBlob?.size || 0) / 1024),
+        })
+        beginStep('idb-write')
         const tDb = performance.now()
         await pendingPhotosDB.put({
           id:                item.id,
@@ -296,7 +321,7 @@ export function usePhotoUploadQueue(woId) {
           geo:               null,
           watermark_applied: true,
         })
-        timing.dbWriteMs = Math.round(performance.now() - tDb)
+        stampStep('dbWriteMs', performance.now() - tDb)
       }
 
       // Phase B: upload to Drive. Uses liveBlob (the local var) so we
@@ -305,18 +330,21 @@ export function usePhotoUploadQueue(woId) {
       // bytes we want on Drive.
       if (!fresh() || !liveBlob) return
       patch(item.id, { status: 'uploading' })
+      beginStep('upload')
       const tUpload = performance.now()
       const res = await uploadToDrive(liveBlob, woId)
-      timing.uploadMs = Math.round(performance.now() - tUpload)
+      stampStep('uploadMs', performance.now() - tUpload, {
+        serverMs: res._server_ms,
+        appsScriptMs: res._appsScript_ms,
+      })
+      beginStep('idb-delete')
       const tDelete = performance.now()
       // Clear the queue row first — if we crash before the state patch
       // we'd rather lose the thumbnail than ship the photo twice.
       await pendingPhotosDB.delete(item.id).catch(() => {})
-      timing.dbDeleteMs = Math.round(performance.now() - tDelete)
+      stampStep('dbDeleteMs', performance.now() - tDelete)
       timing.totalMs = Math.round(performance.now() - tStart)
-      timing.shipSizeKB = Math.round((liveBlob?.size || 0) / 1024)
-      timing.serverMs = res._server_ms
-      timing.appsScriptMs = res._appsScript_ms
+      timing.currentStep = null
       console.log('[photo] pipeline complete', timing)
       patch(item.id, {
         status:         'uploaded',
@@ -395,6 +423,17 @@ export function usePhotoUploadQueue(woId) {
     removeLocal(id)
   }, [removeLocal])
 
+  // Force-abort a stuck in-flight item. The next time kick() runs for
+  // this id it'll be a fresh attempt. Used by the cancel button.
+  const cancelOne = useCallback(async (id) => {
+    const item = itemsRef.current.find(i => i.id === id)
+    if (!item) return
+    inFlightRef.current.delete(id)
+    await pendingPhotosDB.delete(id).catch(() => {})
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    removeLocal(id)
+  }, [removeLocal])
+
   // ── 5. Retry handler for error-status items ─────────────────
   const retryOne = useCallback((id) => {
     const item = itemsRef.current.find(i => i.id === id)
@@ -404,14 +443,16 @@ export function usePhotoUploadQueue(woId) {
   }, [kick, patch])
 
   // ── 6. Resume on visibilitychange + online ──────────────────
+  // Only re-kicks items that haven't started yet — NOT 'error' items.
+  // Previously this re-fired on any visibility flip (iOS Safari emits
+  // visibilitychange every time the keyboard appears, the camera modal
+  // opens, etc.), turning a timed-out upload into a perpetual retry
+  // loop that the user perceived as "the upload is stuck for minutes".
+  // Errored items are only retried via the explicit Retry button.
   useEffect(() => {
     const resume = () => {
       itemsRef.current.forEach(it => {
-        if (it.status === 'pending' || it.status === 'error' ||
-            it.status === 'geocoding' || it.status === 'watermarking' ||
-            it.status === 'uploading') {
-          kick(it)
-        }
+        if (it.status === 'pending') kick(it)
       })
     }
     const onVis    = () => { if (!document.hidden) resume() }
@@ -443,5 +484,6 @@ export function usePhotoUploadQueue(woId) {
     addLibrary,
     deleteOne,
     retryOne,
+    cancelOne,
   }
 }
