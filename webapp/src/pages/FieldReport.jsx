@@ -622,19 +622,24 @@ function PhotoTimingPanel({ items }) {
   // Show the most-recently-uploaded item's breakdown.
   const last = timed[0]
   const t = last.timing
+  const total = t.totalMs != null ? t.totalMs : ((t.compressMs || 0) + (t.uploadMs || 0))
+  const fmt = (ms) => ms == null ? '—' : `${ms} ms`
   return (
     <details className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2 py-1.5">
       <summary className="cursor-pointer font-semibold text-slate-600">
-        Last upload: {((t.compressMs + t.uploadMs) / 1000).toFixed(1)}s
+        Last upload: {(total / 1000).toFixed(1)}s
         <span className="text-slate-400"> · {t.shipSizeKB} KB</span>
       </summary>
       <div className="mt-1 space-y-0.5 font-mono">
-        <div>compress: {t.compressMs} ms</div>
-        <div>upload (round-trip): {t.uploadMs} ms</div>
-        {t.serverMs != null && <div>  ↳ server total: {t.serverMs} ms</div>}
-        {t.appsScriptMs != null && <div>  ↳ Apps Script: {t.appsScriptMs} ms</div>}
+        <div>geocode (Apps Script): {fmt(t.geocodeMs)}</div>
+        <div>watermark (canvas): {fmt(t.watermarkMs)}</div>
+        <div>IDB write (post-watermark): {fmt(t.dbWriteMs)}</div>
+        <div>upload (round-trip): {fmt(t.uploadMs)}</div>
+        {t.serverMs != null && <div>  ↳ server total: {fmt(t.serverMs)}</div>}
+        {t.appsScriptMs != null && <div>  ↳ Apps Script: {fmt(t.appsScriptMs)}</div>}
+        <div>IDB delete: {fmt(t.dbDeleteMs)}</div>
         <div className="text-slate-400 pt-1">
-          ship size: {t.shipSizeKB} KB
+          ship size: {t.shipSizeKB} KB · total kick→done: {(total / 1000).toFixed(1)}s
         </div>
       </div>
     </details>

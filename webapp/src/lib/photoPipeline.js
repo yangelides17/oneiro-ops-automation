@@ -122,17 +122,30 @@ export async function watermarkImage(file, ctx) {
     return file
   }
 
+  // Scale-down + draw + watermark + encode all happen in ONE canvas
+  // pass. The old code path encoded once for the watermark (q=0.92,
+  // full resolution) and then compressForUpload decoded and re-encoded
+  // the result (q=0.85, scaled). That meant two decodes + two encodes
+  // of a 3-5 MB image per photo. Now it's one of each.
+  const MAX_EDGE = 2048
+  const longEdgeIn = Math.max(w, h)
+  const scale = longEdgeIn > MAX_EDGE ? MAX_EDGE / longEdgeIn : 1
+  const targetW = Math.round(w * scale)
+  const targetH = Math.round(h * scale)
   const canvas = typeof OffscreenCanvas !== 'undefined'
-    ? new OffscreenCanvas(w, h)
-    : Object.assign(document.createElement('canvas'), { width: w, height: h })
+    ? new OffscreenCanvas(targetW, targetH)
+    : Object.assign(document.createElement('canvas'), { width: targetW, height: targetH })
   const c = canvas.getContext('2d')
   if (!c) {
     console.warn('[watermark] no 2d context — returning original')
     closeBitmap?.()
     return file
   }
-  c.drawImage(drawable, 0, 0, w, h)
+  c.drawImage(drawable, 0, 0, targetW, targetH)
   closeBitmap?.()
+  // Use the scaled dimensions for everything below — sizing math, text
+  // placement, output blob — so the encoded JPEG is upload-ready.
+  const sw = targetW, sh = targetH
 
   // Compose the text lines.
   const lines = []
@@ -149,11 +162,10 @@ export async function watermarkImage(file, ctx) {
   }
   console.log('[watermark] drawing', lines.length, 'lines on', w, 'x', h)
 
-  // Sizing — tuned against the reference screenshot. Long edge ~ 4000 px
-  // → ~64 px font; short edge ~ 1500 px → ~24 px. Linear scale keeps the
-  // overlay readable across phone resolutions.
-  const longEdge = Math.max(w, h)
-  const fontPx   = Math.max(20, Math.round(longEdge * 0.024))
+  // Sizing tuned against the scaled output (not the input). The 2048px
+  // long-edge target gives a ~50px font that reads clearly on phones.
+  const longEdgeOut = Math.max(sw, sh)
+  const fontPx   = Math.max(20, Math.round(longEdgeOut * 0.024))
   const padX     = Math.round(fontPx * 0.8)
   const padTop   = Math.round(fontPx * 0.6)
   const lineGap  = Math.round(fontPx * 1.25)
@@ -169,7 +181,7 @@ export async function watermarkImage(file, ctx) {
   c.shadowOffsetX = 0
   c.shadowOffsetY = Math.round(fontPx * 0.08)
 
-  const x = w - padX
+  const x = sw - padX
   lines.forEach((line, i) => {
     const y = padTop + i * lineGap
     // Stroke first for the outline halo, then fill the white glyph.
@@ -177,12 +189,11 @@ export async function watermarkImage(file, ctx) {
     c.fillText(line, x, y)
   })
 
-  // Re-encode. Keep JPEG quality high (q=0.92) because compressImage
-  // downstream may further reduce it; we don't want compounding losses
-  // softening the overlay.
+  // Single encode at upload quality — no downstream compressForUpload
+  // pass means no double decode/encode penalty.
   const blob = canvas.convertToBlob
-    ? await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 })
-    : await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.92))
+    ? await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 })
+    : await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85))
   if (!blob) return file
 
   const baseName = (file.name || 'photo').replace(/\.(png|jpg|jpeg|heic|heif|webp)$/i, '')

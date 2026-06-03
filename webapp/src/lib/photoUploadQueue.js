@@ -222,6 +222,8 @@ export function usePhotoUploadQueue(woId) {
       // Phase A: capture-source needs reverse-geocode + watermark first.
       let item = fresh()
       if (!item) return
+      const tStart = performance.now()
+      const timing = {}
       // Track the blob locally — Phase B must NOT re-read from itemsRef
       // because React updates the ref through a useEffect that hasn't
       // fired yet (`patch` schedules a render; the ref-sync runs only
@@ -232,21 +234,34 @@ export function usePhotoUploadQueue(woId) {
       if (item.source === 'capture' && !item.watermark_applied) {
         patch(item.id, { status: 'geocoding' })
         let geoData = null
+        const tGeo = performance.now()
         if (item.geo && isFinite(item.geo.lat) && isFinite(item.geo.lng)) {
           geoData = await reverseGeocode(item.geo.lat, item.geo.lng)
         }
+        timing.geocodeMs = Math.round(performance.now() - tGeo)
         if (!fresh()) return
         patch(item.id, { status: 'watermarking' })
         const tWm = performance.now()
+        // watermarkImage now does scale + watermark + encode at q=0.85
+        // in ONE canvas pass, producing an upload-ready blob. There is
+        // no second compressForUpload pass anymore — that was the old
+        // double-decode/double-encode penalty.
         const watermarked = await watermarkImage(liveBlob, {
           timestamp: item.captured_at ? new Date(item.captured_at) : new Date(),
           addressLines: formatWatermarkAddress(geoData),
           lat: item.geo?.lat,
           lng: item.geo?.lng,
         })
-        console.log(`[photo] watermark ${(performance.now() - tWm).toFixed(0)}ms in=${liveBlob?.size} out=${watermarked?.size}`)
+        timing.watermarkMs = Math.round(performance.now() - tWm)
+        console.log(`[photo] watermark ${timing.watermarkMs}ms in=${liveBlob?.size} out=${watermarked?.size}`)
         liveBlob = watermarked
-        // Persist watermarked blob so a crash doesn't lose the overlay.
+        // ONE IndexedDB write per photo, post-watermark. The old code
+        // also wrote the 3-5 MB original at addCapture time, which on
+        // iOS Safari serialises Blobs through SQLite and can stall
+        // 5-20 sec. We accept that a page-reload during the ~500 ms
+        // watermark window loses the photo — much better than a 5-30
+        // sec per-photo penalty on every capture.
+        const tDb = performance.now()
         await pendingPhotosDB.put({
           id:                item.id,
           wo_id:             woId,
@@ -258,9 +273,30 @@ export function usePhotoUploadQueue(woId) {
           geo:               item.geo,
           watermark_applied: true,
         })
+        timing.dbWriteMs = Math.round(performance.now() - tDb)
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
         const previewUrl = URL.createObjectURL(watermarked)
         patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true })
+      } else if (item.source === 'library') {
+        // Library imports — no watermark, still need to compress before
+        // upload (camera-roll JPEGs are 3-5 MB raw) and land in
+        // IndexedDB so a mid-upload reload recovers them.
+        const tCompress = performance.now()
+        liveBlob = await compressForUpload(liveBlob)
+        timing.compressMs = Math.round(performance.now() - tCompress)
+        const tDb = performance.now()
+        await pendingPhotosDB.put({
+          id:                item.id,
+          wo_id:             woId,
+          source:            item.source,
+          blob:              liveBlob,
+          filename:          item.filename,
+          mime:              item.mime,
+          captured_at:       item.captured_at,
+          geo:               null,
+          watermark_applied: true,
+        })
+        timing.dbWriteMs = Math.round(performance.now() - tDb)
       }
 
       // Phase B: upload to Drive. Uses liveBlob (the local var) so we
@@ -269,28 +305,24 @@ export function usePhotoUploadQueue(woId) {
       // bytes we want on Drive.
       if (!fresh() || !liveBlob) return
       patch(item.id, { status: 'uploading' })
-      const tCompress = performance.now()
-      const toShip = await compressForUpload(liveBlob)
-      const compressMs = Math.round(performance.now() - tCompress)
       const tUpload = performance.now()
-      const res = await uploadToDrive(toShip, woId)
-      const uploadMs = Math.round(performance.now() - tUpload)
+      const res = await uploadToDrive(liveBlob, woId)
+      timing.uploadMs = Math.round(performance.now() - tUpload)
+      const tDelete = performance.now()
       // Clear the queue row first — if we crash before the state patch
       // we'd rather lose the thumbnail than ship the photo twice.
       await pendingPhotosDB.delete(item.id).catch(() => {})
-      // Stash the timing breakdown on the item so the UI can render
-      // "23.4s · server 18.2s" beside the thumbnail without DevTools.
+      timing.dbDeleteMs = Math.round(performance.now() - tDelete)
+      timing.totalMs = Math.round(performance.now() - tStart)
+      timing.shipSizeKB = Math.round((liveBlob?.size || 0) / 1024)
+      timing.serverMs = res._server_ms
+      timing.appsScriptMs = res._appsScript_ms
+      console.log('[photo] pipeline complete', timing)
       patch(item.id, {
         status:         'uploaded',
         drive_file_id:  res.file_id,
         drive_file_url: res.file_url,
-        timing: {
-          shipSizeKB:    Math.round((toShip?.size || 0) / 1024),
-          compressMs,
-          uploadMs,
-          serverMs:      res._server_ms,
-          appsScriptMs:  res._appsScript_ms,
-        },
+        timing,
       })
     } catch (err) {
       patch(initial.id, { status: 'error', error: err?.message || 'Upload failed' })
@@ -300,15 +332,17 @@ export function usePhotoUploadQueue(woId) {
   }, [woId, patch])
 
   // ── 3. Public adders ────────────────────────────────────────
-  const addCapture = useCallback(async (file, geo) => {
+  const addCapture = useCallback((file, geo) => {
     if (!file || !woId) return
+    // NOTE: deliberately NOT awaiting an IndexedDB write here. The old
+    // code did `await pendingPhotosDB.put({blob: file})` with the raw
+    // 3-5 MB camera JPEG, which on iOS Safari can stall 5-20 sec for a
+    // single large-blob write. Now the only persistence write happens
+    // post-watermark with the much smaller (~1 MB) finished blob. The
+    // narrow window (~capture → watermark, typically <2 sec) where a
+    // page reload could lose the photo is acceptable.
     const id = newId()
     const captured_at = new Date().toISOString()
-    await pendingPhotosDB.put({
-      id, wo_id: woId, source: 'capture', blob: file,
-      filename: file.name || `photo-${id}.jpg`, mime: file.type || 'image/jpeg',
-      captured_at, geo: geo || null, watermark_applied: false,
-    })
     const item = {
       id, source: 'capture', status: 'pending', blob: file,
       previewUrl: URL.createObjectURL(file),
@@ -318,23 +352,22 @@ export function usePhotoUploadQueue(woId) {
       watermark_applied: false,
     }
     setItems(prev => [item, ...prev])
-    // Defer to next microtask so itemsRef is fresh inside kick().
     queueMicrotask(() => kick(item))
   }, [woId, kick])
 
-  const addLibrary = useCallback(async (files) => {
+  const addLibrary = useCallback((files) => {
     if (!woId || !files || !files.length) return
-    const records = await Promise.all(Array.from(files).map(async f => {
+    // Same rationale as addCapture: defer the IndexedDB write to kick()
+    // so we don't block the UI on a slow iOS Safari blob write per file.
+    const records = Array.from(files).map(f => {
       const id = newId()
-      const rec = {
+      return {
         id, wo_id: woId, source: 'library', blob: f,
         filename: f.name || `library-${id}.jpg`, mime: f.type || 'image/jpeg',
         captured_at: new Date().toISOString(),
-        geo: null, watermark_applied: true,  // library imports skip watermark
+        geo: null, watermark_applied: true,
       }
-      await pendingPhotosDB.put(rec)
-      return rec
-    }))
+    })
     const newItems = records.map(rec => ({
       id: rec.id, source: 'library', status: 'pending', blob: rec.blob,
       previewUrl: URL.createObjectURL(rec.blob),
