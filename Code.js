@@ -8237,9 +8237,10 @@ function expandDirLetters_(val) {
  * @returns number of rows inserted (0 if nothing to seed or sheet missing).
  */
 function seedMarkingItems_(ss, d) {
-  const topMarkings = d.top_markings       || [];
-  const grid        = d.intersection_grid  || [];
-  if (topMarkings.length === 0 && grid.length === 0) return 0;
+  const topMarkings = d.top_markings        || [];
+  const grid        = d.intersection_grid   || [];
+  const bikeMarks   = d.bike_lane_markings  || [];
+  if (topMarkings.length === 0 && grid.length === 0 && bikeMarks.length === 0) return 0;
 
   const markingSheet = ss.getSheetByName('Marking Items');
   if (!markingSheet) {
@@ -8320,6 +8321,43 @@ function seedMarkingItems_(ss, d) {
         ]);
       });
     });
+  });
+
+  // ── Bike-lane / pedestrian symbols ────────────────────────────
+  // From the WO's General Remarks or the "Bike Lane Work (NEW)" row (per
+  // the vision parse, d.bike_lane_markings). These have no structured
+  // top-table cell, so they're seeded as Pending items the crew completes.
+  // Quantity is left blank (crew enters the completed count); the WO's
+  // stated count goes in the Description. Bike Symbols always map to the
+  // OLD style — an admin switches the rare new ones by hand.
+  const BIKE_TYPE_TO_CATEGORY = {
+    'Bike Symbol':    'Old Bike Symbol (w/ rider)',
+    'Bike Arrow':     'Bike Lane Arrow',
+    'Pedestrian Men': 'Pedestrian Men',
+  };
+  bikeMarks.forEach((bm) => {
+    if (!bm || !bm.type) return;
+    const category = BIKE_TYPE_TO_CATEGORY[String(bm.type).trim()];
+    if (!category) return;   // unknown type — skip
+    const qty = bm.quantity;
+    const hasQty = qty != null && String(qty).trim() !== '' && !isNaN(qty);
+    rows.push([
+      `${woId}-${pad3(n++)}`,                // A  Item ID
+      woId,                                   // B  Work Order #
+      workType,                               // C  Work Type
+      'Top Table',                            // D  WO Section
+      category,                               // E  Marking Type
+      '',                                     // F  Intersection
+      '',                                     // G  Direction
+      hasQty ? `Per WO: ${qty}` : 'Per WO',   // H  Description (count noted here)
+      '',                                     // I  Quantity Completed (blank — crew fills)
+      unitForCategory_(category) || 'EA',     // J  Unit (derived from category → EA)
+      '',                                     // K  Color/Material
+      '',                                     // L  Date Completed
+      'Pending',                              // M  Status
+      'Scanner',                              // N  Added By
+      ''                                      // O  Notes
+    ]);
   });
 
   if (rows.length === 0) return 0;

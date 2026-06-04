@@ -128,6 +128,14 @@ If a field is not visible, illegible, or not applicable, use null. Never guess.
       "stop_msg":   "The value of the 'Stop Msg' column for this row. Usually blank, or a directional string like 'West', 'East', 'EW', 'NSEW'.",
       "stop_lines": "The value of the 'Stop lines' (far-right) column for this row. Same format as stop_msg."
     }
+  ],
+
+  "bike_lane_markings": [
+    {
+      "type":     "Exactly one of: 'Bike Symbol', 'Bike Arrow', 'Pedestrian Men'. See the bike_lane_markings rules below.",
+      "quantity": "The integer written immediately before the symbol's abbreviation/name (e.g. 3 from '3 BS'). Use null if a symbol is named with no count.",
+      "source":   "'general_remarks' if found in the General Remarks line, or 'bike_lane_section' if found in the 'Bike Lane Work (NEW)' row."
+    }
   ]
 }
 
@@ -135,6 +143,46 @@ Important notes:
 - water_blast_sqft may appear as a handwritten number near the words 'waterblast', 'WB', or 'water blast' anywhere on the form.
 - The General Remarks section is critical — it often contains handwritten notes about the type of work (e.g. 'RECAP PAINT FOR BIKE LANE', 'BUS LANE', 'PED SPACE'). Transcribe it fully.
 - The Issue To Contractor Date is near the bottom of the form.
+
+bike_lane_markings rules — a SEPARATE, self-contained extraction. It does NOT change
+anything above: general_remarks is still transcribed in full, and top_markings /
+intersection_grid are unchanged. While you read the General Remarks, ALSO pull out any
+counted preform bike-lane / pedestrian symbols into bike_lane_markings. Scan BOTH of
+these places:
+  (A) The General Remarks line (free text).
+  (B) The 'Bike Lane Work (NEW):' cell — the last row of the top table (often
+      highlighted yellow), labeled 'Bike Lane Work (NEW)'. If it has text, parse the
+      same tokens from it.
+
+Recognize BOTH the abbreviation AND the full written-out name (singular or plural):
+  • 'BS'                     or 'Bike Symbol' / 'Bike Symbols'                  → type 'Bike Symbol'
+  • 'BA' or 'BSA'            or 'Bike Arrow(s)' / 'Bike Symbol Arrow(s)'        → type 'Bike Arrow'
+  • 'PED MEN' / 'PED MAN'    or 'Pedestrian Men' / 'Pedestrian Man'            → type 'Pedestrian Men'
+The quantity is the number written immediately before the abbreviation/name. Set
+source='bike_lane_section' for tokens from (B), otherwise 'general_remarks'.
+
+STRICT rules — to avoid false positives:
+  • Emit an entry ONLY when a number is written immediately before the abbreviation/name.
+    A bare mention with no number (e.g. 'REFURB BS') is descriptive — do NOT emit it.
+  • IGNORE drawing/plan references entirely: tokens like 'MD-762_4', 'MD-882-2,1',
+    'MD-19232_3', 'SEE DWG ...', 'DWG ...' are plan numbers, never markings. A digit that
+    is part of a drawing number is never a quantity.
+  • Do NOT source anything for this field from the standard top-table rows (Double Yellow /
+    Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road / Others) or the
+    intersection grid — those are handled by top_markings / intersection_grid.
+  • If neither place contains a counted bike/ped symbol, return an empty array [].
+
+Examples:
+  'SEE DWG MD-762_4  3 BS  2 PED MEN  2 BA' →
+    [{"type":"Bike Symbol","quantity":3,"source":"general_remarks"},
+     {"type":"Pedestrian Men","quantity":2,"source":"general_remarks"},
+     {"type":"Bike Arrow","quantity":2,"source":"general_remarks"}]
+  'REFURB BS SEE MD-882-2,1  9 BS  6 BSA' →
+    [{"type":"Bike Symbol","quantity":9,"source":"general_remarks"},
+     {"type":"Bike Arrow","quantity":6,"source":"general_remarks"}]
+    (the bare 'REFURB BS' is NOT emitted)
+  'SEE DWG MD-19232_3  13 BS' →
+    [{"type":"Bike Symbol","quantity":13,"source":"general_remarks"}]
 
 top_markings rules:
 - This is the upper table that lists marking CATEGORIES down the middle column (Double Yellow CenterLine / Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road X / Diamond / Others).
@@ -454,6 +502,32 @@ def normalize_wo_data(raw: dict) -> dict:
         if any(v for v in cells.values()):
             intersection_grid.append({'intersection': intersection, **cells})
 
+    # ── Normalize bike_lane_markings ──────────────────────────────
+    # Bike/ped preform symbols pulled from the General Remarks line or the
+    # 'Bike Lane Work (NEW)' row. Passed through to the Apps Script handler,
+    # which seeds them as Pending Marking Items. Drop anything whose type
+    # isn't one of the three known kinds; coerce quantity to int or None.
+    VALID_BIKE_TYPES = {'Bike Symbol', 'Bike Arrow', 'Pedestrian Men'}
+    bike_lane_markings = []
+    for bm in (raw.get('bike_lane_markings') or []):
+        if not isinstance(bm, dict):
+            continue
+        btype = (bm.get('type') or '').strip()
+        if btype not in VALID_BIKE_TYPES:
+            continue
+        qty_raw = bm.get('quantity')
+        qty = None
+        if qty_raw is not None and str(qty_raw).strip() != '':
+            try:
+                qty = int(float(str(qty_raw).strip()))
+            except (ValueError, TypeError):
+                qty = None
+        bike_lane_markings.append({
+            'type':     btype,
+            'quantity': qty,
+            'source':   (bm.get('source') or '').strip(),
+        })
+
     # ── Derive work_type (MMA vs Thermo) ──────────────────────────
     # MMA detection above already sets water_blast_required = 'Yes - MMA'
     # when remarks/handwritten WB SQFT indicate MMA work. Intersection
@@ -461,7 +535,7 @@ def normalize_wo_data(raw: dict) -> dict:
     # either is populated we default to Thermo. Admin can override later.
     if water_blast_required == 'Yes - MMA':
         work_type = 'MMA'
-    elif intersection_grid or top_markings:
+    elif intersection_grid or top_markings or bike_lane_markings:
         work_type = 'Thermo'
     else:
         work_type = ''   # admin decides
@@ -486,6 +560,7 @@ def normalize_wo_data(raw: dict) -> dict:
         'work_type':             work_type,
         'top_markings':          top_markings,
         'intersection_grid':     intersection_grid,
+        'bike_lane_markings':    bike_lane_markings,
         'date_entered':          (raw.get('date_entered') or '').strip(),
         'school':                (raw.get('school') or 'NA').strip() or 'NA',
         'prep_by':               (raw.get('prep_by') or '').strip(),
