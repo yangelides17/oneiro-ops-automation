@@ -159,7 +159,8 @@ DETECT_WO_PROMPT = """You are examining a multi-page PDF scanned from a stack of
 The stack may contain:
   • Work Order pages (WO) — the NYC DOT Pavement Marking Work Order Report form
   • Contractor Field Report pages (CFR) — the form that's usually stapled to each WO
-  • Architectural drawing pages — site diagrams, sometimes attached
+  • Plan / drawing pages — engineering site diagrams or plan sheets, sometimes
+    attached to a WO to clarify the work that needs to be done
   • Blank / separator pages
 
 Your job: identify each Work Order document and return the page numbers that
@@ -184,9 +185,15 @@ make up its scan. Rules:
    into no wo_document. The fact that it physically follows a WO is
    coincidental (staples come loose, scans get reordered) and does NOT
    justify bundling.
-4. Never include architectural drawings or blank pages in any
-   wo_document. Those pages get dropped.
-5. Page numbers are 1-indexed.
+4. Plan / drawing pages (engineering site diagrams or plan sheets) belong to
+   the Work Order they were scanned with. INCLUDE such a page in a wo_document
+   when it falls within that WO's span in the stack — i.e. after that WO's WO
+   page and before the next WO page (it usually sits after the WO's CFR, but
+   include it wherever it appears within that span). These drawings must stay
+   with the WO so the crew can reference them on site.
+5. Never include blank or separator pages in any wo_document. Those pages get
+   dropped.
+6. Page numbers are 1-indexed.
 
 Return ONLY this JSON shape (no explanation, no markdown fences):
 
