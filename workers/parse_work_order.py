@@ -161,16 +161,22 @@ Recognize BOTH the abbreviation AND the full written-out name (singular or plura
 The quantity is the number written immediately before the abbreviation/name. Set
 source='bike_lane_section' for tokens from (B), otherwise 'general_remarks'.
 
-STRICT rules — to avoid false positives:
-  • Emit an entry ONLY when a number is written immediately before the abbreviation/name.
-    A bare mention with no number (e.g. 'REFURB BS') is descriptive — do NOT emit it.
+Rules:
+  • Emit an entry whenever the remarks indicate a bike/ped symbol type needs to be done —
+    WITH OR WITHOUT a number. If a number is written immediately before the
+    abbreviation/name, set quantity to it; otherwise set quantity to null. A bare mention
+    with no count (e.g. 'REFURB BS') still means the symbol is required — emit it with
+    quantity null.
+  • Emit each type AT MOST ONCE. If a type appears both with and without a number
+    (e.g. 'REFURB BS ... 9 BS'), emit it a single time using the number (quantity 9).
   • IGNORE drawing/plan references entirely: tokens like 'MD-762_4', 'MD-882-2,1',
     'MD-19232_3', 'SEE DWG ...', 'DWG ...' are plan numbers, never markings. A digit that
-    is part of a drawing number is never a quantity.
+    is part of a drawing number is never a quantity. The letters BS / BA / BSA / PED MEN
+    (or the full names) must actually appear — never infer a symbol from a drawing number.
   • Do NOT source anything for this field from the standard top-table rows (Double Yellow /
     Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road / Others) or the
     intersection grid — those are handled by top_markings / intersection_grid.
-  • If neither place contains a counted bike/ped symbol, return an empty array [].
+  • If neither place mentions any bike/ped symbol, return an empty array [].
 
 Examples:
   'SEE DWG MD-762_4  3 BS  2 PED MEN  2 BA' →
@@ -180,7 +186,10 @@ Examples:
   'REFURB BS SEE MD-882-2,1  9 BS  6 BSA' →
     [{"type":"Bike Symbol","quantity":9,"source":"general_remarks"},
      {"type":"Bike Arrow","quantity":6,"source":"general_remarks"}]
-    (the bare 'REFURB BS' is NOT emitted)
+    ('REFURB BS' and '9 BS' refer to the same Bike Symbols → one entry, quantity 9)
+  'REFURB BS SEE DWG MD-1226' →
+    [{"type":"Bike Symbol","quantity":null,"source":"general_remarks"}]
+    (no count given, but Bike Symbols are still required)
   'SEE DWG MD-19232_3  13 BS' →
     [{"type":"Bike Symbol","quantity":13,"source":"general_remarks"}]
 
@@ -527,6 +536,17 @@ def normalize_wo_data(raw: dict) -> dict:
             'quantity': qty,
             'source':   (bm.get('source') or '').strip(),
         })
+
+    # Dedupe by type so the same symbol can't seed twice. A type mentioned
+    # both with and without a count (e.g. 'REFURB BS ... 9 BS') collapses to
+    # one entry, preferring the one that carries a quantity; a type mentioned
+    # only without a count is still kept (quantity None → crew fills it in).
+    _deduped = {}
+    for bm in bike_lane_markings:
+        t = bm['type']
+        if t not in _deduped or (_deduped[t]['quantity'] is None and bm['quantity'] is not None):
+            _deduped[t] = bm
+    bike_lane_markings = list(_deduped.values())
 
     # ── Derive work_type (MMA vs Thermo) ──────────────────────────
     # MMA detection above already sets water_blast_required = 'Yes - MMA'
