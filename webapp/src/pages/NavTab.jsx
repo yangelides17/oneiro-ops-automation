@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF } from '@react-google-maps/api'
 import StatusBadge from '../components/StatusBadge'
@@ -121,70 +121,6 @@ export default function NavTab() {
   }, [])
   useEffect(() => { load() }, [load])
 
-  // ── Lock page-level zoom while on the Nav tab (except on the map) ──
-  // In the field it's easy to accidentally zoom the *page* outside the
-  // map; once that happens the 60vh map fills the screen and it's hard to
-  // zoom back out (iOS even persists the zoom across reloads). The map's
-  // own two-finger zoom (gestureHandling: 'cooperative') must keep working
-  // — Google Maps drives that from raw touch events, not the browser zoom,
-  // so blocking the page zoom never touches it.
-  //
-  // Three layers, because no single mechanism covers every engine:
-  //   1. touch-action: manipulation on the root (className below) kills
-  //      iOS double-tap-to-zoom (which fires NO gesture events, so the JS
-  //      below can't catch it — this was the gap letting zoom slip through).
-  //   2. Coordinate-based pinch block: cancel Safari's pinch gesture
-  //      (gesturestart/change/end) and multi-touch moves UNLESS the touch
-  //      is over the map's bounding box. Coordinates are reliable; the old
-  //      e.target.contains() check was not, for multi-touch gestures.
-  //   3. Viewport lock (maximum-scale=1) while mounted: fully disables zoom
-  //      on Android Chrome, is harmless on iOS, and on entry tends to snap
-  //      an already-zoomed page back to 1x. Restored on unmount so every
-  //      other tab keeps normal pinch-zoom.
-  const mapCardRef = useRef(null)
-  useEffect(() => {
-    const pointInMap = (x, y) => {
-      const el = mapCardRef.current
-      if (!el) return false
-      const r = el.getBoundingClientRect()
-      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-    }
-    // Safari pinch gesture events carry the centroid as clientX/clientY.
-    const onGesture = (e) => {
-      if (!pointInMap(e.clientX, e.clientY)) e.preventDefault()
-    }
-    // Multi-touch move = pinch on engines without Safari gesture events.
-    // Block unless EVERY finger is on the map.
-    const onTouchMove = (e) => {
-      if (!e.touches || e.touches.length < 2) return
-      for (let i = 0; i < e.touches.length; i++) {
-        if (!pointInMap(e.touches[i].clientX, e.touches[i].clientY)) {
-          e.preventDefault()
-          return
-        }
-      }
-    }
-    document.addEventListener('gesturestart',  onGesture,   { passive: false })
-    document.addEventListener('gesturechange', onGesture,   { passive: false })
-    document.addEventListener('gestureend',    onGesture,   { passive: false })
-    document.addEventListener('touchmove',     onTouchMove, { passive: false })
-
-    const meta = document.querySelector('meta[name="viewport"]')
-    const originalViewport = meta ? meta.getAttribute('content') : null
-    if (meta) {
-      meta.setAttribute('content',
-        'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no')
-    }
-
-    return () => {
-      document.removeEventListener('gesturestart',  onGesture)
-      document.removeEventListener('gesturechange', onGesture)
-      document.removeEventListener('gestureend',    onGesture)
-      document.removeEventListener('touchmove',     onTouchMove)
-      if (meta && originalViewport != null) meta.setAttribute('content', originalViewport)
-    }
-  }, [])
-
   // Unique filter option lists derived from the union of mapped +
   // unmapped (so admins can filter to see WOs that need geocoding
   // for a specific contractor too).
@@ -237,7 +173,7 @@ export default function NavTab() {
   }
 
   return (
-    <div className="space-y-4 touch-manipulation">
+    <div className="space-y-4">
       {/* Top bar — filters + counts + manual refresh */}
       <div className="card p-4 space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
@@ -281,7 +217,7 @@ export default function NavTab() {
       </div>
 
       {/* Map */}
-      <div ref={mapCardRef} className="card overflow-hidden">
+      <div className="card overflow-hidden">
         {!isLoaded ? (
           <div className={`flex items-center justify-center ${MAP_HEIGHT_CLASS}`}>
             <div className="w-9 h-9 border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
