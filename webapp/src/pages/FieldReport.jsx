@@ -1535,11 +1535,13 @@ export default function FieldReport() {
       setShowCompleteSuggestModal(true)
       return
     }
-    // Guard: no photos on Drive yet (live + library uploads land in the
-    // queue's uploadedCount). If photos are still mid-pipeline we let
-    // doSubmit handle the wait, since "no photos" really means "the user
-    // didn't add any" — not "the photos haven't finished".
-    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0) {
+    // Guard: no photos at all. Only fires when nothing is uploaded,
+    // pending, OR errored — i.e. the user genuinely didn't add any.
+    // If photos exist but failed (errorCount > 0) we fall through to
+    // doSubmit, which surfaces the real "stuck uploading" message
+    // instead of a misleading "did you forget photos?" prompt.
+    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0
+        && photoQueue.errorCount === 0) {
       setShowPhotoModal(true); return
     }
     doSubmit()
@@ -1549,7 +1551,8 @@ export default function FieldReport() {
   // photo guard still fires after the user resolves the suggestion.
   function continueAfterCompleteSuggest() {
     setShowCompleteSuggestModal(false)
-    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0) {
+    if (photoQueue.uploadedCount === 0 && photoQueue.pendingCount === 0
+        && photoQueue.errorCount === 0) {
       setShowPhotoModal(true); return
     }
     doSubmit()

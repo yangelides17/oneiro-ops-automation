@@ -11895,12 +11895,29 @@ function handleListWOPhotos_(body) {
     return jsonResponse_({ photos: [] });
   }
 
-  const out = [];
+  // First pass: collect image-file refs + created dates only — cheap, no
+  // thumbnail fetch. We sort newest-first and then pull thumbnails for at
+  // most MAX_THUMBS files. getThumbnail() is a per-file Drive round-trip,
+  // so a folder with dozens of photos would otherwise serialise dozens of
+  // them (slow gallery load, and a pathological folder could brush the
+  // 6-min execution limit). 120 covers any realistic WO.
+  const MAX_THUMBS = 120;
+  const refs = [];
   const it = folder.getFiles();
   while (it.hasNext()) {
     const f = it.next();
     const mime = f.getMimeType() || '';
     if (mime.indexOf('image/') !== 0) continue;
+    refs.push({ file: f, mime: mime, created: f.getDateCreated() });
+  }
+  refs.sort((a, b) => b.created - a.created);   // newest first (Date math → ms)
+  if (refs.length > MAX_THUMBS) {
+    Logger.log('list_wo_photos: ' + woId + ' has ' + refs.length +
+               ' photos; returning newest ' + MAX_THUMBS);
+  }
+
+  const out = refs.slice(0, MAX_THUMBS).map(r => {
+    const f = r.file;
     let thumb = '';
     try {
       const blob = f.getThumbnail();
@@ -11909,16 +11926,15 @@ function handleListWOPhotos_(body) {
       // Drive sometimes refuses thumbnails for very fresh uploads — UI
       // falls back to the file URL, no need to fail the whole listing.
     }
-    out.push({
+    return {
       file_id:       f.getId(),
       name:          f.getName(),
       url:           f.getUrl(),
       thumbnail_b64: thumb,
-      mime:          mime,
-      created_at:    f.getDateCreated().toISOString(),
-    });
-  }
-  out.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
+      mime:          r.mime,
+      created_at:    r.created.toISOString(),
+    };
+  });
   return jsonResponse_({ photos: out });
 }
 
