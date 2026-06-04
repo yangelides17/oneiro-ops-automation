@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF } from '@react-google-maps/api'
 import StatusBadge from '../components/StatusBadge'
@@ -121,6 +121,35 @@ export default function NavTab() {
   }, [])
   useEffect(() => { load() }, [load])
 
+  // ── Lock page-level zoom while on the Nav tab (except on the map) ──
+  // In the field it's easy to accidentally pinch-zoom the *page* outside
+  // the map; once that happens the 60vh map fills the screen and it's
+  // hard to pinch back out. iOS Safari ignores `user-scalable=no` in the
+  // viewport meta, so the only reliable fix is to cancel Safari's pinch
+  // gesture events (gesturestart/gesturechange) — but ONLY when the
+  // gesture lands outside the map, so the map's own two-finger zoom
+  // (gestureHandling: 'cooperative') keeps working. Listeners are scoped
+  // to this tab's lifetime: switching tabs unmounts NavTab and restores
+  // normal page zoom everywhere else.
+  const mapCardRef = useRef(null)
+  useEffect(() => {
+    const inMap = (target) => !!mapCardRef.current && mapCardRef.current.contains(target)
+    const blockOutsideMap = (e) => { if (!inMap(e.target)) e.preventDefault() }
+    // touchmove with >1 finger = pinch on engines that don't fire the
+    // Safari gesture events; guard the map the same way.
+    const blockPinchMove = (e) => {
+      if (e.touches && e.touches.length > 1 && !inMap(e.target)) e.preventDefault()
+    }
+    document.addEventListener('gesturestart',  blockOutsideMap, { passive: false })
+    document.addEventListener('gesturechange', blockOutsideMap, { passive: false })
+    document.addEventListener('touchmove',     blockPinchMove,  { passive: false })
+    return () => {
+      document.removeEventListener('gesturestart',  blockOutsideMap)
+      document.removeEventListener('gesturechange', blockOutsideMap)
+      document.removeEventListener('touchmove',     blockPinchMove)
+    }
+  }, [])
+
   // Unique filter option lists derived from the union of mapped +
   // unmapped (so admins can filter to see WOs that need geocoding
   // for a specific contractor too).
@@ -217,7 +246,7 @@ export default function NavTab() {
       </div>
 
       {/* Map */}
-      <div className="card overflow-hidden">
+      <div ref={mapCardRef} className="card overflow-hidden">
         {!isLoaded ? (
           <div className={`flex items-center justify-center ${MAP_HEIGHT_CLASS}`}>
             <div className="w-9 h-9 border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
