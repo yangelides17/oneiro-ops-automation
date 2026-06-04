@@ -7595,7 +7595,12 @@ function handleGenerateCPForDoc_(body) {
  * body: { key, file_id }
  */
 function handleTrashFile_(body) {
-  const fileId = body.file_id;
+  // Accept both the legacy flat shape (Python worker posts {key, file_id}
+  // direct) and the Express-proxy shape (callAppsScript wraps data under
+  // body.data). Without this fallback the photo-delete button in the
+  // Field Report UI fires `Missing file_id` because the proxy nests its
+  // payload one level deeper than the original Python caller did.
+  const fileId = (body.data && body.data.file_id) || body.file_id;
   if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
   try {
     DriveApp.getFileById(fileId).setTrashed(true);

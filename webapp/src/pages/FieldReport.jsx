@@ -508,7 +508,7 @@ function WOPanel({ wo }) {
 // on Drive), in-flight (watermarking/uploading), and uploaded-this-
 // session — sorted newest first. Delete on any item routes through a
 // confirmation modal owned by the parent.
-function PhotoCaptureGallery({ queue, onRequestDelete, onRequestPreview }) {
+function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPreview }) {
   const cameraRef  = useRef(null)
   const libraryRef = useRef(null)
 
@@ -524,13 +524,34 @@ function PhotoCaptureGallery({ queue, onRequestDelete, onRequestPreview }) {
     setTimeout(() => done(null), 9000)
   })
 
+  // iOS Safari hands the camera input a generic "image.jpg" filename for
+  // every capture, which lands in Drive as image.jpg, image (1).jpg, etc.
+  // Rename to {WO}_{LOCATION}_{YYYY-MM-DD}_{HH-MM-SS}.jpg before queueing
+  // so the folder is readable and individual files are self-describing.
+  const buildFilename = () => {
+    const woId = woContext?.id || 'WO'
+    const loc  = (woContext?.location || '')
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40) || 'site'
+    const d = new Date()
+    const pad = (n) => String(n).padStart(2, '0')
+    const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    const time = `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
+    return `${woId}_${loc}_${date}_${time}.jpg`
+  }
+  // Materialise the rename as a fresh File. The original camera File's
+  // `name` is read-only, so we have to wrap the bytes in a new one.
+  const renameFile = (file, name) => new File([file], name, { type: file.type || 'image/jpeg' })
+
   const onCaptureChange = async (e) => {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
     const geo = await acquireGeo()
     const prepared = isHeic(file) ? await convertHeicToJpeg(file) : file
-    queue.addCapture(prepared, geo)
+    const named = renameFile(prepared, buildFilename())
+    queue.addCapture(named, geo)
   }
 
   const onLibraryChange = async (e) => {
@@ -540,7 +561,15 @@ function PhotoCaptureGallery({ queue, onRequestDelete, onRequestPreview }) {
     const prepared = await Promise.all(files.map(f =>
       isHeic(f) ? convertHeicToJpeg(f) : Promise.resolve(f)
     ))
-    queue.addLibrary(prepared)
+    // Library imports get the same name format, but with a numeric
+    // suffix when multiple files are picked at once so they don't
+    // collide on the same second.
+    const named = prepared.map((f, i) => {
+      const base = buildFilename().replace(/\.jpg$/, '')
+      const suffix = prepared.length > 1 ? `_${i + 1}` : ''
+      return renameFile(f, `${base}${suffix}.jpg`)
+    })
+    queue.addLibrary(named)
   }
 
   return (
@@ -2177,6 +2206,7 @@ export default function FieldReport() {
           ) : (
             <PhotoCaptureGallery
               queue={photoQueue}
+              woContext={selectedWO ? { id: selectedWO.id, location: selectedWO.location } : null}
               onRequestDelete={(item) => setPhotoDeleteConfirm({ item })}
               onRequestPreview={(item) => setPhotoLightbox(item)}
             />
