@@ -8240,7 +8240,10 @@ function seedMarkingItems_(ss, d) {
   const topMarkings = d.top_markings        || [];
   const grid        = d.intersection_grid   || [];
   const bikeMarks   = d.bike_lane_markings  || [];
-  if (topMarkings.length === 0 && grid.length === 0 && bikeMarks.length === 0) return 0;
+  // PT-XXXXX = Paint → Color Surface / MMA WO; gets one auto-seeded Color
+  // Surface item even when no other markings were parsed off the form.
+  const isPaintWO   = String(d.work_order_id || '').toUpperCase().startsWith('PT-');
+  if (topMarkings.length === 0 && grid.length === 0 && bikeMarks.length === 0 && !isPaintWO) return 0;
 
   const markingSheet = ss.getSheetByName('Marking Items');
   if (!markingSheet) {
@@ -8359,6 +8362,32 @@ function seedMarkingItems_(ss, d) {
       ''                                      // O  Notes
     ]);
   });
+
+  // ── Color Surface auto-seed (Paint / PT WOs) ──────────────────
+  // A PT- WO is a Paint / Color Surface (MMA) job. Seed one Color Surface
+  // item so the crew just confirms the sub-type and fills SQFT + color.
+  // Defaults to 'Bike Lane' (an MMA category, unit SF) — the crew switches
+  // to Bus Lane / Pedestrian Space if needed. Color/Material is left blank
+  // and is required before the item can be marked Completed.
+  if (isPaintWO) {
+    rows.push([
+      `${woId}-${pad3(n++)}`,                 // A  Item ID
+      woId,                                    // B  Work Order #
+      workType,                                // C  Work Type (= MMA for PT)
+      'Top Table',                             // D  WO Section
+      'Bike Lane',                             // E  Marking Type (Color Surface default)
+      '',                                      // F  Intersection
+      '',                                      // G  Direction
+      'Color Surface — confirm type & color',  // H  Description
+      '',                                      // I  Quantity Completed (blank — crew fills SQFT)
+      unitForCategory_('Bike Lane') || 'SF',   // J  Unit (= SF)
+      '',                                      // K  Color/Material (crew fills — required)
+      '',                                      // L  Date Completed
+      'Pending',                               // M  Status
+      'Scanner',                               // N  Added By
+      ''                                       // O  Notes
+    ]);
+  }
 
   if (rows.length === 0) return 0;
 
