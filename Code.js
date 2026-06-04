@@ -318,8 +318,12 @@ function setupMarkingItems() {
     'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
     // Page 2 — miscellaneous
     'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
-    // Page 2 — bike lane
-    'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
+    // Page 2 — bike lane (old/new preform bike symbol; both map to the
+    // same Bike Symbol CFR/PL field and sum, but price differently)
+    'Bike Lane Arrow', 'Old Bike Symbol (w/ rider)', 'New Bike Symbol (just bike)',
+    'Bike Lane Green Bar',
+    // Preform pedestrian symbol
+    'Pedestrian Men',
     // MMA
     'Bike Lane', 'Pedestrian Space', 'Bus Lane',
   ];
@@ -851,7 +855,10 @@ const PL_CATEGORY_MAP_ = {
   'Speed Hump Markings': 'Speed Hump Marking',
   'Shark Teeth 24x36':   'Sharks Teeth 24" 36"',
   'Bike Lane Arrow':     'Bicycle Lane Arrow',
-  'Bike Lane Symbol':    'Bicycle Lane Symbol',
+  'Bike Lane Symbol':    'Bicycle Lane Symbol',   // legacy alias
+  // Old + new preform bike symbols share the PL row; aggregator sums them.
+  'Old Bike Symbol (w/ rider)':  'Bicycle Lane Symbol',
+  'New Bike Symbol (just bike)': 'Bicycle Lane Symbol',
 };
 
 
@@ -910,6 +917,7 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso, crewChief) {
   const colorsSet = {};
   let crosswalkSum = 0;
   let stopLineSum  = 0;
+  let pedMenSum    = 0;
 
   woItems.forEach(r => {
     const category = String(r[4] || '').trim();
@@ -938,6 +946,10 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso, crewChief) {
     if (category === 'HVX Crosswalk') { crosswalkSum += qty; return; }
     if (category === 'Stop Line')     { stopLineSum  += qty; return; }
 
+    // Pedestrian Men → the PL's currently-unused "PED X-ING Message" row,
+    // written as "{n} PED MEN" so it's unmistakably PED MEN, not PED XING.
+    if (category === 'Pedestrian Men') { pedMenSum += qty; return; }
+
     // Standard rename; unmapped categories drop silently
     const plLabel = PL_CATEGORY_MAP_[category];
     if (!plLabel) return;
@@ -946,6 +958,9 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso, crewChief) {
 
   if (crosswalkSum > 0 || stopLineSum > 0) {
     out.markings['CrossWalks/Stop Lines'] = `${crosswalkSum}/${stopLineSum}`;
+  }
+  if (pedMenSum > 0) {
+    out.markings['PED X-ING Message'] = `${pedMenSum} PED MEN`;
   }
   if (sfSum > 0) {
     out.sqft  = sfSum;
@@ -7703,7 +7718,10 @@ const CATEGORY_UNITS_ = {
   'Shark Teeth 12x18':   'EA',
   'Shark Teeth 24x36':   'EA',
   'Bike Lane Arrow':     'EA',
-  'Bike Lane Symbol':    'EA',
+  'Bike Lane Symbol':    'EA',   // legacy — retired from picker, kept for old rows
+  'Old Bike Symbol (w/ rider)':  'EA',
+  'New Bike Symbol (just bike)': 'EA',
+  'Pedestrian Men':      'EA',
   'Bike Lane Green Bar': 'SF',
   // "Others" is intentionally variable (user picks).
 };
@@ -7753,7 +7771,10 @@ const PRICING_GROUP_BY_CATEGORY_ = Object.freeze({
   'Stop Line':          'line12',
 
   // preformed thermoplastic
-  'Bike Lane Symbol':   'preformed',
+  'Bike Lane Symbol':   'preformed',   // legacy alias for Old Bike Symbol
+  'Old Bike Symbol (w/ rider)':  'preformed',
+  'New Bike Symbol (just bike)': 'preformed',
+  'Pedestrian Men':     'preformed',
 
   // extruded thermoplastic — priced by unit count
   'Stop Msg':            'extruded',
@@ -7843,7 +7864,10 @@ const EXTRUDED_UNIT_COUNT_ = Object.freeze({
 });
 
 const PREFORMED_UNIT_COUNT_ = Object.freeze({
-  'Bike Lane Symbol': 0.91,
+  'Bike Lane Symbol': 0.91,   // legacy alias for Old Bike Symbol
+  'Old Bike Symbol (w/ rider)':  0.91,
+  'New Bike Symbol (just bike)': 0.97,
+  'Pedestrian Men':   0.84,
 });
 
 // Line12-group multiplier. HVX Crosswalk is priced at the base 12"
@@ -10055,14 +10079,20 @@ function mapCategoryToCFR_(category) {
     'Combination Arrow':  'Combination Arrows',
     'Combination Arrow (L/R)': 'Combination Arrows',
     'Bike Lane Arrow':    'Bike Lane Arrows',
-    'Bike Lane Symbol':   'Bike Lane Symbols',
+    'Bike Lane Symbol':   'Bike Lane Symbols',   // legacy alias
+    // Both old and new preform bike symbols land in the same CFR cell;
+    // the aggregator sums them via this shared label.
+    'Old Bike Symbol (w/ rider)':  'Bike Lane Symbols',
+    'New Bike Symbol (just bike)': 'Bike Lane Symbols',
   };
-  // Grid-only categories — no top-table cell in the CFR template for
-  // these. Stop Msg used to live here but the CFR has BOTH a top-table
-  // roll-up cell (page0_field23) AND a per-intersection grid cell, so
-  // it gets aggregated into the top_table dict and additionally split
+  // No top-table cell in the CFR template for these. HVX Crosswalk /
+  // Stop Line land in the grid; Pedestrian Men has no CFR field at all
+  // and is surfaced in General Remarks ("PED MEN: {n}") instead.
+  // Stop Msg used to live here but the CFR has BOTH a top-table roll-up
+  // cell (page0_field23) AND a per-intersection grid cell, so it gets
+  // aggregated into the top_table dict and additionally split
   // per-intersection in the grid loop below.
-  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1 };
+  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1, 'Pedestrian Men': 1 };
 
   const c = String(category || '').trim();
   if (!c) return null;
@@ -10167,6 +10197,93 @@ function aggregateMarkingItemsForCFR_(ss, woId) {
 
 
 /**
+ * Build the General Remarks segments for completed markings that have NO
+ * dedicated CFR field, in priority order:
+ *   1. Color Surface — "Color Surface Completed: {SF} SQFT {Color}, …"
+ *      (per-color breakdown across Bike Lane / Bus Lane / Pedestrian Space)
+ *   2. PED MEN       — "PED MEN: {n}"  (Pedestrian Men symbol count)
+ *   3. Other Markings— "Other Markings Completed: {desc} {qty} {unit}, …"
+ *      (every completed 'Others' item)
+ * Returns an array of non-empty segment strings; the caller joins them
+ * with " | " ahead of the Reported Issues. Scope mirrors the CFR
+ * aggregation: all completed items for the WO (every date/crew).
+ *
+ * Col indices: 1 WO#, 4 Marking Type, 7 Description, 8 Quantity, 9 Unit,
+ * 10 Color/Material, 12 Status.
+ */
+function buildMarkingRemarksSegments_(ss, woId) {
+  const segments = [];
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) return segments;
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return segments;
+
+  const items = data.slice(1).filter(r =>
+    String(r[1] || '').trim() === woId &&
+    String(r[12] || '').toLowerCase() === 'completed'
+  );
+  if (items.length === 0) return segments;
+
+  // Trim trailing ".0" so 12.0 → "12" but 12.5 stays.
+  const fmt = (n) => {
+    const v = Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+    return String(v);
+  };
+
+  // Color Surface = the SF color-surface treatments that have no CFR field.
+  // (Bike Lane Green Bar is excluded — it has its own CFR cell, Text_20.)
+  const COLOR_SURFACE = { 'Bike Lane': 1, 'Bus Lane': 1, 'Pedestrian Space': 1 };
+  const sfByColor = {};          // color -> summed SF
+  const sfColorOrder = [];       // first-seen color order
+  let   sfNoColor = 0;           // SF with no color recorded
+  let   pedMen = 0;
+  const others = [];
+
+  items.forEach(r => {
+    const category = String(r[4] || '').trim();
+    const qty      = parseFloat(r[8]);
+    const unit     = String(r[9] || '').trim().toUpperCase();
+
+    if (COLOR_SURFACE[category] && unit === 'SF') {
+      if (isNaN(qty) || qty <= 0) return;
+      const color = String(r[10] || '').trim();
+      if (color && color.toLowerCase() !== 'n/a') {
+        if (!(color in sfByColor)) sfColorOrder.push(color);
+        sfByColor[color] = (sfByColor[color] || 0) + qty;
+      } else {
+        sfNoColor += qty;
+      }
+      return;
+    }
+    if (category === 'Pedestrian Men') {
+      if (!isNaN(qty) && qty > 0) pedMen += qty;
+      return;
+    }
+    if (category === 'Others') {
+      if (isNaN(qty) || qty <= 0) return;
+      const desc = String(r[7] || '').trim();
+      others.push(`${desc ? desc + ' ' : ''}${fmt(qty)}${unit ? ' ' + unit : ''}`.trim());
+      return;
+    }
+  });
+
+  // 1. Color Surface — per-color breakdown
+  const colorParts = sfColorOrder.map(c => `${fmt(sfByColor[c])} SQFT ${c}`);
+  if (sfNoColor > 0) colorParts.push(`${fmt(sfNoColor)} SQFT`);
+  if (colorParts.length) {
+    segments.push(`Color Surface Completed: ${colorParts.join(', ')}`);
+  }
+  // 2. PED MEN
+  if (pedMen > 0) segments.push(`PED MEN: ${fmt(pedMen)}`);
+  // 3. Other Markings
+  if (others.length) {
+    segments.push(`Other Markings Completed: ${others.join(', ')}`);
+  }
+  return segments;
+}
+
+
+/**
  * Build a Contractor Field Report JSON payload from the submitted field
  * report + the WO Tracker row + aggregated Marking Items + the freshly
  * computed (not yet written) issues string. Writes the JSON into the
@@ -10261,15 +10378,17 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues, opts
 
   const aggregated = aggregateMarkingItemsForCFR_(ss, d.wo_id);
 
-  // Flatten multi-line issues to a single line for the PDF (the General
-  // Remarks field is single-line — a raw \n gets truncated at the first
-  // line). Each issue line already carries its own date prefix, so " | "
-  // is enough visual separation.
-  const flatRemarks = String(aggregatedIssues || '')
+  // General Remarks composition. The CFR field renders single-line, so we
+  // join every segment with " | ". Priority order (highest first):
+  //   1. Color Surface  2. PED MEN  3. Other Markings  4. Reported Issues.
+  // The first three come from completed markings that have no dedicated
+  // CFR field; the issues are the accumulated per-submit notes.
+  const markingSegments = buildMarkingRemarksSegments_(ss, d.wo_id);
+  const issueSegments = String(aggregatedIssues || '')
     .split(/\r?\n/)
     .map(s => s.trim())
-    .filter(Boolean)
-    .join(' | ');
+    .filter(Boolean);
+  const flatRemarks = [...markingSegments, ...issueSegments].join(' | ');
 
   const payload = {
     _type:             'contractor_field_report',

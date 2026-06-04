@@ -25,7 +25,10 @@ export const PRICING_GROUP_BY_CATEGORY = {
   'Stop Line':          'line12',
 
   // preformed thermoplastic
-  'Bike Lane Symbol':   'preformed',
+  'Bike Lane Symbol':   'preformed',   // legacy alias for Old Bike Symbol
+  'Old Bike Symbol (w/ rider)':  'preformed',
+  'New Bike Symbol (just bike)': 'preformed',
+  'Pedestrian Men':     'preformed',
 
   // extruded thermoplastic ($/Unit × EXTRUDED_UNIT_COUNT)
   'Stop Msg':            'extruded',
@@ -102,7 +105,10 @@ export const EXTRUDED_UNIT_COUNT = {
 }
 
 export const PREFORMED_UNIT_COUNT = {
-  'Bike Lane Symbol': 0.91,
+  'Bike Lane Symbol': 0.91,   // legacy alias for Old Bike Symbol
+  'Old Bike Symbol (w/ rider)':  0.91,
+  'New Bike Symbol (just bike)': 0.97,
+  'Pedestrian Men':   0.84,
 }
 
 export const PRICING_GROUP_LABEL = {

@@ -19,8 +19,13 @@ export const MARKING_CATEGORIES = [
   'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
   // Page 2 misc
   'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
-  // Page 2 bike lane
-  'Bike Lane Arrow', 'Bike Lane Symbol', 'Bike Lane Green Bar',
+  // Page 2 bike lane — the DOT is migrating the preform bike symbol from
+  // the old rider style to a new bike-only style; both map to the same
+  // Bike Symbol field on the CFR/PL and sum, but price differently.
+  'Bike Lane Arrow', 'Old Bike Symbol (w/ rider)', 'New Bike Symbol (just bike)',
+  'Bike Lane Green Bar',
+  // Preform pedestrian symbol
+  'Pedestrian Men',
   // MMA
   'Bike Lane', 'Pedestrian Space', 'Bus Lane',
 ]
@@ -75,7 +80,10 @@ export const CATEGORY_UNITS = {
   'Shark Teeth 12x18':   'EA',
   'Shark Teeth 24x36':   'EA',
   'Bike Lane Arrow':     'EA',
-  'Bike Lane Symbol':    'EA',
+  'Bike Lane Symbol':    'EA',   // legacy — retired from picker, kept for old rows
+  'Old Bike Symbol (w/ rider)':  'EA',
+  'New Bike Symbol (just bike)': 'EA',
+  'Pedestrian Men':      'EA',
   'Bike Lane Green Bar': 'SF',
 
   // "Others" is intentionally absent — variable unit.

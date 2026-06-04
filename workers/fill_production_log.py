@@ -47,7 +47,7 @@ Field mapping (Production Log):
       'Message Only', 'Stop Message', 'Left & or Right Arrows',
       'Straight Arrow', 'Combination Arrow', 'Railroad - RR', 'Bump',
       'Bicycle Lane Arrow', 'Bicycle Lane Symbol', '20 MPH Message',
-      'PCO #/VNG Message', 'Water Blasting for Surface'
+      'PED X-ING Message', 'Water Blasting for Surface'
     ]
     grid_fields[row][col] = page0_field{26 + row*4 + col}
     (col order matches WO column order: 1, 2, 3, 4)
@@ -123,7 +123,7 @@ MARKING_ROWS = [
     'Message Only', 'Stop Message', 'Left & or Right Arrows',
     'Straight Arrow', 'Combination Arrow', 'Railroad - RR', 'Bump',
     'Bicycle Lane Arrow', 'Bicycle Lane Symbol', '20 MPH Message',
-    'PCO #/VNG Message', 'Water Blasting for Surface'
+    'PED X-ING Message', 'Water Blasting for Surface'
 ]
 
 def _grid_field_name(row_idx, col_idx):
