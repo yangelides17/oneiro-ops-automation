@@ -128,7 +128,7 @@ export default function EditCoordinatesModal({ wo, onSaved, onClose }) {
               onChange={e => setUrl(e.target.value)}
               onBlur={handleUrlBlur}
               placeholder="https://www.google.com/maps/@40.7128,-74.0060,17z"
-              className="field-input text-sm mt-1"
+              className="field-input mt-1"
               disabled={submitting}
             />
             <p className="text-[10px] text-slate-400 mt-1">
@@ -145,7 +145,7 @@ export default function EditCoordinatesModal({ wo, onSaved, onClose }) {
                 value={lat}
                 onChange={e => setLat(e.target.value)}
                 placeholder="40.7128"
-                className="field-input text-sm mt-1"
+                className="field-input mt-1"
                 disabled={submitting}
               />
             </label>
@@ -156,7 +156,7 @@ export default function EditCoordinatesModal({ wo, onSaved, onClose }) {
                 value={lng}
                 onChange={e => setLng(e.target.value)}
                 placeholder="-74.0060"
-                className="field-input text-sm mt-1"
+                className="field-input mt-1"
                 disabled={submitting}
               />
             </label>

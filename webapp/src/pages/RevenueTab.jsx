@@ -142,14 +142,14 @@ function RangePicker({ preset, onPresetChange, customStart, customEnd, onCustomC
             type="date"
             value={customStart}
             onChange={e => onCustomChange({ start: e.target.value, end: customEnd })}
-            className="field-input text-sm"
+            className="field-input"
           />
           <label className="text-xs font-semibold text-slate-500">End</label>
           <input
             type="date"
             value={customEnd}
             onChange={e => onCustomChange({ start: customStart, end: e.target.value })}
-            className="field-input text-sm"
+            className="field-input"
           />
         </div>
       )}
@@ -322,7 +322,7 @@ function TopWosTable({ topWos }) {
       <div className="p-4 border-b border-slate-100">
         <p className="section-label">Top WOs by Revenue</p>
       </div>
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto overscroll-x-contain">
         <table className="w-full min-w-[520px]">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50">
@@ -393,7 +393,7 @@ function NeedsPricingPanel({ items }) {
               <p className="text-xs font-semibold text-amber-900 mb-1.5">
                 {NEEDS_PRICING_REASON_LABEL[reason] || reason} ({byReason[reason].length})
               </p>
-              <div className="overflow-x-auto bg-white rounded-lg border border-amber-200">
+              <div className="overflow-x-auto overscroll-x-contain bg-white rounded-lg border border-amber-200">
                 <table className="w-full min-w-[720px] text-xs">
                   <thead>
                     <tr className="border-b border-slate-100 bg-slate-50">

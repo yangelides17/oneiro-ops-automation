@@ -393,7 +393,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       onChange={e => setWoInput(e.target.value)}
                       placeholder="RM-43101, RM-43102, PT-12345"
                       rows={3}
-                      className="field-input w-full text-sm font-mono"
+                      className="field-input w-full font-mono"
                     />
                     <p className="text-[11px] text-slate-400 mt-1">
                       Comma- or whitespace-separated. Case-insensitive.
@@ -426,7 +426,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       type="date"
                       value={dateStart}
                       onChange={e => setDateStart(e.target.value)}
-                      className="field-input text-sm"
+                      className="field-input"
                     />
                   </div>
                   <div>
@@ -437,7 +437,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       type="date"
                       value={dateEnd}
                       onChange={e => setDateEnd(e.target.value)}
-                      className="field-input text-sm"
+                      className="field-input"
                     />
                   </div>
                 </div>

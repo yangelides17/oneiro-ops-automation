@@ -470,7 +470,9 @@ function WORow({ wo, flagged, qbConnected, onDocsChange, onChangeStatus, onDelet
   return (
     <tr className={`border-b border-slate-100 text-sm transition-colors
                     hover:bg-slate-50 ${flagged ? 'bg-amber-50/60' : ''}`}>
-      <td className="py-2.5 px-3 font-mono font-semibold whitespace-nowrap">
+      <td className={`py-2.5 px-3 font-mono font-semibold whitespace-nowrap
+                      sticky left-0 z-10 shadow-[1px_0_0_#f1f5f9]
+                      ${flagged ? 'bg-amber-50' : 'bg-white'}`}>
         <Link
           to={`/field-report?wo=${encodeURIComponent(wo.id)}`}
           className="text-navy hover:underline"
@@ -569,13 +571,20 @@ function TabStrip({ active, onChange }) {
   // combined SI + PL + CP pending count after the user has visited
   // the tab once (cold-start endpoint intentionally skips it).
   const badgeFor = (id) => id === 'doc_status' ? counts.doc_status_pending : null
+  // Single non-wrapping row that scrolls horizontally on narrow screens
+  // (keeps the underline border intact) and sticks just under the app
+  // header (h-14 / z-50) so tab context survives a long scroll.
   return (
-    <div className="flex items-center gap-1 border-b border-slate-200">
+    <div className="flex items-center gap-1 border-b border-slate-200
+                    overflow-x-auto overscroll-x-contain [-webkit-overflow-scrolling:touch]
+                    [scrollbar-width:none] [&::-webkit-scrollbar]:hidden
+                    sticky top-14 z-30 bg-slate-50">
       {TABS.map(t => (
         <button
           key={t.id}
           onClick={() => onChange(t.id)}
           className={`text-sm font-semibold px-4 py-2 -mb-px border-b-2 transition-colors
+            whitespace-nowrap shrink-0
             ${active === t.id
               ? 'border-navy text-navy'
               : 'border-transparent text-slate-500 hover:text-slate-700'
@@ -844,7 +853,9 @@ export default function Dashboard() {
     <div className="max-w-6xl mx-auto px-4 py-6 space-y-6">
 
       {/* ── Page header ──────────────────────────────── */}
-      <div className="flex items-center justify-between">
+      {/* Stacks title above the action buttons on phones; single row on
+          sm+. The action row wraps so the buttons never overflow. */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-black text-navy leading-none">
             {activeTab === 'revenue'    ? 'Revenue Dashboard'
@@ -859,7 +870,7 @@ export default function Dashboard() {
             </p>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <ToolsMenu />
           <button
             onClick={() => setShowDownloadModal(true)}
@@ -1102,7 +1113,7 @@ function OperationsTabContent({
             placeholder="Search WO #, location, or contractor…"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="field-input max-w-sm text-sm"
+            className="field-input max-w-sm"
           />
 
           {/* Filters */}
@@ -1141,16 +1152,20 @@ function OperationsTabContent({
         {/* QB disconnected banner — silent when connected */}
         <QBStatusBadge status={qbStatus} />
 
-        {/* Table — horizontally scrollable on mobile */}
-        <div className="overflow-x-auto">
+        {/* Table — horizontally scrollable on mobile. overscroll-x-contain
+            stops a sideways pan from dragging the whole page (the two-axis
+            touch conflict); the WO# column is pinned so the row stays
+            identifiable while the rest scrolls under it. */}
+        <div className="overflow-x-auto overscroll-x-contain [-webkit-overflow-scrolling:touch]">
           <table className="w-full min-w-[820px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
                 {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Invoice', 'Drive', ''].map((h, i) => (
                   <th
                     key={h || `col-${i}`}
-                    className="py-2.5 px-3 text-left text-[10px] font-extrabold
-                               uppercase tracking-wider text-slate-400"
+                    className={`py-2.5 px-3 text-left text-[10px] font-extrabold
+                               uppercase tracking-wider text-slate-400
+                               ${i === 0 ? 'sticky left-0 z-10 bg-slate-50' : ''}`}
                   >
                     {h}
                   </th>

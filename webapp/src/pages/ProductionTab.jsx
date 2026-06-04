@@ -132,14 +132,14 @@ function RangePicker({ preset, onPresetChange, customStart, customEnd, onCustomC
             type="date"
             value={customStart}
             onChange={e => onCustomChange({ start: e.target.value, end: customEnd })}
-            className="field-input text-sm"
+            className="field-input"
           />
           <label className="text-xs font-semibold text-slate-500">End</label>
           <input
             type="date"
             value={customEnd}
             onChange={e => onCustomChange({ start: customStart, end: e.target.value })}
-            className="field-input text-sm"
+            className="field-input"
           />
         </div>
       )}
@@ -230,7 +230,7 @@ function ContractorTable({ rows }) {
       <div className="p-4 border-b border-slate-100">
         <p className="section-label">Production by Contractor</p>
       </div>
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto overscroll-x-contain">
         <table className="w-full min-w-[460px]">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50">
@@ -350,7 +350,7 @@ function TopWosTable({ topWos }) {
       <div className="p-4 border-b border-slate-100">
         <p className="section-label">Top WOs by Production</p>
       </div>
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto overscroll-x-contain">
         <table className="w-full min-w-[640px]">
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50">

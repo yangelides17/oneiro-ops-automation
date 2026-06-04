@@ -8,12 +8,20 @@ import EditCoordinatesModal from '../components/EditCoordinatesModal'
 const NYC_CENTER = { lat: 40.7128, lng: -74.0060 }
 const NYC_ZOOM   = 11
 
-const MAP_CONTAINER_STYLE = { width: '100%', height: '600px' }
+// Width is inline (the lib needs an explicit container), height is a
+// Tailwind class so it can shrink on phones — a fixed 600px map dominates
+// a small screen. 60vh leaves room to scroll the page past the map.
+const MAP_CONTAINER_STYLE = { width: '100%' }
+const MAP_HEIGHT_CLASS = 'w-full h-[60vh] sm:h-[600px]'
 const MAP_OPTIONS = {
   disableDefaultUI: false,
   streetViewControl: false,
   mapTypeControl: true,
   fullscreenControl: true,
+  // Cooperative: one-finger drag scrolls the PAGE, two fingers pan the
+  // map, pinch zooms. Without this the map swallows one-finger scroll on
+  // mobile and the user can't scroll past it.
+  gestureHandling: 'cooperative',
 }
 
 // Hex pin colors mirror StatusBadge palette so the legend the user
@@ -211,12 +219,13 @@ export default function NavTab() {
       {/* Map */}
       <div className="card overflow-hidden">
         {!isLoaded ? (
-          <div className="flex items-center justify-center" style={MAP_CONTAINER_STYLE}>
+          <div className={`flex items-center justify-center ${MAP_HEIGHT_CLASS}`}>
             <div className="w-9 h-9 border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
           </div>
         ) : (
           <GoogleMap
             mapContainerStyle={MAP_CONTAINER_STYLE}
+            mapContainerClassName={MAP_HEIGHT_CLASS}
             center={NYC_CENTER}
             zoom={NYC_ZOOM}
             options={MAP_OPTIONS}
@@ -281,7 +290,7 @@ export default function NavTab() {
                 <button
                   type="button"
                   onClick={() => setEditingWo(w)}
-                  className="btn-outline text-xs px-3 py-1"
+                  className="btn-outline text-xs px-3 py-1 w-full sm:w-auto"
                 >
                   Set Coordinates…
                 </button>

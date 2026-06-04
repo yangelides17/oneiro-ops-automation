@@ -2395,7 +2395,7 @@ function UpdateCompletedWOPanel({
           value={productionDate}
           onChange={e => setProductionDate(e.target.value)}
           disabled={!includeInProduction}
-          className="field-input text-sm py-1 px-2 max-w-[160px]"
+          className="field-input py-1 px-2 max-w-[160px]"
         />
       </label>
       <p className="text-[11px] text-slate-400 -mt-1.5 pl-6">
