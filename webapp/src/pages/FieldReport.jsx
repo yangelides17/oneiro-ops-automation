@@ -637,93 +637,31 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
         </p>
       )}
 
-      {/* Per-photo upload timing — visible on-screen so the user can
-          troubleshoot slow uploads without opening DevTools. Hidden
-          when there's nothing to show. */}
-      <PhotoTimingPanel items={queue.items} />
+      {/* Surfaces WHY any photo failed so the user isn't left guessing at
+          the "✕ N failed" badge. Each failed thumbnail also has its own
+          Retry button — this just makes the reason legible. */}
+      <PhotoErrorNotice items={queue.items} />
     </div>
   )
 }
 
-function PhotoTimingPanel({ items }) {
-  // Find the most relevant item to show:
-  //   1. an in-progress item with timing (live debug) — highest priority
-  //   2. otherwise the most recent error
-  //   3. otherwise the most recent uploaded item
-  const live = items.find(i => i.timing && i.status !== 'uploaded' && i.status !== 'error')
-  const err  = items.find(i => i.timing && i.status === 'error')
-  const done = items.find(i => i.timing && i.status === 'uploaded')
-  const target = live || err || done
-  if (!target) return null
-  return <PhotoTimingRow item={target} />
-}
-
-function PhotoTimingRow({ item }) {
-  // Tick every 500 ms while the item is in-progress so the "current
-  // step elapsed" line keeps updating without DevTools.
-  const [, setTick] = useState(0)
-  const inProgress = item.status !== 'uploaded' && item.status !== 'error'
-  useEffect(() => {
-    if (!inProgress) return
-    const id = setInterval(() => setTick(t => t + 1), 500)
-    return () => clearInterval(id)
-  }, [inProgress])
-
-  const t = item.timing || {}
-  const fmt = (ms) => ms == null ? '—' : `${ms} ms`
-  const totalElapsed = t.startedAt ? Date.now() - t.startedAt : (t.totalMs || 0)
-  const stepElapsed = (inProgress && t.currentStepStartedAt)
-    ? Date.now() - t.currentStepStartedAt
-    : null
-
-  const summary = item.status === 'uploaded'
-    ? `Last upload: ${(totalElapsed / 1000).toFixed(1)}s`
-    : item.status === 'error'
-      ? `Failed after ${(totalElapsed / 1000).toFixed(1)}s — ${item.error || 'unknown'}`
-      : `Stuck on: ${t.currentStep || item.status} · ${(stepElapsed / 1000).toFixed(1)}s in step · ${(totalElapsed / 1000).toFixed(1)}s total`
-
-  const summaryClass = item.status === 'uploaded'
-    ? 'text-slate-600'
-    : item.status === 'error'
-      ? 'text-red-700'
-      : 'text-amber-700'
-
+function PhotoErrorNotice({ items }) {
+  const failed = items.filter(i => i.status === 'error')
+  if (failed.length === 0) return null
+  // Collapse identical messages so three matching timeouts read as one.
+  const reasons = [...new Set(failed.map(i => i.error || 'Upload failed'))]
   return (
-    <details open={inProgress || item.status === 'error'}
-      className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2 py-1.5">
-      <summary className={`cursor-pointer font-semibold ${summaryClass}`}>
-        {summary}
-        {t.shipSizeKB != null && <span className="text-slate-400"> · {t.shipSizeKB} KB</span>}
-      </summary>
-      <div className="mt-1 space-y-0.5 font-mono">
-        <Step label="geocode (Apps Script)"    value={t.geocodeMs}     current={t.currentStep === 'geocode'}    stepElapsed={stepElapsed} />
-        <Step label="compress (library only)"  value={t.compressMs}    current={t.currentStep === 'compress'}   stepElapsed={stepElapsed} />
-        <Step label="watermark (canvas)"       value={t.watermarkMs}   current={t.currentStep === 'watermark'}  stepElapsed={stepElapsed} />
-        <Step label="IDB write"                value={t.dbWriteMs}     current={t.currentStep === 'idb-write'}  stepElapsed={stepElapsed} />
-        <Step label="upload (round-trip)"      value={t.uploadMs}      current={t.currentStep === 'upload'}     stepElapsed={stepElapsed} />
-        {t.serverMs != null && <div className="ml-3 text-slate-400">  ↳ server total: {fmt(t.serverMs)}</div>}
-        {t.appsScriptMs != null && <div className="ml-3 text-slate-400">  ↳ Apps Script: {fmt(t.appsScriptMs)}</div>}
-        <Step label="IDB delete"               value={t.dbDeleteMs}    current={t.currentStep === 'idb-delete'} stepElapsed={stepElapsed} />
-        <div className="text-slate-400 pt-1">
-          total kick → now: {(totalElapsed / 1000).toFixed(1)}s
-        </div>
-      </div>
-    </details>
+    <div className="text-[11px] text-red-700 bg-red-50 border border-red-200
+                    rounded-lg px-2.5 py-2 space-y-0.5">
+      <p className="font-semibold">
+        {failed.length} photo{failed.length === 1 ? '' : 's'} failed to upload to Drive
+      </p>
+      {reasons.map((r, i) => <p key={i} className="text-red-600">• {r}</p>)}
+      <p className="text-red-500/80">
+        Tap <span className="font-semibold">Retry</span> on the photo, or remove it and take it again.
+      </p>
+    </div>
   )
-}
-
-function Step({ label, value, current, stepElapsed }) {
-  if (current) {
-    return (
-      <div className="text-amber-700 font-semibold">
-        {label}: running… {stepElapsed != null ? `${(stepElapsed / 1000).toFixed(1)}s` : ''}
-      </div>
-    )
-  }
-  if (value != null) {
-    return <div>{label}: {value} ms</div>
-  }
-  return <div className="text-slate-300">{label}: —</div>
 }
 
 function PhotoThumb({ item, onDelete, onRetry, onOpen }) {

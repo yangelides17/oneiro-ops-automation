@@ -234,21 +234,15 @@ export function usePhotoUploadQueue(woId) {
         console.log('[photo] kick: itemsRef stale, using initial fallback for', initial.id)
       }
       const tStart = performance.now()
-      // Live-update timing on the item so the panel can render the
-      // breakdown step-by-step, not just at completion. Without this
-      // a stuck upload shows nothing useful in the UI until it times
-      // out — defeating the whole point of having timing instrumentation.
-      const timing = { startedAt: Date.now() }
+      // Per-step timing, surfaced only in the console (DevTools / Railway
+      // logs) — there is no on-screen panel. Kept because "where did the
+      // upload spend its time" is the first question when a photo is slow.
+      const timing = {}
       const stampStep = (key, ms, extra) => {
         timing[key] = Math.round(ms)
-        timing.currentStep = null
         if (extra) Object.assign(timing, extra)
-        patch(item.id, { timing: { ...timing } })
       }
       const beginStep = (label) => {
-        timing.currentStep = label
-        timing.currentStepStartedAt = Date.now()
-        patch(item.id, { timing: { ...timing } })
         console.log(`[photo] → ${label} (t+${Math.round(performance.now() - tStart)}ms)`)
       }
       // Track the blob locally — Phase B must NOT re-read from itemsRef
@@ -312,7 +306,7 @@ export function usePhotoUploadQueue(woId) {
         stampStep('dbWriteMs', performance.now() - tDb)
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
         const previewUrl = URL.createObjectURL(watermarked)
-        patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true, timing: { ...timing } })
+        patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true })
       } else if (item.source === 'library') {
         // Library imports — no watermark, still need to compress before
         // upload (camera-roll JPEGs are 3-5 MB raw) and land in
@@ -359,13 +353,11 @@ export function usePhotoUploadQueue(woId) {
       await pendingPhotosDB.delete(item.id).catch(() => {})
       stampStep('dbDeleteMs', performance.now() - tDelete)
       timing.totalMs = Math.round(performance.now() - tStart)
-      timing.currentStep = null
       console.log('[photo] pipeline complete', timing)
       patch(item.id, {
         status:         'uploaded',
         drive_file_id:  res.file_id,
         drive_file_url: res.file_url,
-        timing,
       })
     } catch (err) {
       patch(initial.id, { status: 'error', error: err?.message || 'Upload failed' })
