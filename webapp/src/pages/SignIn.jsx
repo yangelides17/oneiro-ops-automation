@@ -81,6 +81,13 @@ const prettyQueueDate = (iso) => {
   })
 }
 
+// Numerical MM/DD/YY (zero-padded) — the format the crew writes on the
+// sign-in sheet, so they don't have to convert the written date by hand.
+const numericDate = (iso) => {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
+  return m ? `${m[2]}/${m[3]}/${m[1].slice(2)}` : ''
+}
+
 // ── Field wrapper (same pattern as FieldReport) ────────────────
 function Field({ label, required, hint, children }) {
   return (
@@ -904,6 +911,7 @@ export default function SignIn() {
                     <>
                       <p className={`font-semibold ${draft.shiftDateEdited ? 'text-orange-600' : 'text-slate-400'}`}>
                         {prettyQueueDate(effectiveDate)}
+                        {numericDate(effectiveDate) && ` (${numericDate(effectiveDate)})`}
                       </p>
                       <p className="text-[11px] text-slate-400">
                         {draft.shiftDateEdited
