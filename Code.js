@@ -4768,15 +4768,18 @@ function handleListSignInQueue_(body) {
       : { contract_id: '', project_name: '' };
   };
 
-  // Contractor Contacts → the prime contractor's address for the sign-in
-  // header (col 0 = Contractor name, col 5 = Address). Read once into a
-  // map; mirrors the lookup the sign-in PDF builder uses.
+  // Contractor Contacts → the prime contractor's Contact Name (col 1) and
+  // Address (col 5) for the sign-in header, keyed by Contractor (col 0).
+  // Read once into a map; mirrors the lookup the sign-in PDF builder uses.
   const ccSheet = ss.getSheetByName('Contractor Contacts');
-  const ccAddr  = {};
+  const ccByContractor = {};
   if (ccSheet) {
     ccSheet.getDataRange().getValues().forEach(r => {
       const name = String(r[0] || '').trim();
-      if (name) ccAddr[name] = String(r[5] || '').trim();
+      if (name) ccByContractor[name] = {
+        contact: String(r[1] || '').trim(),
+        address: String(r[5] || '').trim(),
+      };
     });
   }
 
@@ -4832,9 +4835,12 @@ function handleListSignInQueue_(body) {
         borough:              borough,
         bill_contract_number: billed.contractNum,
         bill_borough:         billed.borough,
-        contractor:           contractor,          // sign-in "Prime Contractor"
+        contractor:           contractor,          // raw WO-Tracker contractor (logic/remap)
+        // "Prime Contractor" on the sign-in sheet = the Contact Name from
+        // Contractor Contacts (col 1); fall back to the contractor company.
+        prime_contractor:     (ccByContractor[contractor] && ccByContractor[contractor].contact) || '',
         subcontractor:        CONFIG.EMPLOYER.name, // always Oneiro
-        address:              ccAddr[contractor] || '', // prime contractor's address
+        address:              (ccByContractor[contractor] && ccByContractor[contractor].address) || '',
         crew_chief:           crewChief,
         contract_id:          lookup.contract_id,
         project_name:         lookup.project_name,
@@ -5112,14 +5118,19 @@ function handleSubmitSignIn_(body) {
         return r ? String(r[5] || '') : '';
       });
 
-      // Look up address from Contractor Contacts (col 5 = Address).
+      // Look up the Contact Name (col 1) + Address (col 5) from Contractor
+      // Contacts. The sign-in "Prime Contractor" field is the Contact Name.
       let primeAddress = '';
+      let primeContact = '';
       try {
         const ccSheet = ss.getSheetByName('Contractor Contacts');
         if (ccSheet) {
           const ccData = ccSheet.getDataRange().getValues();
           const ccRow  = ccData.find(r => String(r[0] || '').trim() === String(d.contractor || '').trim());
-          if (ccRow) primeAddress = String(ccRow[5] || '').trim();
+          if (ccRow) {
+            primeContact = String(ccRow[1] || '').trim();
+            primeAddress = String(ccRow[5] || '').trim();
+          }
         }
       } catch (err) {
         Logger.log(`⚠️ Contractor Contacts lookup failed: ${err}`);
@@ -5159,7 +5170,7 @@ function handleSubmitSignIn_(body) {
       const payload = {
         _type:              'signin',
         date:               dateFmt(effectiveDate),
-        prime_contractor:   String(d.contractor || ''),
+        prime_contractor:   primeContact || String(d.contractor || ''),
         subcontractor:      CONFIG.EMPLOYER.name,
         contract_number:    contractLabel,
         address:            primeAddress,

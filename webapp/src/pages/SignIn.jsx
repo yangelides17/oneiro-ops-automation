@@ -918,37 +918,28 @@ export default function SignIn() {
                   <p className="font-semibold text-navy">
                     {selected.bill_contract_number || selected.contract_number} · {selected.bill_borough || selected.borough}
                   </p>
-                  {selected.contract_id && (
-                    <p className="text-[11px] text-slate-400">{selected.contract_id}</p>
-                  )}
                 </div>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <span className="field-label">Prime Contractor</span>
-                  <p className="text-sm text-slate-700">{selected.contractor || '—'}</p>
+                  <p className="text-sm font-semibold text-navy">{selected.prime_contractor || selected.contractor || '—'}</p>
                 </div>
                 <div>
                   <span className="field-label">Subcontractor</span>
-                  <p className="text-sm text-slate-700">{selected.subcontractor || '—'}</p>
+                  <p className="text-sm font-semibold text-navy">{selected.subcontractor || '—'}</p>
                 </div>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <span className="field-label">Address</span>
-                  <p className="text-sm text-slate-700">{selected.address || '—'}</p>
+                  <p className="text-sm font-semibold text-navy">{selected.address || '—'}</p>
                 </div>
                 <div>
                   <span className="field-label">Agency</span>
-                  <p className="text-sm text-slate-700">DOT</p>
+                  <p className="text-sm font-semibold text-navy">DOT</p>
                 </div>
               </div>
-              {selected.project_name && (
-                <div>
-                  <span className="field-label">Project</span>
-                  <p className="text-sm text-slate-700">{selected.project_name}</p>
-                </div>
-              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <span className="field-label">Work Orders ({selected.wos.length})</span>
