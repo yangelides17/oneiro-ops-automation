@@ -21,7 +21,7 @@ Input schema (from Apps Script generateSignInJson_):
       "subcontractor":      "Oneiro Collection LLC",
       "contract_number":    "84122MBTP496 - Brooklyn",   # borough appended
       "address":            "54-35 48th St, Maspeth NY 11378",
-      "agency":             "NYCDOT",
+      "agency":             "DOT",
       "project_name":       "PT-11930 | Atlantic Ave",
       "crew": [
         {
@@ -452,7 +452,7 @@ if __name__ == '__main__':
         'subcontractor':     'Oneiro Collection LLC',
         'contract_number':   '84122MBTP496 - Brooklyn',
         'address':           '54-35 48th St, Maspeth NY 11378',
-        'agency':            'NYCDOT',
+        'agency':            'DOT',
         'project_name':      'PT-11930 | Atlantic Ave',
         'contractor_name':   'Stamati Angelides',
         'contractor_title':  'Crew Leader',

@@ -4768,6 +4768,18 @@ function handleListSignInQueue_(body) {
       : { contract_id: '', project_name: '' };
   };
 
+  // Contractor Contacts → the prime contractor's address for the sign-in
+  // header (col 0 = Contractor name, col 5 = Address). Read once into a
+  // map; mirrors the lookup the sign-in PDF builder uses.
+  const ccSheet = ss.getSheetByName('Contractor Contacts');
+  const ccAddr  = {};
+  if (ccSheet) {
+    ccSheet.getDataRange().getValues().forEach(r => {
+      const name = String(r[0] || '').trim();
+      if (name) ccAddr[name] = String(r[5] || '').trim();
+    });
+  }
+
   // ISO-format a Sheet date cell (Date object | string) to YYYY-MM-DD
   // in the local timezone — same logic the rest of the app uses to
   // avoid UTC-shift drift.
@@ -4820,7 +4832,9 @@ function handleListSignInQueue_(body) {
         borough:              borough,
         bill_contract_number: billed.contractNum,
         bill_borough:         billed.borough,
-        contractor:           contractor,
+        contractor:           contractor,          // sign-in "Prime Contractor"
+        subcontractor:        CONFIG.EMPLOYER.name, // always Oneiro
+        address:              ccAddr[contractor] || '', // prime contractor's address
         crew_chief:           crewChief,
         contract_id:          lookup.contract_id,
         project_name:         lookup.project_name,
@@ -5149,7 +5163,7 @@ function handleSubmitSignIn_(body) {
         subcontractor:      CONFIG.EMPLOYER.name,
         contract_number:    contractLabel,
         address:            primeAddress,
-        agency:             'NYCDOT',
+        agency:             'DOT',
         project_name:       projectName,
         crew_chief:         crewChief,
         wo_ids:             woListNorm,

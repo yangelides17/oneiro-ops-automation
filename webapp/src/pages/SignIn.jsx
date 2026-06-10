@@ -877,10 +877,10 @@ export default function SignIn() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                 <div>
                   <div className="flex items-start justify-between">
-                    <span className="field-label">Shift Start Date</span>
+                    <span className="field-label">Shift Date</span>
                     {!dateEditMode && (
                       <RowKebab items={[{
-                        label: 'Edit shift start date',
+                        label: 'Edit shift date',
                         onClick: () => setEditDateModal(true),
                       }]} />
                     )}
@@ -923,9 +923,25 @@ export default function SignIn() {
                   )}
                 </div>
               </div>
-              <div>
-                <span className="field-label">Contractor</span>
-                <p className="text-sm text-slate-700">{selected.contractor || '—'}</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <span className="field-label">Prime Contractor</span>
+                  <p className="text-sm text-slate-700">{selected.contractor || '—'}</p>
+                </div>
+                <div>
+                  <span className="field-label">Subcontractor</span>
+                  <p className="text-sm text-slate-700">{selected.subcontractor || '—'}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <span className="field-label">Address</span>
+                  <p className="text-sm text-slate-700">{selected.address || '—'}</p>
+                </div>
+                <div>
+                  <span className="field-label">Agency</span>
+                  <p className="text-sm text-slate-700">DOT</p>
+                </div>
               </div>
               {selected.project_name && (
                 <div>
@@ -941,7 +957,7 @@ export default function SignIn() {
                       <li key={w.id} className="flex gap-2">
                         <span className="font-mono font-semibold">{w.id}</span>
                         {w.location && (
-                          <span className="text-slate-500">— {w.location}</span>
+                          <span className="text-slate-500">| {w.location}</span>
                         )}
                       </li>
                     ))}
