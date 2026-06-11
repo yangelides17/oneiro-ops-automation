@@ -1640,9 +1640,10 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       const PER_WO = { CFR: 1, Invoice: 1 }
       // SI Sent isn't tracked (Sign-Ins ride out with the CP, CP Sent
       // implies SI Sent) so it's omitted here.
-      // PL is keyed per-(date, contractor) — one row per file regardless
-      // of how many contracts the PL covers.
-      // CP is keyed per-(weekstart, contract, borough).
+      // PL is keyed per-(date, contractor, crew_chief) — multi-crew shifts
+      // get one row per chief. CP is per-(weekstart, contract, borough).
+      // We use the listing's precomputed f.doc_id so the per-crew suffix
+      // is honored rather than reconstructing a chief-less id here.
 
       const perWoUpdates = []
       const perDocUpdates = []
@@ -1664,20 +1665,27 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           })
           return
         }
-        const anchor = String(f.work_date || '').trim()
-        if (!anchor) return
-        let docId = ''
-        if (f.doc_type === 'Production Log') {
-          const contractor = slug(f.contractor)
-          if (!contractor) return
-          docId = `PL_${anchor}_${contractor}`
-        } else if (f.doc_type === 'Certified Payroll') {
-          const cn = String(f.contract_num || '').split('/')[0].trim()
-          const borough = String(f.borough || '').trim()
-          if (!cn || !borough) return
-          docId = `CP_${anchor}_${cn}_${borough}`
-        } else {
-          return  // SI / Photo / unsupported types
+        // Only PL + CP carry a tracked Sent flag (SI rides out with the CP).
+        if (f.doc_type !== 'Production Log' && f.doc_type !== 'Certified Payroll') return
+        // Prefer the lifecycle doc_id the listing handler computed — for
+        // multi-crew PLs it already includes the per-crew `_chief-<slug>`
+        // suffix, so each crew's PL flips its OWN row instead of colliding
+        // on a chief-less id (which left them perpetually "unsent" and
+        // re-downloaded). Fall back to reconstruction only if it's absent.
+        let docId = String(f.doc_id || '').trim()
+        if (!docId) {
+          const anchor = String(f.work_date || '').trim()
+          if (!anchor) return
+          if (f.doc_type === 'Production Log') {
+            const contractor = slug(f.contractor)
+            if (!contractor) return
+            docId = `PL_${anchor}_${contractor}`
+          } else {
+            const cn = String(f.contract_num || '').split('/')[0].trim()
+            const borough = String(f.borough || '').trim()
+            if (!cn || !borough) return
+            docId = `CP_${anchor}_${cn}_${borough}`
+          }
         }
         if (seenDoc.has(docId)) return
         seenDoc.add(docId)

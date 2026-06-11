@@ -11038,11 +11038,18 @@ function handleListDocumentsForBatch_(body) {
   // legacy per-WO Done/Sent columns on the WO Tracker for those types
   // are no longer maintained, so we look up done/sent by Doc ID here.
   const docLog = _readDocLifecycle_(ss);
-  const docStateForMaster = (docType, anchorIso, contractNum, borough, contractor) => {
-    // PL is keyed by (date, contractor); SI/CP keyed by (date, contract, borough).
+  const docStateForMaster = (docType, anchorIso, contractNum, borough, contractor, crewChief) => {
+    // PL keyed by (date, contractor, crew_chief); SI keyed by
+    // (date, contract, borough, crew_chief); CP by (week, contract, borough).
+    // Multi-crew PL/SI files carry a `_chief-<slug>` suffix in their name and
+    // their lifecycle row is keyed per crew — so the chief MUST be included
+    // or the lookup misses and the file is wrongly treated as not-done /
+    // not-sent (skipped on unsent, or re-downloaded because never marked sent).
     const id = (docType === 'Production Log')
-      ? _plDocId_(anchorIso, contractor)
-      : _docLifecycleId_(docType, anchorIso, contractNum, borough);
+      ? _plDocId_(anchorIso, contractor, crewChief)
+      : (docType === 'Sign-In')
+        ? _docLifecycleId_('Sign-In', anchorIso, contractNum, borough, crewChief)
+        : _docLifecycleId_(docType, anchorIso, contractNum, borough);
     const row = docLog.byId[id];
     if (!row) return { done: false, sent: false, doc_id: id };
     return { done: !!row.done, sent: !!row.sent, doc_id: id };
@@ -11155,6 +11162,11 @@ function handleListDocumentsForBatch_(body) {
   const files = [];
   const missing = [];
   const seenFileIds = new Set();
+  // Master docs (PL/SI/CP) are also deduped by their lifecycle doc_id: a PL
+  // that covers WOs across multiple (contract, borough) groups is copied into
+  // EACH group's master "Production Logs" folder, so the same logical PL is
+  // otherwise encountered once per group → duplicate downloads.
+  const seenMasterDocIds = new Set();
   const pushFile = (f) => {
     if (seenFileIds.has(f.file_id)) return;
     seenFileIds.add(f.file_id);
@@ -11380,7 +11392,16 @@ function handleListDocumentsForBatch_(body) {
         // Look up doc state in the Log. Anchor for PL/SI is the file's
         // shift date; for CP it's the week-start (which is what's
         // already in the filename).
-        const logState = docStateForMaster(docType, fileDate, contractNum, borough, contractor);
+        // Multi-crew PL/SI files carry a `_chief-<slug>` suffix and their
+        // lifecycle row is keyed per crew — pull the chief out of the
+        // filename so the state lookup (and mark-sent) hit the right row.
+        // CP filenames never carry a chief.
+        let fileChief = '';
+        if (docType === 'Production Log' || docType === 'Sign-In') {
+          const cm = name.match(/_chief-([A-Za-z0-9]+)/);
+          fileChief = cm ? cm[1] : '';
+        }
+        const logState = docStateForMaster(docType, fileDate, contractNum, borough, contractor, fileChief);
 
         // unsent mode: include only if Done=Yes and Sent=No (or for
         // SI, Done=Yes — SI Sent isn't tracked, so missing == done false).
@@ -11390,6 +11411,13 @@ function handleListDocumentsForBatch_(body) {
           // SI has no separate Sent state — once Done it never becomes
           // "unsent." Keep including SI rows so they show up in batches.
         }
+
+        // Collapse the same logical doc encountered once per (contract,
+        // borough) group — a PL spans contracts so it's copied into each
+        // group's master folder, and repeated archives can leave extra
+        // same-identity copies. One zip entry + one mark-sent per doc_id.
+        if (seenMasterDocIds.has(logState.doc_id)) continue;
+        seenMasterDocIds.add(logState.doc_id);
 
         const allSent = !!logState.sent;
 
@@ -11404,6 +11432,7 @@ function handleListDocumentsForBatch_(body) {
           doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
           wo_ids:       coveredWoIds,
           work_date:    fileDate,
+          doc_id:       logState.doc_id,
           done:         true,
           sent:         allSent,
         });
