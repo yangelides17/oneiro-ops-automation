@@ -6328,6 +6328,20 @@ function _validateSignInDoneForDay_(ss, dateIso, contractNum, borough) {
 }
 
 /**
+ * Sign-In lifecycle rows are keyed per crew chief (…_chief-<name>); a
+ * blank chief omits the suffix (legacy single-crew rows). Returns true
+ * iff THIS crew's Sign-In row for the tuple is marked Done. The CP/PL
+ * gates must check per crew, not one no-chief id per date — otherwise a
+ * sheet submitted by a named crew chief is never found and generation is
+ * wrongly blocked.
+ */
+function _signInRowDone_(byId, dateIso, contractNum, borough, crewChief) {
+  const id  = _docLifecycleId_('Sign-In', dateIso, contractNum, borough, crewChief);
+  const row = byId[id];
+  return !!(row && row.done);
+}
+
+/**
  * Validate that every Sign-In sheet for a (week, contract, borough) is Done.
  * Walks Work Day Log to find every (date) within [weekStart, weekStart+6]
  * that worked for this contract+borough, then checks each one's SI row.
@@ -6355,7 +6369,10 @@ function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
     const end = new Date(y, m - 1, d + 6);
     return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
   })();
-  const workedDates = new Set();
+  // Collect every (date, crew chief) that worked this contract+borough in
+  // the week. Sign-In rows are keyed per crew chief, so each crew's sheet
+  // is validated — not one no-chief id per date.
+  const workedCrews = new Map();   // `${date}|${chief}` → { date, chief }
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     const dateIso = ymd(r[0]);
@@ -6363,9 +6380,10 @@ function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
     const cn = String(r[3] || '').split('/')[0].trim();
     if (cn !== contractNum) continue;
     if (String(r[4] || '').trim() !== borough) continue;
-    workedDates.add(dateIso);
+    const chief = String(r[7] || '').trim();
+    workedCrews.set(dateIso + '|' + chief, { date: dateIso, chief });
   }
-  if (workedDates.size === 0) {
+  if (workedCrews.size === 0) {
     return {
       ok: false,
       error_code: 'NO_WORK',
@@ -6375,11 +6393,13 @@ function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
   }
   const { byId } = _readDocLifecycle_(ss);
   const missing = [];
-  Array.from(workedDates).sort().forEach(dateIso => {
-    const siId = _docLifecycleId_('Sign-In', dateIso, contractNum, borough);
-    const row = byId[siId];
-    if (!row || !row.done) missing.push(dateIso);
-  });
+  Array.from(workedCrews.values())
+    .sort((a, b) => (a.date + '|' + a.chief).localeCompare(b.date + '|' + b.chief))
+    .forEach(({ date, chief }) => {
+      if (!_signInRowDone_(byId, date, contractNum, borough, chief)) {
+        missing.push(chief ? date + ' (' + chief + ')' : date);
+      }
+    });
   if (missing.length === 0) return { ok: true };
   return {
     ok: false,
@@ -7411,6 +7431,7 @@ function _validateAllSIsDoneForContractorDay_(ss, contractor, dateIso) {
     return mm ? mm[1] : '';
   };
   const tupleSet = new Set();
+  const crews    = new Map();   // `${cn}|${bor}|${chief}` → { cn, bor, chief }
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     if (ymd(r[0]) !== dateIso) continue;
@@ -7418,7 +7439,9 @@ function _validateAllSIsDoneForContractorDay_(ss, contractor, dateIso) {
     const cn  = String(r[3] || '').split('/')[0].trim();
     const bor = String(r[4] || '').trim();
     if (!cn || !bor) continue;
+    const chief = String(r[7] || '').trim();
     tupleSet.add(cn + '|' + bor);
+    crews.set(cn + '|' + bor + '|' + chief, { cn, bor, chief });
   }
   if (tupleSet.size === 0) {
     return {
@@ -7433,10 +7456,10 @@ function _validateAllSIsDoneForContractorDay_(ss, contractor, dateIso) {
   });
   const { byId } = _readDocLifecycle_(ss);
   const missing = [];
-  tuples.forEach(t => {
-    const siId = _docLifecycleId_('Sign-In', dateIso, t.contractNum, t.borough);
-    const row = byId[siId];
-    if (!row || !row.done) missing.push(t.contractNum + ' · ' + t.borough);
+  Array.from(crews.values()).forEach(({ cn, bor, chief }) => {
+    if (!_signInRowDone_(byId, dateIso, cn, bor, chief)) {
+      missing.push(cn + ' · ' + bor + (chief ? ' (' + chief + ')' : ''));
+    }
   });
   if (missing.length === 0) return { ok: true, tuples };
   return {
@@ -7474,8 +7497,9 @@ function _validateAllPLEligibleForDay_(ss, dateIso) {
     const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
     return mm ? mm[1] : '';
   };
-  // contractor → Set of "cn|bor"
-  const tuplesByContractor = {};
+  // contractor → Map `${cn}|${bor}|${chief}` → { cn, bor, chief }. Sign-In
+  // rows are keyed per crew chief, so collect the chief dimension too.
+  const crewsByContractor = {};
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     if (ymd(r[0]) !== dateIso) continue;
@@ -7484,22 +7508,22 @@ function _validateAllPLEligibleForDay_(ss, dateIso) {
     const cn  = String(r[3] || '').split('/')[0].trim();
     const bor = String(r[4] || '').trim();
     if (!cn || !bor) continue;
-    if (!tuplesByContractor[contractor]) tuplesByContractor[contractor] = new Set();
-    tuplesByContractor[contractor].add(cn + '|' + bor);
+    const chief = String(r[7] || '').trim();
+    if (!crewsByContractor[contractor]) crewsByContractor[contractor] = new Map();
+    crewsByContractor[contractor].set(cn + '|' + bor + '|' + chief, { cn, bor, chief });
   }
-  if (Object.keys(tuplesByContractor).length === 0) {
+  if (Object.keys(crewsByContractor).length === 0) {
     // No PL-eligible contractor worked this day — nothing to validate.
     return { ok: true, missing: [] };
   }
 
   const { byId } = _readDocLifecycle_(ss);
   const missing = [];
-  Object.keys(tuplesByContractor).forEach(contractor => {
-    Array.from(tuplesByContractor[contractor]).forEach(t => {
-      const [cn, bor] = t.split('|');
-      const siId = _docLifecycleId_('Sign-In', dateIso, cn, bor);
-      const row = byId[siId];
-      if (!row || !row.done) missing.push(contractor + ' · ' + cn + ' · ' + bor);
+  Object.keys(crewsByContractor).forEach(contractor => {
+    Array.from(crewsByContractor[contractor].values()).forEach(({ cn, bor, chief }) => {
+      if (!_signInRowDone_(byId, dateIso, cn, bor, chief)) {
+        missing.push(contractor + ' · ' + cn + ' · ' + bor + (chief ? ' (' + chief + ')' : ''));
+      }
     });
   });
   if (missing.length === 0) return { ok: true, missing: [] };
@@ -7537,8 +7561,9 @@ function _validateAllCPForWeek_(ss, weekStartIso) {
     const end = new Date(y, m - 1, dd + 6);
     return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
   })();
-  // (cn|bor) → Set of dateIso
-  const tupleDates = {};
+  // (cn|bor) → Map `${date}|${chief}` → { date, chief }. Sign-In rows are
+  // keyed per crew chief, so collect the chief dimension too.
+  const tupleCrews = {};
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     const dateIso = ymd(r[0]);
@@ -7546,23 +7571,26 @@ function _validateAllCPForWeek_(ss, weekStartIso) {
     const cn  = String(r[3] || '').split('/')[0].trim();
     const bor = String(r[4] || '').trim();
     if (!cn || !bor) continue;
+    const chief = String(r[7] || '').trim();
     const k = cn + '|' + bor;
-    if (!tupleDates[k]) tupleDates[k] = new Set();
-    tupleDates[k].add(dateIso);
+    if (!tupleCrews[k]) tupleCrews[k] = new Map();
+    tupleCrews[k].set(dateIso + '|' + chief, { date: dateIso, chief });
   }
-  if (Object.keys(tupleDates).length === 0) {
+  if (Object.keys(tupleCrews).length === 0) {
     // No work this week — nothing to validate, generation will simply produce 0.
     return { ok: true, missing: [] };
   }
   const { byId } = _readDocLifecycle_(ss);
   const missing = [];
-  Object.keys(tupleDates).forEach(k => {
+  Object.keys(tupleCrews).forEach(k => {
     const [cn, bor] = k.split('|');
-    Array.from(tupleDates[k]).sort().forEach(dateIso => {
-      const siId = _docLifecycleId_('Sign-In', dateIso, cn, bor);
-      const row = byId[siId];
-      if (!row || !row.done) missing.push(cn + ' · ' + bor + ' · ' + dateIso);
-    });
+    Array.from(tupleCrews[k].values())
+      .sort((a, b) => (a.date + '|' + a.chief).localeCompare(b.date + '|' + b.chief))
+      .forEach(({ date, chief }) => {
+        if (!_signInRowDone_(byId, date, cn, bor, chief)) {
+          missing.push(cn + ' · ' + bor + ' · ' + (chief ? date + ' (' + chief + ')' : date));
+        }
+      });
   });
   if (missing.length === 0) return { ok: true, missing: [] };
   return {
