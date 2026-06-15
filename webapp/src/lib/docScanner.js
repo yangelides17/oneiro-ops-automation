@@ -158,16 +158,18 @@ async function prefetchWithProgress(url) {
   if (!res.ok || !res.body) throw new Error(`prefetch HTTP ${res.status}`)
   const reader = res.body.getReader()
   let loaded = 0
+  let lastRatio = -1
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
     loaded += value.length
-    setProgress({
-      phase: 'downloading',
-      loaded,
-      ratio: Math.min(loaded / EST_OPENCV_BYTES, 0.99),
-      indeterminate: false,
-    })
+    // Throttle to ~2% steps so we don't fire a React re-render per chunk
+    // (a 9 MB file streams in hundreds of chunks).
+    const ratio = Math.min(loaded / EST_OPENCV_BYTES, 0.99)
+    if (ratio - lastRatio >= 0.02) {
+      lastRatio = ratio
+      setProgress({ phase: 'downloading', loaded, ratio, indeterminate: false })
+    }
   }
   log('prefetch complete:', (loaded / 1e6).toFixed(1), 'MB')
 }
@@ -213,7 +215,14 @@ function waitForCvReady(timeoutMs = 45000) {
       if (cv && typeof cv.Mat === 'function') {
         settled = true
         log('cv READY (cv.Mat present)', { elapsedMs: Date.now() - start })
-        return resolve(cv)
+        // CRITICAL: resolve with `true`, NOT `cv`. `cv` is a thenable, and
+        // resolving a Promise with a thenable makes the engine recursively
+        // "assimilate" it by calling cv.then(...) — OpenCV's then() hands
+        // back the module (still a thenable) → infinite unwrap loop that
+        // pegs the main thread and freezes the whole page. Callers read
+        // the runtime via window.cv, so the resolved value is irrelevant.
+        resolve(true)
+        return
       }
       tryHooks()
       const elapsed = Date.now() - start
