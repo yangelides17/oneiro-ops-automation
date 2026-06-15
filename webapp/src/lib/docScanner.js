@@ -119,18 +119,32 @@ async function prefetchWithProgress(url) {
   log('prefetch complete:', (loaded / 1e6).toFixed(1), 'MB')
 }
 
-// OpenCV.js signals readiness differently across builds. Polling for a
-// real class (cv.Mat) is the one universally reliable check.
+// Wait for the OpenCV runtime to be usable. OpenCV.js exposes `cv` in a
+// build-dependent way: sometimes a ready namespace, sometimes a THENABLE
+// (`await cv`) whose `.then()` is NOT a real Promise (no `.catch`). So we
+// never chain `.catch` on it — we kick the thenable once (single-arg
+// `.then`, assigning the resolved namespace back to window.cv) and
+// otherwise poll for a real class (`cv.Mat`), which is the one
+// universally reliable readiness signal.
 function waitForCvReady(timeoutMs = 90000) {
   return new Promise((resolve, reject) => {
     const start = Date.now()
+    let kicked = false
     const tick = () => {
       const cv = window.cv
       if (cv && typeof cv.Mat === 'function') { log('cv runtime ready'); return resolve(cv) }
-      if (cv && cv.then) { cv.then(c => { window.cv = c; log('cv ready (promise)'); resolve(c) }).catch(reject); return }
+      if (cv && typeof cv.then === 'function' && !kicked) {
+        kicked = true
+        log('cv is a thenable — kicking runtime init')
+        try {
+          cv.then((c) => { if (c && typeof c.Mat === 'function') window.cv = c })
+        } catch (e) {
+          warn('cv.then kick threw (ignored):', e && e.message)
+        }
+      }
       if (Date.now() - start > timeoutMs) {
-        warn('cv init timed out; window.cv is', typeof cv)
-        return reject(new Error('OpenCV.js initialized but the runtime never became ready'))
+        warn('cv init timed out; window.cv is', typeof cv, cv && Object.keys(cv).slice(0, 5))
+        return reject(new Error('OpenCV.js loaded but the runtime never became ready'))
       }
       setTimeout(tick, 50)
     }
