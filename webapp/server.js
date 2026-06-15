@@ -2244,6 +2244,15 @@ app.post('/api/qb/invoice/:woId', async (req, res) => {
 // ── Static file serving (production only) ────────────────────
 if (process.env.NODE_ENV === 'production') {
   const distDir = path.join(__dirname, 'dist')
+
+  // Self-hosted scanner assets (OpenCV.js ~9 MB + jscanify). Cache hard
+  // so the crew downloads them once per device, not every scan — these
+  // are pinned versions, so bump the filename if the version changes.
+  app.use('/vendor', express.static(path.join(distDir, 'vendor'), {
+    immutable: true,
+    maxAge:    '365d',
+  }))
+
   app.use(express.static(distDir))
 
   // All non-API routes → serve index.html (client-side routing)

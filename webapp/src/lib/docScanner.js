@@ -14,11 +14,15 @@
 // fails, the caller can still fall back to the raw photo so a scan is
 // never blocked — it just won't be auto-cropped.
 
-// Pinned CDN builds (jscanify's own demo pins this OpenCV release). To
-// self-host for tighter cache control, drop these files under
-// webapp/public/vendor/ and point these constants at /vendor/... .
-const OPENCV_URL   = 'https://docs.opencv.org/4.7.0/opencv.js'
-const JSCANIFY_URL = 'https://cdn.jsdelivr.net/npm/jscanify@1.2.0/src/jscanify.min.js'
+// Self-hosted under webapp/public/vendor/ (served same-origin from our
+// own Railway app). We do NOT load these from a public CDN because
+// docs.opencv.org is blocked on some field networks (ERR_CONNECTION_CLOSED)
+// and doesn't send CORS headers. Same-origin means: no CORS, never
+// blocked by a third party, and a real byte-level download progress bar.
+// opencv.js is the 4.7.0 single-file build (wasm embedded as base64, so
+// no separate .wasm fetch); jscanify is v1.2.0.
+const OPENCV_URL   = '/vendor/opencv.js'
+const JSCANIFY_URL = '/vendor/jscanify.min.js'
 
 // Approx uncompressed size of opencv.js — used to render a rough but
 // honest progress bar. The streaming reader yields decompressed bytes,
