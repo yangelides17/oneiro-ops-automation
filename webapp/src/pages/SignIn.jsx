@@ -10,7 +10,6 @@ import ScanCapture  from '../components/ScanCapture'
 import { opDayFromIsoTime } from '../lib/dateOps'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 import { CLASSIFICATIONS, calcHours, splitStOt } from '../lib/signinShared'
-import { prefetchScanner } from '../lib/docScanner'
 
 // Mirror the Approvals page wiring — same pdf.js worker URL, version
 // pinned to the bundled react-pdf so we don't drift if Vite swaps it.
@@ -352,12 +351,11 @@ export default function SignIn() {
   const { setCount } = usePendingCounts()
 
   // True while the in-app camera scanner is open (Upload / Scan tab).
+  // We intentionally do NOT prefetch the OpenCV.js scanner runtime on
+  // page mount: executing/instantiating the ~9 MB module runs on the
+  // main thread and would freeze the whole SPA on every Sign-In visit.
+  // It loads on demand when the user actually opens the scanner.
   const [scanning, setScanning] = useState(false)
-
-  // Warm the OpenCV.js scanner runtime in the background so the first
-  // "Take Photos" tap doesn't pay the full ~8 MB download inline. Loads
-  // only on this page; cached immutably thereafter.
-  useEffect(() => { prefetchScanner() }, [])
 
   // ── Load queue + employees on mount ──────────────────────────
   useEffect(() => {
