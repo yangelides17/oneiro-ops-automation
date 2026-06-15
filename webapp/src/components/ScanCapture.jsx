@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  loadScanner, imageToCanvas, detectCorners, warpAndClean,
+  loadScanner, onScannerProgress, imageToCanvas, detectCorners,
+  warpAndClean, canvasToJpeg,
 } from '../lib/docScanner'
 import { imagesToPdf, normalizeHeic } from '../lib/imagesToPdf'
 
@@ -11,22 +12,37 @@ import { imagesToPdf, normalizeHeic } from '../lib/imagesToPdf'
 // which is handed to onScanned() to flow through the existing upload/OCR
 // path. onCancel() backs out.
 //
-// Corners are stored in SOURCE-image coordinates; the overlay scales
-// them to the displayed size.
+// The first scan downloads OpenCV.js (~9 MB) — we show a progress bar
+// for that and log each step to the console ([docScanner]) so a stuck
+// load is diagnosable. If OpenCV can't load at all, the user can still
+// scan "without auto-crop" (pages uploaded as photographed) or fall
+// back to choosing a PDF.
 
 const CORNER_KEYS = ['topLeftCorner', 'topRightCorner', 'bottomRightCorner', 'bottomLeftCorner']
 const DISPLAY_W = 320
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36)
 
 export default function ScanCapture({ onScanned, onCancel }) {
-  const [pages, setPages]   = useState([])   // { id, canvas, width, height, dataUrl, corners }
+  const [pages, setPages]   = useState([])   // { id, canvas, width, height, dataUrl, corners|null }
   const [activeIdx, setActiveIdx] = useState(0)
   const [busy, setBusy]     = useState('')   // '' | 'reading' | 'building'
   const [error, setError]   = useState('')
+  const [prog, setProg]     = useState({ phase: 'idle', ratio: 0, loaded: 0, indeterminate: false, error: '' })
+  const [rawMode, setRawMode] = useState(false)   // skip OpenCV (no auto-crop)
   const fileInputRef = useRef(null)
 
-  // Warm the OpenCV runtime as soon as the scanner opens.
-  useEffect(() => { loadScanner().catch(() => {}) }, [])
+  const ready  = prog.phase === 'ready'
+  const failed = prog.phase === 'error'
+  const useScanner = ready && !rawMode
+
+  // Subscribe to load progress + kick the scanner load on mount.
+  useEffect(() => {
+    const off = onScannerProgress(setProg)
+    loadScanner().catch(() => {})   // errors surface via progress phase
+    return off
+  }, [])
+
+  const retryLoad = () => { setProg({ phase: 'downloading', ratio: 0, indeterminate: true, error: '' }); loadScanner().catch(() => {}) }
 
   const addFiles = async (fileList) => {
     const files = Array.from(fileList || [])
@@ -37,15 +53,16 @@ export default function ScanCapture({ onScanned, onCancel }) {
       for (const raw of files) {
         const file = await normalizeHeic(raw)
         const { canvas, width, height } = await imageToCanvas(file)
-        const corners = await detectCorners(canvas)
+        const corners = useScanner ? await detectCorners(canvas) : null
         next.push({ id: uid(), canvas, width, height, dataUrl: canvas.toDataURL('image/jpeg', 0.9), corners })
       }
       setPages(prev => {
         const merged = [...prev, ...next]
-        setActiveIdx(merged.length - next.length)   // jump to first new page
+        setActiveIdx(merged.length - next.length)
         return merged
       })
     } catch (err) {
+      console.warn('[ScanCapture] addFiles failed', err)
       setError(err.message || 'Could not read photo')
     } finally {
       setBusy('')
@@ -62,7 +79,7 @@ export default function ScanCapture({ onScanned, onCancel }) {
 
   const setCorner = (key, pt) => {
     setPages(prev => prev.map((p, i) =>
-      i === activeIdx ? { ...p, corners: { ...p.corners, [key]: pt } } : p))
+      i === activeIdx && p.corners ? { ...p, corners: { ...p.corners, [key]: pt } } : p))
   }
 
   const buildPdf = async () => {
@@ -70,17 +87,22 @@ export default function ScanCapture({ onScanned, onCancel }) {
     setError(''); setBusy('building')
     try {
       const blobs = []
-      for (const p of pages) blobs.push(await warpAndClean(p.canvas, p.corners))
+      for (const p of pages) {
+        blobs.push(p.corners ? await warpAndClean(p.canvas, p.corners) : await canvasToJpeg(p.canvas))
+      }
       const bytes = await imagesToPdf(blobs)
       const file = new File([bytes], `scan-${Date.now()}.pdf`, { type: 'application/pdf' })
       onScanned(file)
     } catch (err) {
+      console.warn('[ScanCapture] buildPdf failed', err)
       setError(err.message || 'Could not build the scan')
       setBusy('')
     }
   }
 
   const active = pages[activeIdx] || null
+  // Capture is allowed once the scanner is ready, or in raw mode.
+  const canCapture = useScanner || rawMode
 
   return (
     <div className="card p-4 space-y-3">
@@ -102,7 +124,36 @@ export default function ScanCapture({ onScanned, onCancel }) {
         onChange={e => { addFiles(e.target.files); e.target.value = '' }}
       />
 
-      {pages.length === 0 ? (
+      {/* Loader / error gating before capture is available */}
+      {!canCapture && !failed && <LoadProgress prog={prog} onSkip={() => setRawMode(true)} />}
+
+      {!canCapture && failed && (
+        <div className="space-y-2">
+          <p className="text-sm font-semibold text-red-600">Couldn’t load the scanner.</p>
+          <p className="text-[12px] text-slate-500 break-words">
+            {prog.error || 'The scanner components failed to download.'} Check your connection,
+            then retry — or continue without auto-crop (pages upload as photographed), or use
+            “Choose PDF” instead.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={retryLoad} className="btn-outline !py-1.5 text-sm">Retry</button>
+            <button type="button" onClick={() => setRawMode(true)} className="btn-outline !py-1.5 text-sm">
+              Continue without auto-crop
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Capture + staging */}
+      {canCapture && (
+        rawMode && (
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-1.5 text-[11px] text-amber-800">
+            Auto-crop is off — pages will be uploaded as photographed.
+          </div>
+        )
+      )}
+
+      {canCapture && pages.length === 0 && (
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
@@ -114,18 +165,21 @@ export default function ScanCapture({ onScanned, onCancel }) {
             {busy === 'reading' ? 'Reading…' : 'Take photos of the sheet'}
           </p>
           <p className="text-[12px] text-slate-500 mt-1">
-            Capture each page — edges are auto-detected and cleaned up.
+            {useScanner
+              ? 'Capture each page — edges are auto-detected and cleaned up.'
+              : 'Capture each page.'}
           </p>
         </button>
-      ) : (
+      )}
+
+      {canCapture && pages.length > 0 && (
         <>
-          {/* Corner-adjust view for the active page */}
-          {active && (
-            <CornerAdjuster
-              page={active}
-              onCorner={setCorner}
-            />
-          )}
+          {/* Corner-adjust view (auto mode) or plain preview (raw mode) */}
+          {active && (active.corners
+            ? <CornerAdjuster page={active} onCorner={setCorner} />
+            : <div className="mx-auto bg-slate-100 rounded-lg overflow-hidden" style={{ width: DISPLAY_W }}>
+                <img src={active.dataUrl} alt="page" width={DISPLAY_W} />
+              </div>)}
 
           {/* Page strip */}
           <div className="flex items-center gap-2 overflow-x-auto py-1">
@@ -156,9 +210,11 @@ export default function ScanCapture({ onScanned, onCancel }) {
             </button>
           </div>
 
-          <p className="text-[11px] text-slate-400">
-            Drag the corner handles to match the sheet edges if the auto-detection is off.
-          </p>
+          {useScanner && (
+            <p className="text-[11px] text-slate-400">
+              Drag the corner handles to match the sheet edges if the auto-detection is off.
+            </p>
+          )}
 
           <button
             type="button"
@@ -171,6 +227,37 @@ export default function ScanCapture({ onScanned, onCancel }) {
       )}
 
       {error && <p className="text-[12px] text-red-600">{error}</p>}
+    </div>
+  )
+}
+
+// ── Load progress indicator ───────────────────────────────────
+function LoadProgress({ prog, onSkip }) {
+  const pct = Math.round((prog.ratio || 0) * 100)
+  const downloading  = prog.phase === 'downloading'
+  const initializing = prog.phase === 'initializing'
+  const showBar = downloading && !prog.indeterminate
+  return (
+    <div className="space-y-2 py-2">
+      <div className="flex items-center gap-2 text-sm text-slate-600">
+        <span className="w-4 h-4 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
+        <span>
+          {initializing ? 'Starting scanner…' : downloading ? 'Downloading scanner…' : 'Preparing scanner…'}
+        </span>
+      </div>
+      <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+        {showBar
+          ? <div className="h-full bg-navy rounded-full transition-all" style={{ width: `${pct}%` }} />
+          : <div className="h-full w-1/3 bg-navy/70 rounded-full animate-pulse" />}
+      </div>
+      <p className="text-[11px] text-slate-400">
+        First-time setup downloads ~9&nbsp;MB and is cached for next time.
+        {showBar && ` ${(prog.loaded / 1e6).toFixed(1)} MB`}
+      </p>
+      <button type="button" onClick={onSkip}
+        className="text-[11px] text-navy font-semibold hover:underline">
+        Skip and scan without auto-crop
+      </button>
     </div>
   )
 }

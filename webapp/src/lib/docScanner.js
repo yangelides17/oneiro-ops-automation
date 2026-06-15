@@ -20,65 +20,159 @@
 const OPENCV_URL   = 'https://docs.opencv.org/4.7.0/opencv.js'
 const JSCANIFY_URL = 'https://cdn.jsdelivr.net/npm/jscanify@1.2.0/src/jscanify.min.js'
 
+// Approx uncompressed size of opencv.js — used to render a rough but
+// honest progress bar. The streaming reader yields decompressed bytes,
+// so this works whether or not the CDN gzips the response.
+const EST_OPENCV_BYTES = 9 * 1024 * 1024
+
 let _scannerPromise = null
 
-// Inject a <script> once; resolve when it has loaded.
-function loadScript(src) {
+// ── Load-progress pub/sub ─────────────────────────────────────
+// So the scan UI can show a "Preparing scanner…" indicator + progress
+// bar for the one-time OpenCV.js download instead of a frozen screen.
+// phase: 'idle' | 'downloading' | 'initializing' | 'ready' | 'error'
+let _progress = { phase: 'idle', loaded: 0, ratio: 0, indeterminate: false, error: '' }
+const _listeners = new Set()
+
+function setProgress(patch) {
+  _progress = { ..._progress, ...patch }
+  _listeners.forEach(fn => { try { fn(_progress) } catch { /* noop */ } })
+}
+
+export function getScannerProgress() { return _progress }
+
+// Subscribe to load progress. Immediately invokes with the current
+// value; returns an unsubscribe fn.
+export function onScannerProgress(fn) {
+  _listeners.add(fn)
+  fn(_progress)
+  return () => _listeners.delete(fn)
+}
+
+const log = (...a) => console.log('[docScanner]', ...a)
+const warn = (...a) => console.warn('[docScanner]', ...a)
+
+// Inject a <script> once; resolve when it loads. Rejects on error OR if
+// neither load nor error fires within timeoutMs (a hung request).
+function loadScript(src, timeoutMs = 90000) {
   return new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[data-src="${src}"]`)
-    if (existing) {
-      if (existing.dataset.loaded === '1') return resolve()
-      existing.addEventListener('load', () => resolve())
-      existing.addEventListener('error', () => reject(new Error(`Failed to load ${src}`)))
-      return
+    if (existing && existing.dataset.loaded === '1') return resolve()
+    const target = existing || document.createElement('script')
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      warn('script load timed out after', timeoutMs, 'ms:', src)
+      reject(new Error(`Timed out loading ${src}`))
+    }, timeoutMs)
+    const onLoad = () => {
+      if (settled) return
+      settled = true; clearTimeout(timer); target.dataset.loaded = '1'
+      log('script loaded:', src)
+      resolve()
     }
-    const s = document.createElement('script')
-    s.src = src
-    s.async = true
-    s.dataset.src = src
-    s.addEventListener('load', () => { s.dataset.loaded = '1'; resolve() })
-    s.addEventListener('error', () => reject(new Error(`Failed to load ${src}`)))
-    document.head.appendChild(s)
+    const onErr = () => {
+      if (settled) return
+      settled = true; clearTimeout(timer)
+      warn('script failed:', src)
+      reject(new Error(`Failed to load ${src}`))
+    }
+    target.addEventListener('load', onLoad)
+    target.addEventListener('error', onErr)
+    if (!existing) {
+      target.src = src
+      target.async = true
+      target.dataset.src = src
+      log('injecting script:', src)
+      document.head.appendChild(target)
+    }
   })
+}
+
+// Best-effort streaming download so we can show a progress bar. Warms
+// the HTTP cache so the subsequent <script> load is instant. May throw
+// (CORS / network) — callers fall back to a plain script load. The
+// reader yields decompressed bytes, so we gauge progress against an
+// estimated uncompressed size rather than Content-Length.
+async function prefetchWithProgress(url) {
+  log('prefetch (with progress) start:', url)
+  const res = await fetch(url, { mode: 'cors', cache: 'force-cache' })
+  if (!res.ok || !res.body) throw new Error(`prefetch HTTP ${res.status}`)
+  const reader = res.body.getReader()
+  let loaded = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    loaded += value.length
+    setProgress({
+      phase: 'downloading',
+      loaded,
+      ratio: Math.min(loaded / EST_OPENCV_BYTES, 0.99),
+      indeterminate: false,
+    })
+  }
+  log('prefetch complete:', (loaded / 1e6).toFixed(1), 'MB')
 }
 
 // OpenCV.js signals readiness differently across builds. Polling for a
 // real class (cv.Mat) is the one universally reliable check.
-function waitForCvReady(timeoutMs = 60000) {
+function waitForCvReady(timeoutMs = 90000) {
   return new Promise((resolve, reject) => {
     const start = Date.now()
     const tick = () => {
       const cv = window.cv
-      if (cv && typeof cv.Mat === 'function') return resolve(cv)
-      if (cv && cv.then) { cv.then(c => { window.cv = c; resolve(c) }).catch(reject); return }
-      if (Date.now() - start > timeoutMs) return reject(new Error('OpenCV.js init timed out'))
-      setTimeout(tick, 40)
+      if (cv && typeof cv.Mat === 'function') { log('cv runtime ready'); return resolve(cv) }
+      if (cv && cv.then) { cv.then(c => { window.cv = c; log('cv ready (promise)'); resolve(c) }).catch(reject); return }
+      if (Date.now() - start > timeoutMs) {
+        warn('cv init timed out; window.cv is', typeof cv)
+        return reject(new Error('OpenCV.js initialized but the runtime never became ready'))
+      }
+      setTimeout(tick, 50)
     }
     tick()
   })
 }
 
 // Load OpenCV.js + jscanify (idempotent, memoized). Returns a jscanify
-// scanner instance. Safe to call repeatedly / concurrently.
+// scanner instance. Safe to call repeatedly / concurrently. Progress is
+// reported via onScannerProgress(); on failure sets phase 'error'.
 export function loadScanner() {
   if (_scannerPromise) return _scannerPromise
   _scannerPromise = (async () => {
+    log('loadScanner: starting; OpenCV from', OPENCV_URL)
+    // 1) Download OpenCV with a progress bar (best effort). If the CDN
+    //    blocks CORS, fall back to an opaque script-tag download.
+    try {
+      setProgress({ phase: 'downloading', loaded: 0, ratio: 0, indeterminate: false, error: '' })
+      await prefetchWithProgress(OPENCV_URL)
+    } catch (e) {
+      warn('progress prefetch unavailable, falling back to script download:', e.message)
+      setProgress({ phase: 'downloading', indeterminate: true })
+    }
+    // 2) Run OpenCV (from cache if the prefetch succeeded).
     await loadScript(OPENCV_URL)
+    setProgress({ phase: 'initializing', indeterminate: true })
     await waitForCvReady()
+    // 3) Load jscanify (tiny) on top of the cv runtime.
+    log('loading jscanify from', JSCANIFY_URL)
     await loadScript(JSCANIFY_URL)
     const JsScanify = window.jscanify
-    if (typeof JsScanify !== 'function') throw new Error('jscanify failed to load')
+    if (typeof JsScanify !== 'function') throw new Error('jscanify loaded but global is missing')
+    setProgress({ phase: 'ready', ratio: 1, indeterminate: false })
+    log('loadScanner: ready')
     return new JsScanify()
   })().catch(err => {
     _scannerPromise = null   // allow a later retry
+    warn('loadScanner FAILED:', err && err.message || err)
+    setProgress({ phase: 'error', error: (err && err.message) || 'Scanner failed to load' })
     throw err
   })
   return _scannerPromise
 }
 
 // Fire-and-forget warm-up — start the big download early without
-// blocking. Swallows errors (a failed prefetch just means the first
-// scan pays the cost itself).
+// blocking. Errors are surfaced via onScannerProgress (phase 'error').
 export function prefetchScanner() {
   loadScanner().catch(() => {})
 }
@@ -179,6 +273,6 @@ export async function warpAndClean(canvas, corners) {
   }
 }
 
-function canvasToJpeg(canvas, quality = 0.85) {
+export function canvasToJpeg(canvas, quality = 0.85) {
   return new Promise(resolve => canvas.toBlob(b => resolve(b), 'image/jpeg', quality))
 }
