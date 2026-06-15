@@ -12734,8 +12734,8 @@ function setupQbCustomerCache() {
     // WO Tracker contractor string  →  QB Customer ID
     'Metro Express': '10',
     'Denville':      '217',
+    'Delan':         '219',
     // Add more contractors here as customers are added in QB:
-    // 'Delan':      '<qb_id>',
   };
 
   const cache = {};
