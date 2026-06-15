@@ -6,6 +6,7 @@ import 'react-pdf/dist/Page/TextLayer.css'
 import PrincipalSignModal from '../components/PrincipalSignModal'
 import RowKebab from '../components/RowKebab'
 import GenerateDocModal from '../components/GenerateDocModal'
+import SignInHoursEditor from '../components/SignInHoursEditor'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
 // Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
@@ -148,6 +149,17 @@ export default function Approvals() {
   // Sign-In docs route through PrincipalSignModal; everything else fires
   // the lightweight direct approve.
   const [signingItem, setSigningItem] = useState(null)
+  // True while the sign-in hours editor (right pane) has unsaved edits —
+  // approving moves the file, so warn before discarding those edits.
+  const [signinEditsDirty, setSigninEditsDirty] = useState(false)
+
+  // Gate any approve action when the hours editor has unsaved edits.
+  const confirmDiscardEdits = () =>
+    !signinEditsDirty ||
+    window.confirm(
+      'You have unsaved hour edits. Approving moves the sheet and those ' +
+      'edits will be lost unless you Save them first. Approve anyway?'
+    )
 
   // Remove the just-approved item from local state + advance to next in
   // the filtered view. Shared by direct-approve and signed-approve paths.
@@ -160,6 +172,7 @@ export default function Approvals() {
 
   const handleApprove = async () => {
     if (!selected || approving) return
+    if (!confirmDiscardEdits()) return
     setActionError('')
     // Manually-uploaded sign-in: skip the electronic sign-off (already
     // wet-signed by the principal in person).
@@ -382,11 +395,11 @@ export default function Approvals() {
                       isManualSignIn(selected)
                         ? [{
                             label:   'Approve with sign-off',
-                            onClick: () => setSigningItem(selected),
+                            onClick: () => { if (confirmDiscardEdits()) setSigningItem(selected) },
                           }]
                         : [{
                             label:   'Skip sign-off',
-                            onClick: doSkipSignoff,
+                            onClick: () => { if (confirmDiscardEdits()) doSkipSignoff() },
                           }]
                     } />
                   )}
@@ -398,6 +411,17 @@ export default function Approvals() {
                                 px-3 py-2 rounded-lg mb-3">
                   {actionError}
                 </div>
+              )}
+
+              {/* Editable recorded-hours table — sign-in sheets only.
+                  Other doc types keep the plain read-only PDF view. */}
+              {selected.doc_type === 'signin' && (
+                <SignInHoursEditor
+                  key={selected.file_id}
+                  fileId={selected.file_id}
+                  filename={selected.filename}
+                  onDirtyChange={setSigninEditsDirty}
+                />
               )}
 
               <PDFViewer fileId={selected.file_id} width={viewerWidth} />

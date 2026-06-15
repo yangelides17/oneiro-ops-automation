@@ -705,6 +705,51 @@ app.post('/api/approvals/:fileId/skip-signoff', async (req, res) => {
 })
 
 /**
+ * GET /api/approvals/:fileId/signin-rows?filename=...
+ * Returns the Daily Sign-In Data rows for a pending sign-in sheet so the
+ * Approvals page can show/edit the recorded hours. `filename` (carried
+ * by the approvals list item) is the lookup key — it encodes contract /
+ * borough / date / crew chief. Response:
+ *   { rows: [{ row_index, name, classification, time_in, time_out,
+ *              hours, overtime, crew_chief }],
+ *     other_hours: { name: hours },     // other sheets, same day
+ *     meta: { date, contract, borough, chief_slug, ambiguous } }
+ */
+app.get('/api/approvals/:fileId/signin-rows', async (req, res) => {
+  try {
+    const data = await callAppsScript('list_signin_rows_for_file', {
+      file_id:  req.params.fileId,
+      filename: req.query.filename || '',
+    })
+    res.json(data)
+  } catch (err) {
+    console.error(`GET /api/approvals/${req.params.fileId}/signin-rows error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/approvals/:fileId/save-signin-rows
+ * Admin edits to a submitted sign-in's hours. Writes Classification /
+ * Time In / Time Out / Hours back to Daily Sign-In Data and recomputes
+ * Overtime for the whole day. The signed PDF is left untouched (the
+ * sheet is the payroll source of truth). Body: { filename, rows }.
+ */
+app.post('/api/approvals/:fileId/save-signin-rows', async (req, res) => {
+  try {
+    const data = await callAppsScript('save_signin_row_edits', {
+      file_id:  req.params.fileId,
+      filename: req.body.filename || '',
+      rows:     req.body.rows || [],
+    })
+    res.json(data)
+  } catch (err) {
+    console.error(`POST /api/approvals/${req.params.fileId}/save-signin-rows error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/approvals/:fileId/approve-signin
  * Sign-In-specific approval: takes the principal's signature + printed
  * name + title from the webapp modal, patches the PDF via pdf-lib

@@ -3871,6 +3871,10 @@ function doPost(e) {
       return handleCheckSignInContinuation_(body);
     } else if (action === 'list_signin_day_hours') {
       return handleListSignInDayHours_(body);
+    } else if (action === 'list_signin_rows_for_file') {
+      return handleListSignInRowsForFile_(body);
+    } else if (action === 'save_signin_row_edits') {
+      return handleSaveSignInRowEdits_(body);
     } else if (action === 'approve_doc_skip_signoff') {
       return handleApproveDocSkipSignoff_(body);
     } else if (action === 'lookup_archived_wo_pdf') {
@@ -4999,25 +5003,19 @@ function handleSubmitSignIn_(body) {
       priorHoursByEmp[n] = (priorHoursByEmp[n] || 0) + (Number(row[10]) || 0);
     }
 
-    const crewRows = d.crew.map(member => {
-      const hours   = parseFloat(member.hours) || 0;
-      const nameKey = normNameKey(member.name);
-      const prior   = priorHoursByEmp[nameKey] || 0;
+    // Per-row OT via the shared allocator — single source of truth with
+    // handleSaveSignInRowEdits_ (the Approvals-page hours editor) so the
+    // two can never diverge. priorHoursByEmp seeds hours already on this
+    // opDay from earlier Sign-In Groups so the 8h ST cap is shared.
+    const otByRow = _allocateDayOvertime_(
+      d.crew.map(m => ({ key: normNameKey(m.name), hours: parseFloat(m.hours) || 0 })),
+      isWeekend,
+      priorHoursByEmp
+    );
 
-      let overtime;
-      if (isWeekend) {
-        overtime = hours;
-      } else {
-        const combinedST = Math.min(prior + hours, 8);
-        const priorST    = Math.min(prior, 8);
-        const newST      = combinedST - priorST;
-        overtime         = Math.max(0, hours - newST);
-      }
-
-      // Roll forward so a duplicate of this employee later in the
-      // same submission picks up these hours as "prior".
-      priorHoursByEmp[nameKey] = prior + hours;
-
+    const crewRows = d.crew.map((member, idx) => {
+      const hours    = parseFloat(member.hours) || 0;
+      const overtime = otByRow[idx];
       return [
         effectiveDate,                                //  0  Date (shift START, opDay-derived)
         woListStr,                                    //  1  Work Order # (comma-list)
@@ -5404,6 +5402,283 @@ function handleListSignInDayHours_(body) {
   });
 
   return jsonResponse_({ totals });
+}
+
+
+// ── Sign-In OT + row helpers (shared submit + admin-edit) ─────
+
+// Allocate per-row overtime across one operational day. `entries` are
+// ordered the way hours should fill each employee's 8-hour straight-time
+// bucket; `prior` seeds hours already counted earlier that day (other
+// sheets / earlier rows in the same submission). Weekend → all OT.
+// Returns OT values aligned to `entries`. Single source of truth so
+// handleSubmitSignIn_ and handleSaveSignInRowEdits_ can never diverge.
+function _allocateDayOvertime_(entries, isWeekend, prior) {
+  const counted = Object.assign({}, prior || {});
+  return entries.map(e => {
+    const hours = Number(e.hours) || 0;
+    const key   = e.key;
+    let ot;
+    if (isWeekend) {
+      ot = hours;
+    } else {
+      const p          = counted[key] || 0;
+      const combinedST = Math.min(p + hours, 8);
+      const priorST    = Math.min(p, 8);
+      ot = Math.max(0, hours - (combinedST - priorST));
+    }
+    counted[key] = (counted[key] || 0) + hours;
+    return ot;
+  });
+}
+
+function _normDateKey_(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const s = String(v);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  const dt = new Date(s);
+  return isNaN(dt.getTime()) ? s : Utilities.formatDate(dt, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+}
+function _normNameKey_(s) { return String(s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+function _slugify_(s)     { return String(s || '').replace(/[^A-Za-z0-9]/g, ''); }
+function _round2_(n)      { return Math.round((Number(n) || 0) * 100) / 100; }
+function _isWeekendDateStr_(dateStr) {
+  const m = String(dateStr || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return false;
+  const dow = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
+  return dow === 0 || dow === 6;
+}
+
+// Hours between two Sign-In time cells, mirroring the client calcHours:
+// cross-midnight (out <= in) rolls to the next day; rounded to 2dp.
+function _signInRowHours_(timeIn, timeOut) {
+  const a = _parseSignInTimeOfDay_(timeIn);
+  const b = _parseSignInTimeOfDay_(timeOut);
+  if (!a || !b) return 0;
+  let mins = (b.hours * 60 + b.minutes) - (a.hours * 60 + a.minutes);
+  if (mins <= 0) mins += 24 * 60;
+  return _round2_(mins / 60);
+}
+
+// Parse a Sign-In PDF filename into its routing parts. Mirrors the
+// archive matcher regex (archiveDocument_ Sign-In branch). Returns null
+// for legacy/non-matching names. contractorSlug is suppressed when it is
+// really a _MANUAL/_FILLED suffix marker rather than a contractor.
+function _parseSignInFilename_(filename) {
+  const cleanName = String(filename || '').replace(/\.pdf$/i, '');
+  const m = cleanName.match(
+    /^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_(?!chief-)([A-Za-z0-9]+))?(?:_chief-([A-Za-z0-9]+))?/
+  );
+  if (!m) return null;
+  const [, contractNum, borough, dateStr, rawContractor, chiefSlug] = m;
+  const isSuffixMarker = rawContractor === 'MANUAL' || rawContractor === 'FILLED';
+  return {
+    contractNum,
+    borough,
+    dateStr,
+    contractorSlug: (rawContractor && !isSuffixMarker) ? rawContractor : '',
+    chiefSlug: chiefSlug || '',
+  };
+}
+
+// True when a Daily Sign-In Data row belongs to the sign-in sheet
+// described by `f` (a _parseSignInFilename_ result). Matches by date +
+// contract + borough, plus contractor/chief slug when the filename
+// carries them (billing-remap / multi-crew disambiguation).
+function _signInRowMatchesFile_(row, f) {
+  if (_normDateKey_(row[0]) !== f.dateStr) return false;
+  if (String(row[3] || '').trim() !== f.contractNum) return false;
+  if (String(row[4] || '').trim() !== f.borough) return false;
+  if (f.contractorSlug && _slugify_(row[2]) !== f.contractorSlug) return false;
+  if (f.chiefSlug && _slugify_(row[12]) !== f.chiefSlug) return false;
+  return true;
+}
+
+function _signInRowView_(row, sheetRowIndex) {
+  return {
+    row_index:      sheetRowIndex,
+    name:           String(row[6]  || '').trim(),
+    classification: String(row[7]  || '').trim(),
+    time_in:        String(row[8]  || '').trim(),
+    time_out:       String(row[9]  || '').trim(),
+    hours:          Number(row[10]) || 0,
+    overtime:       Number(row[11]) || 0,
+    crew_chief:     String(row[12] || '').trim(),
+  };
+}
+
+
+// ── action: list_signin_rows_for_file ─────────────────────────
+//
+// Powers the Approvals-page hours editor. Given a pending sign-in's
+// file_id + filename, returns each Daily Sign-In Data row for that sheet
+// (with its 1-based sheet row index so edits can target exact cells),
+// the other-sheet hours per employee for that day (for the shift-totals
+// strip), and an `ambiguous` flag when a legacy chief-less filename
+// can't be safely attributed to one of several crews on that day.
+function handleListSignInRowsForFile_(body) {
+  const d        = body.data || {};
+  const filename = String(d.filename || '').trim();
+  const f = _parseSignInFilename_(filename);
+  if (!f) return jsonResponse_({ error: 'Could not parse sign-in filename: ' + filename }, 400);
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Daily Sign-In Data');
+  if (!sheet) return jsonResponse_({ error: 'Daily Sign-In Data not found' }, 500);
+  const data = sheet.getDataRange().getValues();
+
+  const rows       = [];
+  const fileRowSet = {};          // 1-based sheet row index → true
+  for (let i = 1; i < data.length; i++) {
+    if (!_signInRowMatchesFile_(data[i], f)) continue;
+    fileRowSet[i + 1] = true;
+    rows.push(_signInRowView_(data[i], i + 1));
+  }
+
+  // Ambiguity guard — only when the filename carries no chief slug. If
+  // the (date, contract, borough) bucket holds rows from 2+ distinct
+  // crew chiefs, we can't attribute the file to one crew → refuse edit.
+  let ambiguous = false;
+  if (!f.chiefSlug) {
+    const chiefs = {};
+    rows.forEach(r => { const c = _slugify_(r.crew_chief); if (c) chiefs[c] = true; });
+    if (Object.keys(chiefs).length >= 2) ambiguous = true;
+  }
+
+  // Other-sheet hours per employee for this date (everything on the date
+  // NOT belonging to this file) → feeds the shift-totals strip.
+  const otherHours = {};
+  for (let i = 1; i < data.length; i++) {
+    if (fileRowSet[i + 1]) continue;
+    if (_normDateKey_(data[i][0]) !== f.dateStr) continue;
+    const name = String(data[i][6] || '').trim();
+    if (!name) continue;
+    otherHours[name] = (otherHours[name] || 0) + (Number(data[i][10]) || 0);
+  }
+
+  return jsonResponse_({
+    rows,
+    other_hours: otherHours,
+    meta: {
+      date:            f.dateStr,
+      contract:        f.contractNum,
+      borough:         f.borough,
+      contractor_slug: f.contractorSlug,
+      chief_slug:      f.chiefSlug,
+      ambiguous,
+    },
+  });
+}
+
+
+// ── action: save_signin_row_edits ─────────────────────────────
+//
+// Admin corrections to a submitted sign-in. Writes Classification /
+// Time In / Time Out / Hours for the edited rows, then recomputes
+// Overtime for EVERY row on that operational day — OT caps are per
+// employee-per-day across ALL sheets, so editing one crew can shift a
+// shared employee's split on another sheet. Daily Sign-In Data is the
+// payroll source of truth; the signed PDF is never touched.
+function handleSaveSignInRowEdits_(body) {
+  const d        = body.data || {};
+  const filename = String(d.filename || '').trim();
+  const editsIn  = Array.isArray(d.rows) ? d.rows : [];
+  const f = _parseSignInFilename_(filename);
+  if (!f) return jsonResponse_({ error: 'Could not parse sign-in filename: ' + filename }, 400);
+  if (!editsIn.length) return jsonResponse_({ error: 'No rows to save' }, 400);
+
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(20000); } catch (e) {
+    return jsonResponse_({ error: 'Could not acquire lock — try again' }, 503);
+  }
+  try {
+    const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName('Daily Sign-In Data');
+    if (!sheet) return jsonResponse_({ error: 'Daily Sign-In Data not found' }, 500);
+    const data    = sheet.getDataRange().getValues();
+    const lastRow = data.length;
+
+    // Validate every edited row still matches this file before writing
+    // (guards a stale row_index after concurrent appends / re-sorts).
+    const editByRow = {};
+    for (const e of editsIn) {
+      const ri = Number(e.row_index);
+      if (!ri || ri < 2 || ri > lastRow) {
+        return jsonResponse_({ error: `Row ${e.row_index} out of range — refresh and retry` }, 409);
+      }
+      if (!_signInRowMatchesFile_(data[ri - 1], f)) {
+        return jsonResponse_({ error: `Row ${ri} no longer matches this sheet — refresh and retry` }, 409);
+      }
+      editByRow[ri] = e;
+    }
+
+    // 1) Apply edits (class/times/hours) to the in-memory working copy.
+    Object.keys(editByRow).forEach(riStr => {
+      const row = data[Number(riStr) - 1];
+      const e   = editByRow[riStr];
+      const cls = (e.classification === 'LP' || e.classification === 'SAT')
+        ? e.classification : String(row[7] || '').trim();
+      const tin  = String(e.time_in  || '').trim();
+      const tout = String(e.time_out || '').trim();
+      row[7]  = cls;
+      row[8]  = _fmt24to12_(tin);
+      row[9]  = _fmt24to12_(tout);
+      row[10] = _signInRowHours_(tin, tout);
+    });
+
+    // 2) Recompute OT for the whole day in sheet order (across all sheets).
+    const dayRowIdx = [];                       // 0-based data indices for the date
+    for (let i = 1; i < data.length; i++) {
+      if (_normDateKey_(data[i][0]) === f.dateStr) dayRowIdx.push(i);
+    }
+    const beforeOt = {};
+    dayRowIdx.forEach(i => { beforeOt[i] = Number(data[i][11]) || 0; });
+    const otVals = _allocateDayOvertime_(
+      dayRowIdx.map(i => ({ key: _normNameKey_(data[i][6]), hours: Number(data[i][10]) || 0 })),
+      _isWeekendDateStr_(f.dateStr), {}
+    );
+    dayRowIdx.forEach((i, k) => { data[i][11] = _round2_(otVals[k]); });
+
+    // 3a) Edited rows: write Classification..Overtime (sheet cols 8–12).
+    let fileTouched = 0, otherTouched = 0;
+    Object.keys(editByRow).forEach(riStr => {
+      const i = Number(riStr) - 1;
+      sheet.getRange(i + 1, 8, 1, 5)
+        .setValues([[data[i][7], data[i][8], data[i][9], data[i][10], data[i][11]]]);
+      fileTouched++;
+    });
+    // 3b) Non-edited day rows: only OT (col 12) can have shifted.
+    dayRowIdx.forEach(i => {
+      if (editByRow[i + 1]) return;
+      if ((Number(data[i][11]) || 0) === beforeOt[i]) return;
+      sheet.getRange(i + 1, 12).setValue(data[i][11]);
+      if (_signInRowMatchesFile_(data[i], f)) fileTouched++; else otherTouched++;
+    });
+
+    // Refreshed file-row view for the UI.
+    const updatedFileRows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (_signInRowMatchesFile_(data[i], f)) updatedFileRows.push(_signInRowView_(data[i], i + 1));
+    }
+
+    _logAutomation_(
+      'Sign-In Edit',
+      'Admin edited hours',
+      `${f.contractNum}/${f.borough} ${f.dateStr}${f.chiefSlug ? ' (' + f.chiefSlug + ')' : ''}`,
+      `Edited ${Object.keys(editByRow).length} row(s); recomputed OT on ${otherTouched} other-sheet row(s). File: ${filename}`,
+      'Success', 'No'
+    );
+
+    return jsonResponse_({
+      success: true,
+      rows: updatedFileRows,
+      other_sheet_updates: otherTouched,
+    });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 

@@ -6,19 +6,16 @@ import 'react-pdf/dist/Page/TextLayer.css'
 import SignaturePad from '../components/SignaturePad'
 import RowKebab     from '../components/RowKebab'
 import ConfirmModal from '../components/ConfirmModal'
+import ScanCapture  from '../components/ScanCapture'
 import { opDayFromIsoTime } from '../lib/dateOps'
 import { usePendingCounts } from '../lib/PendingCountsContext'
+import { CLASSIFICATIONS, calcHours, splitStOt } from '../lib/signinShared'
+import { prefetchScanner } from '../lib/docScanner'
 
 // Mirror the Approvals page wiring — same pdf.js worker URL, version
 // pinned to the bundled react-pdf so we don't drift if Vite swaps it.
 pdfjs.GlobalWorkerOptions.workerSrc =
   `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`
-
-// ── Constants ──────────────────────────────────────────────────
-// Mirrors the dropdown validation on Daily Sign-In Data → Classification.
-// Keep this in sync with FieldReport.jsx and the sheet validation, or
-// submissions will fail with "Invalid Entry".
-const CLASSIFICATIONS = ['LP', 'SAT']
 
 // ── Helpers ────────────────────────────────────────────────────
 const newCrew = () => ({
@@ -44,32 +41,6 @@ const normName = (s) => String(s || '')
   .replace(/[.,]/g, '')
   .replace(/\s+/g, ' ')
   .trim()
-
-// Day-of-week-aware OT calc. Sat/Sun → all OT; weekday over 8 → OT.
-// workDateIso is the SHIFT START date as YYYY-MM-DD. Constructed from
-// local parts so it doesn't UTC-shift the day-of-week.
-//
-// Cross-midnight: if Time Out <= Time In we assume the shift rolled
-// over to the next calendar day and add 24h. Hours are still bucketed
-// under the start day for OT purposes — a Fri-night → Sat-morning
-// shift counts as 8h Friday-rate.
-const calcHours = (tin, tout, workDateIso) => {
-  if (!tin || !tout) return { hours: '', overtime: '' }
-  const [ih, im] = tin.split(':').map(Number)
-  const [oh, om] = tout.split(':').map(Number)
-  let mins = (oh * 60 + om) - (ih * 60 + im)
-  if (mins <= 0) mins += 24 * 60
-  const hrs = mins / 60
-
-  let isWeekend = false
-  const dm = String(workDateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
-  if (dm) {
-    const dow = new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3])).getDay()
-    isWeekend = (dow === 0 || dow === 6)
-  }
-  const ot = isWeekend ? hrs : Math.max(0, hrs - 8)
-  return { hours: hrs.toFixed(2), overtime: ot.toFixed(2) }
-}
 
 // Pretty date for the queue cards: "Apr 26 (Sat)"
 const prettyQueueDate = (iso) => {
@@ -380,6 +351,14 @@ export default function SignIn() {
   // queue length changes (load + submit-and-remove flows).
   const { setCount } = usePendingCounts()
 
+  // True while the in-app camera scanner is open (Upload / Scan tab).
+  const [scanning, setScanning] = useState(false)
+
+  // Warm the OpenCV.js scanner runtime in the background so the first
+  // "Take Photos" tap doesn't pay the full ~8 MB download inline. Loads
+  // only on this page; cached immutably thereafter.
+  useEffect(() => { prefetchScanner() }, [])
+
   // ── Load queue + employees on mount ──────────────────────────
   useEffect(() => {
     let cancelled = false
@@ -486,9 +465,10 @@ export default function SignIn() {
   const handleUploadFile = async (file) => {
     if (!selected || !file) return
     if (!file.type || file.type !== 'application/pdf') {
-      showToast('Upload must be a PDF', 'error')
+      showToast('Upload must be a PDF or scanned photos', 'error')
       return
     }
+    setScanning(false)
     updateDraft(selected.queue_id, { parseStatus: 'parsing', parseError: '' })
 
     try {
@@ -556,16 +536,6 @@ export default function SignIn() {
   // in the same shift shows stale totals (sign-in #1's hours don't
   // appear under "Other") until the user reloads the page.
   const [hoursRefreshTick, setHoursRefreshTick] = useState(0)
-
-  // Apply the Mon–Fri-over-8 / Sat-Sun-all-OT rule to a given date+hours.
-  const splitStOt = (hours, dateIso) => {
-    const m = String(dateIso || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
-    const dow = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay() : -1
-    const isWeekend = (dow === 0 || dow === 6)
-    if (isWeekend) return { st: 0, ot: hours }
-    if (hours <= 8) return { st: hours, ot: 0 }
-    return { st: 8, ot: hours - 8 }
-  }
 
   // Aggregate { name → { thisSheet, otherSheets, total, st, ot } } for
   // the currently-loaded crew. "thisSheet" = sum of crew rows for that
@@ -647,6 +617,7 @@ export default function SignIn() {
   useEffect(() => {
     setDateEditMode(false)
     setEditDateModal(false)
+    setScanning(false)
   }, [selectedId])
 
   // Pull existing Daily Sign-In Data hours for the effectiveDate so the
@@ -977,7 +948,7 @@ export default function SignIn() {
               <div className="grid grid-cols-2">
                 {[
                   { key: 'generate', label: 'Generate' },
-                  { key: 'upload',   label: 'Upload PDF' },
+                  { key: 'upload',   label: 'Upload / Scan' },
                 ].map(t => (
                   <button
                     key={t.key}
@@ -997,16 +968,36 @@ export default function SignIn() {
                 After parse, the form sections below take over and the
                 user reviews/edits prior to submit. */}
             {draft.mode === 'upload' && draft.parseStatus !== 'parsed' && (
-              <div className="card p-6 space-y-3">
-                <p className="section-label">Upload Hand-Filled Sheet</p>
-                {draft.parseStatus === 'parsing' ? (
+              draft.parseStatus === 'parsing' ? (
+                <div className="card p-6">
                   <div className="flex items-center gap-3 py-6 justify-center">
                     <div className="w-5 h-5 border-2 border-slate-200 border-t-navy rounded-full animate-spin" />
                     <span className="text-sm text-slate-600">Reading sheet…</span>
                   </div>
-                ) : (
-                  <>
-                    <label className="block border-2 border-dashed border-slate-300 rounded-xl p-8 text-center cursor-pointer hover:border-navy transition-colors">
+                </div>
+              ) : scanning ? (
+                <ScanCapture
+                  onScanned={handleUploadFile}
+                  onCancel={() => setScanning(false)}
+                />
+              ) : (
+                <div className="card p-6 space-y-3">
+                  <p className="section-label">Add Hand-Filled Sheet</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {/* Scan with the phone camera — auto-cropped + cleaned. */}
+                    <button
+                      type="button"
+                      onClick={() => setScanning(true)}
+                      className="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center
+                                 hover:border-navy transition-colors">
+                      <div className="text-3xl mb-1">📷</div>
+                      <p className="text-sm font-semibold text-navy">Scan with camera</p>
+                      <p className="text-[12px] text-slate-500 mt-1">
+                        Photograph the sheet — cropped &amp; cleaned for you
+                      </p>
+                    </button>
+                    {/* Or upload an existing PDF (unchanged path). */}
+                    <label className="block border-2 border-dashed border-slate-300 rounded-xl p-6 text-center cursor-pointer hover:border-navy transition-colors">
                       <input
                         type="file"
                         accept="application/pdf"
@@ -1018,17 +1009,17 @@ export default function SignIn() {
                         }}
                       />
                       <div className="text-3xl mb-1">📄</div>
-                      <p className="text-sm font-semibold text-navy">Click to choose PDF</p>
+                      <p className="text-sm font-semibold text-navy">Choose PDF</p>
                       <p className="text-[12px] text-slate-500 mt-1">
-                        Hand-filled paper sheet, scanned to PDF (≤ 15 MB)
+                        Already-scanned sheet as a PDF (≤ 15 MB)
                       </p>
                     </label>
-                    {draft.parseStatus === 'error' && (
-                      <p className="text-[12px] text-red-600">{draft.parseError}</p>
-                    )}
-                  </>
-                )}
-              </div>
+                  </div>
+                  {draft.parseStatus === 'error' && (
+                    <p className="text-[12px] text-red-600">{draft.parseError}</p>
+                  )}
+                </div>
+              )
             )}
 
             {/* Once parsed, render the uploaded PDF inline so the user
