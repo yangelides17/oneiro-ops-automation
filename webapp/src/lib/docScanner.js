@@ -39,8 +39,12 @@ let _progress = { phase: 'idle', loaded: 0, ratio: 0, indeterminate: false, erro
 const _listeners = new Set()
 
 function setProgress(patch) {
+  const prevPhase = _progress.phase
   _progress = { ..._progress, ...patch }
-  _listeners.forEach(fn => { try { fn(_progress) } catch { /* noop */ } })
+  if (patch.phase && patch.phase !== prevPhase) {
+    console.log('[docScanner] progress phase ->', patch.phase, '(' + _listeners.size + ' listeners)')
+  }
+  _listeners.forEach(fn => { try { fn(_progress) } catch (e) { console.warn('[docScanner] listener threw', e) } })
 }
 
 export function getScannerProgress() { return _progress }
@@ -252,13 +256,17 @@ export function loadScanner() {
     log('opencv.js executed in', Date.now() - tScript, 'ms; cv shape:', describeCv())
     await waitForCvReady()
     // 3) Load jscanify (tiny) on top of the cv runtime.
-    log('loading jscanify from', JSCANIFY_URL)
+    log('STEP A: cv ready returned; loading jscanify from', JSCANIFY_URL)
     await loadScript(JSCANIFY_URL)
+    log('STEP B: jscanify script loaded; typeof window.jscanify =', typeof window.jscanify)
     const JsScanify = window.jscanify
     if (typeof JsScanify !== 'function') throw new Error('jscanify loaded but global is missing')
+    log('STEP C: constructing JsScanify')
+    const inst = new JsScanify()
+    log('STEP D: scanner instance constructed; marking ready')
     setProgress({ phase: 'ready', ratio: 1, indeterminate: false })
     log('loadScanner: ready')
-    return new JsScanify()
+    return inst
   })().catch(err => {
     _scannerPromise = null   // allow a later retry
     warn('loadScanner FAILED:', err && err.message || err)

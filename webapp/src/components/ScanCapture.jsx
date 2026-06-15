@@ -34,6 +34,7 @@ export default function ScanCapture({ onScanned, onCancel }) {
   const ready  = prog.phase === 'ready'
   const failed = prog.phase === 'error'
   const useScanner = ready && !rawMode
+  console.log('[ScanCapture] render', { phase: prog.phase, ready, failed, rawMode, pages: pages.length, busy })
 
   // Subscribe to load progress + kick the scanner load on mount.
   useEffect(() => {
