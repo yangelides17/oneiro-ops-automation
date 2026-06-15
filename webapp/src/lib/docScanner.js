@@ -56,6 +56,55 @@ export function onScannerProgress(fn) {
 const log = (...a) => console.log('[docScanner]', ...a)
 const warn = (...a) => console.warn('[docScanner]', ...a)
 
+// Set by the Emscripten runtime-ready hook (see installModuleReadyHook).
+let _cvReadyFired = false
+
+// One-time global error spy so a silent OpenCV/wasm failure (CSP block,
+// OOM, parse error) shows up in our logs instead of vanishing.
+function installErrorSpy() {
+  if (window.__docScannerSpy) return
+  window.__docScannerSpy = true
+  window.addEventListener('error', (e) => {
+    warn('window error event:', e.message, '@', e.filename + ':' + e.lineno)
+  })
+  window.addEventListener('unhandledrejection', (e) => {
+    warn('unhandledrejection:', (e.reason && (e.reason.message || e.reason)) || e.reason)
+  })
+  log('WebAssembly available?', typeof WebAssembly,
+      '| instantiate?', typeof (WebAssembly && WebAssembly.instantiate),
+      '| crossOriginIsolated?', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'n/a')
+}
+
+// Emscripten reads a global `Module` for config BEFORE the runtime boots.
+// Registering onRuntimeInitialized here (prior to injecting opencv.js) is
+// the documented, race-free readiness signal for the docs.opencv.org
+// build. Safe no-op if cv is already up.
+function installModuleReadyHook() {
+  if (window.cv && typeof window.cv.Mat === 'function') { _cvReadyFired = true; return }
+  const Module = (window.Module = window.Module || {})
+  const prev = Module.onRuntimeInitialized
+  Module.onRuntimeInitialized = () => {
+    log('Module.onRuntimeInitialized fired; window.cv.Mat?', !!(window.cv && window.cv.Mat))
+    _cvReadyFired = true
+    try { prev && prev() } catch (e) { warn('prev onRuntimeInitialized threw', e && e.message) }
+  }
+  log('installed Module.onRuntimeInitialized hook')
+}
+
+// Snapshot of the global `cv` shape for diagnostics.
+function describeCv() {
+  const cv = window.cv
+  return {
+    typeofCv: typeof cv,
+    isFunction: typeof cv === 'function',
+    hasMat: !!(cv && cv.Mat),
+    hasThen: !!(cv && typeof cv.then === 'function'),
+    hasOnRuntimeInit: !!(cv && typeof cv === 'object' && 'onRuntimeInitialized' in cv),
+    moduleReadyFired: _cvReadyFired,
+    keys: (cv && typeof cv === 'object') ? Object.keys(cv).slice(0, 12) : null,
+  }
+}
+
 // Inject a <script> once; resolve when it loads. Rejects on error OR if
 // neither load nor error fires within timeoutMs (a hung request).
 function loadScript(src, timeoutMs = 90000) {
@@ -119,34 +168,59 @@ async function prefetchWithProgress(url) {
   log('prefetch complete:', (loaded / 1e6).toFixed(1), 'MB')
 }
 
-// Wait for the OpenCV runtime to be usable. OpenCV.js exposes `cv` in a
-// build-dependent way: sometimes a ready namespace, sometimes a THENABLE
-// (`await cv`) whose `.then()` is NOT a real Promise (no `.catch`). So we
-// never chain `.catch` on it — we kick the thenable once (single-arg
-// `.then`, assigning the resolved namespace back to window.cv) and
-// otherwise poll for a real class (`cv.Mat`), which is the one
-// universally reliable readiness signal.
-function waitForCvReady(timeoutMs = 90000) {
+// Wait for the OpenCV runtime to be usable. OpenCV.js exposes readiness
+// in build-dependent ways, so we try ALL of them and log a heartbeat of
+// the live `cv` shape so a stuck init is diagnosable:
+//   1. Module.onRuntimeInitialized (installed before the script ran)
+//   2. cv.onRuntimeInitialized (docs build, set post-load)
+//   3. cv as a thenable (`await cv`) — kicked once (no `.catch`)
+//   4. polling for cv.Mat — the universal "ready" signal
+function waitForCvReady(timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const start = Date.now()
-    let kicked = false
-    const tick = () => {
+    let settled = false
+    let lastBeat = -1
+    log('waitForCvReady: begin; initial cv =', describeCv())
+
+    const tryHooks = () => {
       const cv = window.cv
-      if (cv && typeof cv.Mat === 'function') { log('cv runtime ready'); return resolve(cv) }
-      if (cv && typeof cv.then === 'function' && !kicked) {
-        kicked = true
+      if (cv && typeof cv === 'object' && typeof cv.Mat !== 'function' && !cv.__oriHooked) {
+        try {
+          cv.__oriHooked = true
+          cv.onRuntimeInitialized = () => { log('cv.onRuntimeInitialized fired'); _cvReadyFired = true }
+          log('registered cv.onRuntimeInitialized hook')
+        } catch (e) { warn('could not set cv.onRuntimeInitialized:', e && e.message) }
+      }
+      if (cv && typeof cv.then === 'function' && !cv.__thenKicked) {
+        cv.__thenKicked = true
         log('cv is a thenable — kicking runtime init')
         try {
-          cv.then((c) => { if (c && typeof c.Mat === 'function') window.cv = c })
-        } catch (e) {
-          warn('cv.then kick threw (ignored):', e && e.message)
-        }
+          cv.then((c) => {
+            log('cv thenable resolved; c.Mat?', !!(c && c.Mat))
+            if (c && typeof c.Mat === 'function') { window.cv = c; _cvReadyFired = true }
+          })
+        } catch (e) { warn('cv.then kick threw (ignored):', e && e.message) }
       }
-      if (Date.now() - start > timeoutMs) {
-        warn('cv init timed out; window.cv is', typeof cv, cv && Object.keys(cv).slice(0, 5))
-        return reject(new Error('OpenCV.js loaded but the runtime never became ready'))
+    }
+
+    const tick = () => {
+      if (settled) return
+      const cv = window.cv
+      if (cv && typeof cv.Mat === 'function') {
+        settled = true
+        log('cv READY (cv.Mat present)', { elapsedMs: Date.now() - start })
+        return resolve(cv)
       }
-      setTimeout(tick, 50)
+      tryHooks()
+      const elapsed = Date.now() - start
+      const beat = Math.floor(elapsed / 1500)
+      if (beat !== lastBeat) { lastBeat = beat; log('waitForCvReady heartbeat', { elapsedMs: elapsed, ...describeCv() }) }
+      if (elapsed > timeoutMs) {
+        settled = true
+        warn('waitForCvReady TIMEOUT after', timeoutMs, 'ms; final cv =', describeCv())
+        return reject(new Error(`OpenCV runtime never became ready after ${Math.round(timeoutMs / 1000)}s`))
+      }
+      setTimeout(tick, 200)
     }
     tick()
   })
@@ -159,6 +233,7 @@ export function loadScanner() {
   if (_scannerPromise) return _scannerPromise
   _scannerPromise = (async () => {
     log('loadScanner: starting; OpenCV from', OPENCV_URL)
+    installErrorSpy()
     // 1) Download OpenCV with a progress bar (best effort). If the CDN
     //    blocks CORS, fall back to an opaque script-tag download.
     try {
@@ -168,9 +243,13 @@ export function loadScanner() {
       warn('progress prefetch unavailable, falling back to script download:', e.message)
       setProgress({ phase: 'downloading', indeterminate: true })
     }
-    // 2) Run OpenCV (from cache if the prefetch succeeded).
-    await loadScript(OPENCV_URL)
+    // 2) Register the runtime-ready hook BEFORE the script boots, then
+    //    run OpenCV (from cache if the prefetch succeeded).
+    installModuleReadyHook()
     setProgress({ phase: 'initializing', indeterminate: true })
+    const tScript = Date.now()
+    await loadScript(OPENCV_URL)
+    log('opencv.js executed in', Date.now() - tScript, 'ms; cv shape:', describeCv())
     await waitForCvReady()
     // 3) Load jscanify (tiny) on top of the cv runtime.
     log('loading jscanify from', JSCANIFY_URL)
