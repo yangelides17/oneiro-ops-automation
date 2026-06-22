@@ -278,6 +278,74 @@ function GroupStackedChart({ daily }) {
   )
 }
 
+// ── Labor cost by work type ───────────────────────────────────
+// Fully-loaded crew cost (ST/OT × prevailing rate + supplemental) per day,
+// split MMA (PT- work orders) vs Thermo (RM- work orders). Mirrors
+// GroupStackedChart: stacked bars, switching to weekly buckets past the
+// shared threshold. Server already bucketed each shift by WO prefix.
+const LABOR_TYPES = ['mma', 'thermo']
+const LABOR_LABEL = { mma: 'MMA', thermo: 'Thermo' }
+const LABOR_COLOR = { mma: '#f59e0b', thermo: '#0f766e' }  // amber / teal
+
+function LaborCostChart({ laborDaily }) {
+  const weekly = (laborDaily?.length || 0) > WEEKLY_THRESHOLD
+  const source = weekly ? bucketByWeek(laborDaily || [], LABOR_TYPES) : (laborDaily || [])
+  const data = source.map(d => ({
+    date:   d.date.slice(5),
+    mma:    Number(d.mma)    || 0,
+    thermo: Number(d.thermo) || 0,
+  }))
+  const xInterval = data.length > 14 ? Math.max(0, Math.floor(data.length / 12) - 1) : 0
+  const hasData = data.some(d => d.mma > 0 || d.thermo > 0)
+  return (
+    <div className="card p-4">
+      <div className="flex items-baseline justify-between">
+        <p className="section-label">
+          {weekly ? 'Weekly Labor Cost by Work Type' : 'Daily Labor Cost by Work Type'}
+        </p>
+        {weekly && (
+          <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">
+            bucketed by week
+          </span>
+        )}
+      </div>
+      {hasData ? (
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={data} barSize={weekly ? 18 : (data.length > 31 ? 6 : 16)}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+            <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={xInterval} />
+            <YAxis
+              tick={{ fontSize: 10, fill: '#94a3b8' }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={fmtUsd}
+              width={56}
+            />
+            <Tooltip
+              contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
+              formatter={(v, name) => [fmtUsdSmall(v), LABOR_LABEL[name] || name]}
+              labelFormatter={(l) => weekly ? `Week of ${l}` : l}
+              cursor={{ fill: '#f1f5f9' }}
+            />
+            <Legend
+              wrapperStyle={{ fontSize: 11 }}
+              formatter={(value) => LABOR_LABEL[value] || value}
+            />
+            {LABOR_TYPES.map(t => (
+              <Bar key={t} dataKey={t} stackId="labor" fill={LABOR_COLOR[t]} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <p className="text-sm text-slate-400 py-12 text-center">
+          No labor recorded in range — needs Daily Sign-In Data with PT-/RM- work
+          orders and matching Payroll Rates.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function ContractorBreakdown({ byContractor, total }) {
   const list = byContractor || []
   return (
@@ -497,6 +565,8 @@ export default function RevenueTab() {
   const byContractor = data?.by_contractor|| []
   const topWos       = data?.top_wos      || []
   const needs        = data?.needs_pricing|| []
+  const laborDaily   = data?.labor_daily  || []
+  const laborTotals  = data?.labor_totals || { mma: 0, thermo: 0, total: 0 }
 
   // Roll the per-pricing-group period totals (data.by_group) into the three
   // headline buckets. Together they equal totals.revenue (unpriced items
@@ -570,6 +640,40 @@ export default function RevenueTab() {
       <DailyRevenueChart daily={daily} />
 
       <GroupStackedChart daily={daily} />
+
+      {/* Labor by type — fully-loaded crew cost split MMA (PT WOs) vs Thermo
+          (RM WOs). Read against the Revenue total / by-type row above. */}
+      <div className="space-y-2">
+        <p className="section-label">Labor cost by type</p>
+        <div className="grid grid-cols-3 gap-3">
+          <StatCard
+            label="MMA"
+            value={fmtUsd(laborTotals.mma)}
+            sub={laborTotals.total > 0
+              ? `${Math.round((laborTotals.mma / laborTotals.total) * 100)}% of labor`
+              : '—'}
+            color="text-amber-600"
+          />
+          <StatCard
+            label="Thermo"
+            value={fmtUsd(laborTotals.thermo)}
+            sub={laborTotals.total > 0
+              ? `${Math.round((laborTotals.thermo / laborTotals.total) * 100)}% of labor`
+              : '—'}
+            color="text-teal-700"
+          />
+          <StatCard
+            label="Total Labor"
+            value={fmtUsd(laborTotals.total)}
+            sub={totals.revenue > 0
+              ? `${Math.round((laborTotals.total / totals.revenue) * 100)}% of revenue`
+              : 'fully loaded'}
+            color="text-navy"
+          />
+        </div>
+      </div>
+
+      <LaborCostChart laborDaily={laborDaily} />
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <ContractorBreakdown byContractor={byContractor} total={totals.revenue} />

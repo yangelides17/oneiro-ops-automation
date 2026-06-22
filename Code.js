@@ -11194,6 +11194,54 @@ function _buildRevenuePayload_(startIso, endIso) {
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 25);
 
+  // ── Walk Daily Sign-In Data → fully-loaded labor cost per day, split by
+  // work type (MMA vs Thermo). Work type comes from the WO-number prefix:
+  // PT- = Paint/MMA, RM- = Road Markings/Thermo. A crew never mixes the two
+  // in a single shift (different vehicles/material), so the shift's first
+  // PT/RM token decides the bucket. Cost uses the same fully-loaded formula
+  // as Certified Payroll: ST×(st_rate+st_supp) + OT×(ot_rate+ot_supp), with
+  // ST = HoursWorked − Overtime. Per-shift ST/OT here (cols 10/11) can differ
+  // slightly from the CP's weekly-40h/YTD OT allocation — fine for a trend.
+  const siSheet     = ss.getSheetByName('Daily Sign-In Data');
+  const payrollRates = _loadPayrollRates_(ss);
+  const laborDailyMap = {};   // dateIso → { mma, thermo }
+  let laborMmaTotal    = 0;
+  let laborThermoTotal = 0;
+
+  if (siSheet && Array.isArray(payrollRates) && payrollRates.length) {
+    const siData = siSheet.getDataRange().getValues();
+    for (let i = 1; i < siData.length; i++) {
+      const row = siData[i];
+      if (!row[0]) continue;
+      const dateIso = fmt(row[0]);
+      if (!dateIso || dateIso < startIso || dateIso > endIso) continue;
+
+      const m = String(row[1] || '').match(/(PT|RM)-/i);
+      if (!m) continue;   // no recognizable work-type prefix — skip
+      const workType = m[1].toUpperCase() === 'PT' ? 'mma' : 'thermo';
+
+      const cls  = String(row[7] || '').trim().toUpperCase();
+      const rate = _resolvePayrollRate_(payrollRates, cls, dateIso);
+      if (!rate) continue;   // no rate effective for this (date, class) — skip
+
+      const hours = Number(row[10]) || 0;
+      if (hours <= 0) continue;
+      const ot = Number(row[11]) || 0;
+      const st = Math.max(0, hours - ot);
+      const cost = st * ((rate.st_rate || 0) + (rate.st_supp || 0))
+                 + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
+      if (cost <= 0) continue;
+
+      let bucket = laborDailyMap[dateIso];
+      if (!bucket) bucket = laborDailyMap[dateIso] = { date: dateIso, mma: 0, thermo: 0 };
+      bucket[workType] += cost;
+      if (workType === 'mma') laborMmaTotal += cost;
+      else                    laborThermoTotal += cost;
+    }
+  }
+
+  const laborDaily = Object.keys(laborDailyMap).sort().map(k => laborDailyMap[k]);
+
   return {
     range: { start: startIso, end: endIso },
     totals: {
@@ -11206,6 +11254,12 @@ function _buildRevenuePayload_(startIso, endIso) {
     by_group:      byGroup,
     top_wos:       topWos,
     needs_pricing: needsPricing,
+    labor_daily:   laborDaily,
+    labor_totals:  {
+      mma:    laborMmaTotal,
+      thermo: laborThermoTotal,
+      total:  laborMmaTotal + laborThermoTotal,
+    },
   };
 }
 
