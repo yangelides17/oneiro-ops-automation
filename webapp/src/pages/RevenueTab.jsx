@@ -9,6 +9,7 @@ import {
   PRICING_GROUPS,
   PRICING_GROUP_LABEL,
   NEEDS_PRICING_REASON_LABEL,
+  REVENUE_BUCKETS,
 } from '../lib/pricing'
 
 // ── Date range helpers ────────────────────────────────────────
@@ -497,6 +498,17 @@ export default function RevenueTab() {
   const topWos       = data?.top_wos      || []
   const needs        = data?.needs_pricing|| []
 
+  // Roll the per-pricing-group period totals (data.by_group) into the three
+  // headline buckets. Together they equal totals.revenue (unpriced items
+  // contribute $0 and surface under "Needs Pricing").
+  const groupRevenue = {}
+  ;(data?.by_group || []).forEach(g => { groupRevenue[g.group] = g.revenue || 0 })
+  const bucketTotals = REVENUE_BUCKETS.map(b => ({
+    key:     b.key,
+    label:   b.label,
+    revenue: b.groups.reduce((sum, g) => sum + (groupRevenue[g] || 0), 0),
+  }))
+
   return (
     <div className="space-y-6">
       <RangePicker
@@ -532,6 +544,25 @@ export default function RevenueTab() {
           sub={totals.unpriced_items === 0 ? 'all clear' : 'see panel below'}
           color={totals.unpriced_items === 0 ? 'text-green-600' : 'text-amber-600'}
         />
+      </div>
+
+      {/* Revenue by type — Thermo / MMA / Preform roll-ups of the pricing
+          groups; the three sum to the Revenue total above. */}
+      <div className="space-y-2">
+        <p className="section-label">Revenue by type</p>
+        <div className="grid grid-cols-3 gap-3">
+          {bucketTotals.map(b => (
+            <StatCard
+              key={b.key}
+              label={b.label}
+              value={fmtUsd(b.revenue)}
+              sub={totals.revenue > 0
+                ? `${Math.round((b.revenue / totals.revenue) * 100)}% of revenue`
+                : '—'}
+              color="text-navy"
+            />
+          ))}
+        </div>
       </div>
 
       <NeedsPricingPanel items={needs} />

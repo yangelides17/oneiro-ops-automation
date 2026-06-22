@@ -120,6 +120,18 @@ export const PRICING_GROUP_LABEL = {
   unpriced:      'Unpriced',
 }
 
+// Higher-level revenue roll-ups for the Revenue tab KPIs. Each bucket sums
+// the pricing groups below it; the three together equal total revenue
+// (unpriced items contribute $0 and surface under "Needs Pricing").
+//   Thermo  = 4" Line + Crosswalk/Stop Line + Extruded L&S
+//   MMA     = Color Surface
+//   Preform = Preformed L&S
+export const REVENUE_BUCKETS = [
+  { key: 'thermo',  label: 'Thermo',  groups: ['line4', 'line12', 'extruded'] },
+  { key: 'mma',     label: 'MMA',     groups: ['color_surface'] },
+  { key: 'preform', label: 'Preform', groups: ['preformed'] },
+]
+
 export const NEEDS_PRICING_REASON_LABEL = {
   no_rate:           'No Contract Pricing row matches this contract',
   no_unit_count:     'Unit count missing from extruded table',
