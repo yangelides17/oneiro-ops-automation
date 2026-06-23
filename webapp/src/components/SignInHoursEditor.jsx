@@ -206,17 +206,17 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
             depends on their whole-day total across sheets, so the
             accurate split lives in the Shift Totals strip below. */}
         <div className="hidden sm:grid grid-cols-12 gap-2 px-3 py-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-400">
-          <span className="col-span-4">Employee</span>
+          <span className="col-span-3">Employee</span>
           <span className="col-span-2">Class</span>
           <span className="col-span-3">In</span>
-          <span className="col-span-2">Out</span>
+          <span className="col-span-3">Out</span>
           <span className="col-span-1 text-right">Hrs</span>
         </div>
         {edits.map((e, i) => {
           const c = rowCalc(e)
           return (
             <div key={e.row_index} className="grid grid-cols-12 gap-2 px-3 py-2 items-center">
-              <span className="col-span-12 sm:col-span-4 text-sm font-semibold text-navy truncate">
+              <span className="col-span-12 sm:col-span-3 text-sm font-semibold text-navy truncate">
                 {e.name}
               </span>
               <div className="col-span-4 sm:col-span-2">
@@ -236,7 +236,7 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
                   disabled={!editing}
                   className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default" />
               </div>
-              <div className="col-span-4 sm:col-span-2">
+              <div className="col-span-4 sm:col-span-3">
                 <input
                   type="time"
                   value={e.timeOut}
