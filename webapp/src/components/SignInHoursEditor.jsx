@@ -32,11 +32,14 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
   const [saving,  setSaving]    = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedNote, setSavedNote] = useState('')
+  // Locked by default — admin clicks "Edit" to unlock, "Save hours" to
+  // commit + relock. Prevents accidental edits while reviewing.
+  const [editing, setEditing]   = useState(false)
 
   // ── Load rows whenever the selected file changes ─────────────
   useEffect(() => {
     let cancelled = false
-    setLoading(true); setError(''); setSaveError(''); setSavedNote('')
+    setLoading(true); setError(''); setSaveError(''); setSavedNote(''); setEditing(false)
     const qs = new URLSearchParams({ filename: filename || '' }).toString()
     fetch(`/api/approvals/${encodeURIComponent(fileId)}/signin-rows?${qs}`)
       .then(r => r.json())
@@ -116,7 +119,8 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
       return !o || e.classification !== o.classification ||
         e.timeIn !== o.timeIn || e.timeOut !== o.timeOut
     })
-    if (!changed.length) return
+    // No changes → just relock without a round-trip.
+    if (!changed.length) { setEditing(false); return }
     setSaving(true)
     try {
       const res = await fetch(`/api/approvals/${encodeURIComponent(fileId)}/save-signin-rows`, {
@@ -141,11 +145,18 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
       setSavedNote(n > 0
         ? `Saved. Also recomputed overtime on ${n} row(s) on other sheets for this day.`
         : 'Saved.')
+      setEditing(false)   // relock after a successful save
     } catch (err) {
       setSaveError(err.message || 'Save failed')
     } finally {
       setSaving(false)
     }
+  }
+
+  // Leave edit mode, discarding any uncommitted changes.
+  const cancelEditing = () => {
+    setEdits(original.map(o => ({ ...o })))
+    setSaveError(''); setSavedNote(''); setEditing(false)
   }
 
   // ── Render ───────────────────────────────────────────────────
@@ -212,7 +223,8 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
                 <select
                   value={e.classification}
                   onChange={ev => setRow(i, { classification: ev.target.value })}
-                  className="field-input !py-1 text-sm">
+                  disabled={!editing}
+                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default">
                   {CLASSIFICATIONS.map(cl => <option key={cl}>{cl}</option>)}
                 </select>
               </div>
@@ -221,14 +233,16 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
                   type="time"
                   value={e.timeIn}
                   onChange={ev => setRow(i, { timeIn: ev.target.value })}
-                  className="field-input !py-1 text-sm" />
+                  disabled={!editing}
+                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default" />
               </div>
               <div className="col-span-4 sm:col-span-2">
                 <input
                   type="time"
                   value={e.timeOut}
                   onChange={ev => setRow(i, { timeOut: ev.target.value })}
-                  className="field-input !py-1 text-sm" />
+                  disabled={!editing}
+                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default" />
               </div>
               <span className="col-span-12 sm:col-span-1 text-right text-sm font-semibold text-slate-700">
                 {c.hours || '—'}
@@ -256,20 +270,40 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
         </div>
       </div>
 
-      {/* Save */}
+      {/* Footer: status + Edit / Save-Cancel toggle */}
       <div className="flex items-center justify-between gap-3 px-3 py-2 border-t border-slate-100">
         <div className="text-[11px] min-w-0">
           {saveError && <span className="text-red-600">{saveError}</span>}
           {!saveError && savedNote && <span className="text-emerald-700">{savedNote}</span>}
         </div>
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={!isDirty || saving}
-          className="text-xs font-bold px-4 py-1.5 rounded-lg bg-navy text-white
-                     hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0">
-          {saving ? 'Saving…' : 'Save hours'}
-        </button>
+        {editing ? (
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              type="button"
+              onClick={cancelEditing}
+              disabled={saving}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg text-slate-600
+                         hover:bg-slate-100 disabled:opacity-40">
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving}
+              className="text-xs font-bold px-4 py-1.5 rounded-lg bg-navy text-white
+                         hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed">
+              {saving ? 'Saving…' : 'Save hours'}
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            className="text-xs font-bold px-4 py-1.5 rounded-lg bg-navy text-white
+                       hover:opacity-90 flex-shrink-0">
+            Edit
+          </button>
+        )}
       </div>
     </div>
   )

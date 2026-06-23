@@ -5496,13 +5496,37 @@ function _signInRowMatchesFile_(row, f) {
   return true;
 }
 
+// Normalize a Daily Sign-In Data time cell to 24-hour "HH:MM" for the
+// Approvals editor's <input type="time">. Google Sheets coerces the
+// "h:mm AM/PM" strings we write into actual time values, so getValues()
+// hands them back as Date objects — String(cell) on those yields an
+// unparseable JS-date string (the bug where times showed blank). Handle
+// Date, 12-hour (incl. seconds), 24-hour, and date-like-string cases.
+function _signInTimeCellToHHMM_(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    return Utilities.formatDate(v, CONFIG.TIMEZONE, 'HH:mm');
+  }
+  const s = String(v || '').trim();
+  if (!s) return '';
+  let m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)$/i);
+  if (m) {
+    let h = Number(m[1]) % 12;
+    if (m[3].toUpperCase() === 'PM') h += 12;
+    return ('0' + h).slice(-2) + ':' + m[2];
+  }
+  m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (m) return ('0' + Number(m[1])).slice(-2) + ':' + m[2];
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? '' : Utilities.formatDate(d, CONFIG.TIMEZONE, 'HH:mm');
+}
+
 function _signInRowView_(row, sheetRowIndex) {
   return {
     row_index:      sheetRowIndex,
     name:           String(row[6]  || '').trim(),
     classification: String(row[7]  || '').trim(),
-    time_in:        String(row[8]  || '').trim(),
-    time_out:       String(row[9]  || '').trim(),
+    time_in:        _signInTimeCellToHHMM_(row[8]),
+    time_out:       _signInTimeCellToHHMM_(row[9]),
     hours:          Number(row[10]) || 0,
     overtime:       Number(row[11]) || 0,
     crew_chief:     String(row[12] || '').trim(),
