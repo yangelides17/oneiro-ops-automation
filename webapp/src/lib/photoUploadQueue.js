@@ -68,7 +68,7 @@ async function fetchWithTimeout(input, init, timeoutMs) {
   }
 }
 
-async function reverseGeocode(lat, lng) {
+export async function reverseGeocode(lat, lng) {
   const t0 = performance.now()
   try {
     // 6s: a healthy Apps Script Maps.newGeocoder round-trip is 1-2s.
@@ -252,15 +252,23 @@ export function usePhotoUploadQueue(woId) {
       // pre-watermark blob, which is why Drive received un-watermarked
       // photos while the in-memory preview correctly showed the overlay.
       let liveBlob = item.blob
-      if (item.source === 'capture' && !item.watermark_applied) {
+      if ((item.source === 'capture' || item.source === 'manual') && !item.watermark_applied) {
         patch(item.id, { status: 'geocoding' })
         let geoData = null
         beginStep('geocode')
         const tGeo = performance.now()
-        if (item.geo && isFinite(item.geo.lat) && isFinite(item.geo.lng)) {
+        // Manual stamps (legacy photos uploaded with a hand-entered time +
+        // coords) arrive with their address lines already resolved — and
+        // possibly hand-edited — in the upload modal. Don't re-geocode and
+        // risk overwriting them. Live captures geocode from their GPS fix.
+        if (!Array.isArray(item.addressLines) &&
+            item.geo && isFinite(item.geo.lat) && isFinite(item.geo.lng)) {
           geoData = await reverseGeocode(item.geo.lat, item.geo.lng)
         }
         stampStep('geocodeMs', performance.now() - tGeo)
+        const addressLines = Array.isArray(item.addressLines)
+          ? item.addressLines
+          : formatWatermarkAddress(geoData)
         // Deletion guard. cancelOne removes the id from inFlightRef AND
         // from items. We can't rely on `fresh()` being undefined now
         // that it falls back to `initial` — instead read inFlightRef
@@ -275,7 +283,7 @@ export function usePhotoUploadQueue(woId) {
         // double-decode/double-encode penalty.
         const watermarked = await watermarkImage(liveBlob, {
           timestamp: item.captured_at ? new Date(item.captured_at) : new Date(),
-          addressLines: formatWatermarkAddress(geoData),
+          addressLines,
           lat: item.geo?.lat,
           lng: item.geo?.lng,
         })
@@ -413,6 +421,34 @@ export function usePhotoUploadQueue(woId) {
     queueMicrotask(() => newItems.forEach(kick))
   }, [woId, kick])
 
+  // Manual stamp path — legacy/library photos the user wants watermarked
+  // with a hand-entered timestamp + coordinates (e.g. photos taken before
+  // the live-capture stamp existed). Same watermark + upload pipeline as a
+  // live capture, but the timestamp/geo come from `ctx` instead of the
+  // device clock + GPS. `ctx`: { captured_at: ISO string, geo: {lat,lng},
+  // addressLines?: string[] } — addressLines are pre-resolved in the modal
+  // so the queue doesn't re-geocode and risk a different result.
+  const addManual = useCallback((files, ctx) => {
+    if (!woId || !files || !files.length) return
+    const captured_at = ctx?.captured_at || new Date().toISOString()
+    const geo = (ctx?.geo && isFinite(ctx.geo.lat) && isFinite(ctx.geo.lng))
+      ? { lat: ctx.geo.lat, lng: ctx.geo.lng }
+      : null
+    const addressLines = Array.isArray(ctx?.addressLines) ? ctx.addressLines : null
+    const newItems = Array.from(files).map(f => {
+      const id = newId()
+      return {
+        id, source: 'manual', status: 'pending', blob: f,
+        previewUrl: URL.createObjectURL(f),
+        captured_at, geo, addressLines,
+        filename: f.name || `photo-${id}.jpg`,
+        mime: f.type || 'image/jpeg', watermark_applied: false,
+      }
+    })
+    setItems(prev => [...newItems, ...prev])
+    queueMicrotask(() => newItems.forEach(kick))
+  }, [woId, kick])
+
   // ── 4. Delete (server-side trash if uploaded, local-only otherwise)
   const deleteOne = useCallback(async (id) => {
     const item = itemsRef.current.find(i => i.id === id)
@@ -489,6 +525,7 @@ export function usePhotoUploadQueue(woId) {
     errorCount,
     addCapture,
     addLibrary,
+    addManual,
     deleteOne,
     retryOne,
     cancelOne,

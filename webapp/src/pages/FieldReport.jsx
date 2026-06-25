@@ -11,7 +11,8 @@ import {
 import { parseQty }    from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
 import { opToday } from '../lib/dateOps'
-import { usePhotoUploadQueue } from '../lib/photoUploadQueue'
+import { usePhotoUploadQueue, reverseGeocode } from '../lib/photoUploadQueue'
+import { formatWatermarkAddress } from '../lib/photoPipeline'
 
 const SECTION_HEADERS = {
   'Top Table':          'WO Top Table',
@@ -512,6 +513,19 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
   const cameraRef  = useRef(null)
   const libraryRef = useRef(null)
 
+  // Library-upload stamp modal. When the user picks photos from their
+  // library we ask whether to burn on a date/time/location stamp (for
+  // legacy photos taken before live capture stamped them). `stampModal`
+  // holds the HEIC-normalised File[] awaiting that decision plus the
+  // form fields.
+  const [stampModal, setStampModal] = useState(null) // { files } | null
+  const [stampDateTime, setStampDateTime] = useState('') // datetime-local string
+  const [stampLat, setStampLat] = useState('')
+  const [stampLng, setStampLng] = useState('')
+  const [stampAddr, setStampAddr] = useState(null)   // string[] | null (looked-up preview)
+  const [stampLooking, setStampLooking] = useState(false)
+  const [stampError, setStampError] = useState('')
+
   const acquireGeo = () => new Promise(resolve => {
     if (!navigator.geolocation) { resolve(null); return }
     let settled = false
@@ -528,13 +542,12 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
   // every capture, which lands in Drive as image.jpg, image (1).jpg, etc.
   // Rename to {WO}_{LOCATION}_{YYYY-MM-DD}_{HH-MM-SS}.jpg before queueing
   // so the folder is readable and individual files are self-describing.
-  const buildFilename = () => {
+  const buildFilename = (d = new Date()) => {
     const woId = woContext?.id || 'WO'
     const loc  = (woContext?.location || '')
       .replace(/[^a-zA-Z0-9]+/g, '_')
       .replace(/^_+|_+$/g, '')
       .slice(0, 40) || 'site'
-    const d = new Date()
     const pad = (n) => String(n).padStart(2, '0')
     const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
     const time = `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
@@ -561,15 +574,75 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
     const prepared = await Promise.all(files.map(f =>
       isHeic(f) ? convertHeicToJpeg(f) : Promise.resolve(f)
     ))
-    // Library imports get the same name format, but with a numeric
-    // suffix when multiple files are picked at once so they don't
-    // collide on the same second.
-    const named = prepared.map((f, i) => {
-      const base = buildFilename().replace(/\.jpg$/, '')
-      const suffix = prepared.length > 1 ? `_${i + 1}` : ''
-      return renameFile(f, `${base}${suffix}.jpg`)
+    // Don't queue yet — ask whether to stamp these first. The actual
+    // rename happens at decision time so a stamped photo's filename can
+    // embed the hand-entered capture time, not "now".
+    setStampDateTime('')
+    setStampLat('')
+    setStampLng('')
+    setStampAddr(null)
+    setStampError('')
+    setStampModal({ files: prepared })
+  }
+
+  // Name a batch of library files, suffixing _N when more than one is
+  // picked at once so same-second captures don't collide in Drive.
+  const nameBatch = (files, when) => files.map((f, i) => {
+    const base = buildFilename(when).replace(/\.jpg$/, '')
+    const suffix = files.length > 1 ? `_${i + 1}` : ''
+    return renameFile(f, `${base}${suffix}.jpg`)
+  })
+
+  // "Just upload" — current behaviour, no stamp.
+  const submitPlainUpload = () => {
+    queue.addLibrary(nameBatch(stampModal.files, new Date()))
+    setStampModal(null)
+  }
+
+  // Reverse-geocode the entered coords so the user previews the exact
+  // address lines that will render — same endpoint + formatter the live
+  // capture pipeline uses, so the preview matches the burned-in result.
+  const lookupAddress = async () => {
+    const lat = parseFloat(stampLat), lng = parseFloat(stampLng)
+    if (!isFinite(lat) || !isFinite(lng)) {
+      setStampError('Enter a valid latitude and longitude first.')
+      return
+    }
+    setStampError('')
+    setStampLooking(true)
+    try {
+      const data = await reverseGeocode(lat, lng)
+      setStampAddr(formatWatermarkAddress(data)) // [] when geocode unavailable
+    } finally {
+      setStampLooking(false)
+    }
+  }
+
+  // "Add stamp & upload" — routes through the manual watermark path with
+  // the hand-entered time + coords (+ looked-up address if previewed).
+  const submitStampedUpload = async () => {
+    const lat = parseFloat(stampLat), lng = parseFloat(stampLng)
+    if (!stampDateTime) { setStampError('Enter the date & time.'); return }
+    if (!isFinite(lat) || !isFinite(lng)) {
+      setStampError('Enter a valid latitude and longitude.')
+      return
+    }
+    const when = new Date(stampDateTime) // datetime-local → device-local Date
+    if (isNaN(when.getTime())) { setStampError('That date & time isn’t valid.'); return }
+    // If the user never tapped "Look up address", resolve it now so the
+    // address lines are deterministic rather than racing in the queue.
+    let addressLines = stampAddr
+    if (addressLines == null) {
+      setStampLooking(true)
+      try { addressLines = formatWatermarkAddress(await reverseGeocode(lat, lng)) }
+      finally { setStampLooking(false) }
+    }
+    queue.addManual(nameBatch(stampModal.files, when), {
+      captured_at: when.toISOString(),
+      geo: { lat, lng },
+      addressLines,
     })
-    queue.addLibrary(named)
+    setStampModal(null)
   }
 
   return (
@@ -597,7 +670,9 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
                className="hidden" onChange={onLibraryChange} />
       </div>
       <p className="text-[11px] text-slate-400">
-        Live photos get a date/time/location stamp. All photos save to Drive automatically.
+        Live photos get a date/time/location stamp automatically. Uploading from
+        your library? You'll be asked whether to stamp those too. All photos save
+        to Drive automatically.
       </p>
 
       {queue.historicLoading && (
@@ -641,6 +716,105 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
           the "✕ N failed" badge. Each failed thumbnail also has its own
           Retry button — this just makes the reason legible. */}
       <PhotoErrorNotice items={queue.items} />
+
+      {/* Library-upload stamp prompt. Asks whether to burn a date/time/
+          location overlay onto the picked photos before upload — for
+          legacy photos taken before live capture stamped them. */}
+      {stampModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
+          onClick={() => setStampModal(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4 max-h-[90vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-center space-y-1">
+              <div className="text-3xl">🏷️</div>
+              <h2 className="text-lg font-black text-navy">Add a date &amp; location stamp?</h2>
+              <p className="text-slate-500 text-sm leading-relaxed">
+                {stampModal.files.length === 1
+                  ? 'This photo'
+                  : `These ${stampModal.files.length} photos`} can be stamped with a
+                timestamp and geotag, matching live captures. Leave it off to
+                upload as-is.
+              </p>
+            </div>
+
+            <div className="space-y-3 border-t border-slate-100 pt-4">
+              <label className="block">
+                <span className="section-label">Date &amp; time</span>
+                <input
+                  type="datetime-local" step="1"
+                  value={stampDateTime}
+                  onChange={e => setStampDateTime(e.target.value)}
+                  className="field-input w-full"
+                />
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="block">
+                  <span className="section-label">Latitude</span>
+                  <input
+                    type="text" inputMode="decimal" placeholder="40.750505"
+                    value={stampLat}
+                    onChange={e => { setStampLat(e.target.value); setStampAddr(null) }}
+                    className="field-input w-full"
+                  />
+                </label>
+                <label className="block">
+                  <span className="section-label">Longitude</span>
+                  <input
+                    type="text" inputMode="decimal" placeholder="-73.999877"
+                    value={stampLng}
+                    onChange={e => { setStampLng(e.target.value); setStampAddr(null) }}
+                    className="field-input w-full"
+                  />
+                </label>
+              </div>
+
+              <button
+                type="button" onClick={lookupAddress} disabled={stampLooking}
+                className="text-xs font-bold text-navy hover:underline disabled:opacity-50"
+              >
+                {stampLooking ? 'Looking up…' : '🔎 Look up address'}
+              </button>
+              {stampAddr && (
+                <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-2 space-y-0.5">
+                  {stampAddr.length
+                    ? stampAddr.map((l, i) => <div key={i}>{l}</div>)
+                    : <div className="italic text-slate-400">No address found — coordinates only will be shown.</div>}
+                </div>
+              )}
+              {stampError && <p className="text-[11px] text-red-600">{stampError}</p>}
+            </div>
+
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                onClick={submitStampedUpload} disabled={stampLooking}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white
+                           hover:opacity-90 active:opacity-80 transition-all disabled:opacity-50"
+              >
+                Add stamp &amp; upload
+              </button>
+              <button
+                onClick={submitPlainUpload}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
+                           text-slate-600 hover:bg-slate-200 transition-all"
+              >
+                Upload without stamp
+              </button>
+              <button
+                onClick={() => setStampModal(null)}
+                className="w-full py-2 rounded-xl font-semibold text-xs text-slate-400
+                           hover:text-slate-600 transition-all"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -790,6 +964,10 @@ export default function FieldReport() {
   const photoQueue = usePhotoUploadQueue(selectedWOId)
   const [photoDeleteConfirm, setPhotoDeleteConfirm] = useState(null)  // {item} or null
   const [photoLightbox, setPhotoLightbox] = useState(null)            // item or null
+  // Completed WOs hide the photo uploader by default; this reveals it so
+  // a crew can still add photos to a finished report (e.g. legacy photos
+  // they forgot to attach). Reset whenever the selected WO changes.
+  const [showCompletedUploader, setShowCompletedUploader] = useState(false)
 
   // Per-row UI state for the Marking Items list
   const [bulkMode,      setBulkMode]      = useState(false)
@@ -1001,6 +1179,7 @@ export default function FieldReport() {
   // Reset the "unlock" state whenever the selected WO changes so the
   // locked pill is back by default on the next WO.
   useEffect(() => { setWbEditUnlocked(false) }, [selectedWOId])
+  useEffect(() => { setShowCompletedUploader(false) }, [selectedWOId])
   // Reset edit mode + production-day defaults whenever the selected WO
   // changes. The completed-WO edit panel state is scoped per-WO.
   useEffect(() => {
@@ -2137,13 +2316,25 @@ export default function FieldReport() {
           <p className="section-label">Site Photos</p>
           {!selectedWOId ? (
             <p className="text-sm text-slate-400 italic">Select a Work Order above to add photos.</p>
-          ) : lockedAlwaysForCompleted ? (
-            <p className="text-sm text-slate-500 italic">
-              Photos can't be added via the edit flow.
-              {selectedWO?.folder_url
-                ? <> Use the <a href={selectedWO.folder_url} target="_blank" rel="noopener noreferrer" className="font-bold text-navy hover:underline">View WO 📁</a> link in WO Details to drop them into Drive directly.</>
-                : <> Drop them into the WO's Drive folder directly.</>}
-            </p>
+          ) : lockedAlwaysForCompleted && !showCompletedUploader ? (
+            <div className="space-y-2">
+              <p className="text-sm text-slate-500 italic">
+                This Work Order is completed. You can still add photos to the
+                report — useful for legacy photos that were taken on-site but
+                never attached.
+                {selectedWO?.folder_url
+                  ? <> Or use the <a href={selectedWO.folder_url} target="_blank" rel="noopener noreferrer" className="font-bold text-navy hover:underline">View WO 📁</a> link to drop them into Drive directly.</>
+                  : null}
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowCompletedUploader(true)}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-white text-navy
+                           border-2 border-navy/15 hover:border-navy/40 active:bg-slate-50 transition-colors"
+              >
+                ＋ Add photos to completed report
+              </button>
+            </div>
           ) : (
             <PhotoCaptureGallery
               queue={photoQueue}
