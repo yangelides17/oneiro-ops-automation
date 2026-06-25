@@ -60,6 +60,29 @@ async function convertHeicToJpeg(file) {
   }
 }
 
+// Can the browser actually decode this file to pixels? HEIC that
+// heic2any failed to convert (and any corrupt image) will fail here.
+// We MUST catch it before queueing a stamped photo: once it reaches
+// watermarkImage the failure is silent — it returns the original
+// unstamped, and Drive ends up with an unstamped / undecodable file.
+// Mirrors watermarkImage's own decode path (createImageBitmap, then an
+// <img> fallback for the iOS-Safari cases createImageBitmap chokes on).
+async function isDecodableImage(file) {
+  try {
+    const bmp = await createImageBitmap(file)
+    bmp.close?.()
+    return true
+  } catch {
+    return await new Promise(resolve => {
+      const url = URL.createObjectURL(file)
+      const img = new Image()
+      img.onload  = () => { URL.revokeObjectURL(url); resolve(true) }
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(false) }
+      img.src = url
+    })
+  }
+}
+
 // Image compression now lives inside usePhotoUploadQueue —
 // compressed-on-upload (post-watermark for captures, raw for library).
 
@@ -571,18 +594,26 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
     const files = Array.from(e.target.files || [])
     e.target.value = ''
     if (files.length === 0) return
-    const prepared = await Promise.all(files.map(f =>
-      isHeic(f) ? convertHeicToJpeg(f) : Promise.resolve(f)
-    ))
-    // Don't queue yet — ask whether to stamp these first. The actual
-    // rename happens at decision time so a stamped photo's filename can
-    // embed the hand-entered capture time, not "now".
+    // Open the modal immediately in a "preparing" state. HEIC conversion
+    // (heic2any is a 1.3 MB chunk + a multi-second decode) otherwise runs
+    // with zero feedback and the button looks frozen.
     setStampDateTime('')
     setStampLat('')
     setStampLng('')
     setStampAddr(null)
     setStampError('')
-    setStampModal({ files: prepared })
+    setStampModal({ files: null, skipped: [], preparing: true })
+    // Convert any HEIC, then decode-check each file. Anything the browser
+    // can't decode (a HEIC heic2any couldn't convert, a corrupt file) is
+    // skipped rather than silently uploaded unstamped/undecodable.
+    const ready = []
+    const skipped = []
+    for (const f of files) {
+      const converted = isHeic(f) ? await convertHeicToJpeg(f) : f
+      if (await isDecodableImage(converted)) ready.push(converted)
+      else skipped.push(f.name || 'photo')
+    }
+    setStampModal({ files: ready, skipped, preparing: false })
   }
 
   // Name a batch of library files, suffixing _N when more than one is
@@ -595,6 +626,7 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
 
   // "Just upload" — current behaviour, no stamp.
   const submitPlainUpload = () => {
+    if (!stampModal?.files?.length) { setStampModal(null); return }
     queue.addLibrary(nameBatch(stampModal.files, new Date()))
     setStampModal(null)
   }
@@ -621,6 +653,7 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
   // "Add stamp & upload" — routes through the manual watermark path with
   // the hand-entered time + coords (+ looked-up address if previewed).
   const submitStampedUpload = async () => {
+    if (!stampModal?.files?.length) { setStampError('No usable photos to upload.'); return }
     const lat = parseFloat(stampLat), lng = parseFloat(stampLng)
     if (!stampDateTime) { setStampError('Enter the date & time.'); return }
     if (!isFinite(lat) || !isFinite(lng)) {
@@ -730,88 +763,131 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
             className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4 max-h-[90vh] overflow-y-auto"
             onClick={e => e.stopPropagation()}
           >
-            <div className="text-center space-y-1">
-              <div className="text-3xl">🏷️</div>
-              <h2 className="text-lg font-black text-navy">Add a date &amp; location stamp?</h2>
-              <p className="text-slate-500 text-sm leading-relaxed">
-                {stampModal.files.length === 1
-                  ? 'This photo'
-                  : `These ${stampModal.files.length} photos`} can be stamped with a
-                timestamp and geotag, matching live captures. Leave it off to
-                upload as-is.
-              </p>
-            </div>
-
-            <div className="space-y-3 border-t border-slate-100 pt-4">
-              <label className="block">
-                <span className="section-label">Date &amp; time</span>
-                <input
-                  type="datetime-local" step="1"
-                  value={stampDateTime}
-                  onChange={e => setStampDateTime(e.target.value)}
-                  className="field-input w-full"
-                />
-              </label>
-              <div className="grid grid-cols-2 gap-2">
-                <label className="block">
-                  <span className="section-label">Latitude</span>
-                  <input
-                    type="text" inputMode="decimal" placeholder="40.750505"
-                    value={stampLat}
-                    onChange={e => { setStampLat(e.target.value); setStampAddr(null) }}
-                    className="field-input w-full"
-                  />
-                </label>
-                <label className="block">
-                  <span className="section-label">Longitude</span>
-                  <input
-                    type="text" inputMode="decimal" placeholder="-73.999877"
-                    value={stampLng}
-                    onChange={e => { setStampLng(e.target.value); setStampAddr(null) }}
-                    className="field-input w-full"
-                  />
-                </label>
+            {stampModal.preparing ? (
+              <div className="py-8 flex flex-col items-center gap-3 text-center">
+                <span className="w-8 h-8 border-4 border-slate-200 border-t-navy rounded-full animate-spin" />
+                <p className="text-sm font-semibold text-slate-600">Preparing photos…</p>
+                <p className="text-[11px] text-slate-400">
+                  HEIC photos are converted in your browser, which can take a few seconds.
+                </p>
               </div>
-
-              <button
-                type="button" onClick={lookupAddress} disabled={stampLooking}
-                className="text-xs font-bold text-navy hover:underline disabled:opacity-50"
-              >
-                {stampLooking ? 'Looking up…' : '🔎 Look up address'}
-              </button>
-              {stampAddr && (
-                <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-2 space-y-0.5">
-                  {stampAddr.length
-                    ? stampAddr.map((l, i) => <div key={i}>{l}</div>)
-                    : <div className="italic text-slate-400">No address found — coordinates only will be shown.</div>}
+            ) : (
+              <>
+                <div className="text-center space-y-1">
+                  <div className="text-3xl">🏷️</div>
+                  <h2 className="text-lg font-black text-navy">Add a date &amp; location stamp?</h2>
+                  {stampModal.files.length > 0 ? (
+                    <p className="text-slate-500 text-sm leading-relaxed">
+                      {stampModal.files.length === 1
+                        ? 'This photo'
+                        : `These ${stampModal.files.length} photos`} can be stamped with a
+                      timestamp and geotag, matching live captures. Leave it off to
+                      upload as-is.
+                    </p>
+                  ) : (
+                    <p className="text-slate-500 text-sm leading-relaxed">
+                      None of the selected photos could be read in this browser.
+                    </p>
+                  )}
                 </div>
-              )}
-              {stampError && <p className="text-[11px] text-red-600">{stampError}</p>}
-            </div>
 
-            <div className="flex flex-col gap-2 pt-1">
-              <button
-                onClick={submitStampedUpload} disabled={stampLooking}
-                className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white
-                           hover:opacity-90 active:opacity-80 transition-all disabled:opacity-50"
-              >
-                Add stamp &amp; upload
-              </button>
-              <button
-                onClick={submitPlainUpload}
-                className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
-                           text-slate-600 hover:bg-slate-200 transition-all"
-              >
-                Upload without stamp
-              </button>
-              <button
-                onClick={() => setStampModal(null)}
-                className="w-full py-2 rounded-xl font-semibold text-xs text-slate-400
-                           hover:text-slate-600 transition-all"
-              >
-                Cancel
-              </button>
-            </div>
+                {/* Files the browser couldn't decode (HEIC heic2any failed
+                    on, corrupt images). Surfaced loudly instead of silently
+                    uploading them unstamped / undecodable. */}
+                {stampModal.skipped?.length > 0 && (
+                  <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                    <p className="font-bold">
+                      ⚠️ Couldn't read {stampModal.skipped.length} photo{stampModal.skipped.length > 1 ? 's' : ''} — likely
+                      a HEIC this browser can't decode:
+                    </p>
+                    <ul className="list-disc list-inside">
+                      {stampModal.skipped.map((n, i) => <li key={i} className="truncate">{n}</li>)}
+                    </ul>
+                    <p>
+                      Convert {stampModal.skipped.length > 1 ? 'them' : 'it'} to JPEG and try again.
+                      On a Mac: open in Preview → File → Export → Format: JPEG.
+                    </p>
+                  </div>
+                )}
+
+                {stampModal.files.length > 0 && (
+                  <div className="space-y-3 border-t border-slate-100 pt-4">
+                    <label className="block">
+                      <span className="section-label">Date &amp; time</span>
+                      <input
+                        type="datetime-local" step="1"
+                        value={stampDateTime}
+                        onChange={e => setStampDateTime(e.target.value)}
+                        className="field-input w-full"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="block">
+                        <span className="section-label">Latitude</span>
+                        <input
+                          type="text" inputMode="decimal" placeholder="40.750505"
+                          value={stampLat}
+                          onChange={e => { setStampLat(e.target.value); setStampAddr(null) }}
+                          className="field-input w-full"
+                        />
+                      </label>
+                      <label className="block">
+                        <span className="section-label">Longitude</span>
+                        <input
+                          type="text" inputMode="decimal" placeholder="-73.999877"
+                          value={stampLng}
+                          onChange={e => { setStampLng(e.target.value); setStampAddr(null) }}
+                          className="field-input w-full"
+                        />
+                      </label>
+                    </div>
+
+                    <button
+                      type="button" onClick={lookupAddress} disabled={stampLooking}
+                      className="text-xs font-bold text-navy hover:underline disabled:opacity-50"
+                    >
+                      {stampLooking ? 'Looking up…' : '🔎 Look up address'}
+                    </button>
+                    {stampAddr && (
+                      <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-2 space-y-0.5">
+                        {stampAddr.length
+                          ? stampAddr.map((l, i) => <div key={i}>{l}</div>)
+                          : <div className="italic text-slate-400">No address found — coordinates only will be shown.</div>}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {stampError && <p className="text-[11px] text-red-600">{stampError}</p>}
+
+                <div className="flex flex-col gap-2 pt-1">
+                  {stampModal.files.length > 0 && (
+                    <>
+                      <button
+                        onClick={submitStampedUpload} disabled={stampLooking}
+                        className="w-full py-3 rounded-xl font-bold text-sm bg-navy text-white
+                                   hover:opacity-90 active:opacity-80 transition-all disabled:opacity-50"
+                      >
+                        Add stamp &amp; upload
+                      </button>
+                      <button
+                        onClick={submitPlainUpload}
+                        className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
+                                   text-slate-600 hover:bg-slate-200 transition-all"
+                      >
+                        Upload without stamp
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => setStampModal(null)}
+                    className="w-full py-2 rounded-xl font-semibold text-xs text-slate-400
+                               hover:text-slate-600 transition-all"
+                  >
+                    {stampModal.files.length > 0 ? 'Cancel' : 'Close'}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
