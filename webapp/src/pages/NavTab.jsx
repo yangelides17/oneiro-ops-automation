@@ -32,19 +32,18 @@ const PIN_COLOR = {
   'in progress': '#f97316',  // orange-500
 }
 
-// Pin silhouettes. RM (and anything else) keeps the classic teardrop
-// whose tip points at the exact coordinate (anchor at the tip). PT
-// orders get a rounded square so the two work types are instantly
-// distinguishable on the map at a glance; the square is centered on
-// the coordinate (anchor at its middle).
+// Pin silhouettes. RM (and anything else) keeps the classic teardrop.
+// PT orders get a rounded-square body with the same pointed bottom tip,
+// so the two work types are instantly distinguishable at a glance while
+// both still point their tip at the exact coordinate (anchor at the tip).
 const PIN_SHAPE = {
   teardrop: {
     path: 'M 12,2 C 7.589,2 4,5.589 4,10 c 0,5.5 8,12 8,12 0,0 8,-6.5 8,-12 0,-4.411 -3.589,-8 -8,-8 z',
     anchor: { x: 12, y: 22 },
   },
   square: {
-    path: 'M 7,4 L 17,4 Q 20,4 20,7 L 20,17 Q 20,20 17,20 L 7,20 Q 4,20 4,17 L 4,7 Q 4,4 7,4 Z',
-    anchor: { x: 12, y: 12 },
+    path: 'M 7,2 L 17,2 Q 20,2 20,5 L 20,13 Q 20,16 17,16 L 15,16 L 12,22 L 9,16 L 7,16 Q 4,16 4,13 L 4,5 Q 4,2 7,2 Z',
+    anchor: { x: 12, y: 22 },
   },
 }
 
