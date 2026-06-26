@@ -32,19 +32,38 @@ const PIN_COLOR = {
   'in progress': '#f97316',  // orange-500
 }
 
-// Build a Google Maps Symbol icon for a colored teardrop pin. The
-// strokeColor flips red on pins with a geocode_warning so admins
-// notice them at a glance.
-function buildPinIcon(status, hasWarning) {
-  const color = PIN_COLOR[(status || '').toLowerCase()] || '#94a3b8'  // slate fallback
-  return {
+// Pin silhouettes. RM (and anything else) keeps the classic teardrop
+// whose tip points at the exact coordinate (anchor at the tip). PT
+// orders get a rounded square so the two work types are instantly
+// distinguishable on the map at a glance; the square is centered on
+// the coordinate (anchor at its middle).
+const PIN_SHAPE = {
+  teardrop: {
     path: 'M 12,2 C 7.589,2 4,5.589 4,10 c 0,5.5 8,12 8,12 0,0 8,-6.5 8,-12 0,-4.411 -3.589,-8 -8,-8 z',
+    anchor: { x: 12, y: 22 },
+  },
+  square: {
+    path: 'M 7,4 L 17,4 Q 20,4 20,7 L 20,17 Q 20,20 17,20 L 7,20 Q 4,20 4,17 L 4,7 Q 4,4 7,4 Z',
+    anchor: { x: 12, y: 12 },
+  },
+}
+
+// Build a Google Maps Symbol icon for a colored pin. Color still mirrors
+// status (blue/amber/orange); shape now encodes work type — square for
+// PT, teardrop for everything else (RM). The strokeColor flips red on
+// pins with a geocode_warning so admins notice them at a glance.
+function buildPinIcon(status, hasWarning, woId) {
+  const color = PIN_COLOR[(status || '').toLowerCase()] || '#94a3b8'  // slate fallback
+  const isPT = (woId || '').trim().toUpperCase().startsWith('PT')
+  const shape = isPT ? PIN_SHAPE.square : PIN_SHAPE.teardrop
+  return {
+    path: shape.path,
     fillColor: color,
     fillOpacity: 1,
     strokeColor: hasWarning ? '#dc2626' : '#0f172a',  // red-600 or navy
     strokeWeight: hasWarning ? 2.5 : 1.2,
     scale: 1.6,
-    anchor: { x: 12, y: 22 },
+    anchor: shape.anchor,
   }
 }
 
@@ -235,7 +254,7 @@ export default function NavTab() {
               <MarkerF
                 key={w.wo_id}
                 position={{ lat: w.lat, lng: w.lng }}
-                icon={buildPinIcon(w.status, !!w.geocode_warning)}
+                icon={buildPinIcon(w.status, !!w.geocode_warning, w.wo_id)}
                 onClick={() => setActivePin(w)}
               />
             ))}
