@@ -83,7 +83,7 @@ function buildPinIcon(status, hasWarning, woId, hasPreform) {
     const svg =
       `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 24">` +
         `<path d="${shape.path}" fill="${color}" stroke="${strokeColor}" stroke-width="${strokeWeight}"/>` +
-        `<circle cx="18.5" cy="5.5" r="5" fill="#dc2626" stroke="#ffffff" stroke-width="1"/>` +
+        `<circle cx="18.5" cy="5.5" r="5" fill="#16a34a" stroke="#ffffff" stroke-width="1"/>` +
         BIKE_GLYPH +
       `</svg>`
     return {
