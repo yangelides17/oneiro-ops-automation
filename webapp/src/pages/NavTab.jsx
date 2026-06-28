@@ -47,21 +47,59 @@ const PIN_SHAPE = {
   },
 }
 
-// Build a Google Maps Symbol icon for a colored pin. Color still mirrors
-// status (blue/amber/orange); shape now encodes work type — square for
-// PT, teardrop for everything else (RM). The strokeColor flips red on
-// pins with a geocode_warning so admins notice them at a glance.
-function buildPinIcon(status, hasWarning, woId) {
+// Pins render at this many screen px per SVG/path unit. Shared by the
+// vector Symbol path (scale) and the composed SVG icon (scaledSize) so a
+// badged pin is exactly the same size as a plain one.
+const PIN_SCALE = 1.6
+
+// White bike glyph (two wheels + frame) for the preform badge, drawn in
+// the same 0–24 unit space as the pin and centered on the badge circle.
+const BIKE_GLYPH =
+  '<g fill="none" stroke="#ffffff" stroke-width="0.7" ' +
+  'stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="16.4" cy="6.7" r="1.6"/><circle cx="20.6" cy="6.7" r="1.6"/>' +
+  '<path d="M16.4 6.7 L18.1 4.3 L20.6 6.7 M18.1 4.3 L19 6.7 M17.4 4.3 L18.7 4.3"/></g>'
+
+// Build the Google Maps icon for a pin. Color always mirrors status
+// (blue/amber/orange); shape encodes work type — square for PT, teardrop
+// for everything else (RM). The outline flips red on pins with a
+// geocode_warning so admins notice them at a glance.
+//
+// Plain pins use a lightweight vector Symbol. RM orders that include a
+// preformed marking item (bike-lane / pedestrian symbols) instead get a
+// composed SVG icon with a small iOS-style corner badge + bike glyph, so
+// the separate preform crew can spot them on the map without opening
+// every pin. (PT orders never carry preform thermo, so no badge there.)
+function buildPinIcon(status, hasWarning, woId, hasPreform) {
   const color = PIN_COLOR[(status || '').toLowerCase()] || '#94a3b8'  // slate fallback
   const isPT = (woId || '').trim().toUpperCase().startsWith('PT')
   const shape = isPT ? PIN_SHAPE.square : PIN_SHAPE.teardrop
+  const strokeColor = hasWarning ? '#dc2626' : '#0f172a'  // red-600 or navy
+  const strokeWeight = hasWarning ? 2.5 : 1.2
+
+  if (!isPT && hasPreform) {
+    // viewBox is wider/taller than the pin body to leave room for the
+    // badge in the top-right corner without clipping.
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 24">` +
+        `<path d="${shape.path}" fill="${color}" stroke="${strokeColor}" stroke-width="${strokeWeight}"/>` +
+        `<circle cx="18.5" cy="5.5" r="5" fill="#dc2626" stroke="#ffffff" stroke-width="1"/>` +
+        BIKE_GLYPH +
+      `</svg>`
+    return {
+      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+      scaledSize: new window.google.maps.Size(26 * PIN_SCALE, 24 * PIN_SCALE),
+      anchor: new window.google.maps.Point(shape.anchor.x * PIN_SCALE, shape.anchor.y * PIN_SCALE),
+    }
+  }
+
   return {
     path: shape.path,
     fillColor: color,
     fillOpacity: 1,
-    strokeColor: hasWarning ? '#dc2626' : '#0f172a',  // red-600 or navy
-    strokeWeight: hasWarning ? 2.5 : 1.2,
-    scale: 1.6,
+    strokeColor,
+    strokeWeight,
+    scale: PIN_SCALE,
     anchor: shape.anchor,
   }
 }
@@ -253,7 +291,7 @@ export default function NavTab() {
               <MarkerF
                 key={w.wo_id}
                 position={{ lat: w.lat, lng: w.lng }}
-                icon={buildPinIcon(w.status, !!w.geocode_warning, w.wo_id)}
+                icon={buildPinIcon(w.status, !!w.geocode_warning, w.wo_id, !!w.has_preform)}
                 onClick={() => setActivePin(w)}
               />
             ))}

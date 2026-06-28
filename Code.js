@@ -10049,6 +10049,10 @@ function handleGetWOMapData_(_body) {
 
   // Marking-items count per WO — same shape as _buildDashboardPayload_
   // computes. Total + completed so the popover can show progress.
+  // `preform` flags a WO that has at least one marking item in the
+  // 'preformed' pricing group (bike-lane / pedestrian symbols) — the map
+  // badge keys off this so the separate preform crew can plan from the
+  // map without opening each pin. Col E (idx 4) is the Marking Type.
   const miCounts = {};
   const miSheet = ss.getSheetByName('Marking Items');
   if (miSheet) {
@@ -10056,9 +10060,10 @@ function handleGetWOMapData_(_body) {
     for (let i = 1; i < miData.length; i++) {
       const woId = String(miData[i][1] || '').trim();
       if (!woId) continue;
-      const bucket = miCounts[woId] || (miCounts[woId] = { total: 0, completed: 0 });
+      const bucket = miCounts[woId] || (miCounts[woId] = { total: 0, completed: 0, preform: false });
       bucket.total += 1;
       if (String(miData[i][12] || '').toLowerCase() === 'completed') bucket.completed += 1;
+      if (PRICING_GROUP_BY_CATEGORY_[String(miData[i][4] || '').trim()] === 'preformed') bucket.preform = true;
     }
   }
 
@@ -10075,7 +10080,7 @@ function handleGetWOMapData_(_body) {
 
     const lat = r[45];
     const lng = r[46];
-    const counts = miCounts[woId] || { total: 0, completed: 0 };
+    const counts = miCounts[woId] || { total: 0, completed: 0, preform: false };
 
     const base = {
       wo_id:                  woId,
@@ -10094,6 +10099,7 @@ function handleGetWOMapData_(_body) {
       geocode_warning:        String(r[47] || ''),
       marking_item_count:     counts.total,
       marking_completed_count: counts.completed,
+      has_preform:            counts.preform,
     };
 
     if (typeof lat === 'number' && typeof lng === 'number' && !isNaN(lat) && !isNaN(lng)) {
