@@ -156,6 +156,10 @@ export default function Approvals() {
   // Controls the Reupload modal (replace the pending PDF with a signed/
   // rescanned version).
   const [reuploadOpen, setReuploadOpen] = useState(false)
+  // Bumped after a reupload to cache-bust the PDF viewer — the reupload
+  // replaces content in place (same file_id), so the URL is otherwise
+  // unchanged and react-pdf wouldn't re-fetch.
+  const [pdfVersion, setPdfVersion] = useState(0)
 
   // Gate any approve action when the hours editor has unsaved edits.
   const confirmDiscardEdits = () =>
@@ -242,16 +246,14 @@ export default function Approvals() {
     setSigningItem(null)
   }
 
-  // Called by ReuploadModal after the PDF is replaced. The replace
-  // trashes the original and creates a new file (new file_id), so we
-  // re-fetch the list and select the new id — PDFViewer (keyed by
-  // file_id) then re-fetches the fresh bytes. Note: the recreated file
-  // is "newest" so it sorts to the bottom of the FIFO list.
-  const handleReuploaded = async (newFileId) => {
+  // Called by ReuploadModal after the PDF content is replaced in place.
+  // The file_id, name, created date, and list position are unchanged, so
+  // we only need to cache-bust the PDF viewer to show the new bytes. The
+  // sign-in hours editor stays mounted (same file_id) — its data is
+  // unaffected by a PDF swap, so unsaved edits are preserved.
+  const handleReuploaded = () => {
     setReuploadOpen(false)
-    setSigninEditsDirty(false)   // the sign-in hours editor remounts on the new id
-    await refresh()
-    if (newFileId) setSelectedId(newFileId)
+    setPdfVersion(v => v + 1)
   }
 
   const openInDrive = () => {
@@ -390,7 +392,7 @@ export default function Approvals() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => { if (confirmDiscardEdits()) setReuploadOpen(true) }}
+                    onClick={() => setReuploadOpen(true)}
                     disabled={approving}
                     title="Replace this PDF with a signed/rescanned version"
                     className="text-xs font-bold px-3 py-1.5 rounded-lg
@@ -451,7 +453,7 @@ export default function Approvals() {
                 />
               )}
 
-              <PDFViewer fileId={selected.file_id} width={viewerWidth} />
+              <PDFViewer fileId={selected.file_id} width={viewerWidth} version={pdfVersion} />
             </>
           )}
         </section>
@@ -529,21 +531,23 @@ function ApprovalRow({ item, active, onClick }) {
 }
 
 // ── PDF viewer wrapping react-pdf ─────────────────────────────
-function PDFViewer({ fileId, width }) {
+function PDFViewer({ fileId, width, version = 0 }) {
   const [numPages, setNumPages] = useState(null)
   const [loadErr, setLoadErr]   = useState(null)
 
   // react-pdf's `file` prop. Using the URL directly lets pdf.js stream
-  // the document — faster than fetching the whole blob first.
+  // the document — faster than fetching the whole blob first. `version`
+  // is a cache-buster bumped after a reupload (content replaced in place
+  // under the same file_id) so react-pdf re-fetches the new bytes.
   const file = useMemo(() => ({
-    url: `/api/approvals/${encodeURIComponent(fileId)}/pdf`,
-  }), [fileId])
+    url: `/api/approvals/${encodeURIComponent(fileId)}/pdf${version ? `?v=${version}` : ''}`,
+  }), [fileId, version])
 
-  // Reset error / page count whenever fileId changes
+  // Reset error / page count whenever the document changes
   useEffect(() => {
     setLoadErr(null)
     setNumPages(null)
-  }, [fileId])
+  }, [fileId, version])
 
   return (
     <div className="flex-1 min-h-0 overflow-auto bg-slate-50 rounded-lg border border-slate-200">
@@ -554,7 +558,7 @@ function PDFViewer({ fileId, width }) {
       )}
       {!loadErr && (
         <Document
-          key={fileId}
+          key={`${fileId}:${version}`}
           file={file}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
           onLoadError={(e) => setLoadErr(e)}

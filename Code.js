@@ -4632,12 +4632,15 @@ function handleApproveSignInWithBytes_(body) {
 // Replace a pending-approval PDF (still in a Docs Needing Review
 // subfolder) with a new signed/rescanned version. Used when the admin
 // couldn't sign before the crew scanned: they print, wet-sign, and
-// reupload here. DriveApp can't overwrite file content (no Drive
-// advanced API), so we recreate: drop a new file with the SAME filename
-// into the SAME subfolder, then trash the original. The filename is
-// preserved verbatim because the archive job parses it
-// (SignIn_<contract>_<borough>_<date>… / Certified_Payroll_…). The
-// file_id changes — the caller re-selects the returned id.
+// reupload here.
+//
+// We update the file's CONTENT IN PLACE via the Drive advanced service
+// (Drive.Files.update) — exactly like dragging a same-named file into
+// the Drive folder. This keeps the SAME file_id, the SAME created date
+// (so the approvals list order is unchanged), and stacks a new revision
+// (version 2). DriveApp alone can't overwrite binary content, hence the
+// advanced service (enabled in appsscript.json; uses the existing
+// auth/drive scope). supportsAllDrives covers Shared Drive files.
 function handleReuploadPendingApproval_(body) {
   const d      = body.data || {};
   const fileId = String(d.file_id   || '').trim();
@@ -4654,43 +4657,37 @@ function handleReuploadPendingApproval_(body) {
     step = 'isTrashed';
     if (original.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
 
-    step = 'getName/parent';
-    const filename = original.getName();   // preserve EXACTLY — load-bearing
-    const parents  = original.getParents();
-    if (!parents.hasNext()) return jsonResponse_({ error: 'File has no parent folder' }, 500);
-    const parent = parents.next();
-
+    step = 'parent gate';
     // Safety gate without the throw-prone upward walk (_isUnderParent_
     // fails on Shared Drives): the single-hop parent must be one of the
     // four review subfolders.
-    if (!_docTypeFromSubfolderName_(parent.getName())) {
+    const parents = original.getParents();
+    if (!parents.hasNext()) return jsonResponse_({ error: 'File has no parent folder' }, 500);
+    if (!_docTypeFromSubfolderName_(parents.next().getName())) {
       return jsonResponse_({ error: 'File is not in a Docs Needing Review subfolder' }, 403);
     }
 
-    step = 'createFile';
-    const bytes   = Utilities.base64Decode(b64);
-    const blob    = Utilities.newBlob(bytes, 'application/pdf', filename);
-    const newFile = _withDriveRetry_('createFile reupload', () => parent.createFile(blob));
+    step = 'Drive.Files.update (content replace)';
+    const blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/pdf');
+    // Empty metadata resource — we replace ONLY the content, leaving the
+    // name, id, created date, and parents untouched.
+    _withDriveRetry_('Drive.Files.update reupload', () =>
+      Drive.Files.update({}, fileId, blob, { supportsAllDrives: true }));
 
-    step = 'trash original';
-    _withDriveRetry_('trash original reupload', () => original.setTrashed(true));
-
+    const filename = original.getName();
     try {
       SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
         .getSheetByName('Automation Log')
         .appendRow([
-          new Date(), 'Approvals', 'Reuploaded', newFile.getName(),
-          'Pending-approval PDF replaced via webapp', 'Pending review', '', ''
+          new Date(), 'Approvals', 'Reuploaded', filename,
+          'Pending-approval PDF content replaced in place via webapp', 'Pending review', '', ''
         ]);
     } catch (logErr) {
       Logger.log('⚠️ Automation Log write failed on reupload: ' + logErr);
     }
 
-    return jsonResponse_({
-      success:  true,
-      file_id:  newFile.getId(),
-      filename: newFile.getName(),
-    });
+    // Same file_id — the caller bumps a cache-buster to re-fetch the PDF.
+    return jsonResponse_({ success: true, file_id: fileId, filename: filename });
   } catch (err) {
     Logger.log(`❌ handleReuploadPendingApproval_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
