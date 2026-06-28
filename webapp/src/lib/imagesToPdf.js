@@ -1,12 +1,20 @@
 // Assemble cleaned scan images into a single multi-page PDF — one image
-// per page, each page sized to its image so nothing is cropped or
-// letterboxed. This PDF is what flows into the EXISTING sign-in upload
-// path (parse-upload → Claude Vision → submit → Drive storage), so the
-// stored artifact stays a PDF and no server changes are needed.
+// per page, on a STANDARD US-Letter page (oriented to match the image),
+// with the image fit-to-page and centered. This PDF flows into the
+// EXISTING sign-in upload path (parse-upload → Claude Vision → submit →
+// Drive storage), so the stored artifact stays a PDF and no server
+// changes are needed.
 //
-// Page orientation is left as captured (portrait or landscape); the
-// server's parse-upload rotation pre-pass normalizes sideways pages
-// before Claude sees them, so we must NOT force orientation here.
+// Why a fixed Letter size (NOT page = image pixels): pdf-lib page
+// dimensions are POINTS (1/72"), so sizing a page to the image's pixel
+// count produced a ~22"×28" page. Desktop apps auto-fit it, but Drive's
+// web viewer and Chrome's in-browser print render at native size and
+// show only a cropped corner. A normal Letter page prints correctly
+// everywhere.
+
+// US Letter in points.
+const LETTER_SHORT = 612   //  8.5"
+const LETTER_LONG  = 792   // 11"
 
 // jpegBlobs: array of image/jpeg Blobs. Returns Uint8Array PDF bytes.
 // pdf-lib is imported lazily so its ~400 KB only loads on the scan flow,
@@ -17,8 +25,20 @@ export async function imagesToPdf(jpegBlobs) {
   for (const blob of jpegBlobs) {
     const bytes = new Uint8Array(await blob.arrayBuffer())
     const img = await doc.embedJpg(bytes)
-    const page = doc.addPage([img.width, img.height])
-    page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
+
+    // Match page orientation to the image so the sheet fills the page.
+    const landscape = img.width >= img.height
+    const pageW = landscape ? LETTER_LONG : LETTER_SHORT
+    const pageH = landscape ? LETTER_SHORT : LETTER_LONG
+    const page = doc.addPage([pageW, pageH])
+
+    // Contain-fit: scale to fit within the page, preserving aspect,
+    // centered (thin white margins if the scan's aspect differs slightly
+    // from Letter — normal scanner behavior).
+    const scale = Math.min(pageW / img.width, pageH / img.height)
+    const w = img.width * scale
+    const h = img.height * scale
+    page.drawImage(img, { x: (pageW - w) / 2, y: (pageH - h) / 2, width: w, height: h })
   }
   return await doc.save()
 }
