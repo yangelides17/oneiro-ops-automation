@@ -105,20 +105,41 @@ async function uploadToDrive(file, wo_id) {
     res = await fetchWithTimeout('/api/upload-photo', { method: 'POST', body: form }, 90000)
   } catch (err) {
     const ms = (performance.now() - t0).toFixed(0)
-    console.warn(`[photo] upload FAILED ${ms}ms size=${file.size}`, err?.message || err)
+    console.warn(`[photo] upload FAILED ${ms}ms size=${file.size}`, err?.name, err?.message || err)
     if (err?.name === 'AbortError') {
       throw new Error('Upload stalled after 90s — tap Retry')
     }
+    // Safari surfaces a dropped/blocked request as TypeError "Load failed"
+    // — preserve the name so the detail line shows it.
     throw err
   }
   const data = await res.json().catch(() => ({}))
   const ms = (performance.now() - t0).toFixed(0)
   if (!res.ok || data.error) {
     console.warn(`[photo] upload HTTP ${res.status} ${ms}ms size=${file.size}`, data?.error)
-    throw new Error(data.error || `HTTP ${res.status}`)
+    const e = new Error(data.error || `Server returned HTTP ${res.status}`)
+    e.httpStatus = res.status
+    throw e
   }
   console.log(`[photo] upload ok ${ms}ms size=${file.size}`)
   return data   // { success, file_id, file_url }
+}
+
+// Short, human-readable reason for the red error notice. The precise
+// technical breadcrumb travels separately in item.errorDetail.
+function friendlyPhotoError(err, phase) {
+  const name = err?.name || ''
+  if (name === 'AbortError') return 'Upload timed out — slow or dropped connection'
+  if (name === 'QuotaExceededError') return 'Out of device storage for this photo'
+  if (phase === 'watermark' || phase === 'compress') {
+    return 'Couldn’t process this photo on your device'
+  }
+  if (phase === 'upload') {
+    if (name === 'TypeError') return 'Couldn’t reach the server — check your connection'
+    if (err?.httpStatus) return `Server rejected the upload (HTTP ${err.httpStatus})`
+    return err?.message || 'Upload failed'
+  }
+  return err?.message || 'Upload failed'
 }
 
 export function usePhotoUploadQueue(woId) {
@@ -127,7 +148,10 @@ export function usePhotoUploadQueue(woId) {
   //     status: 'pending' | 'geocoding' | 'watermarking' | 'uploading' | 'uploaded' | 'error',
   //     blob?, previewUrl?, captured_at, geo?,
   //     drive_file_id?, drive_file_url?, drive_url?, thumbnail_b64?,
-  //     filename, mime, error? }
+  //     filename, mime, error?, errorDetail? }
+  // error      — short human reason shown in the red notice.
+  // errorDetail — technical breadcrumb (step · errName · HTTP · size ·
+  //              offline) for field debugging; user can screenshot it.
   const [items, setItems]   = useState([])
   const [historicLoading, setHistoricLoading] = useState(false)
   const [historicError,   setHistoricError]   = useState(null)
@@ -215,6 +239,11 @@ export function usePhotoUploadQueue(woId) {
     if (inFlightRef.current.has(initial.id)) return
     inFlightRef.current.add(initial.id)
     console.log('[photo] kick() entered for', initial.id, 'source=' + initial.source)
+    // Tracked across the whole pipeline so the catch can report WHERE it
+    // died and on a photo of WHAT size — the generic "Upload failed" gave
+    // us nothing to debug field reports with.
+    let phase = 'init'
+    let blobSize = initial?.blob?.size || null
     try {
       // fresh() lags React state by one commit + one useEffect tick
       // (itemsRef is synced inside an effect, not synchronously with
@@ -243,6 +272,7 @@ export function usePhotoUploadQueue(woId) {
         if (extra) Object.assign(timing, extra)
       }
       const beginStep = (label) => {
+        phase = label
         console.log(`[photo] → ${label} (t+${Math.round(performance.now() - tStart)}ms)`)
       }
       // Track the blob locally — Phase B must NOT re-read from itemsRef
@@ -300,6 +330,11 @@ export function usePhotoUploadQueue(woId) {
         // sec per-photo penalty on every capture.
         beginStep('idb-write')
         const tDb = performance.now()
+        // Non-fatal: the IndexedDB write only exists for crash-recovery
+        // (resume a half-finished upload after a reload). iOS Safari
+        // Private Browsing and tight storage quotas can make put() throw,
+        // and that must NOT sink the upload — we still have the blob in
+        // memory and can ship it. Swallow + log instead of bubbling.
         await pendingPhotosDB.put({
           id:                item.id,
           wo_id:             woId,
@@ -310,8 +345,9 @@ export function usePhotoUploadQueue(woId) {
           captured_at:       item.captured_at,
           geo:               item.geo,
           watermark_applied: true,
-        })
+        }).catch(e => console.warn('[photo] IndexedDB put failed (continuing; Private Browsing / quota?):', e?.name, e?.message || e))
         stampStep('dbWriteMs', performance.now() - tDb)
+        blobSize = watermarked?.size || blobSize
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
         const previewUrl = URL.createObjectURL(watermarked)
         patch(item.id, { blob: watermarked, previewUrl, watermark_applied: true })
@@ -327,6 +363,8 @@ export function usePhotoUploadQueue(woId) {
         })
         beginStep('idb-write')
         const tDb = performance.now()
+        // Non-fatal — see the watermark-branch note above. A failed
+        // recovery-write must not block the upload itself.
         await pendingPhotosDB.put({
           id:                item.id,
           wo_id:             woId,
@@ -337,8 +375,9 @@ export function usePhotoUploadQueue(woId) {
           captured_at:       item.captured_at,
           geo:               null,
           watermark_applied: true,
-        })
+        }).catch(e => console.warn('[photo] IndexedDB put failed (continuing; Private Browsing / quota?):', e?.name, e?.message || e))
         stampStep('dbWriteMs', performance.now() - tDb)
+        blobSize = liveBlob?.size || blobSize
       }
 
       // Phase B: upload to Drive. Uses liveBlob (the local var) so we
@@ -348,6 +387,7 @@ export function usePhotoUploadQueue(woId) {
       if (!inFlightRef.current.has(initial.id) || !liveBlob) return
       patch(item.id, { status: 'uploading' })
       beginStep('upload')
+      blobSize = liveBlob?.size || blobSize
       const tUpload = performance.now()
       const res = await uploadToDrive(liveBlob, woId)
       stampStep('uploadMs', performance.now() - tUpload, {
@@ -368,7 +408,26 @@ export function usePhotoUploadQueue(woId) {
         drive_file_url: res.file_url,
       })
     } catch (err) {
-      patch(initial.id, { status: 'error', error: err?.message || 'Upload failed' })
+      // Build a technical, copy-pasteable detail line so a field user can
+      // screenshot it and we can tell at a glance WHERE and WHY it died:
+      // which pipeline step, the JS error name (AbortError / TypeError /
+      // QuotaExceededError…), the message, HTTP status if the server
+      // answered, the photo size, and whether the device was offline.
+      const sizeKB = blobSize ? Math.round(blobSize / 1024) : null
+      const errorDetail = [
+        `step=${phase}`,
+        (err?.name && err.name !== 'Error') ? err.name : null,
+        err?.httpStatus ? `HTTP ${err.httpStatus}` : null,
+        err?.message || 'no message',
+        sizeKB != null ? `${sizeKB}KB` : null,
+        (typeof navigator !== 'undefined' && navigator.onLine === false) ? 'device offline' : null,
+      ].filter(Boolean).join(' · ')
+      console.warn('[photo] pipeline FAILED —', errorDetail, err)
+      patch(initial.id, {
+        status: 'error',
+        error: friendlyPhotoError(err, phase),
+        errorDetail,
+      })
     } finally {
       inFlightRef.current.delete(initial.id)
     }

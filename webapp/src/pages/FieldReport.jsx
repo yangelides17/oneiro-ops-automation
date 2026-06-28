@@ -898,17 +898,31 @@ function PhotoCaptureGallery({ queue, woContext, onRequestDelete, onRequestPrevi
 function PhotoErrorNotice({ items }) {
   const failed = items.filter(i => i.status === 'error')
   if (failed.length === 0) return null
-  // Collapse identical messages so three matching timeouts read as one.
-  const reasons = [...new Set(failed.map(i => i.error || 'Upload failed'))]
   return (
     <div className="text-[11px] text-red-700 bg-red-50 border border-red-200
-                    rounded-lg px-2.5 py-2 space-y-0.5">
+                    rounded-lg px-2.5 py-2 space-y-1.5">
       <p className="font-semibold">
         {failed.length} photo{failed.length === 1 ? '' : 's'} failed to upload to Drive
       </p>
-      {reasons.map((r, i) => <p key={i} className="text-red-600">• {r}</p>)}
+      {/* One row per failed photo: a plain-English reason plus a
+          technical breadcrumb (step · error · HTTP · size · offline) the
+          user can screenshot for us to debug from. */}
+      {failed.map(it => (
+        <div key={it.id} className="space-y-0.5">
+          <p className="text-red-600">
+            • {it.error || 'Upload failed'}
+            {it.filename ? <span className="text-red-500/70"> — {it.filename}</span> : null}
+          </p>
+          {it.errorDetail && (
+            <p className="font-mono text-[10px] leading-snug text-red-500/80 break-all select-all pl-2.5">
+              {it.errorDetail}
+            </p>
+          )}
+        </div>
+      ))}
       <p className="text-red-500/80">
-        Tap <span className="font-semibold">Retry</span> on the photo, or remove it and take it again.
+        Tap <span className="font-semibold">Retry</span> on the photo, or remove it and take it
+        again. If it keeps failing, screenshot this notice and send it over.
       </p>
     </div>
   )
