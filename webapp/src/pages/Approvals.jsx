@@ -371,17 +371,17 @@ export default function Approvals() {
           {selected && (
             <>
               <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
-                <div>
+                <div className="min-w-0 flex-1">
                   <p className="text-sm font-bold text-slate-800 truncate">
                     {selected.filename}
                   </p>
-                  <p className="text-[11px] text-slate-500 mt-0.5">
+                  <p className="text-[11px] text-slate-500 mt-0.5 truncate">
                     {docTypeMeta(selected.doc_type).label}
                     {selected.subtitle && <> · {selected.subtitle}</>}
                     <> · {fmtTime(selected.created_at)}</>
                   </p>
                 </div>
-                <div className="flex items-center gap-2 flex-shrink-0">
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={openInDrive}

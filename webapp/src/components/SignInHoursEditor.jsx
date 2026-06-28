@@ -214,37 +214,39 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
         </div>
         {edits.map((e, i) => {
           const c = rowCalc(e)
+          const inputCls = 'field-input !py-1 !px-2 text-sm w-full disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default'
           return (
-            <div key={e.row_index} className="grid grid-cols-12 gap-2 px-3 py-2 items-center">
-              <span className="col-span-12 sm:col-span-3 text-sm font-semibold text-navy truncate">
-                {e.name}
-              </span>
-              <div className="col-span-4 sm:col-span-2">
-                <select
-                  value={e.classification}
-                  onChange={ev => setRow(i, { classification: ev.target.value })}
-                  disabled={!editing}
-                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default">
-                  {CLASSIFICATIONS.map(cl => <option key={cl}>{cl}</option>)}
-                </select>
+            <div key={e.row_index}
+              className="flex flex-col gap-2 px-3 py-2.5 sm:grid sm:grid-cols-12 sm:items-center">
+              {/* Name (+ hours on mobile) */}
+              <div className="flex items-center justify-between gap-2 sm:col-span-3">
+                <span className="text-sm font-semibold text-navy truncate">{e.name}</span>
+                <span className="text-sm font-semibold text-slate-700 sm:hidden flex-shrink-0">
+                  {c.hours || '—'}
+                </span>
               </div>
-              <div className="col-span-4 sm:col-span-3">
-                <input
-                  type="time"
-                  value={e.timeIn}
-                  onChange={ev => setRow(i, { timeIn: ev.target.value })}
-                  disabled={!editing}
-                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default" />
+              {/* Class / In / Out — one row on mobile, grid cells on desktop */}
+              <div className="flex items-center gap-2 sm:contents">
+                <div className="w-16 sm:w-auto sm:col-span-2">
+                  <select
+                    value={e.classification}
+                    onChange={ev => setRow(i, { classification: ev.target.value })}
+                    disabled={!editing}
+                    className={inputCls}>
+                    {CLASSIFICATIONS.map(cl => <option key={cl}>{cl}</option>)}
+                  </select>
+                </div>
+                <div className="flex-1 sm:col-span-3">
+                  <input type="time" value={e.timeIn} disabled={!editing}
+                    onChange={ev => setRow(i, { timeIn: ev.target.value })} className={inputCls} />
+                </div>
+                <div className="flex-1 sm:col-span-3">
+                  <input type="time" value={e.timeOut} disabled={!editing}
+                    onChange={ev => setRow(i, { timeOut: ev.target.value })} className={inputCls} />
+                </div>
               </div>
-              <div className="col-span-4 sm:col-span-3">
-                <input
-                  type="time"
-                  value={e.timeOut}
-                  onChange={ev => setRow(i, { timeOut: ev.target.value })}
-                  disabled={!editing}
-                  className="field-input !py-1 text-sm disabled:bg-slate-50 disabled:text-slate-500 disabled:border-slate-100 disabled:cursor-default" />
-              </div>
-              <span className="col-span-12 sm:col-span-1 text-right text-sm font-semibold text-slate-700">
+              {/* Hours (desktop column only) */}
+              <span className="hidden sm:block sm:col-span-1 text-right text-sm font-semibold text-slate-700">
                 {c.hours || '—'}
               </span>
             </div>
@@ -252,19 +254,27 @@ export default function SignInHoursEditor({ fileId, filename, onDirtyChange }) {
         })}
       </div>
 
-      {/* Shift totals strip */}
+      {/* Shift totals strip — "This sheet" / "Other sheets" are
+          informational and hidden on mobile to keep ST/OT readable. */}
       <div className="px-3 py-2 border-t border-slate-100 bg-slate-50/60">
         <p className="text-[10px] uppercase tracking-wider font-bold text-slate-400 mb-1">
           Shift Totals · all sign-ins this date
         </p>
+        <div className="grid grid-cols-12 gap-2 text-[9px] uppercase tracking-wider font-bold text-slate-400 mb-0.5">
+          <span className="col-span-6 sm:col-span-5" />
+          <span className="hidden sm:block col-span-2 text-right">This</span>
+          <span className="hidden sm:block col-span-2 text-right">Other</span>
+          <span className="col-span-3 sm:col-span-2 text-right">ST</span>
+          <span className="col-span-3 sm:col-span-1 text-right">OT</span>
+        </div>
         <div className="space-y-1">
           {totals.map(t => (
             <div key={t.name} className="grid grid-cols-12 gap-2 text-[12px] items-baseline">
-              <span className="col-span-5 font-medium text-slate-700 truncate">{t.name}</span>
-              <span className="col-span-2 text-right text-slate-500" title="this sheet">{t.thisSheet.toFixed(2)}</span>
-              <span className="col-span-2 text-right text-slate-400" title="other sheets">{t.otherSheets.toFixed(2)}</span>
-              <span className="col-span-2 text-right font-semibold text-navy" title="ST">{t.st.toFixed(2)}</span>
-              <span className={`col-span-1 text-right font-bold ${t.ot > 0 ? 'text-orange-600' : 'text-slate-300'}`} title="OT">{t.ot.toFixed(2)}</span>
+              <span className="col-span-6 sm:col-span-5 font-medium text-slate-700 truncate">{t.name}</span>
+              <span className="hidden sm:block col-span-2 text-right text-slate-500">{t.thisSheet.toFixed(2)}</span>
+              <span className="hidden sm:block col-span-2 text-right text-slate-400">{t.otherSheets.toFixed(2)}</span>
+              <span className="col-span-3 sm:col-span-2 text-right font-semibold text-navy">{t.st.toFixed(2)}</span>
+              <span className={`col-span-3 sm:col-span-1 text-right font-bold ${t.ot > 0 ? 'text-orange-600' : 'text-slate-300'}`}>{t.ot.toFixed(2)}</span>
             </div>
           ))}
         </div>

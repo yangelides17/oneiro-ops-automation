@@ -174,12 +174,9 @@ export default function ScanCapture({ onScanned, onCancel }) {
 
       {canCapture && pages.length > 0 && (
         <>
-          {/* Corner-adjust view (auto mode) or plain preview (raw mode) */}
-          {active && (active.corners
-            ? <CornerAdjuster page={active} onCorner={setCorner} />
-            : <div className="mx-auto bg-slate-100 rounded-lg overflow-hidden" style={{ width: DISPLAY_W }}>
-                <img src={active.dataUrl} alt="page" width={DISPLAY_W} />
-              </div>)}
+          {/* Corner-adjust view (auto mode) or plain preview (raw mode) —
+              sized to fit the viewport so the action button stays in view. */}
+          {active && <PagePreview page={active} onCorner={setCorner} />}
 
           {/* Page strip */}
           <div className="flex items-center gap-2 overflow-x-auto py-1">
@@ -262,22 +259,49 @@ function LoadProgress({ prog, onSkip }) {
   )
 }
 
-// ── Corner adjuster ───────────────────────────────────────────
-// Renders the page at a fixed display width with a draggable quad. All
-// math is done in source coordinates; the SVG just scales for display.
-function CornerAdjuster({ page, onCorner }) {
-  const scale = DISPLAY_W / page.width
-  const dispH = Math.round(page.height * scale)
+// Track viewport size so the preview can fit within the screen (so the
+// "Use N pages" button never ends up below the fold on a phone).
+function useViewport() {
+  const get = () => ({
+    w: typeof window !== 'undefined' ? window.innerWidth : 360,
+    h: typeof window !== 'undefined' ? window.innerHeight : 720,
+  })
+  const [vp, setVp] = useState(get)
+  useEffect(() => {
+    const onR = () => setVp(get())
+    window.addEventListener('resize', onR)
+    window.addEventListener('orientationchange', onR)
+    return () => {
+      window.removeEventListener('resize', onR)
+      window.removeEventListener('orientationchange', onR)
+    }
+  }, [])
+  return vp
+}
+
+// ── Page preview + corner adjuster ────────────────────────────
+// Renders the captured page scaled to fit within the viewport (bounded
+// by both width and height), with a draggable quad overlaid when corners
+// are present (auto-crop mode). All corner math is in source
+// coordinates; the SVG just scales for display.
+function PagePreview({ page, onCorner }) {
+  const vp = useViewport()
   const svgRef = useRef(null)
   const dragKey = useRef(null)
 
+  // Fit within the available width and ~42% of the viewport height so the
+  // thumbnails + "Use N pages" button stay visible without scrolling.
+  const maxW  = Math.min(DISPLAY_W, vp.w - 72)
+  const maxH  = Math.round(vp.h * 0.42)
+  const scale = Math.min(maxW / page.width, maxH / page.height)
+  const dispW = Math.round(page.width * scale)
+  const dispH = Math.round(page.height * scale)
+
   const toSource = (clientX, clientY) => {
     const rect = svgRef.current.getBoundingClientRect()
-    const x = (clientX - rect.left) / scale
-    const y = (clientY - rect.top) / scale
     return {
-      x: Math.max(0, Math.min(page.width, x)),
-      y: Math.max(0, Math.min(page.height, y)),
+      x: Math.max(0, Math.min(page.width, (clientX - rect.left) / scale)),
+      y: Math.max(0, Math.min(page.height, (clientY - rect.top) / scale)),
     }
   }
 
@@ -297,33 +321,30 @@ function CornerAdjuster({ page, onCorner }) {
   }, [page, scale])
 
   const c = page.corners
-  const poly = CORNER_KEYS.map(k => `${c[k].x * scale},${c[k].y * scale}`).join(' ')
+  const poly = c ? CORNER_KEYS.map(k => `${c[k].x * scale},${c[k].y * scale}`).join(' ') : ''
 
   return (
     <div className="relative mx-auto bg-slate-100 rounded-lg overflow-hidden"
-         style={{ width: DISPLAY_W, height: dispH }}>
-      <img src={page.dataUrl} alt="page" width={DISPLAY_W} height={dispH} draggable={false} />
-      <svg
-        ref={svgRef}
-        className="absolute inset-0 touch-none"
-        width={DISPLAY_W}
-        height={dispH}
-      >
-        <polygon points={poly} fill="rgba(37,99,235,0.12)" stroke="#2563eb" strokeWidth="2" />
-        {CORNER_KEYS.map(k => (
-          <circle
-            key={k}
-            cx={c[k].x * scale}
-            cy={c[k].y * scale}
-            r="9"
-            fill="#ffffff"
-            stroke="#2563eb"
-            strokeWidth="2"
-            style={{ cursor: 'grab' }}
-            onPointerDown={(e) => { e.preventDefault(); dragKey.current = k }}
-          />
-        ))}
-      </svg>
+         style={{ width: dispW, height: dispH }}>
+      <img src={page.dataUrl} alt="page" width={dispW} height={dispH} draggable={false} />
+      {c && (
+        <svg ref={svgRef} className="absolute inset-0 touch-none" width={dispW} height={dispH}>
+          <polygon points={poly} fill="rgba(37,99,235,0.12)" stroke="#2563eb" strokeWidth="2" />
+          {CORNER_KEYS.map(k => (
+            <circle
+              key={k}
+              cx={c[k].x * scale}
+              cy={c[k].y * scale}
+              r="10"
+              fill="#ffffff"
+              stroke="#2563eb"
+              strokeWidth="2"
+              style={{ cursor: 'grab' }}
+              onPointerDown={(e) => { e.preventDefault(); dragKey.current = k }}
+            />
+          ))}
+        </svg>
+      )}
     </div>
   )
 }
