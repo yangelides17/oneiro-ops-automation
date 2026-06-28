@@ -705,6 +705,30 @@ app.post('/api/approvals/:fileId/skip-signoff', async (req, res) => {
 })
 
 /**
+ * POST /api/approvals/:fileId/reupload
+ * Replaces a pending-approval PDF (sitting in a Docs Needing Review
+ * subfolder) with a new signed/rescanned version. Multipart field:
+ *   file — the replacement PDF (raw scan or chosen PDF; no OCR/parse).
+ * Apps Script recreates the file with the SAME name in the SAME folder
+ * and trashes the original, so a NEW file_id comes back.
+ */
+app.post('/api/approvals/:fileId/reupload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' })
+    const base64 = req.file.buffer.toString('base64')
+    const data = await callAppsScript('reupload_pending_approval', {
+      file_id:   req.params.fileId,
+      bytes_b64: base64,
+    })
+    if (data && data.error) return res.status(500).json(data)
+    res.json(data)   // { success, file_id, filename }
+  } catch (err) {
+    console.error(`POST /api/approvals/${req.params.fileId}/reupload error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * GET /api/approvals/:fileId/signin-rows?filename=...
  * Returns the Daily Sign-In Data rows for a pending sign-in sheet so the
  * Approvals page can show/edit the recorded hours. `filename` (carried

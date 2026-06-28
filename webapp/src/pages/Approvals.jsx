@@ -7,6 +7,7 @@ import PrincipalSignModal from '../components/PrincipalSignModal'
 import RowKebab from '../components/RowKebab'
 import GenerateDocModal from '../components/GenerateDocModal'
 import SignInHoursEditor from '../components/SignInHoursEditor'
+import ReuploadModal from '../components/ReuploadModal'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
 // Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
@@ -152,6 +153,9 @@ export default function Approvals() {
   // True while the sign-in hours editor (right pane) has unsaved edits —
   // approving moves the file, so warn before discarding those edits.
   const [signinEditsDirty, setSigninEditsDirty] = useState(false)
+  // Controls the Reupload modal (replace the pending PDF with a signed/
+  // rescanned version).
+  const [reuploadOpen, setReuploadOpen] = useState(false)
 
   // Gate any approve action when the hours editor has unsaved edits.
   const confirmDiscardEdits = () =>
@@ -236,6 +240,18 @@ export default function Approvals() {
     if (!signingItem) return
     removeApprovedAndAdvance(signingItem.file_id)
     setSigningItem(null)
+  }
+
+  // Called by ReuploadModal after the PDF is replaced. The replace
+  // trashes the original and creates a new file (new file_id), so we
+  // re-fetch the list and select the new id — PDFViewer (keyed by
+  // file_id) then re-fetches the fresh bytes. Note: the recreated file
+  // is "newest" so it sorts to the bottom of the FIFO list.
+  const handleReuploaded = async (newFileId) => {
+    setReuploadOpen(false)
+    setSigninEditsDirty(false)   // the sign-in hours editor remounts on the new id
+    await refresh()
+    if (newFileId) setSelectedId(newFileId)
   }
 
   const openInDrive = () => {
@@ -374,6 +390,17 @@ export default function Approvals() {
                   </button>
                   <button
                     type="button"
+                    onClick={() => { if (confirmDiscardEdits()) setReuploadOpen(true) }}
+                    disabled={approving}
+                    title="Replace this PDF with a signed/rescanned version"
+                    className="text-xs font-bold px-3 py-1.5 rounded-lg
+                               bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors
+                               disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Reupload
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleApprove}
                     disabled={approving}
                     className="text-xs font-bold px-4 py-1.5 rounded-lg
@@ -457,6 +484,18 @@ export default function Approvals() {
             `/api/approvals/${encodeURIComponent(signingItem.file_id)}/approve-signin`}
           onCancel={() => setSigningItem(null)}
           onSigned={handleSignedApproved}
+        />
+      )}
+
+      {/* Reupload modal — replace the pending PDF with a signed/rescanned
+          version. Sign-ins get scan + PDF; other doc types get PDF only. */}
+      {reuploadOpen && selected && (
+        <ReuploadModal
+          fileId={selected.file_id}
+          filename={selected.filename}
+          allowScan={selected.doc_type === 'signin'}
+          onClose={() => setReuploadOpen(false)}
+          onReuploaded={handleReuploaded}
         />
       )}
     </div>

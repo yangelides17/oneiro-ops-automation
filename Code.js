@@ -3849,6 +3849,8 @@ function doPost(e) {
       return handleApproveDoc_(body);
     } else if (action === 'approve_signin_with_bytes') {
       return handleApproveSignInWithBytes_(body);
+    } else if (action === 'reupload_pending_approval') {
+      return handleReuploadPendingApproval_(body);
     } else if (action === 'set_waterblast_confirmed') {
       return handleSetWaterblastConfirmed_(body);
     } else if (action === 'generate_daily_documents') {
@@ -4621,6 +4623,77 @@ function handleApproveSignInWithBytes_(body) {
     });
   } catch (err) {
     return jsonResponse_({ error: String(err) }, 500);
+  }
+}
+
+
+// ── action: reupload_pending_approval ──────────────────────────
+//
+// Replace a pending-approval PDF (still in a Docs Needing Review
+// subfolder) with a new signed/rescanned version. Used when the admin
+// couldn't sign before the crew scanned: they print, wet-sign, and
+// reupload here. DriveApp can't overwrite file content (no Drive
+// advanced API), so we recreate: drop a new file with the SAME filename
+// into the SAME subfolder, then trash the original. The filename is
+// preserved verbatim because the archive job parses it
+// (SignIn_<contract>_<borough>_<date>… / Certified_Payroll_…). The
+// file_id changes — the caller re-selects the returned id.
+function handleReuploadPendingApproval_(body) {
+  const d      = body.data || {};
+  const fileId = String(d.file_id   || '').trim();
+  const b64    = String(d.bytes_b64 || '');
+  if (!fileId || !b64) {
+    return jsonResponse_({ error: 'Missing required fields: file_id, bytes_b64' }, 400);
+  }
+
+  let step = 'init';
+  try {
+    step = 'getFileById';
+    const original = _withDriveRetry_('getFileById reupload', () => DriveApp.getFileById(fileId));
+
+    step = 'isTrashed';
+    if (original.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+
+    step = 'getName/parent';
+    const filename = original.getName();   // preserve EXACTLY — load-bearing
+    const parents  = original.getParents();
+    if (!parents.hasNext()) return jsonResponse_({ error: 'File has no parent folder' }, 500);
+    const parent = parents.next();
+
+    // Safety gate without the throw-prone upward walk (_isUnderParent_
+    // fails on Shared Drives): the single-hop parent must be one of the
+    // four review subfolders.
+    if (!_docTypeFromSubfolderName_(parent.getName())) {
+      return jsonResponse_({ error: 'File is not in a Docs Needing Review subfolder' }, 403);
+    }
+
+    step = 'createFile';
+    const bytes   = Utilities.base64Decode(b64);
+    const blob    = Utilities.newBlob(bytes, 'application/pdf', filename);
+    const newFile = _withDriveRetry_('createFile reupload', () => parent.createFile(blob));
+
+    step = 'trash original';
+    _withDriveRetry_('trash original reupload', () => original.setTrashed(true));
+
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Reuploaded', newFile.getName(),
+          'Pending-approval PDF replaced via webapp', 'Pending review', '', ''
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on reupload: ' + logErr);
+    }
+
+    return jsonResponse_({
+      success:  true,
+      file_id:  newFile.getId(),
+      filename: newFile.getName(),
+    });
+  } catch (err) {
+    Logger.log(`❌ handleReuploadPendingApproval_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
 }
 
