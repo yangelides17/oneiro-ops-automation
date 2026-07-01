@@ -3875,6 +3875,8 @@ function doPost(e) {
       return handleListSignInDayHours_(body);
     } else if (action === 'list_signin_rows_for_file') {
       return handleListSignInRowsForFile_(body);
+    } else if (action === 'signin_header_for_file') {
+      return handleSignInHeaderForFile_(body);
     } else if (action === 'save_signin_row_edits') {
       return handleSaveSignInRowEdits_(body);
     } else if (action === 'approve_doc_skip_signoff') {
@@ -5662,6 +5664,87 @@ function handleListSignInRowsForFile_(body) {
       contractor_slug: f.contractorSlug,
       chief_slug:      f.chiefSlug,
       ambiguous,
+    },
+  });
+}
+
+
+// ── action: signin_header_for_file ────────────────────────────
+//
+// Powers the Approvals-page sign-in header card — the read-only replica
+// of the Sign-In tab's header so an admin can hand-fill a printed sheet's
+// header when the crew left it blank. Given a submitted sign-in's
+// file_id + filename, reconstructs the same header fields the Sign-In
+// queue surfaces (contract, billing identity, prime contractor, address,
+// work orders + locations, crew chief), sourced from the already-written
+// Daily Sign-In Data rows plus the same Contractor Contacts / billing /
+// WO-location lookups the queue + PDF builder use. Read-only: the shift
+// date is fixed by the submitted sheet, so there is no edit path here.
+function handleSignInHeaderForFile_(body) {
+  const d        = body.data || {};
+  const filename = String(d.filename || '').trim();
+  const f = _parseSignInFilename_(filename);
+  if (!f) return jsonResponse_({ error: 'Could not parse sign-in filename: ' + filename }, 400);
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // Matched Daily Sign-In Data rows carry the raw contractor (col 2),
+  // WO comma-list (col 1), crew chief (col 12) for this exact submission.
+  const siSheet = ss.getSheetByName('Daily Sign-In Data');
+  const siData  = siSheet ? siSheet.getDataRange().getValues() : [];
+  let contractor = '';
+  let woListStr  = '';
+  const chiefs   = {};
+  for (let i = 1; i < siData.length; i++) {
+    if (!_signInRowMatchesFile_(siData[i], f)) continue;
+    if (!contractor) contractor = String(siData[i][2] || '').trim();
+    if (!woListStr)  woListStr  = String(siData[i][1] || '').trim();
+    const c = String(siData[i][12] || '').trim();
+    if (c) chiefs[c] = true;
+  }
+  // A single distinct chief is safe to show; multiple (legacy chief-less
+  // multi-crew day) → leave blank, matching the card's conditional render.
+  const chiefNames = Object.keys(chiefs);
+  const crewChief  = chiefNames.length === 1 ? chiefNames[0] : '';
+
+  // Contractor Contacts → prime-contractor Contact Name (col 1) + Address
+  // (col 5), keyed by the raw contractor. Same map the queue builds.
+  const ccSheet = ss.getSheetByName('Contractor Contacts');
+  const cc = { contact: '', address: '' };
+  if (ccSheet && contractor) {
+    const ccData = ccSheet.getDataRange().getValues();
+    const hit = ccData.find(r => String(r[0] || '').trim() === contractor);
+    if (hit) { cc.contact = String(hit[1] || '').trim(); cc.address = String(hit[5] || '').trim(); }
+  }
+
+  // Per-WO locations from the Work Order Tracker (col 5), mirroring the
+  // submit path. The Daily Sign-In Data Location column is a lossy
+  // semicolon-join (blanks dropped) so it can't pair back to WO ids.
+  const woIds = woListStr.split(',').map(s => s.trim()).filter(Boolean);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  const woData  = woSheet ? woSheet.getDataRange().getValues() : [];
+  const wos = woIds.map(id => {
+    const r = woData.find(rr => String(rr[0] || '') === id);
+    return { id, location: r ? String(r[5] || '').trim() : '' };
+  });
+
+  // Billing identity the printed sheet is labeled with (e.g. Denville/BK
+  // billed as QU). Raw contract/borough come from the filename.
+  const billed = _billingRemap_(f.contractNum, f.borough, contractor);
+
+  return jsonResponse_({
+    header: {
+      date:                 f.dateStr,
+      contract_number:      f.contractNum,
+      borough:              f.borough,
+      bill_contract_number: billed.contractNum,
+      bill_borough:         billed.borough,
+      contractor:           contractor,                 // raw WO-Tracker contractor
+      prime_contractor:     cc.contact,                 // Contact Name from Contractor Contacts
+      subcontractor:        CONFIG.EMPLOYER.name,        // always Oneiro
+      address:              cc.address,
+      crew_chief:           crewChief,
+      wos:                  wos,
     },
   });
 }

@@ -753,6 +753,28 @@ app.get('/api/approvals/:fileId/signin-rows', async (req, res) => {
 })
 
 /**
+ * GET /api/approvals/:fileId/signin-header
+ * Read-only header metadata for a submitted sign-in — the fields the
+ * Approvals-page header card mirrors from the Sign-In tab (contract,
+ * billing identity, prime contractor, address, work orders, crew chief).
+ * Response: { header: { date, contract_number, borough,
+ *   bill_contract_number, bill_borough, contractor, prime_contractor,
+ *   subcontractor, address, crew_chief, wos: [{id, location}] } }
+ */
+app.get('/api/approvals/:fileId/signin-header', async (req, res) => {
+  try {
+    const data = await callAppsScript('signin_header_for_file', {
+      file_id:  req.params.fileId,
+      filename: req.query.filename || '',
+    })
+    res.json(data)
+  } catch (err) {
+    console.error(`GET /api/approvals/${req.params.fileId}/signin-header error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/approvals/:fileId/save-signin-rows
  * Admin edits to a submitted sign-in's hours. Writes Classification /
  * Time In / Time Out / Hours back to Daily Sign-In Data and recomputes

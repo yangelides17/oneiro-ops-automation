@@ -7,6 +7,7 @@ import PrincipalSignModal from '../components/PrincipalSignModal'
 import RowKebab from '../components/RowKebab'
 import GenerateDocModal from '../components/GenerateDocModal'
 import SignInHoursEditor from '../components/SignInHoursEditor'
+import SignInHeaderCard from '../components/SignInHeaderCard'
 import ReuploadModal from '../components/ReuploadModal'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
@@ -440,6 +441,17 @@ export default function Approvals() {
                                 px-3 py-2 rounded-lg mb-3">
                   {actionError}
                 </div>
+              )}
+
+              {/* Read-only sign-in sheet header — mirrors the Sign-In tab
+                  header so an admin can hand-fill a printed sheet's header
+                  when the crew left it blank. Sign-in sheets only. */}
+              {selected.doc_type === 'signin' && (
+                <SignInHeaderCard
+                  key={`hdr-${selected.file_id}`}
+                  fileId={selected.file_id}
+                  filename={selected.filename}
+                />
               )}
 
               {/* Editable recorded-hours table — sign-in sheets only.
