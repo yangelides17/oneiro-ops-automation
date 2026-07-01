@@ -72,6 +72,17 @@ const STATUS_BG = {
   green: 'bg-green-100  text-green-800 border-green-200',
 }
 
+// ── Month-end documents (per month, per contract-borough) ─────
+// Mirrors MONTH_END_DOCS_ in Code.js — keep keys/labels in sync. These
+// four are completed once a month for each (contract, borough) pair and
+// are folded into the last Certified Payroll week of the month.
+const MONTH_END_DOCS = [
+  { key: 'EU',  label: 'Employee Utilization' },
+  { key: 'CTC', label: "Contractor's Certificate" },
+  { key: 'CMP', label: 'Compliance Certificate' },
+  { key: 'LLC', label: '220 Labor Law Certificate' },
+]
+
 // ── Pending-list action label per missing-flag ────────────────
 const ACTION_TITLE = {
   'PL Done': 'Complete Production Log',
@@ -79,6 +90,12 @@ const ACTION_TITLE = {
   'SI Done': 'Complete Sign-In Sheet',
   'CP Done': 'Complete Certified Payroll',
   'CP Sent': 'Send Certified Payroll',
+  // Month-end docs — one Complete/Send pair per doc.
+  ...MONTH_END_DOCS.reduce((m, d) => {
+    m[`${d.key} Done`] = `Complete ${d.label}`
+    m[`${d.key} Sent`] = `Send ${d.label}`
+    return m
+  }, {}),
 }
 
 // ── Bullet summary for a calendar cell's breakdown ────────────
@@ -121,14 +138,29 @@ function summarizeBreakdown(breakdown, kind) {
     }
     return bullets
   }
-  // kind === 'week' → CP only
+  // kind === 'week' → CP, plus month-end docs on the month's last week.
   const total = breakdown.length
   const cpDone = breakdown.filter(b => b.cp.done).length
   const cpSent = breakdown.filter(b => b.cp.sent).length
-  return [
+  const bullets = [
     bulletFor('CP Done', cpDone, total),
     bulletFor('CP Sent', cpSent, total),
   ]
+  // Month-end docs live only on the last-week cell. Aggregate all four
+  // docs across every (contract, borough) row that carries them.
+  let meTotal = 0, meDone = 0, meSent = 0
+  breakdown.forEach(b => {
+    ;(b.month_docs || []).forEach(m => {
+      meTotal += 1
+      if (m.done) meDone += 1
+      if (m.sent) meSent += 1
+    })
+  })
+  if (meTotal > 0) {
+    bullets.push(bulletFor('Mo-End Done', meDone, meTotal))
+    bullets.push(bulletFor('Mo-End Sent', meSent, meTotal))
+  }
+  return bullets
 }
 
 function StatusBullet({ icon, label, tone }) {
@@ -217,6 +249,7 @@ function dayBreakdownStatus(b) {
 }
 function weekBreakdownStatus(b) {
   const flags = [b.cp?.done, b.cp?.sent]
+  ;(b.month_docs || []).forEach(m => { flags.push(m.done, m.sent) })
   const allDone = flags.every(Boolean)
   const noneDone = flags.every(f => !f)
   return allDone ? 'green' : noneDone ? 'gray' : 'amber'
@@ -379,6 +412,33 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
                     onClick={() => onFlip(b.cp.doc_id, 'sent', !b.cp.sent)}
                   />
                 </div>
+                {/* Month-end docs — only on the month's last-week row.
+                    One Done/Sent pair per doc; Sent gated on Done. */}
+                {b.month_docs?.length > 0 && (
+                  <div className="pt-2 mt-1 border-t border-slate-300/60 space-y-1.5">
+                    <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
+                      Month-End Documents
+                    </p>
+                    {b.month_docs.map((m) => (
+                      <div key={m.key} className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-700 min-w-0 truncate">{m.label}</span>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <TogglePill
+                            label="Done"
+                            on={m.done}
+                            onClick={() => onFlip(m.doc_id, 'done', !m.done)}
+                          />
+                          <TogglePill
+                            label="Sent"
+                            on={m.sent}
+                            disabled={!m.done}
+                            onClick={() => onFlip(m.doc_id, 'sent', !m.sent)}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )
           })}
@@ -521,7 +581,7 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
 function PendingActionButton({ item, onMark }) {
   const [pending, setPending] = useState(false)
   const flag = item.missing[0]
-  const isSent = flag === 'PL Sent' || flag === 'CP Sent'
+  const isSent = / Sent$/.test(flag)
   const label  = isSent ? 'Mark Sent' : 'Mark Done'
 
   const handle = async () => {
@@ -695,8 +755,21 @@ export default function DocStatusTab() {
         return next
       }
       const updateWeekBreakdown = (b) => {
-        if (!b.cp || b.cp.doc_id !== docId) return b
-        return { ...b, cp: { ...b.cp, [flag]: value } }
+        if (b.cp && b.cp.doc_id === docId) {
+          return { ...b, cp: { ...b.cp, [flag]: value } }
+        }
+        if (Array.isArray(b.month_docs)) {
+          let touched = false
+          const month_docs = b.month_docs.map(m => {
+            if (m.doc_id === docId) {
+              touched = true
+              return { ...m, [flag]: value }
+            }
+            return m
+          })
+          if (touched) return { ...b, month_docs }
+        }
+        return b
       }
       const days = prev.days?.map(d => ({
         ...d,
@@ -725,8 +798,13 @@ export default function DocStatusTab() {
       const recolorWeek = (cell) => {
         let allFull = cell.breakdown.length > 0, allEmpty = true
         cell.breakdown.forEach(b => {
-          const full  = b.cp.done && b.cp.sent
-          const empty = !b.cp.done && !b.cp.sent
+          const meDocs = b.month_docs || []
+          const cpFull  = b.cp.done && b.cp.sent
+          const cpEmpty = !b.cp.done && !b.cp.sent
+          const meFull  = meDocs.every(m => m.done && m.sent)
+          const meEmpty = meDocs.every(m => !m.done && !m.sent)
+          const full  = cpFull  && meFull
+          const empty = cpEmpty && meEmpty
           if (!full)  allFull  = false
           if (!empty) allEmpty = false
         })

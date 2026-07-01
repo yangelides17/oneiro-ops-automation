@@ -6437,6 +6437,62 @@ function _docLifecycleId_(docType, anchorIso, contractNum, borough, crewChief) {
   return chiefSlug ? (base + '_chief-' + chiefSlug) : base;
 }
 
+// ── Month-end documents (per month, per contract-borough) ──────
+//
+// Four documents that must be completed once a month for every
+// (contract, borough) pair the company worked — same per-pair unit as
+// Certified Payroll but on a MONTHLY cadence. Tracked in the same Doc
+// Lifecycle Log; the UI folds them into the last CP week of the month.
+//
+// Doc ID is month-anchored (YYYY-MM, not a full date) so identity stays
+// stable no matter which week we happen to display them under:
+//   EU_2026-07_84125MBTP701_BK
+// The YYYY-MM anchor also guarantees these never collide with the
+// PL/SI/CP parser (_parseDocLifecycleId_ requires YYYY-MM-DD).
+//
+// `key` is the ID prefix; `doc_type` is the human name stored in the
+// Doc Type column; `label` drives the UI. Order = display order.
+const MONTH_END_DOCS_ = Object.freeze([
+  { key: 'EU',  doc_type: 'Employee Utilization',       label: 'Employee Utilization' },
+  { key: 'CTC', doc_type: "Contractor's Certificate",   label: "Contractor's Certificate" },
+  { key: 'CMP', doc_type: 'Compliance Certificate',     label: 'Compliance Certificate' },
+  { key: 'LLC', doc_type: '220 Labor Law Certificate',  label: '220 Labor Law Certificate' },
+]);
+const _MONTH_END_BY_KEY_ = Object.freeze(
+  MONTH_END_DOCS_.reduce((m, d) => { m[d.key] = d; return m; }, {})
+);
+
+/**
+ * Build a month-end Doc ID: <KEY>_<YYYY-MM>_<contractNum>_<borough>.
+ * Strips any '/EXT' suffix from the contract number to match the rest
+ * of the codebase.
+ *
+ *   _monthEndDocId_('EU', '2026-07', '84125MBTP701/EXT', 'BK')
+ *     → 'EU_2026-07_84125MBTP701_BK'
+ */
+function _monthEndDocId_(key, monthIso, contractNum, borough) {
+  if (!_MONTH_END_BY_KEY_[key]) return '';
+  const cn = String(contractNum || '').split('/')[0].trim();
+  return key + '_' + String(monthIso).trim() + '_' + cn + '_' + String(borough).trim();
+}
+
+/**
+ * Inverse of _monthEndDocId_. Returns { key, monthIso, contractNum,
+ * borough } or null. The leading token must be a known month-end key,
+ * and the anchor must be YYYY-MM (no day) — both guard against
+ * accidentally matching PL/SI/CP IDs.
+ *
+ *   "EU_2026-07_84125MBTP701_BK" → { key:'EU', monthIso:'2026-07',
+ *                                    contractNum:'84125MBTP701', borough:'BK' }
+ */
+function _parseMonthEndDocId_(docId) {
+  const m = String(docId || '').match(
+    /^([A-Z]{2,4})_(\d{4}-\d{2})_(.+)_([A-Z]{1,2})$/
+  );
+  if (!m || !_MONTH_END_BY_KEY_[m[1]]) return null;
+  return { key: m[1], monthIso: m[2], contractNum: m[3], borough: m[4] };
+}
+
 /**
  * Read the entire Doc Lifecycle Log into an array of objects keyed by
  * Doc ID. Single sheet read; callers can pass the result to multiple
@@ -6599,6 +6655,21 @@ function _resolveDocLifecycleMetadata_(ss, docId) {
       wo_ids:     woIds,
     };
   }
+  // Month-end docs (EU / CTC / CMP / LLC) — <KEY>_<YYYY-MM>_<cn>_<bor>.
+  // Checked before the SI/CP parser: their YYYY-MM anchor can't match
+  // _parseDocLifecycleId_ (YYYY-MM-DD), but keep the ordering explicit.
+  const meParsed = _parseMonthEndDocId_(docId);
+  if (meParsed) {
+    const matches = _scanWorkDayLogForMonth_(ss, meParsed.monthIso, meParsed.contractNum, meParsed.borough);
+    return {
+      doc_type:     _MONTH_END_BY_KEY_[meParsed.key].doc_type,
+      anchor:       meParsed.monthIso + '-01',
+      contractor:   matches.length > 0 ? matches[0].contractor : '',
+      contract_num: meParsed.contractNum,
+      borough:      meParsed.borough,
+      wo_ids:       Array.from(new Set(matches.map(r => r.wo_id).filter(Boolean))),
+    };
+  }
   // SI / CP — <prefix>_<date-or-week>_<contractnum>_<borough>
   const stdParsed = _parseDocLifecycleId_(docId);
   if (!stdParsed) return null;
@@ -6654,6 +6725,42 @@ function _scanWorkDayLogForDate_(ss, dateIso) {
       contractor:   String(r[2] || '').trim(),
       contract_num: String(r[3] || '').split('/')[0].trim(),
       borough:      String(r[4] || '').trim(),
+    });
+  }
+  return out;
+}
+
+/**
+ * Read every Work Day Log row for a given month (YYYY-MM) that matches
+ * a (contractNum, borough) pair. Month-end analogue of
+ * _scanWorkDayLogForDate_ — used to reverse-engineer contractor +
+ * WO IDs when a manual Mark Done flips a month-end doc whose Log row
+ * doesn't exist yet. Returns [{ wo_id, contractor }, ...].
+ */
+function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
+  const sheet = ss.getSheetByName('Work Day Log');
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const s = String(v || '').trim();
+    const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return mm ? mm[1] : '';
+  };
+  const cnWant  = String(contractNum || '').split('/')[0].trim();
+  const borWant = String(borough || '').trim();
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const iso = ymd(r[0]);
+    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    if (String(r[3] || '').split('/')[0].trim() !== cnWant) continue;
+    if (String(r[4] || '').trim() !== borWant) continue;
+    out.push({
+      wo_id:      String(r[1] || '').trim(),
+      contractor: String(r[2] || '').trim(),
     });
   }
   return out;
@@ -12369,6 +12476,11 @@ function _buildDocStatusPayload_(monthIso) {
   // 4=Borough, 7=Crew Chief (blank for legacy / single-crew rows).
   const contractorDays = {};
   const weekTuples = {};
+  // Month-end docs: one obligation per (month, contract, borough). We
+  // track the LATEST Sunday-anchored week the pair worked within that
+  // month so the UI can fold the 4 docs into that (already-existing)
+  // week cell. Key: monthIso|contractNum|borough.
+  const monthTuples = {};
 
   for (let i = 1; i < wdlData.length; i++) {
     const r = wdlData[i];
@@ -12410,6 +12522,18 @@ function _buildDocStatusPayload_(monthIso) {
       };
     }
     weekTuples[wKey].wo_ids.add(woId);
+
+    const monthIso2 = dateIso.slice(0, 7);
+    const mKey = monthIso2 + '|' + contractNum + '|' + borough;
+    if (!monthTuples[mKey]) {
+      monthTuples[mKey] = {
+        month: monthIso2, contractor, contract_num: contractNum, borough,
+        wo_ids: new Set(), last_week_start: wkStart,
+      };
+    }
+    const mEntry = monthTuples[mKey];
+    mEntry.wo_ids.add(woId);
+    if (wkStart > mEntry.last_week_start) mEntry.last_week_start = wkStart;
   }
 
   // Build the days[] entries — only those whose date falls in the month.
@@ -12498,14 +12622,46 @@ function _buildDocStatusPayload_(monthIso) {
     }
     weekCellByStart[w.week_start].breakdown.push(bdRow);
   });
+
+  // Fold month-end docs into the last work-week cell of the VIEWED
+  // month for each (contract, borough) pair. Only pairs whose month
+  // matches the viewed month attach here (pending stays all-time). The
+  // target week row is guaranteed to exist: last_week_start is derived
+  // from a work date in the month, so its weekTuple — and thus its
+  // breakdown row — was already built above.
+  Object.values(monthTuples).forEach(mt => {
+    if (mt.month !== monthIso) return;
+    const cell = weekCellByStart[mt.last_week_start];
+    if (!cell) return;
+    const row = cell.breakdown.find(
+      b => b.contract_num === mt.contract_num && b.borough === mt.borough
+    );
+    if (!row) return;
+    row.month_docs = MONTH_END_DOCS_.map(md => {
+      const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
+      const rec = logById[id];
+      return {
+        key:    md.key,
+        label:  md.label,
+        doc_id: id,
+        done:   !!(rec && rec.done),
+        sent:   !!(rec && rec.sent),
+      };
+    });
+  });
+
   Object.values(weekCellByStart).forEach(cell => {
-    let anyPartial = false, allFull = cell.breakdown.length > 0, allEmpty = true;
+    let allFull = cell.breakdown.length > 0, allEmpty = true;
     cell.breakdown.forEach(b => {
-      const full  = b.cp.done && b.cp.sent;
-      const empty = !b.cp.done && !b.cp.sent;
+      const meDocs = b.month_docs || [];
+      const cpFull  = b.cp.done && b.cp.sent;
+      const cpEmpty = !b.cp.done && !b.cp.sent;
+      const meFull  = meDocs.every(m => m.done && m.sent);
+      const meEmpty = meDocs.every(m => !m.done && !m.sent);
+      const full  = cpFull  && meFull;
+      const empty = cpEmpty && meEmpty;
       if (!full)  allFull  = false;
       if (!empty) allEmpty = false;
-      if (!full && !empty) anyPartial = true;
     });
     cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
   });
@@ -12575,11 +12731,30 @@ function _buildDocStatusPayload_(monthIso) {
     if (!cpDone) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
     if (cpDone && !cpSent) pushPending(w, 'week', w.week_start, cpId, ['CP Sent']);
   });
-  // Within same anchor, order: SI Done → PL Done → PL Sent → CP Done → CP Sent.
+  // Month-end pending (all-time, week-kind). Anchored at the pair's last
+  // work-week of the month so it interleaves with CP in the same list
+  // and reads as "Week of <that Sunday>". One entry per missing flag
+  // per doc; Sent only surfaces once Done is set (same rule as CP).
+  Object.values(monthTuples).forEach(mt => {
+    MONTH_END_DOCS_.forEach(md => {
+      const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
+      const rec = logById[id];
+      const done = rec && rec.done;
+      const sent = rec && rec.sent;
+      if (!done) pushPending(mt, 'week', mt.last_week_start, id, [md.key + ' Done']);
+      if (done && !sent) pushPending(mt, 'week', mt.last_week_start, id, [md.key + ' Sent']);
+    });
+  });
+  // Within same anchor, order: SI Done → PL Done → PL Sent → CP Done →
+  // CP Sent, then the month-end docs (Done before Sent, in config order).
   // Then break further ties on (contract_num, borough).
   const PENDING_RANK = {
     'SI Done': 0, 'PL Done': 1, 'PL Sent': 2, 'CP Done': 3, 'CP Sent': 4,
   };
+  MONTH_END_DOCS_.forEach((md, i) => {
+    PENDING_RANK[md.key + ' Done'] = 5 + i * 2;
+    PENDING_RANK[md.key + ' Sent'] = 6 + i * 2;
+  });
   pending.sort((a, b) => {
     if (a.anchor !== b.anchor) return a.anchor < b.anchor ? -1 : 1;
     const ra = PENDING_RANK[a.missing[0]] != null ? PENDING_RANK[a.missing[0]] : 99;
