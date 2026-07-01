@@ -12623,48 +12623,57 @@ function _buildDocStatusPayload_(monthIso) {
     weekCellByStart[w.week_start].breakdown.push(bdRow);
   });
 
-  // Fold month-end docs into the last work-week cell of the VIEWED
-  // month for each (contract, borough) pair. Only pairs whose month
-  // matches the viewed month attach here (pending stays all-time). The
-  // target week row is guaranteed to exist: last_week_start is derived
-  // from a work date in the month, so its weekTuple — and thus its
-  // breakdown row — was already built above.
-  Object.values(monthTuples).forEach(mt => {
-    if (mt.month !== monthIso) return;
-    const cell = weekCellByStart[mt.last_week_start];
-    if (!cell) return;
-    const row = cell.breakdown.find(
-      b => b.contract_num === mt.contract_num && b.borough === mt.borough
-    );
-    if (!row) return;
-    row.month_docs = MONTH_END_DOCS_.map(md => {
-      const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
-      const rec = logById[id];
-      return {
-        key:    md.key,
-        label:  md.label,
-        doc_id: id,
-        done:   !!(rec && rec.done),
-        sent:   !!(rec && rec.sent),
-      };
-    });
-  });
-
   Object.values(weekCellByStart).forEach(cell => {
     let allFull = cell.breakdown.length > 0, allEmpty = true;
     cell.breakdown.forEach(b => {
-      const meDocs = b.month_docs || [];
-      const cpFull  = b.cp.done && b.cp.sent;
-      const cpEmpty = !b.cp.done && !b.cp.sent;
-      const meFull  = meDocs.every(m => m.done && m.sent);
-      const meEmpty = meDocs.every(m => !m.done && !m.sent);
-      const full  = cpFull  && meFull;
-      const empty = cpEmpty && meEmpty;
+      const full  = b.cp.done && b.cp.sent;
+      const empty = !b.cp.done && !b.cp.sent;
       if (!full)  allFull  = false;
       if (!empty) allEmpty = false;
     });
     cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
   });
+
+  // Month-end docs (EU / CTC / CMP / LLC) are clustered into ONE panel
+  // for the viewed month rather than folded into individual week cells.
+  // One breakdown row per (contract, borough) pair that worked the month,
+  // each carrying the four docs' Done/Sent state. Rendered below the week
+  // calendar; bullets roll up per doc across all pairs.
+  const monthEndBreakdown = Object.values(monthTuples)
+    .filter(mt => mt.month === monthIso)
+    .map(mt => ({
+      contractor:   mt.contractor,
+      contract_num: mt.contract_num,
+      borough:      mt.borough,
+      wo_ids:       Array.from(mt.wo_ids).sort(),
+      docs: MONTH_END_DOCS_.map(md => {
+        const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
+        const rec = logById[id];
+        return {
+          key:    md.key,
+          label:  md.label,
+          doc_id: id,
+          done:   !!(rec && rec.done),
+          sent:   !!(rec && rec.sent),
+        };
+      }),
+    }))
+    .sort((a, b) => (a.contract_num + a.borough).localeCompare(b.contract_num + b.borough));
+
+  let meAllFull = monthEndBreakdown.length > 0, meAllEmpty = true;
+  monthEndBreakdown.forEach(row => {
+    row.docs.forEach(m => {
+      const full  = m.done && m.sent;
+      const empty = !m.done && !m.sent;
+      if (!full)  meAllFull  = false;
+      if (!empty) meAllEmpty = false;
+    });
+  });
+  const monthEndPanel = {
+    month:     monthIso,
+    status:    meAllFull ? 'green' : (meAllEmpty ? 'gray' : 'amber'),
+    breakdown: monthEndBreakdown,
+  };
 
   // Pending list (all-time, FIFO oldest first). We emit one entry per
   // "missing" doc — so a (date, contract, borough) where both PL and
@@ -12769,6 +12778,7 @@ function _buildDocStatusPayload_(monthIso) {
     month: monthIso,
     days:   Object.values(dayCellByDate).sort((a, b) => a.date < b.date ? -1 : 1),
     weeks:  Object.values(weekCellByStart).sort((a, b) => a.week_start < b.week_start ? -1 : 1),
+    month_end: monthEndPanel,
     pending,
   };
 }
