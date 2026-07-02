@@ -646,6 +646,11 @@ function MonthEndPopover({ monthIso, monthEnd, onClose, onFlip }) {
                   <p className="font-semibold text-sm text-slate-800">{row.contractor}</p>
                   <p className="text-xs text-slate-500 font-mono">{row.contract_num} · {row.borough}</p>
                 </div>
+                {row.contract_id && (
+                  <p className="text-[11px] text-slate-500">
+                    <span className="font-semibold">Contract ID:</span> <span className="font-mono">{row.contract_id}</span>
+                  </p>
+                )}
                 <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
                   {(row.docs || []).map((m) => (
                     <div key={m.key} className="flex items-center justify-between gap-2">

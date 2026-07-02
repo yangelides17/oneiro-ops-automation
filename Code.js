@@ -6494,6 +6494,32 @@ function _parseMonthEndDocId_(docId) {
 }
 
 /**
+ * Build a (contractNum|boroughCode → Contract ID / Reg #) map from the
+ * Contract Lookup sheet. The Contract ID is a distinct identifier the
+ * month-end forms require; it is NOT the contract number.
+ *
+ * Contract Lookup columns:
+ *   0 = Contract Number   1 = Borough Code
+ *   2 = Borough Full Name 3 = Contract ID / Reg #
+ * Contract numbers are stripped of any '/EXT' suffix to match the rest
+ * of the codebase.
+ */
+function _readContractIdMap_(ss) {
+  const sheet = ss.getSheetByName('Contract Lookup');
+  const map = {};
+  if (!sheet) return map;
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    const cn  = String(data[i][0] || '').split('/')[0].trim();
+    const bor = String(data[i][1] || '').trim();
+    const id  = String(data[i][3] || '').trim();
+    if (!cn || !bor) continue;
+    map[cn + '|' + bor] = id;
+  }
+  return map;
+}
+
+/**
  * Read the entire Doc Lifecycle Log into an array of objects keyed by
  * Doc ID. Single sheet read; callers can pass the result to multiple
  * helpers without re-fetching.
@@ -12639,12 +12665,14 @@ function _buildDocStatusPayload_(monthIso) {
   // One breakdown row per (contract, borough) pair that worked the month,
   // each carrying the four docs' Done/Sent state. Rendered below the week
   // calendar; bullets roll up per doc across all pairs.
+  const contractIdMap = _readContractIdMap_(ss);
   const monthEndBreakdown = Object.values(monthTuples)
     .filter(mt => mt.month === monthIso)
     .map(mt => ({
       contractor:   mt.contractor,
       contract_num: mt.contract_num,
       borough:      mt.borough,
+      contract_id:  contractIdMap[mt.contract_num + '|' + mt.borough] || '',
       wo_ids:       Array.from(mt.wo_ids).sort(),
       docs: MONTH_END_DOCS_.map(md => {
         const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
