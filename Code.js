@@ -6439,24 +6439,27 @@ function _docLifecycleId_(docType, anchorIso, contractNum, borough, crewChief) {
 
 // ── Month-end documents (per month, per contract-borough) ──────
 //
-// Four documents that must be completed once a month for every
-// (contract, borough) pair the company worked — same per-pair unit as
-// Certified Payroll but on a MONTHLY cadence. Tracked in the same Doc
-// Lifecycle Log; the UI folds them into the last CP week of the month.
+// Documents that must be completed once a month for every (contract,
+// borough) pair the company worked — same per-pair unit as Certified
+// Payroll but on a MONTHLY cadence. Tracked in the same Doc Lifecycle
+// Log; the UI folds them into the last CP week of the month.
+//
+// The three certificates (Contractor's, Compliance, 220 Labor Law) are
+// always completed and sent together, so they're tracked as a SINGLE
+// "Certificates" line item to keep the pending list manageable. Employee
+// Utilization stays separate. → two tracked docs total.
 //
 // Doc ID is month-anchored (YYYY-MM, not a full date) so identity stays
 // stable no matter which week we happen to display them under:
-//   EU_2026-07_84125MBTP701_BK
+//   EU_2026-07_84125MBTP701_BK   CERT_2026-07_84125MBTP701_BK
 // The YYYY-MM anchor also guarantees these never collide with the
 // PL/SI/CP parser (_parseDocLifecycleId_ requires YYYY-MM-DD).
 //
 // `key` is the ID prefix; `doc_type` is the human name stored in the
 // Doc Type column; `label` drives the UI. Order = display order.
 const MONTH_END_DOCS_ = Object.freeze([
-  { key: 'EU',  doc_type: 'Employee Utilization',       label: 'Employee Utilization' },
-  { key: 'CTC', doc_type: "Contractor's Certificate",   label: "Contractor's Certificate" },
-  { key: 'CMP', doc_type: 'Compliance Certificate',     label: 'Compliance Certificate' },
-  { key: 'LLC', doc_type: '220 Labor Law Certificate',  label: '220 Labor Law Certificate' },
+  { key: 'EU',   doc_type: 'Employee Utilization', label: 'Employee Utilization' },
+  { key: 'CERT', doc_type: 'Certificates',         label: 'Certificates' },
 ]);
 const _MONTH_END_BY_KEY_ = Object.freeze(
   MONTH_END_DOCS_.reduce((m, d) => { m[d.key] = d; return m; }, {})

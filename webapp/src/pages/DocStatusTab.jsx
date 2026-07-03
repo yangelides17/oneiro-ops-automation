@@ -73,17 +73,18 @@ const STATUS_BG = {
 }
 
 // ── Month-end documents (per month, per contract-borough) ─────
-// Mirrors MONTH_END_DOCS_ in Code.js — keep keys/labels in sync. These
-// four are completed once a month for each (contract, borough) pair and
-// are folded into the last Certified Payroll week of the month.
+// Mirrors MONTH_END_DOCS_ in Code.js — keep keys/labels in sync. The
+// three certificates are tracked as one "Certificates" line item (they
+// ship together); Employee Utilization stays separate. Completed once a
+// month per (contract, borough) pair and folded into the last CP week.
 const MONTH_END_DOCS = [
-  { key: 'EU',  label: 'Employee Utilization',       short: 'Emp Util' },
-  { key: 'CTC', label: "Contractor's Certificate",   short: 'Contr Cert' },
-  { key: 'CMP', label: 'Compliance Certificate',     short: 'Compl Cert' },
-  { key: 'LLC', label: '220 Labor Law Certificate',  short: '220 LL' },
+  { key: 'EU',   label: 'Employee Utilization', short: 'EU' },
+  { key: 'CERT', label: 'Certificates',         short: 'CC',
+    note: "Contractor's · Compliance · 220 Labor Law" },
 ]
 
 const MONTH_END_KEYS = new Set(MONTH_END_DOCS.map(d => d.key))
+const MONTH_END_NOTE = Object.fromEntries(MONTH_END_DOCS.map(d => [d.key, d.note || '']))
 
 // A month-end pending item is anchored to a whole month, not a week.
 // Detect it from the missing flag's doc key and pull the month out of
@@ -490,7 +491,12 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
                     <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
                       {(row.docs || []).map((mdoc) => (
                         <div key={mdoc.key} className="flex items-center justify-between gap-2">
-                          <span className="text-xs text-slate-700 min-w-0 truncate">{mdoc.label}</span>
+                          <div className="min-w-0">
+                            <span className="text-xs text-slate-700 truncate block">{mdoc.label}</span>
+                            {MONTH_END_NOTE[mdoc.key] && (
+                              <span className="text-[10px] text-slate-400 block truncate">{MONTH_END_NOTE[mdoc.key]}</span>
+                            )}
+                          </div>
                           <div className="flex items-center gap-1.5 flex-shrink-0">
                             <TogglePill
                               label="Done"
@@ -650,15 +656,15 @@ function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCel
                 {fmtWeekRange(c.week_start)}
               </span>
               {isLastWeek ? (
-                <div className="mt-1.5 flex gap-6 w-full">
+                <div className="mt-1.5 flex gap-8 w-full">
                   {/* CP bullets — left-justified, always shown */}
                   <div className="space-y-1 flex-shrink-0">
                     {cpBullets.map((b, i) => (
                       <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
                     ))}
                   </div>
-                  {/* Month-end bullets — right, two columns */}
-                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 flex-1 min-w-0">
+                  {/* Month-end bullets — single column (EU + Certificates) */}
+                  <div className="space-y-1 flex-1 min-w-0">
                     {meBullets.map((b, i) => (
                       <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
                     ))}
