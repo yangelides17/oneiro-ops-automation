@@ -266,6 +266,22 @@ function monthEndRowStatus(row) {
   return allDone ? 'green' : noneDone ? 'gray' : 'amber'
 }
 
+// Combined status for the month's last-week cell: rolls up BOTH the
+// week's CP flags AND the month-end docs (which live on this cell).
+// Used only for the last-week card, whose color reflects everything
+// shown on it. Other week cells stay CP-only (cell.status).
+function combinedLastWeekStatus(cell, monthEnd) {
+  const flags = []
+  ;(cell?.breakdown || []).forEach(b => { flags.push(!!b.cp?.done, !!b.cp?.sent) })
+  ;(monthEnd?.breakdown || []).forEach(r => {
+    ;(r.docs || []).forEach(m => flags.push(!!m.done, !!m.sent))
+  })
+  if (flags.length === 0) return 'gray'
+  if (flags.every(Boolean)) return 'green'
+  if (flags.every(f => !f)) return 'gray'
+  return 'amber'
+}
+
 // ── Day cell popover (PL + SI per breakdown) ──────────────────
 function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
   const wrapRef = useRef(null)
@@ -368,7 +384,10 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
 }
 
 // ── Week cell popover (CP per breakdown) ──────────────────────
-function WeekCellPopover({ cell, onClose, onFlip }) {
+// On the month's last worked week (showMonthEnd), the CP entries render
+// at the top and the month-end docs (one section per pair, all four
+// docs) render underneath — everything in one popover.
+function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
   const wrapRef = useRef(null)
   useEffect(() => {
     const handler = (e) => {
@@ -383,6 +402,8 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
     }
   }, [onClose])
 
+  const meRows = showMonthEnd ? (monthEnd?.breakdown || []) : []
+
   return (
     <div
       ref={wrapRef}
@@ -396,6 +417,7 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none">×</button>
         </div>
         <div className="space-y-3 max-h-[60vh] overflow-y-auto">
+          {/* Certified Payroll — top */}
           {(cell.breakdown || []).map((b, i) => {
             const rowBg = STATUS_BG[weekBreakdownStatus(b)]
             return (
@@ -426,6 +448,51 @@ function WeekCellPopover({ cell, onClose, onFlip }) {
               </div>
             )
           })}
+
+          {/* Month-End Documents — underneath, one section per pair */}
+          {meRows.length > 0 && (
+            <div className="pt-2 border-t-2 border-slate-200 space-y-3">
+              <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
+                Month-End Documents · {fmtMonth(monthEnd.month)}
+              </p>
+              {meRows.map((row, i) => {
+                const rowBg = STATUS_BG[monthEndRowStatus(row)]
+                return (
+                  <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
+                    <div className="flex justify-between items-baseline">
+                      <p className="font-semibold text-sm text-slate-800">{row.contractor}</p>
+                      <p className="text-xs text-slate-500 font-mono">{row.contract_num} · {row.borough}</p>
+                    </div>
+                    {row.contract_id && (
+                      <p className="text-[11px] text-slate-500">
+                        <span className="font-semibold">Contract ID:</span> <span className="font-mono">{row.contract_id}</span>
+                      </p>
+                    )}
+                    <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
+                      {(row.docs || []).map((mdoc) => (
+                        <div key={mdoc.key} className="flex items-center justify-between gap-2">
+                          <span className="text-xs text-slate-700 min-w-0 truncate">{mdoc.label}</span>
+                          <div className="flex items-center gap-1.5 flex-shrink-0">
+                            <TogglePill
+                              label="Done"
+                              on={mdoc.done}
+                              onClick={() => onFlip(mdoc.doc_id, 'done', !mdoc.done)}
+                            />
+                            <TogglePill
+                              label="Sent"
+                              on={mdoc.sent}
+                              disabled={!mdoc.done}
+                              onClick={() => onFlip(mdoc.doc_id, 'sent', !mdoc.sent)}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -499,7 +566,10 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
 }
 
 // ── Week calendar (Sunday-anchored, ~5 cells per month) ───────
-function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
+// The month's last worked week additionally carries the month-end docs:
+// CP bullets stay left-justified; the 8 month-end bullets sit to the
+// right in two columns, and that cell's color rolls up both.
+function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCellClick }) {
   const weekByStart = useMemo(() => {
     const m = {}
     ;(weeks || []).forEach(w => { m[w.week_start] = w })
@@ -524,157 +594,71 @@ function WeekCalendar({ monthIso, weeks, loading, onCellClick }) {
     cursor.setDate(cursor.getDate() + 7)
   }
 
+  const meBullets = summarizeMonthEnd(monthEnd?.breakdown)
+
   return (
     <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
       <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-1">Week of</p>
       <div className="space-y-1">
         {cells.map(c => {
           const cell = c.cell
-          const status = cell?.status || 'gray'
+          // The last calendar week carries the month-end docs — even when
+          // it had no CP work. Then it's still clickable (opens the
+          // month-end popover) and shows only the month-end bullets.
+          const isLastWeek = c.week_start === lastWeekStart && meBullets.length > 0
+          const clickable = !!cell || isLastWeek
+          const effectiveCell = cell || (isLastWeek ? { week_start: c.week_start, breakdown: [] } : null)
+          const status = isLastWeek
+            ? combinedLastWeekStatus(cell, monthEnd)
+            : (cell?.status || 'gray')
           const bg = STATUS_BG[status] || STATUS_BG.gray
-          const clickable = !!cell
-          const bullets = summarizeBreakdown(cell?.breakdown, 'week')
+          // CP bullets: real ones when this week had work; on the last
+          // week with no CP, none (we just show the month-end bullets).
+          const cpBullets = cell
+            ? summarizeBreakdown(cell.breakdown, 'week')
+            : (isLastWeek ? [] : summarizeBreakdown(undefined, 'week'))
           return (
             <button
               key={c.week_start}
               type="button"
               disabled={!clickable}
-              onClick={() => clickable && onCellClick(cell)}
+              onClick={() => clickable && onCellClick(effectiveCell)}
               className={`w-full rounded-md border text-left p-1.5 transition-all
-                          flex flex-col items-stretch h-[80px] overflow-hidden
+                          flex flex-col items-stretch overflow-hidden
+                          ${isLastWeek ? 'min-h-[80px]' : 'h-[80px]'}
                           ${bg}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
             >
               <span className="text-[11px] font-semibold text-slate-700">
                 {fmtWeekRange(c.week_start)}
               </span>
-              <div className="mt-1 space-y-0.5 w-full">
-                {bullets.map((b, i) => (
-                  <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
-                ))}
-              </div>
+              {isLastWeek ? (
+                <div className="mt-1 flex gap-2 w-full">
+                  {/* CP bullets — left-justified (omitted if no CP this week) */}
+                  {cpBullets.length > 0 && (
+                    <div className="space-y-0.5 flex-shrink-0">
+                      {cpBullets.map((b, i) => (
+                        <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
+                      ))}
+                    </div>
+                  )}
+                  {/* Month-end bullets — right, two columns */}
+                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 flex-1 min-w-0">
+                    {meBullets.map((b, i) => (
+                      <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-1 space-y-0.5 w-full">
+                  {cpBullets.map((b, i) => (
+                    <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
+                  ))}
+                </div>
+              )}
             </button>
           )
         })}
-      </div>
-    </div>
-  )
-}
-
-// ── Month-End cluster cell ────────────────────────────────────
-// All four month-end docs for every (contract, borough) pair worked in
-// the viewed month, clustered into one cell below the week calendar.
-// Bullets roll up per doc (Done + Sent) across all pairs; click opens a
-// popover with the per-pair toggles.
-function MonthEndCard({ monthIso, monthEnd, loading, onOpen }) {
-  if (loading && !monthEnd) {
-    return (
-      <div className="card p-4 text-xs text-slate-400 italic flex items-center justify-center min-h-[80px]">
-        Loading…
-      </div>
-    )
-  }
-  const breakdown = monthEnd?.breakdown || []
-  const status = monthEnd?.status || 'gray'
-  const bg = STATUS_BG[status] || STATUS_BG.gray
-  const clickable = breakdown.length > 0
-  const bullets = summarizeMonthEnd(breakdown)
-
-  return (
-    <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
-      <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-1">
-        Month-End Documents
-      </p>
-      <button
-        type="button"
-        disabled={!clickable}
-        onClick={() => clickable && onOpen()}
-        className={`w-full rounded-md border text-left p-2 transition-all
-                    flex flex-col items-stretch overflow-hidden
-                    ${bg}
-                    ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
-      >
-        <span className="text-[11px] font-semibold text-slate-700">{fmtMonth(monthIso)}</span>
-        {clickable ? (
-          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 w-full">
-            {bullets.map((b, i) => (
-              <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
-            ))}
-          </div>
-        ) : (
-          <span className="text-[10px] text-slate-500 mt-1">No work this month</span>
-        )}
-      </button>
-    </div>
-  )
-}
-
-// ── Month-End popover (per-pair, all four docs) ───────────────
-function MonthEndPopover({ monthIso, monthEnd, onClose, onFlip }) {
-  const wrapRef = useRef(null)
-  useEffect(() => {
-    const handler = (e) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target)) onClose()
-    }
-    const esc = (e) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('mousedown', handler)
-    document.addEventListener('keydown', esc)
-    return () => {
-      document.removeEventListener('mousedown', handler)
-      document.removeEventListener('keydown', esc)
-    }
-  }, [onClose])
-
-  return (
-    <div
-      ref={wrapRef}
-      className="fixed inset-0 z-40 flex items-center justify-center p-4"
-      style={{ backgroundColor: 'rgba(0,0,0,0.4)' }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
-    >
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-black text-navy">Month-End · {fmtMonth(monthIso)}</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none">×</button>
-        </div>
-        <div className="space-y-3 max-h-[60vh] overflow-y-auto">
-          {(monthEnd?.breakdown || []).map((row, i) => {
-            const rowBg = STATUS_BG[monthEndRowStatus(row)]
-            return (
-              <div key={i} className={`border rounded-lg p-3 space-y-2 ${rowBg}`}>
-                <div className="flex justify-between items-baseline">
-                  <p className="font-semibold text-sm text-slate-800">{row.contractor}</p>
-                  <p className="text-xs text-slate-500 font-mono">{row.contract_num} · {row.borough}</p>
-                </div>
-                {row.contract_id && (
-                  <p className="text-[11px] text-slate-500">
-                    <span className="font-semibold">Contract ID:</span> <span className="font-mono">{row.contract_id}</span>
-                  </p>
-                )}
-                <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
-                  {(row.docs || []).map((m) => (
-                    <div key={m.key} className="flex items-center justify-between gap-2">
-                      <span className="text-xs text-slate-700 min-w-0 truncate">{m.label}</span>
-                      <div className="flex items-center gap-1.5 flex-shrink-0">
-                        <TogglePill
-                          label="Done"
-                          on={m.done}
-                          onClick={() => onFlip(m.doc_id, 'done', !m.done)}
-                        />
-                        <TogglePill
-                          label="Sent"
-                          on={m.sent}
-                          disabled={!m.done}
-                          onClick={() => onFlip(m.doc_id, 'sent', !m.sent)}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )
-          })}
-        </div>
       </div>
     </div>
   )
@@ -798,7 +782,6 @@ export default function DocStatusTab() {
 
   const [activeDay,  setActiveDay]  = useState(null)
   const [activeWeek, setActiveWeek] = useState(null)
-  const [monthEndOpen, setMonthEndOpen] = useState(false)
 
   // GenerateDocModal state — `pendingItem` is the pending-list row the
   // user clicked Generate on; null = modal closed.
@@ -832,6 +815,17 @@ export default function DocStatusTab() {
     if (data == null) return
     setCount('doc_status_pending', (data.pending || []).length)
   }, [data, setCount])
+
+  // The month's last CALENDAR week (Sunday of the week containing the
+  // month's last day) — the card that carries the month-end docs, even
+  // if that week had no CP work.
+  const lastWeekStart = useMemo(() => {
+    const [y, m] = monthIso.split('-').map(Number)
+    const lastDay = new Date(y, m, 0)
+    const sun = new Date(lastDay)
+    sun.setDate(lastDay.getDate() - lastDay.getDay())
+    return `${sun.getFullYear()}-${String(sun.getMonth() + 1).padStart(2, '0')}-${String(sun.getDate()).padStart(2, '0')}`
+  }, [monthIso])
 
   // Optimistic flip + revert on failure
   const flip = async (docId, flag, value) => {
@@ -997,10 +991,9 @@ export default function DocStatusTab() {
           <PendingList kind="day" pending={data?.pending} loading={loading} onMark={onPendingMark} onGenerate={onPendingGenerate} />
         </div>
         <div className="space-y-3">
-          <p className="section-label">Certified Payroll</p>
-          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} loading={loading} onCellClick={setActiveWeek} />
+          <p className="section-label">Certified Payroll + Month-End Docs</p>
+          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} monthEnd={data?.month_end} lastWeekStart={lastWeekStart} loading={loading} onCellClick={setActiveWeek} />
           <PendingList kind="week" pending={data?.pending} loading={loading} onMark={onPendingMark} onGenerate={onPendingGenerate} />
-          <MonthEndCard monthIso={monthIso} monthEnd={data?.month_end} loading={loading} onOpen={() => setMonthEndOpen(true)} />
         </div>
       </div>
 
@@ -1014,15 +1007,9 @@ export default function DocStatusTab() {
       {activeWeek && (
         <WeekCellPopover
           cell={activeWeek}
-          onClose={() => setActiveWeek(null)}
-          onFlip={flip}
-        />
-      )}
-      {monthEndOpen && (
-        <MonthEndPopover
-          monthIso={monthIso}
           monthEnd={data?.month_end}
-          onClose={() => setMonthEndOpen(false)}
+          showMonthEnd={activeWeek.week_start === lastWeekStart}
+          onClose={() => setActiveWeek(null)}
           onFlip={flip}
         />
       )}
