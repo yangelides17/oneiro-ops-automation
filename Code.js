@@ -12488,6 +12488,15 @@ function _buildDocStatusPayload_(monthIso) {
     new Date(yyyy, mm, 0), CONFIG.TIMEZONE, 'yyyy-MM-dd'
   );
 
+  // Today (TZ) + "first day of the last week" of any month. Month-end
+  // docs are due at month end, so they only surface once the month's
+  // final (Sunday-anchored) week has begun — not when work first starts.
+  const todayIso = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const monthLastWeekStartIso = (monIso) => {
+    const [my, mn] = monIso.split('-').map(Number);
+    return weekStartIsoFor(new Date(my, mn, 0));  // Sunday of week holding the last day
+  };
+
   // Walk Work Day Log → group at TWO granularities:
   //   contractorDays[dateIso|contractor|crewChief] = per-crew PL shell
   //     .contracts[cn|bor] = per-(contract, borough) sub-entry (one per SI within this crew)
@@ -12554,12 +12563,10 @@ function _buildDocStatusPayload_(monthIso) {
     if (!monthTuples[mKey]) {
       monthTuples[mKey] = {
         month: monthIso2, contractor, contract_num: contractNum, borough,
-        wo_ids: new Set(), last_week_start: wkStart,
+        wo_ids: new Set(),
       };
     }
-    const mEntry = monthTuples[mKey];
-    mEntry.wo_ids.add(woId);
-    if (wkStart > mEntry.last_week_start) mEntry.last_week_start = wkStart;
+    monthTuples[mKey].wo_ids.add(woId);
   }
 
   // Build the days[] entries — only those whose date falls in the month.
@@ -12660,14 +12667,15 @@ function _buildDocStatusPayload_(monthIso) {
     cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
   });
 
-  // Month-end docs (EU / CTC / CMP / LLC) are clustered into ONE panel
-  // for the viewed month rather than folded into individual week cells.
-  // One breakdown row per (contract, borough) pair that worked the month,
-  // each carrying the four docs' Done/Sent state. Rendered below the week
-  // calendar; bullets roll up per doc across all pairs.
+  // Month-end docs (EU / CTC / CMP / LLC) for the viewed month, surfaced
+  // on the calendar's last week. One breakdown row per (contract, borough)
+  // pair that worked the month, each carrying the four docs' Done/Sent
+  // state. Only populated once the month's final week has begun (they're
+  // due at month end) — and only for months that actually had work.
   const contractIdMap = _readContractIdMap_(ss);
-  const monthEndBreakdown = Object.values(monthTuples)
-    .filter(mt => mt.month === monthIso)
+  const monthEndDue = todayIso >= monthLastWeekStartIso(monthIso);
+  const monthEndBreakdown = (!monthEndDue ? [] : Object.values(monthTuples)
+    .filter(mt => mt.month === monthIso))
     .map(mt => ({
       contractor:   mt.contractor,
       contract_num: mt.contract_num,
@@ -12768,18 +12776,21 @@ function _buildDocStatusPayload_(monthIso) {
     if (!cpDone) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
     if (cpDone && !cpSent) pushPending(w, 'week', w.week_start, cpId, ['CP Sent']);
   });
-  // Month-end pending (all-time, week-kind). Anchored at the pair's last
-  // work-week of the month so it interleaves with CP in the same list
-  // and reads as "Week of <that Sunday>". One entry per missing flag
-  // per doc; Sent only surfaces once Done is set (same rule as CP).
+  // Month-end pending (all-time, week-kind). Only surfaces once the
+  // month's final week has begun (due at month end). Anchored at that
+  // month's last-week Sunday so all of a month's docs cluster together;
+  // the client labels them "Month of <Month Year>". One entry per
+  // missing flag per doc; Sent only surfaces once Done is set.
   Object.values(monthTuples).forEach(mt => {
+    const mws = monthLastWeekStartIso(mt.month);
+    if (todayIso < mws) return;   // not due until the last week arrives
     MONTH_END_DOCS_.forEach(md => {
       const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
       const rec = logById[id];
       const done = rec && rec.done;
       const sent = rec && rec.sent;
-      if (!done) pushPending(mt, 'week', mt.last_week_start, id, [md.key + ' Done']);
-      if (done && !sent) pushPending(mt, 'week', mt.last_week_start, id, [md.key + ' Sent']);
+      if (!done) pushPending(mt, 'week', mws, id, [md.key + ' Done']);
+      if (done && !sent) pushPending(mt, 'week', mws, id, [md.key + ' Sent']);
     });
   });
   // Within same anchor, order: SI Done → PL Done → PL Sent → CP Done →

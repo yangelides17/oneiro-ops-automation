@@ -83,6 +83,19 @@ const MONTH_END_DOCS = [
   { key: 'LLC', label: '220 Labor Law Certificate',  short: '220 LL' },
 ]
 
+const MONTH_END_KEYS = new Set(MONTH_END_DOCS.map(d => d.key))
+
+// A month-end pending item is anchored to a whole month, not a week.
+// Detect it from the missing flag's doc key and pull the month out of
+// the doc_id (e.g. "EU_2026-06_84125MBTP701_BK" → "2026-06"). Returns
+// the month string for such items, else null.
+function monthEndPendingMonth(item) {
+  const key = String(item?.missing?.[0] || '').split(' ')[0]
+  if (!MONTH_END_KEYS.has(key)) return null
+  const m = String(item?.doc_id || '').match(/_(\d{4}-\d{2})_/)
+  return m ? m[1] : null
+}
+
 // ── Pending-list action label per missing-flag ────────────────
 const ACTION_TITLE = {
   'PL Done': 'Complete Production Log',
@@ -418,6 +431,12 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
         </div>
         <div className="space-y-3 max-h-[60vh] overflow-y-auto">
           {/* Certified Payroll — top */}
+          <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
+            Certified Payroll
+          </p>
+          {(cell.breakdown || []).length === 0 && (
+            <p className="text-xs text-slate-400 italic">No Certified Payroll this week.</p>
+          )}
           {(cell.breakdown || []).map((b, i) => {
             const rowBg = STATUS_BG[weekBreakdownStatus(b)]
             return (
@@ -612,20 +631,18 @@ function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCel
             ? combinedLastWeekStatus(cell, monthEnd)
             : (cell?.status || 'gray')
           const bg = STATUS_BG[status] || STATUS_BG.gray
-          // CP bullets: real ones when this week had work; on the last
-          // week with no CP, none (we just show the month-end bullets).
-          const cpBullets = cell
-            ? summarizeBreakdown(cell.breakdown, 'week')
-            : (isLastWeek ? [] : summarizeBreakdown(undefined, 'week'))
+          // CP bullets always render (even "– No Work" on the last week
+          // when that week had no CP) so it's clear why there's no CP.
+          const cpBullets = summarizeBreakdown(cell?.breakdown, 'week')
           return (
             <button
               key={c.week_start}
               type="button"
               disabled={!clickable}
               onClick={() => clickable && onCellClick(effectiveCell)}
-              className={`w-full rounded-md border text-left p-1.5 transition-all
+              className={`w-full rounded-md border text-left transition-all
                           flex flex-col items-stretch overflow-hidden
-                          ${isLastWeek ? 'min-h-[80px]' : 'h-[80px]'}
+                          ${isLastWeek ? 'min-h-[80px] p-2.5' : 'h-[80px] p-1.5'}
                           ${bg}
                           ${clickable ? 'cursor-pointer hover:ring-2 hover:ring-navy/40' : 'cursor-default'}`}
             >
@@ -633,17 +650,15 @@ function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCel
                 {fmtWeekRange(c.week_start)}
               </span>
               {isLastWeek ? (
-                <div className="mt-1 flex gap-2 w-full">
-                  {/* CP bullets — left-justified (omitted if no CP this week) */}
-                  {cpBullets.length > 0 && (
-                    <div className="space-y-0.5 flex-shrink-0">
-                      {cpBullets.map((b, i) => (
-                        <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
-                      ))}
-                    </div>
-                  )}
+                <div className="mt-1.5 flex gap-6 w-full">
+                  {/* CP bullets — left-justified, always shown */}
+                  <div className="space-y-1 flex-shrink-0">
+                    {cpBullets.map((b, i) => (
+                      <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
+                    ))}
+                  </div>
                   {/* Month-end bullets — right, two columns */}
-                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 flex-1 min-w-0">
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 flex-1 min-w-0">
                     {meBullets.map((b, i) => (
                       <StatusBullet key={i} icon={b.icon} label={b.label} tone={b.tone} />
                     ))}
@@ -742,14 +757,18 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
         <p className="text-[10px] text-slate-400 italic">FIFO · oldest first</p>
       </div>
       <div className="max-h-[280px] overflow-y-auto divide-y divide-slate-100">
-        {items.map((it, i) => (
+        {items.map((it, i) => {
+          const meMonth = monthEndPendingMonth(it)
+          return (
           <div key={i} className="px-3 py-2.5 flex items-center justify-between gap-3">
             <div className="min-w-0 flex-1">
               <p className="font-semibold text-sm text-slate-800 truncate">
                 {ACTION_TITLE[it.missing[0]] || it.missing.join(', ')}
               </p>
               <p className="text-xs text-slate-500 mt-0.5">
-                {it.kind === 'week' ? `Week of ${fmtShortDate(it.anchor)}` : fmtShortDate(it.anchor)}
+                {meMonth
+                  ? `Month of ${fmtMonth(meMonth)}`
+                  : (it.kind === 'week' ? `Week of ${fmtShortDate(it.anchor)}` : fmtShortDate(it.anchor))}
               </p>
               <p className="text-xs text-slate-500 truncate">
                 {it.contract_num
@@ -767,7 +786,8 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
               <PendingActionButton item={it} onMark={onMark} />
             </div>
           </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
