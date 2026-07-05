@@ -6623,34 +6623,46 @@ const _MONTH_END_BY_KEY_ = Object.freeze(
 );
 
 /**
- * Build a month-end Doc ID: <KEY>_<YYYY-MM>_<contractNum>_<borough>.
- * Strips any '/EXT' suffix from the contract number to match the rest
- * of the codebase.
+ * Build a month-end Doc ID:
+ *   <KEY>_<YYYY-MM>_<contractNum>_<borough>_<contractorSlug>
+ * The prime contractor slug is REQUIRED for identity: two different
+ * primes can work (and, pre-cutover, be tracked under) the same
+ * (contract, borough) — e.g. Metro Express AND Denville both on
+ * 84125MBTP701 · BK — so the contractor is part of the key, or their
+ * month-end docs collide and one is silently dropped. Applied to ALL
+ * months (no cutover gate): month-end rows are unmarked, so re-keying
+ * legacy months just fixes their display, nothing to orphan.
+ * Strips any '/EXT' suffix from the contract number.
  *
- *   _monthEndDocId_('EU', '2026-07', '84125MBTP701/EXT', 'BK')
- *     → 'EU_2026-07_84125MBTP701_BK'
+ *   _monthEndDocId_('EU', '2026-07', '84125MBTP701/EXT', 'BK', 'Metro Express')
+ *     → 'EU_2026-07_84125MBTP701_BK_MetroExpress'
  */
-function _monthEndDocId_(key, monthIso, contractNum, borough) {
+function _monthEndDocId_(key, monthIso, contractNum, borough, contractor) {
   if (!_MONTH_END_BY_KEY_[key]) return '';
   const cn = String(contractNum || '').split('/')[0].trim();
-  return key + '_' + String(monthIso).trim() + '_' + cn + '_' + String(borough).trim();
+  const base = key + '_' + String(monthIso).trim() + '_' + cn + '_' + String(borough).trim();
+  const coSlug = _slugify_(contractor);
+  return coSlug ? (base + '_' + coSlug) : base;
 }
 
 /**
  * Inverse of _monthEndDocId_. Returns { key, monthIso, contractNum,
- * borough } or null. The leading token must be a known month-end key,
- * and the anchor must be YYYY-MM (no day) — both guard against
- * accidentally matching PL/SI/CP IDs.
+ * borough, contractor } (contractor is the SLUG) or null. The leading
+ * token must be a known month-end key and the anchor must be YYYY-MM
+ * (no day) — both guard against accidentally matching PL/SI/CP IDs.
+ * The trailing contractor slug is optional so any legacy contractor-less
+ * ID still parses (contractor: '').
  *
- *   "EU_2026-07_84125MBTP701_BK" → { key:'EU', monthIso:'2026-07',
- *                                    contractNum:'84125MBTP701', borough:'BK' }
+ *   "EU_2026-07_84125MBTP701_BK_MetroExpress"
+ *     → { key:'EU', monthIso:'2026-07', contractNum:'84125MBTP701',
+ *         borough:'BK', contractor:'MetroExpress' }
  */
 function _parseMonthEndDocId_(docId) {
   const m = String(docId || '').match(
-    /^([A-Z]{2,4})_(\d{4}-\d{2})_(.+)_([A-Z]{1,2})$/
+    /^([A-Z]{2,4})_(\d{4}-\d{2})_(.+)_([A-Z]{1,2})(?:_([A-Za-z0-9]+))?$/
   );
   if (!m || !_MONTH_END_BY_KEY_[m[1]]) return null;
-  return { key: m[1], monthIso: m[2], contractNum: m[3], borough: m[4] };
+  return { key: m[1], monthIso: m[2], contractNum: m[3], borough: m[4], contractor: m[5] || '' };
 }
 
 /**
@@ -6846,7 +6858,7 @@ function _resolveDocLifecycleMetadata_(ss, docId) {
   // _parseDocLifecycleId_ (YYYY-MM-DD), but keep the ordering explicit.
   const meParsed = _parseMonthEndDocId_(docId);
   if (meParsed) {
-    const matches = _scanWorkDayLogForMonth_(ss, meParsed.monthIso, meParsed.contractNum, meParsed.borough);
+    const matches = _scanWorkDayLogForMonth_(ss, meParsed.monthIso, meParsed.contractNum, meParsed.borough, meParsed.contractor);
     return {
       doc_type:     _MONTH_END_BY_KEY_[meParsed.key].doc_type,
       anchor:       meParsed.monthIso + '-01',
@@ -6935,7 +6947,7 @@ function _scanWorkDayLogForDate_(ss, dateIso) {
  * cutover month bills as one — see _billingRemapForMonth_), raw before.
  * Returns [{ wo_id, contractor }, ...].
  */
-function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
+function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractorSlug) {
   const sheet = ss.getSheetByName('Work Day Log');
   if (!sheet) return [];
   const data = sheet.getDataRange().getValues();
@@ -6947,8 +6959,9 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
     const mm = s.match(/^(\d{4}-\d{2}-\d{2})/);
     return mm ? mm[1] : '';
   };
-  const cnWant  = String(contractNum || '').split('/')[0].trim();
-  const borWant = String(borough || '').trim();
+  const cnWant   = String(contractNum || '').split('/')[0].trim();
+  const borWant  = String(borough || '').trim();
+  const coWant   = String(contractorSlug || '');   // slug; '' = any (legacy IDs)
   const out = [];
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
@@ -6959,6 +6972,10 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
     const rowCo  = String(r[2] || '').trim();
     const billed = _billingRemapForMonth_(monthIso, rowCn, rowBor, rowCo);
     if (billed.contractNum !== cnWant || billed.borough !== borWant) continue;
+    // Contractor is part of the doc identity — a month-end doc belongs to
+    // ONE prime. Match on the slug so Metro's 701·BK doc doesn't scoop up
+    // Denville's rows (or vice-versa).
+    if (coWant && _slugify_(rowCo) !== coWant) continue;
     out.push({
       wo_id:      String(r[1] || '').trim(),
       contractor: rowCo,
@@ -12893,9 +12910,13 @@ function _buildDocStatusPayload_(monthIso) {
 
     // Month-end docs remap at MONTH granularity — the whole cutover
     // month bills as one so its identity isn't split mid-month.
+    // The prime CONTRACTOR is part of the key (unconditionally, no cutover
+    // gate): two primes can share a (contract, borough) — e.g. Metro AND
+    // Denville on 701·BK — and each needs its own month-end docs. Without
+    // the contractor they collide and one is dropped.
     const monthIso2 = dateIso.slice(0, 7);
     const billedMonth = _billingRemapForMonth_(monthIso2, contractNum, borough, contractor);
-    const mKey = monthIso2 + '|' + billedMonth.contractNum + '|' + billedMonth.borough;
+    const mKey = monthIso2 + '|' + contractor + '|' + billedMonth.contractNum + '|' + billedMonth.borough;
     if (!monthTuples[mKey]) {
       monthTuples[mKey] = {
         month: monthIso2, contractor,
@@ -13020,7 +13041,7 @@ function _buildDocStatusPayload_(monthIso) {
       contract_id:  contractIdMap[mt.contract_num + '|' + mt.borough] || '',
       wo_ids:       Array.from(mt.wo_ids).sort(),
       docs: MONTH_END_DOCS_.map(md => {
-        const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
+        const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough, mt.contractor);
         const rec = logById[id];
         return {
           key:    md.key,
@@ -13122,7 +13143,7 @@ function _buildDocStatusPayload_(monthIso) {
     const mws = monthLastWeekStartIso(mt.month);
     if (todayIso < mws) return;   // not due until the last week arrives
     MONTH_END_DOCS_.forEach(md => {
-      const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough);
+      const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough, mt.contractor);
       const rec = logById[id];
       const done = rec && rec.done;
       const sent = rec && rec.sent;
