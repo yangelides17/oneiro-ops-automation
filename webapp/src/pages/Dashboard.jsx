@@ -779,7 +779,7 @@ export default function Dashboard() {
   // Cross-cutting predicates on the per-WO docs lifecycle (cfr / invoice,
   // each { done, sent }). Rendered as their own FilterBar row and matched
   // via the same OR-within / AND-across model as the real categories.
-  const DOCS_INCOMPLETE = 'Completed · docs not done'   // filter 1
+  const DOCS_INCOMPLETE = 'Incomplete CFR / Invoice'    // filter 1
   const DOCS_UNSENT     = 'Unsent CFR / Invoice'         // filter 2
 
   // Filter 1: WO is Completed but the CFR and/or Invoice is still not Done.
