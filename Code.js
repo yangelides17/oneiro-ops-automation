@@ -1846,12 +1846,19 @@ function archiveDocument_(file, docType, woId, ss) {
 
     } else if (docType === 'Sign-In') {
       // New multi-WO sign-ins land as SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_<ContractorSlug>][_chief-<ChiefSlug>][_MANUAL].pdf.
-      // We look up every WO that worked that contract on that day and copy
-      // the same PDF into each WO folder (same pattern as Production Logs).
-      // Optional <ContractorSlug> appears when a billing remap split the
-      // file by sub-prime; optional `_chief-<ChiefSlug>` appears when
-      // multiple crews from the same prime worked the same source job.
-      // Both are used to route the file to the right lifecycle row.
+      // The filename tuple is the sheet's DOC identity — raw before the
+      // billing-remap cutover, BILLING from it. Identity stays billing
+      // (ONE lifecycle row keyed by the filename tuple); STORAGE stays
+      // raw: we resolve every raw (contract, borough) source whose
+      // billing identity matches the filename and copy the file into
+      // each source's folder tree — a merged Manhattan sheet covering
+      // Brooklyn-sourced WOs lands under BOTH "… - Brooklyn/Sign-Ins"
+      // and "… - Manhattan/Sign-Ins", plus each WO's own folder. No
+      // billing folder is introduced.
+      // Optional <ContractorSlug> appears on raw-named files when a
+      // billing remap split the file by sub-prime; optional
+      // `_chief-<ChiefSlug>` appears when multiple crews from the same
+      // prime worked the same source job.
       const newPat = cleanName.match(
         /^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_(?!chief-)([A-Za-z0-9]+))?(?:_chief-([A-Za-z0-9]+))?/
       );
@@ -1862,39 +1869,60 @@ function archiveDocument_(file, docType, woId, ss) {
         const useFileContractor = fileContractorSlug && !isSuffixMarker;
         const crewChief = fileChiefSlug || '';
         const logDate = new Date(dateStr + 'T12:00:00');
+        // Raw-keyed groups (contractor|cn|bor from the WO Tracker) —
+        // keep every group whose billing identity as-of the sheet date
+        // matches the filename tuple (identity match pre-cutover).
         const wosByContract = getWOsForDate_(logDate, ss);
-        const matchKey = Object.keys(wosByContract).find(k => {
-          const parts = k.split('|');
-          if (parts[1] !== contractNum || parts[2] !== borough) return false;
-          if (useFileContractor && !slugMatches(parts[0])) return false;
-          return true;
+        const matchEntries = Object.entries(wosByContract).filter(([k]) => {
+          const [co, cn, bor] = k.split('|');
+          if (useFileContractor && !slugMatches(co)) return false;
+          const billed = _billingRemapAsOf_(dateStr, cn, bor, co);
+          return billed.contractNum === contractNum && billed.borough === borough;
         });
-        if (!matchKey) {
+        if (matchEntries.length === 0) {
           return {
             success: false,
             reason: `No WOs found in Daily Sign-In Data for ${contractNum}/${borough}${useFileContractor ? ' (' + fileContractorSlug + ')' : ''} on ${dateStr} — sign-in submitted before any matching Work Day Log row?`
           };
         }
-        const [contractor] = matchKey.split('|');
-        const wos = wosByContract[matchKey];
-        const contractFolder = getOrCreateSubfolder_(
-          getOrCreateSubfolder_(archiveRoot, contractor),
-          `${contractNum} - ${getBoroughName_(borough)}`
-        );
-        // Master copy at contract level — mirrors Production Logs and
-        // Certified Payroll. Lets the listing handler read Sign-Ins
-        // from a single place instead of de-duping across WO folders.
-        const masterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Sign-Ins'));
-        wos.forEach(wo => {
-          const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
-          file.makeCopy(cleanName, woFolder);
+        // One sheet = one prime. If two contractors somehow share the
+        // billing identity (a second genuine prime on the billing
+        // tuple), file under the first and log loudly — mirrors the CP
+        // generator's merge guard.
+        const contractor = matchEntries[0][0].split('|')[0];
+        const ownEntries = matchEntries.filter(([k]) => k.split('|')[0] === contractor);
+        if (ownEntries.length !== matchEntries.length) {
+          Logger.log('🚨 archiveDocument_ Sign-In: multiple contractors matched identity ' +
+                     contractNum + '/' + borough + ' on ' + dateStr +
+                     ' — filing under ' + contractor + ' only.');
+        }
+        // Master copy per RAW source contract-borough folder — mirrors
+        // Production Logs and Certified Payroll. Lets the listing
+        // handler read Sign-Ins from the contract-level folders
+        // (de-duped downstream by the billing doc_id).
+        let masterCopyId = '';
+        const allWoIds = [];
+        ownEntries.forEach(([k, wos]) => {
+          const [, rawCn, rawBor] = k.split('|');
+          const contractFolder = getOrCreateSubfolder_(
+            getOrCreateSubfolder_(archiveRoot, contractor),
+            `${rawCn} - ${getBoroughName_(rawBor)}`
+          );
+          const masterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Sign-Ins'));
+          if (!masterCopyId) masterCopyId = masterCopy.getId();
+          wos.forEach(wo => {
+            const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
+            file.makeCopy(cleanName, woFolder);
+            allWoIds.push(wo.id);
+          });
         });
-        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum}${crewChief ? ' (' + crewChief + ')' : ''} + master + ${wos.length} WO folder(s)`);
+        Logger.log(`📁 Archived Sign-In → ${contractor}/${contractNum}${crewChief ? ' (' + crewChief + ')' : ''} across ${ownEntries.length} raw folder(s) + ${allWoIds.length} WO folder(s)`);
 
-        // Doc Lifecycle Log: upsert SI row with done=true. Crew chief
-        // (from filename slug) routes to the correct pending row when
-        // multiple crews share the same source job. Blank chief matches
-        // legacy single-crew rows.
+        // Doc Lifecycle Log: upsert ONE row keyed by the filename's
+        // (billing) identity, done=true, WO union across raw sources.
+        // Crew chief (from filename slug) routes to the correct pending
+        // row when multiple crews share the same source job. Blank
+        // chief matches legacy single-crew rows.
         try {
           _upsertDocLifecycleRow_(ss, {
             doc_id:       _docLifecycleId_('Sign-In', dateStr, contractNum, borough, crewChief),
@@ -1904,15 +1932,15 @@ function archiveDocument_(file, docType, woId, ss) {
             contract_num: contractNum,
             borough:      borough,
             crew_chief:   crewChief,
-            wo_ids:       wos.map(w => w.id),
+            wo_ids:       allWoIds,
             done:         true,
-            file_id:      masterCopy.getId(),
+            file_id:      masterCopyId,
           });
         } catch (e) {
           Logger.log('⚠️ archiveDocument_ Sign-In: Doc Lifecycle Log upsert failed: ' + e.message);
         }
 
-        return { success: true, doc_type: 'Sign-In', wo_ids: wos.map(w => w.id) };
+        return { success: true, doc_type: 'Sign-In', wo_ids: allWoIds };
       }
       // Legacy single-WO Sign-In (pre-multi-WO refactor) — keep working.
       if (!woId) {
@@ -2013,9 +2041,16 @@ function archiveDocument_(file, docType, woId, ss) {
 
     } else if (docType === 'Certified Payroll') {
       // Parse from filename: Certified_Payroll_[contractNum]_[borough]_YYYY-MM-DD[_<ContractorSlug>][_FILLED].pdf
-      // Optional <ContractorSlug> after the date appears when a billing
-      // remap split the CP by sub-prime — used to pick the right
-      // contractor folder when multiple primes worked the same source job.
+      // The filename tuple is the CP's DOC identity — raw pre-cutover,
+      // BILLING from the cutover on. Identity stays billing (ONE
+      // lifecycle row keyed by the filename tuple); STORAGE stays raw:
+      // getWOsForPayrollWeek_ returns every covered WO tagged with its
+      // RAW tuple, and the file fans out into each distinct raw
+      // contract-borough folder + each raw WO folder. No billing folder.
+      // Optional <ContractorSlug> after the date appears on raw-named
+      // files when a billing remap split the CP by sub-prime — used to
+      // pick the right contractor folder when multiple primes worked
+      // the same source job.
       const match = cleanName.match(/Certified_Payroll_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})(?:_([A-Za-z0-9]+))?/);
       if (!match) {
         return { success: false, reason: 'Could not parse contract info from Certified Payroll filename' };
@@ -2025,14 +2060,18 @@ function archiveDocument_(file, docType, woId, ss) {
       const _cpUseFileContractor = fileContractorSlug && !_cpIsSuffixMarker;
       const _cpSlugMatches = (co) => String(co || '').replace(/[^A-Za-z0-9]/g, '') === fileContractorSlug;
       const weekStart = new Date(weekStartStr + 'T12:00:00');
-      const wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
+      let wos = getWOsForPayrollWeek_(contractNum, borough, weekStart, ss);
       let contractor = '';
       if (_cpUseFileContractor) {
         // Narrow to the WOs matching the filename's contractor slug —
         // when both primes worked the same source job, picking the
-        // first wo's contractor would archive to the wrong folder.
+        // first wo's contractor would archive to the wrong folder, and
+        // filing the other prime's WOs would leak this CP into their tree.
         const filtered = wos.filter(w => _cpSlugMatches(w.contractor));
-        if (filtered.length > 0) contractor = filtered[0].contractor || '';
+        if (filtered.length > 0) {
+          contractor = filtered[0].contractor || '';
+          wos = filtered;
+        }
       }
       if (!contractor) contractor = wos.length > 0 ? (wos[0].contractor || '') : '';
       if (!contractor) {
@@ -2050,20 +2089,46 @@ function archiveDocument_(file, docType, woId, ss) {
         };
       }
 
-      const contractFolder = getOrCreateSubfolder_(
-        getOrCreateSubfolder_(archiveRoot, contractor),
-        `${contractNum} - ${getBoroughName_(borough)}`
-      );
-      // Master copy at contract level
-      const cpMasterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
-      // Duplicate into each WO folder worked during that payroll week for this contract
-      wos.forEach(wo => {
-        const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
-        file.makeCopy(cleanName, woFolder);
-      });
+      let cpMasterCopyId = '';
+      if (wos.length === 0) {
+        // No covered WOs resolvable (Contract Lookup fallback path) —
+        // file one master under the identity tuple's folder so the CP
+        // is never lost.
+        const contractFolder = getOrCreateSubfolder_(
+          getOrCreateSubfolder_(archiveRoot, contractor),
+          `${contractNum} - ${getBoroughName_(borough)}`
+        );
+        cpMasterCopyId = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll')).getId();
+      } else {
+        // Group covered WOs by their RAW (contract, borough): one
+        // master copy per distinct raw source folder (a merged M CP
+        // lands under both "… - Brooklyn/Certified Payroll" and
+        // "… - Manhattan/Certified Payroll"), plus a copy in each raw
+        // WO folder beside that WO's CFR/PL/SI.
+        const byRawFolder = {};
+        wos.forEach(w => {
+          const k = `${w.contract_num}|${w.borough}`;
+          if (!byRawFolder[k]) byRawFolder[k] = [];
+          byRawFolder[k].push(w);
+        });
+        Object.entries(byRawFolder).forEach(([k, group]) => {
+          const [rawCn, rawBor] = k.split('|');
+          const contractFolder = getOrCreateSubfolder_(
+            getOrCreateSubfolder_(archiveRoot, contractor),
+            `${rawCn} - ${getBoroughName_(rawBor)}`
+          );
+          const masterCopy = file.makeCopy(cleanName, getOrCreateSubfolder_(contractFolder, 'Certified Payroll'));
+          if (!cpMasterCopyId) cpMasterCopyId = masterCopy.getId();
+          group.forEach(wo => {
+            const woFolder = getOrCreateSubfolder_(contractFolder, `${wo.id} - ${wo.location}`);
+            file.makeCopy(cleanName, woFolder);
+          });
+        });
+      }
       Logger.log(`📁 Archived Certified Payroll → ${contractor}/${contractNum} + ${wos.length} WO folder(s)`);
 
-      // Doc Lifecycle Log: one row per (week, contract, borough).
+      // Doc Lifecycle Log: ONE row keyed by the filename's (billing)
+      // identity per (week, contract, borough).
       try {
         _upsertDocLifecycleRow_(ss, {
           doc_id:       _docLifecycleId_('Certified Payroll', weekStartStr, contractNum, borough),
@@ -2074,7 +2139,7 @@ function archiveDocument_(file, docType, woId, ss) {
           borough:      borough,
           wo_ids:       wos.map(w => w.id),
           done:         true,
-          file_id:      cpMasterCopy.getId(),
+          file_id:      cpMasterCopyId,
         });
       } catch (e) {
         Logger.log('⚠️ archiveDocument_ CP: Doc Lifecycle Log upsert failed: ' + e.message);
@@ -2659,16 +2724,25 @@ function _persistGeocode_(ss, woId, result) {
 
 
 /**
- * Build a fast WO# → Location map from the Work Order Tracker. Used by
- * the WO-listing helpers below so multi-WO sign-in rows (where the WO#
- * column is a comma-list "RM-1, RM-2") still resolve each WO's actual
- * location for archive-folder paths.
+ * Build a fast WO# → RAW identity map from the Work Order Tracker:
+ * { contractor, contract_num, borough, location } per WO, matching the
+ * folder-path semantics of getWOFolder_ / findWOFolder_. Used by the
+ * WO-listing helpers below: multi-WO sign-in rows (where the WO# column
+ * is a comma-list "RM-1, RM-2") resolve each WO's actual location, and
+ * — post-cutover, when Daily Sign-In Data cols 3/4 carry the BILLING
+ * tuple — each WO's raw source (contract, borough) for archive routing.
  */
-function _buildLocationByWOMap_(ss) {
+function _buildWOTrackerMap_(ss) {
   const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
   const byId = {};
   woData.slice(1).forEach(r => {
-    if (r[0]) byId[String(r[0])] = String(r[5] || '');
+    if (!r[0]) return;
+    byId[String(r[0])] = {
+      contractor:   String(r[1] || 'General'),
+      contract_num: String(r[2] || '').split('/')[0],
+      borough:      String(r[3] || '').trim(),
+      location:     String(r[5] || ''),
+    };
   });
   return byId;
 }
@@ -2681,51 +2755,80 @@ function _splitWOIds_(cell) {
     .filter(Boolean);
 }
 
-/** Return WOs worked on a given date, grouped by "contractor|contractNum|borough" */
+/**
+ * Return WOs worked on a given date, grouped by the RAW
+ * "contractor|contractNum|borough" tuple resolved per-WO from the WO
+ * Tracker — NOT from Daily Sign-In Data cols 3/4, which carry the
+ * BILLING tuple post-cutover. Archive routing (PL / SI copies) must
+ * keep filing into the raw source-job folders, so the raw key is the
+ * contract here. WOs missing from the Tracker fall back to the sign-in
+ * row's own values so nothing silently drops.
+ */
 function getWOsForDate_(date, ss) {
   const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
-  const locByWO = _buildLocationByWOMap_(ss);
+  const woById = _buildWOTrackerMap_(ss);
   const wosByContract = {};
   const seen = new Set();
   data.slice(1).forEach(row => {
     if (!row[0]) return;
     if (new Date(row[0]).toDateString() !== date.toDateString()) return;
-    const key = `${row[2]}|${String(row[3]).split('/')[0]}|${row[4]}`;
-    if (!wosByContract[key]) wosByContract[key] = [];
     _splitWOIds_(row[1]).forEach(woId => {
       if (seen.has(woId)) return;
       seen.add(woId);
-      wosByContract[key].push({ id: woId, location: locByWO[woId] || row[5] || '' });
+      const t = woById[woId];
+      const contractor = t ? t.contractor   : String(row[2] || '').trim();
+      const cn         = t ? t.contract_num : String(row[3] || '').split('/')[0];
+      const bor        = t ? t.borough      : String(row[4] || '').trim();
+      const key = `${contractor}|${cn}|${bor}`;
+      if (!wosByContract[key]) wosByContract[key] = [];
+      wosByContract[key].push({ id: woId, location: (t && t.location) || row[5] || '' });
     });
   });
   return wosByContract;
 }
 
 /**
- * Return unique WOs for a contract+borough during a payroll week.
- * Each entry: { id, location, contractor } — contractor pulled from
- * Daily Sign-In Data's Prime Contractor column so the Cert Payroll
- * archive path can be derived without depending on Contract Lookup.
+ * Return unique WOs covered by the CP identified by (contractNum,
+ * borough, weekStart). The tuple is the CP's DOC identity — raw
+ * pre-cutover, BILLING post-cutover — and matching is billing-aware:
+ * a WO belongs when its RAW tuple (from the WO Tracker) remapped
+ * as-of the sign-in row's date equals the target, so raw-M and
+ * remapped raw-BK WOs both land on the one M CP (union).
+ *
+ * Each entry: { id, location, contractor, contract_num, borough } —
+ * all RAW, from the WO Tracker — so the Cert Payroll archive path can
+ * fan the billing-named file out into each raw source folder. WOs
+ * missing from the Tracker fall back to the sign-in row's own values.
  */
 function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
   const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
-  const locByWO = _buildLocationByWOMap_(ss);
+  const woById = _buildWOTrackerMap_(ss);
+  const wantCn  = String(contractNum || '').trim();
+  const wantBor = String(borough || '').trim();
   const wos = [];
   const seen = new Set();
   data.slice(1).forEach(row => {
     if (!row[0]) return;
     const d = new Date(row[0]);
     if (d < weekStart || d > weekEnd) return;
-    if (String(row[3]).split('/')[0] !== contractNum || row[4] !== borough) return;
+    const rowDateIso = _normDateKey_(row[0]);
     _splitWOIds_(row[1]).forEach(woId => {
       if (seen.has(woId)) return;
+      const t = woById[woId];
+      const rawContractor = t ? t.contractor   : String(row[2] || '').trim();
+      const rawCn         = t ? t.contract_num : String(row[3] || '').split('/')[0];
+      const rawBor        = t ? t.borough      : String(row[4] || '').trim();
+      const billed = _billingRemapAsOf_(rowDateIso, rawCn, rawBor, rawContractor);
+      if (billed.contractNum !== wantCn || billed.borough !== wantBor) return;
       seen.add(woId);
       wos.push({
-        id:         woId,
-        location:   locByWO[woId] || row[5] || '',
-        contractor: String(row[2] || '').trim(),
+        id:           woId,
+        location:     (t && t.location) || row[5] || '',
+        contractor:   rawContractor,
+        contract_num: rawCn,
+        borough:      rawBor,
       });
     });
   });
@@ -2945,7 +3048,10 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     return 0;
   }
   
-  // Group by Contract # + Borough (which maps to Contract ID)
+  // Group by Contract # + Borough (which maps to Contract ID).
+  // Post-cutover rows carry the BILLING tuple in cols 3/4 (written at
+  // sign-in submit), so these buckets are billing buckets — raw-BK and
+  // raw-M work for the same prime lands in ONE bucket → ONE CP.
   const byContract = {};
   weekEntries.forEach(row => {
     const contractNum = String(row[3]).split('/')[0]; // Strip suffix
@@ -3002,6 +3108,24 @@ function generateCertifiedPayroll(weekStartStr, opts) {
 
   subBuckets.forEach(({ contractor: bucketContractor, contractNum, borough, entries }) => {
     cpSubBucketsGenerated++;
+
+    // Guard: merging boroughs within ONE prime is intended post-cutover;
+    // merging two PRIMES onto one CP never is. If a non-split bucket
+    // (billing tuple, or a raw tuple with no remap rule) ever holds >1
+    // distinct DSID contractor — e.g. a second genuine 701-M prime
+    // appears alongside remapped Metro-BK rows — log loudly so it's
+    // caught in review. Generation continues (existing behavior).
+    if (!bucketContractor) {
+      const _distinctContractors = Array.from(new Set(
+        entries.map(r => String(r[2] || '').trim()).filter(Boolean)
+      ));
+      if (_distinctContractors.length > 1) {
+        Logger.log('🚨 Certified Payroll: bucket ' + contractNum + '|' + borough +
+                   ' (week of ' + weekStartStr + ') contains ' + _distinctContractors.length +
+                   ' distinct contractors (' + _distinctContractors.join(', ') +
+                   ') merged onto ONE CP — verify this is intended; the billing remap must never merge two primes.');
+      }
+    }
 
     // Look up Contract ID from lookup table (uses MAPPED contract+borough
     // when remap applied, so the right contract's registration/project
@@ -3221,11 +3345,13 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     // The form still prints "WEEK ENDING DATE" (Saturday) in its header
     // because that's the standard payroll convention on the form itself.
     //
-    // Filename keeps RAW (contract, borough) so archive parsers still
-    // match against WO Tracker (also raw). When a split happened
-    // (sub-prime billing remap), append a contractor slug to
-    // disambiguate the two PDFs that share the same raw key — without
-    // the slug they'd collide in Drive and one would clobber the other.
+    // Filename carries this bucket's DOC identity: post-cutover buckets
+    // are billing-keyed (DSID cols 3/4 are billing), so the filename is
+    // billing-named and the archive stores it into every raw folder it
+    // covers. Pre-cutover raw buckets that hit the sub-prime split keep
+    // the RAW key + a contractor slug to disambiguate the two PDFs that
+    // share it — without the slug they'd collide in Drive and one would
+    // clobber the other.
     const _cpRawContract = bucketContractor ? rawContractNum : contractNum;
     const _cpRawBorough  = bucketContractor ? rawBorough     : borough;
     const _cpContractorSlug = bucketContractor
@@ -4889,28 +5015,42 @@ function handleListSignInQueue_(body) {
     const crewChief   = String(row[7] || '').trim();
     if (!dateStr || !woId || !contractNum || !borough) return;
 
+    // Billing remap, cutover-gated on the work date: from the cutover
+    // on, the queue card carries the BILLING (contract, borough) — so a
+    // crew that worked raw 701-M and raw 701-BK the same day gets ONE
+    // card under M, accumulating both source jobs' WOs — and the submit
+    // path writes that billing tuple into Daily Sign-In Data + the SI
+    // filename. Pre-cutover dates stay raw (identity) so overdue
+    // sign-ins keep matching their raw-keyed history.
+    const billed = _billingRemapAsOf_(dateStr, contractNum, borough, contractor);
+
     // Key includes contractor AND crew chief. Per the multi-crew model,
     // each crew (identified by chief) gets its own queue card → its own
     // SI submission → its own filename/lifecycle row. Without the chief
     // in the key, two crews on the same source job would collapse into
-    // one card and one prime's WOs would silently merge with the other's.
+    // one card and one prime's WOs would silently merge with the other's
+    // — the remap merges boroughs within ONE prime, never across primes
+    // (Metro→M and Denville→QU can't collide).
     // Blank chief is a first-class value (legacy single-crew rows) and
     // groups with itself just like a named chief would.
-    const key = `${dateStr}|${contractor}|${contractNum}|${borough}|${crewChief}`;
+    const key = `${dateStr}|${contractor}|${billed.contractNum}|${billed.borough}|${crewChief}`;
     if (!groups.has(key)) {
-      const lookup = lookupContract(contractNum, borough);
-      // Billing remap: the sign-in sheet the user signs is labeled with
-      // the billing identity (e.g. Denville/BK billed as QU). Source data
-      // stays raw — we just surface the remapped tuple alongside it so
-      // the queue UI matches what gets printed on the doc.
-      const billed = _billingRemap_(contractNum, borough, contractor);
+      // Contract ID / project name from the billing tuple — the raw
+      // source borough (e.g. 701-BK) isn't in Contract Lookup; the
+      // billing one is.
+      const lookup = lookupContract(billed.contractNum, billed.borough);
+      // bill_* stays the un-gated remap: the printed sheet is ALWAYS
+      // labeled with the billing identity (pre-cutover included — that
+      // was the original content-only bandaid), so the card badge
+      // matches the doc even for overdue pre-cutover submits.
+      const billedLabel = _billingRemap_(contractNum, borough, contractor);
       groups.set(key, {
         queue_id:             key,
         date:                 dateStr,
-        contract_number:      contractNum,
-        borough:              borough,
-        bill_contract_number: billed.contractNum,
-        bill_borough:         billed.borough,
+        contract_number:      billed.contractNum,
+        borough:              billed.borough,
+        bill_contract_number: billedLabel.contractNum,
+        bill_borough:         billedLabel.borough,
         contractor:           contractor,          // raw WO-Tracker contractor (logic/remap)
         // "Prime Contractor" on the sign-in sheet = the Contact Name from
         // Contractor Contacts (col 1); fall back to the contractor company.
@@ -5018,6 +5158,18 @@ function handleSubmitSignIn_(body) {
     // Time In on a Monday-shift would wrongly slip back to Sunday.)
     const effectiveDate = String(d.date);
 
+    // ── Billing identity for this sheet ───────────────────────────
+    // From the cutover on, the queue already sends the BILLING
+    // (contract, borough); this re-remap is then a safe no-op. A stale
+    // client (or a pre-cutover overdue card) may still send the raw
+    // tuple — remap it here, gated on the work date, so Daily Sign-In
+    // Data cols 3/4 and the SI filename always carry the sheet's doc
+    // identity: raw pre-cutover, billing post-cutover. Contractor is
+    // never remapped.
+    const siBilled = _billingRemapAsOf_(
+      effectiveDate, d.contract_number, d.borough, d.contractor
+    );
+
     // ── Determine OT rule by start-day DOW ────────────────────────
     const dowOfWork = (() => {
       const m = String(effectiveDate).match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -5091,9 +5243,9 @@ function handleSubmitSignIn_(body) {
       return [
         effectiveDate,                                //  0  Date (shift START, opDay-derived)
         woListStr,                                    //  1  Work Order # (comma-list)
-        String(d.contractor || '').trim(),            //  2  Prime Contractor
-        String(d.contract_number || '').trim(),       //  3  Contract #
-        String(d.borough || '').trim(),               //  4  Borough
+        String(d.contractor || '').trim(),            //  2  Prime Contractor (raw — never remapped)
+        siBilled.contractNum,                         //  3  Contract # (BILLING from cutover on)
+        siBilled.borough,                             //  4  Borough    (BILLING from cutover on)
         displayLocation,                              //  5  Location
         String(member.name || '').trim(),             //  6  Employee Name
         String(member.classification || '').trim(),   //  7  Classification
@@ -5145,11 +5297,17 @@ function handleSubmitSignIn_(body) {
     const signInFolder = getOrCreateSubfolder_(reviewFolder, 'Sign-In Logs');
 
     const isoDate = String(effectiveDate).slice(0, 10);
-    // Filename keeps RAW (contract, borough) so the archive parser
-    // matches WO Tracker. Two suffixes can append after the date:
-    //   - `_<ContractorSlug>` when the sub-prime billing remap applies
-    //     (Brooklyn → Manhattan/Queens) — disambiguates two primes
-    //     submitting against the same source job.
+    // Filename carries the sheet's DOC identity (siBilled): raw before
+    // the cutover, BILLING from it — the archive parser stores the file
+    // into the raw folders it covers either way. Two suffixes can
+    // append after the date:
+    //   - `_<ContractorSlug>` when the INPUT tuple was a raw remap
+    //     source (pre-cutover, or a stale client sending raw) —
+    //     disambiguates two primes submitting against the same raw
+    //     source job (raw-named files would otherwise collide). Never
+    //     appears post-cutover from an up-to-date queue: billing
+    //     tuples aren't remap sources, and Metro→M / Denville→QU can't
+    //     collide by name.
     //   - `_chief-<ChiefSlug>` when this submission carries a crew chief
     //     — disambiguates two crews from the SAME prime submitting
     //     against the same source job on the same day.
@@ -5162,7 +5320,7 @@ function handleSubmitSignIn_(body) {
     const _siChiefSlug = crewChief
       ? '_chief-' + crewChief.replace(/[^A-Za-z0-9]/g, '')
       : '';
-    const baseName = `SignIn_${d.contract_number}_${d.borough}_${isoDate}${_siContractorSlug}${_siChiefSlug}`;
+    const baseName = `SignIn_${siBilled.contractNum}_${siBilled.borough}_${isoDate}${_siContractorSlug}${_siChiefSlug}`;
 
     let writtenName;
 
@@ -5206,11 +5364,10 @@ function handleSubmitSignIn_(body) {
         Logger.log(`⚠️ Contractor Contacts lookup failed: ${err}`);
       }
 
-      // Apply billing remap for the PDF content: sub-prime work on a
-      // contract they didn't win shows the billed-under contract here.
-      // Filename / Daily Sign-In Data row stay raw so the archive cron
-      // matches WO Tracker (also raw) and the source job stays one
-      // folder.
+      // PDF content always shows the billing identity — un-gated remap,
+      // because the printed sheet was billing-labeled even before the
+      // cutover (the original content-only bandaid). Post-cutover this
+      // is a no-op re-remap of the already-billing input.
       const _siMapped = _billingRemap_(d.contract_number, d.borough, d.contractor);
       const siContractNum = _siMapped.contractNum;
       const siBorough = _siMapped.borough;
@@ -6703,8 +6860,15 @@ function _resolveDocLifecycleMetadata_(ss, docId) {
   const stdParsed = _parseDocLifecycleId_(docId);
   if (!stdParsed) return null;
   if (stdParsed.prefix === 'SI') {
+    // The doc_id tuple is the sheet's identity (BILLING post-cutover);
+    // WDL rows stay raw — match on each row's billing identity as-of
+    // the anchor date (contractor-aware) so BK-sourced work days land
+    // on the merged billing row with the union of their wo_ids.
     const matches = _scanWorkDayLogForDate_(ss, stdParsed.anchor)
-      .filter(r => r.contract_num === stdParsed.contractNum && r.borough === stdParsed.borough);
+      .filter(r => {
+        const billed = _billingRemapAsOf_(stdParsed.anchor, r.contract_num, r.borough, r.contractor);
+        return billed.contractNum === stdParsed.contractNum && billed.borough === stdParsed.borough;
+      });
     return {
       doc_type:     'Sign-In',
       anchor:       stdParsed.anchor,
@@ -6715,6 +6879,8 @@ function _resolveDocLifecycleMetadata_(ss, docId) {
     };
   }
   if (stdParsed.prefix === 'CP') {
+    // getWOsForPayrollWeek_ is billing-aware: the union of raw-M and
+    // remapped raw-BK WOs comes back for a billing-keyed doc_id.
     const weekStart = new Date(stdParsed.anchor + 'T12:00:00');
     const wos = getWOsForPayrollWeek_(stdParsed.contractNum, stdParsed.borough, weekStart, ss);
     return {
@@ -6764,7 +6930,10 @@ function _scanWorkDayLogForDate_(ss, dateIso) {
  * a (contractNum, borough) pair. Month-end analogue of
  * _scanWorkDayLogForDate_ — used to reverse-engineer contractor +
  * WO IDs when a manual Mark Done flips a month-end doc whose Log row
- * doesn't exist yet. Returns [{ wo_id, contractor }, ...].
+ * doesn't exist yet. The target tuple is the month-end DOC identity:
+ * BILLING at MONTH granularity from the cutover month on (the whole
+ * cutover month bills as one — see _billingRemapForMonth_), raw before.
+ * Returns [{ wo_id, contractor }, ...].
  */
 function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
   const sheet = ss.getSheetByName('Work Day Log');
@@ -6785,11 +6954,14 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough) {
     const r = data[i];
     const iso = ymd(r[0]);
     if (!iso || iso.slice(0, 7) !== monthIso) continue;
-    if (String(r[3] || '').split('/')[0].trim() !== cnWant) continue;
-    if (String(r[4] || '').trim() !== borWant) continue;
+    const rowCn  = String(r[3] || '').split('/')[0].trim();
+    const rowBor = String(r[4] || '').trim();
+    const rowCo  = String(r[2] || '').trim();
+    const billed = _billingRemapForMonth_(monthIso, rowCn, rowBor, rowCo);
+    if (billed.contractNum !== cnWant || billed.borough !== borWant) continue;
     out.push({
       wo_id:      String(r[1] || '').trim(),
-      contractor: String(r[2] || '').trim(),
+      contractor: rowCo,
     });
   }
   return out;
@@ -6898,7 +7070,10 @@ function _lookupContractorForDateContractBorough_(ss, dateIso, contractNum, boro
 
 /**
  * Validate that the Sign-In sheet for a single (date, contract, borough)
- * tuple is marked Done in the Doc Lifecycle Log. Returns:
+ * tuple is marked Done in the Doc Lifecycle Log. The tuple must be the
+ * sheet's DOC identity — raw pre-cutover, BILLING post-cutover (apply
+ * _billingRemapAsOf_ before calling if starting from raw WDL values).
+ * Currently uncalled; kept for parity with the week validator. Returns:
  *   { ok: true }
  *   { ok: false, error_code: 'SI_NOT_DONE', error: '...' }
  */
@@ -6958,16 +7133,22 @@ function _validateSignInDoneForWeek_(ss, weekStartIso, contractNum, borough) {
     return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
   })();
   // Collect every (date, crew chief) that worked this contract+borough in
-  // the week. Sign-In rows are keyed per crew chief, so each crew's sheet
-  // is validated — not one no-chief id per date.
+  // the week. WDL rows stay RAW while the target tuple is the CP's DOC
+  // identity (raw pre-cutover, BILLING from the cutover on) — so compare
+  // each row's billing identity as-of its date, contractor-aware, and
+  // remapped raw-BK rows correctly gate the merged billing CP.
+  // Sign-In rows are keyed per crew chief, so each crew's sheet is
+  // validated — not one no-chief id per date.
   const workedCrews = new Map();   // `${date}|${chief}` → { date, chief }
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     const dateIso = ymd(r[0]);
     if (!dateIso || dateIso < weekStartIso || dateIso > weekEndIso) continue;
-    const cn = String(r[3] || '').split('/')[0].trim();
-    if (cn !== contractNum) continue;
-    if (String(r[4] || '').trim() !== borough) continue;
+    const cn  = String(r[3] || '').split('/')[0].trim();
+    const bor = String(r[4] || '').trim();
+    const rowContractor = String(r[2] || '').trim();
+    const billed = _billingRemapAsOf_(dateIso, cn, bor, rowContractor);
+    if (billed.contractNum !== contractNum || billed.borough !== borough) continue;
     const chief = String(r[7] || '').trim();
     workedCrews.set(dateIso + '|' + chief, { date: dateIso, chief });
   }
@@ -7068,13 +7249,22 @@ function backfillDocLifecycleLog() {
     const crewChief   = String(r[7] || '').trim();
     if (!woId || !contractor || !contractNum || !borough) continue;
 
+    // SI/CP doc identity per row: raw pre-cutover, BILLING from the
+    // cutover on — the same rule every read-time consumer applies, so
+    // a re-run never inserts billing duplicates of already-done raw
+    // rows (or raw phantoms next to billing ones). PL stays raw
+    // (keyed by contractor, no borough).
+    const billed = _billingRemapAsOf_(dateIso, contractNum, borough, contractor);
+
     // SI key includes crew chief so two crews on the same source job
     // produce two separate pending SI lifecycle rows (Doc Status shows
     // each as its own card).
-    const siKey = dateIso + '|' + contractor + '|' + contractNum + '|' + borough + '|' + crewChief;
+    const siKey = dateIso + '|' + contractor + '|' + billed.contractNum + '|' + billed.borough + '|' + crewChief;
     if (!siGroups[siKey]) {
       siGroups[siKey] = {
-        anchor: dateIso, contractor, contractNum, borough, crewChief, wo_ids: new Set(),
+        anchor: dateIso, contractor,
+        contractNum: billed.contractNum, borough: billed.borough,
+        crewChief, wo_ids: new Set(),
       };
     }
     siGroups[siKey].wo_ids.add(woId);
@@ -7091,12 +7281,15 @@ function backfillDocLifecycleLog() {
 
     // Week tuple uses Sunday anchor of the day's date. CP stays single-
     // crew per (week, contract, borough) by design — workers are
-    // reported per (employee, classification), not per crew.
+    // reported per (employee, classification), not per crew. Keyed by
+    // the billed tuple so raw-M + raw-BK days share one CP row.
     const wkStart = weekStartIsoFor(new Date(dateIso + 'T12:00:00'));
-    const weekKey = wkStart + '|' + contractNum + '|' + borough;
+    const weekKey = wkStart + '|' + billed.contractNum + '|' + billed.borough;
     if (!weekTuples[weekKey]) {
       weekTuples[weekKey] = {
-        anchor: wkStart, contractor, contractNum, borough, wo_ids: new Set(),
+        anchor: wkStart, contractor,
+        contractNum: billed.contractNum, borough: billed.borough,
+        wo_ids: new Set(),
       };
     }
     weekTuples[weekKey].wo_ids.add(woId);
@@ -8024,9 +8217,15 @@ function _validateAllSIsDoneForContractorDay_(ss, contractor, dateIso) {
     const r = data[i];
     if (ymd(r[0]) !== dateIso) continue;
     if (String(r[2] || '').trim() !== contractor) continue;
-    const cn  = String(r[3] || '').split('/')[0].trim();
-    const bor = String(r[4] || '').trim();
-    if (!cn || !bor) continue;
+    const cnRaw  = String(r[3] || '').split('/')[0].trim();
+    const borRaw = String(r[4] || '').trim();
+    if (!cnRaw || !borRaw) continue;
+    // SI lifecycle rows are keyed by the sheet's DOC identity (billing
+    // from the cutover on); WDL is raw — remap before the lookup so a
+    // merged M sheet satisfies both its raw-M and raw-BK work days.
+    const billed = _billingRemapAsOf_(dateIso, cnRaw, borRaw, contractor);
+    const cn  = billed.contractNum;
+    const bor = billed.borough;
     const chief = String(r[7] || '').trim();
     tupleSet.add(cn + '|' + bor);
     crews.set(cn + '|' + bor + '|' + chief, { cn, bor, chief });
@@ -8087,15 +8286,20 @@ function _validateAllPLEligibleForDay_(ss, dateIso) {
   };
   // contractor → Map `${cn}|${bor}|${chief}` → { cn, bor, chief }. Sign-In
   // rows are keyed per crew chief, so collect the chief dimension too.
+  // Tuples are the SI DOC identity — WDL raw remapped per row, cutover-
+  // gated, contractor-aware — so the lookup hits the billing-keyed rows.
   const crewsByContractor = {};
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     if (ymd(r[0]) !== dateIso) continue;
     const contractor = String(r[2] || '').trim();
     if (!enabled.has(contractor)) continue;
-    const cn  = String(r[3] || '').split('/')[0].trim();
-    const bor = String(r[4] || '').trim();
-    if (!cn || !bor) continue;
+    const cnRaw  = String(r[3] || '').split('/')[0].trim();
+    const borRaw = String(r[4] || '').trim();
+    if (!cnRaw || !borRaw) continue;
+    const billed = _billingRemapAsOf_(dateIso, cnRaw, borRaw, contractor);
+    const cn  = billed.contractNum;
+    const bor = billed.borough;
     const chief = String(r[7] || '').trim();
     if (!crewsByContractor[contractor]) crewsByContractor[contractor] = new Map();
     crewsByContractor[contractor].set(cn + '|' + bor + '|' + chief, { cn, bor, chief });
@@ -8150,17 +8354,22 @@ function _validateAllCPForWeek_(ss, weekStartIso) {
     return Utilities.formatDate(end, CONFIG.TIMEZONE, 'yyyy-MM-dd');
   })();
   // (cn|bor) → Map `${date}|${chief}` → { date, chief }. Sign-In rows are
-  // keyed per crew chief, so collect the chief dimension too.
+  // keyed per crew chief, so collect the chief dimension too. Tuples are
+  // the doc identity — WDL raw remapped per row (cutover-gated,
+  // contractor-aware), so raw-M + raw-BK days collapse onto the one
+  // billing tuple and its merged SI/CP rows.
   const tupleCrews = {};
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     const dateIso = ymd(r[0]);
     if (!dateIso || dateIso < weekStartIso || dateIso > weekEndIso) continue;
-    const cn  = String(r[3] || '').split('/')[0].trim();
-    const bor = String(r[4] || '').trim();
-    if (!cn || !bor) continue;
+    const cnRaw  = String(r[3] || '').split('/')[0].trim();
+    const borRaw = String(r[4] || '').trim();
+    if (!cnRaw || !borRaw) continue;
+    const rowContractor = String(r[2] || '').trim();
+    const billed = _billingRemapAsOf_(dateIso, cnRaw, borRaw, rowContractor);
     const chief = String(r[7] || '').trim();
-    const k = cn + '|' + bor;
+    const k = billed.contractNum + '|' + billed.borough;
     if (!tupleCrews[k]) tupleCrews[k] = new Map();
     tupleCrews[k].set(dateIso + '|' + chief, { date: dateIso, chief });
   }
@@ -8682,14 +8891,20 @@ function _resolvePayrollRate_(rates, classification, dateIso) {
 // When a sub-prime is performing work on a contract they did NOT win
 // (because the original prime is failing to perform), the work is
 // billed under a contract the sub-prime DID win. Source data (WO
-// Tracker, Daily Sign-In Data, Work Day Log) keeps the raw source
-// contract+borough; billing-doc generation applies this remap so the
-// Invoice / Sign-In Sheet / Certified Payroll content (and the
-// Invoices & AR / CP Tracker rows) reflect the billing identity.
+// Tracker, Work Day Log) keeps the raw source contract+borough.
 //
-// Drive archive folders and Doc Lifecycle keys stay keyed by RAW so
-// source-job artifacts (CFR, Production Log) co-locate with the
-// billing docs in one folder per source job.
+// From _BILLING_REMAP_CUTOVER_ISO_ on, Sign-In / Certified Payroll /
+// month-end docs carry the BILLING identity end-to-end: sign-in submit
+// writes the billing tuple into Daily Sign-In Data cols 3/4 and the SI
+// filename, so raw-BK work + genuine raw-M work roll up into ONE doc,
+// ONE Doc Lifecycle row, and ONE Doc Status entry under the billing
+// borough. Production Log / CFR / Invoice stay RAW. Drive archive
+// folders ALSO stay raw — the billing-named file is stored into every
+// raw contract-borough folder it covers (see archiveDocument_), so
+// source-job artifacts still co-locate per source job.
+//
+// Dates BEFORE the cutover keep the old raw-keyed behavior everywhere
+// (see _billingRemapAsOf_) so history matches its raw lifecycle rows.
 //
 // Bandaid for now — if this becomes routine, lift into a sheet tab + UI.
 // Borough values are stored as abbreviations everywhere in source data
@@ -8713,10 +8928,50 @@ function _billingRemap_(contractNum, borough, contractor) {
   return hit ? { ...hit.bill_as } : { contractNum: cn, borough: br };
 }
 
+// Cutover date for the SI/CP/month-end billing rollup. Work dated
+// before this stays raw-keyed everywhere (filenames, lifecycle rows,
+// Doc Status, validators) so history keeps matching its existing raw
+// rows; work from this date on is keyed by the billing identity.
+// Deploy on this Sunday, before the week's first sign-in submit, so no
+// payroll week straddles the boundary.
+const _BILLING_REMAP_CUTOVER_ISO_ = '2026-07-05';
+
+/**
+ * Cutover-gated remap for date-bearing (Work Day Log / doc-anchor)
+ * consumers: identity before the cutover, _billingRemap_ from the
+ * cutover on. Strips any '/EXT' contract suffix in BOTH branches so
+ * the two eras key identically. `dateIso` is a YYYY-MM-DD string.
+ */
+function _billingRemapAsOf_(dateIso, contractNum, borough, contractor) {
+  const cn = String(contractNum || '').split('/')[0].trim();
+  const br = String(borough || '').trim();
+  if (!dateIso || String(dateIso) < _BILLING_REMAP_CUTOVER_ISO_) {
+    return { contractNum: cn, borough: br };
+  }
+  return _billingRemap_(cn, br, contractor);
+}
+
+/**
+ * Month-granularity variant for month-end docs (EU / Certificates):
+ * the WHOLE cutover month rolls up to billing — otherwise the days
+ * before the cutover Sunday would key raw and split the month's
+ * month-end identity in two. Months before the cutover month stay raw.
+ */
+function _billingRemapForMonth_(monthIso, contractNum, borough, contractor) {
+  const cn = String(contractNum || '').split('/')[0].trim();
+  const br = String(borough || '').trim();
+  if (!monthIso || String(monthIso) < _BILLING_REMAP_CUTOVER_ISO_.slice(0, 7)) {
+    return { contractNum: cn, borough: br };
+  }
+  return _billingRemap_(cn, br, contractor);
+}
+
 // True when at least one remap rule targets this (raw contract, borough).
 // Used by the CP generator to decide whether to split a bucket by
 // contractor (each sub-prime gets their own CP billed under their own
-// contract). Clean buckets just produce one CP as before.
+// contract). Clean buckets just produce one CP as before. Post-cutover
+// DSID rows already carry the billing tuple (no rule targets a billing
+// borough), so the split only fires for pre-cutover raw data.
 function _hasBillingRemap_(contractNum, borough) {
   const cn = String(contractNum || '').trim();
   const br = String(borough || '').trim();
@@ -11689,6 +11944,11 @@ function handleListDocumentsForBatch_(body) {
   const docStateForMaster = (docType, anchorIso, contractNum, borough, contractor, crewChief) => {
     // PL keyed by (date, contractor, crew_chief); SI keyed by
     // (date, contract, borough, crew_chief); CP by (week, contract, borough).
+    // For SI/CP the (contractNum, borough) MUST be the tuple parsed from
+    // the FILE's name — its doc identity (BILLING post-cutover) — not the
+    // raw folder it was found in: merged billing docs are stored into
+    // every raw source folder, and only the filename tuple matches their
+    // single billing lifecycle row.
     // Multi-crew PL/SI files carry a `_chief-<slug>` suffix in their name and
     // their lifecycle row is keyed per crew — so the chief MUST be included
     // or the lookup misses and the file is wrongly treated as not-done /
@@ -11812,8 +12072,11 @@ function handleListDocumentsForBatch_(body) {
   const seenFileIds = new Set();
   // Master docs (PL/SI/CP) are also deduped by their lifecycle doc_id: a PL
   // that covers WOs across multiple (contract, borough) groups is copied into
-  // EACH group's master "Production Logs" folder, so the same logical PL is
-  // otherwise encountered once per group → duplicate downloads.
+  // EACH group's master "Production Logs" folder, and a merged BILLING
+  // SI/CP is copied into each raw contract-borough folder it covers — so
+  // the same logical doc is otherwise encountered once per folder →
+  // duplicate downloads. The doc_id comes from the file's own (billing)
+  // filename, which is identical for every copy.
   const seenMasterDocIds = new Set();
   const pushFile = (f) => {
     if (seenFileIds.has(f.file_id)) return;
@@ -11998,6 +12261,19 @@ function handleListDocumentsForBatch_(body) {
         if (!dm) continue;
         const fileDate = dm[1];
 
+        // SI/CP doc identity comes from the FILENAME tuple (billing
+        // post-cutover), not the raw folder being walked — merged
+        // billing docs sit in every raw source folder they cover. PL
+        // filenames carry no tuple; they stay folder/contractor-keyed.
+        let fileCn = contractNum, fileBor = borough;
+        if (docType === 'Sign-In') {
+          const pm = name.match(/^SignIn_([^_]+)_([^_]+)_\d{4}-\d{2}-\d{2}/i);
+          if (pm) { fileCn = pm[1]; fileBor = pm[2]; }
+        } else if (docType === 'Certified Payroll') {
+          const pm = name.match(/^Certified_Payroll_([^_]+)_([^_]+)_\d{4}-\d{2}-\d{2}/i);
+          if (pm) { fileCn = pm[1]; fileBor = pm[2]; }
+        }
+
         // Apply date_range filter — natural date per doc type:
         //   PL/SI: production date / sign-in date (file's own anchor)
         //   CP:    week_start..week_start+6 must overlap [dateStart, dateEnd]
@@ -12014,17 +12290,30 @@ function handleListDocumentsForBatch_(body) {
 
         // Resolve covered WOs (used for the manifest + the wo_numbers
         // overlap gate; not used to gate date_range any more — that's
-        // the file's own date that matters).
+        // the file's own date that matters). For SI/CP this is the
+        // UNION across raw source groups whose billing identity matches
+        // the file — never crossing contractors — so a merged M doc
+        // lists its BK-sourced WOs too.
         let coveredWoIds;
-        if (docType === 'Production Log' || docType === 'Sign-In') {
+        if (docType === 'Production Log') {
           const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
           const keyMatch = Object.keys(map).find(k => {
             const parts = k.split('|');
             return parts[0] === contractor && parts[1] === contractNum && parts[2] === borough;
           });
           coveredWoIds = keyMatch ? map[keyMatch].map(x => x.id) : [];
+        } else if (docType === 'Sign-In') {
+          const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
+          coveredWoIds = [];
+          Object.keys(map).forEach(k => {
+            const [kCo, kCn, kBor] = k.split('|');
+            if (kCo !== contractor) return;
+            const b = _billingRemapAsOf_(fileDate, kCn, kBor, kCo);
+            if (b.contractNum !== fileCn || b.borough !== fileBor) return;
+            map[k].forEach(x => coveredWoIds.push(x.id));
+          });
         } else {
-          const wos = getWOsForPayrollWeek_(contractNum, borough, new Date(fileDate + 'T12:00:00'), ss);
+          const wos = getWOsForPayrollWeek_(fileCn, fileBor, new Date(fileDate + 'T12:00:00'), ss);
           coveredWoIds = wos.map(x => x.id);
         }
         if (coveredWoIds.length === 0) continue;
@@ -12049,7 +12338,7 @@ function handleListDocumentsForBatch_(body) {
           const cm = name.match(/_chief-([A-Za-z0-9]+)/);
           fileChief = cm ? cm[1] : '';
         }
-        const logState = docStateForMaster(docType, fileDate, contractNum, borough, contractor, fileChief);
+        const logState = docStateForMaster(docType, fileDate, fileCn, fileBor, contractor, fileChief);
 
         // unsent mode: include only if Done=Yes and Sent=No (or for
         // SI, Done=Yes — SI Sent isn't tracked, so missing == done false).
@@ -12075,8 +12364,10 @@ function handleListDocumentsForBatch_(body) {
           mime_type:    f.getMimeType(),
           size:         f.getSize(),
           contractor,
-          contract_num: contractNum,
-          borough,
+          // Manifest shows the doc's own identity tuple (from its
+          // filename), not the raw folder it happened to be walked in.
+          contract_num: fileCn,
+          borough:      fileBor,
           doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
           wo_ids:       coveredWoIds,
           work_date:    fileDate,
@@ -12091,26 +12382,56 @@ function handleListDocumentsForBatch_(body) {
         // at the root and "Sign-Ins for CP …/" alongside.
         if (docType === 'Certified Payroll' && includeSIsWithCP && mode === 'unsent') {
           const [yy, mm, ddd] = fileDate.split('-').map(Number);
-          const weekStartDt = new Date(yy, mm - 1, ddd);
           const weekEndIso = Utilities.formatDate(
             new Date(yy, mm - 1, ddd + 6), CONFIG.TIMEZONE, 'yyyy-MM-dd'
           );
-          const siFolder = masters.signin;
-          if (siFolder) {
-            const bundleDir = 'Sign-Ins for CP ' + contractNum + ' ' + borough + ' ' + fileDate;
+          // Reverse-remap the CP's identity tuple to its raw source
+          // folders for THIS contractor: the identity folder itself
+          // plus every _BILLING_REMAP_ source that bills as it (e.g.
+          // Metro's 701-BK for a 701-M CP). Merged SIs are stored RAW,
+          // so a BK-only day's sheet lives only under the Brooklyn
+          // folder and would be missed by the identity folder alone.
+          const siFolders = [];
+          const addSiFolder = (cn2, bor2) => {
+            const m2 = getMasters(contractor, cn2, bor2);
+            if (m2.signin) siFolders.push(m2.signin);
+          };
+          addSiFolder(fileCn, fileBor);
+          _BILLING_REMAP_.forEach(rule => {
+            if (rule.contractor !== contractor) return;
+            if (rule.bill_as.contractNum !== fileCn || rule.bill_as.borough !== fileBor) return;
+            addSiFolder(rule.contractNum, rule.borough);
+          });
+          const bundleDir = 'Sign-Ins for CP ' + fileCn + ' ' + fileBor + ' ' + fileDate;
+          // The same merged SI is COPIED into every raw folder it
+          // covers (distinct Drive file ids) — dedupe on its lifecycle
+          // doc_id so each sheet lands in the bundle once.
+          const bundledSiDocIds = new Set();
+          siFolders.forEach(siFolder => {
             const siIter = siFolder.getFiles();
             while (siIter.hasNext()) {
               if (files.length >= MAX_BATCH_FILES_) break;
               const sf = siIter.next();
               const sname = sf.getName();
-              if (!/^SignIn_/i.test(sname)) continue;
-              const sm = sname.match(/(\d{4}-\d{2}-\d{2})/);
-              if (!sm) continue;
-              const sDate = sm[1];
+              const spm = sname.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/i);
+              if (!spm) continue;
+              const [, siCn, siBor, sDate] = spm;
               if (sDate < fileDate || sDate > weekEndIso) continue;
-              // Only include SIs that are Done in the Log.
-              const siState = docStateForMaster('Sign-In', sDate, contractNum, borough, contractor);
+              // Filter by the SI's OWN billing identity (filename tuple
+              // remapped as-of its date): a pre-cutover raw-BK sheet
+              // bills BK (identity) and must not ride along on a
+              // post-cutover M CP — and a raw-named source sheet from
+              // another era never false-positives into this bundle.
+              const own = _billingRemapAsOf_(sDate, siCn, siBor, contractor);
+              if (own.contractNum !== fileCn || own.borough !== fileBor) continue;
+              // Only include SIs that are Done in the Log — keyed by the
+              // filename tuple (the sheet's identity), per crew chief.
+              const scm = sname.match(/_chief-([A-Za-z0-9]+)/);
+              const siChief = scm ? scm[1] : '';
+              const siState = docStateForMaster('Sign-In', sDate, siCn, siBor, contractor, siChief);
               if (!siState.done) continue;
+              if (bundledSiDocIds.has(siState.doc_id)) continue;
+              bundledSiDocIds.add(siState.doc_id);
               pushFile({
                 file_id:      sf.getId(),
                 filename:     sname,
@@ -12118,8 +12439,8 @@ function handleListDocumentsForBatch_(body) {
                 mime_type:    sf.getMimeType(),
                 size:         sf.getSize(),
                 contractor,
-                contract_num: contractNum,
-                borough,
+                contract_num: siCn,
+                borough:      siBor,
                 doc_type:     'Sign-In',
                 wo_ids:       [],
                 work_date:    sDate,
@@ -12128,7 +12449,7 @@ function handleListDocumentsForBatch_(body) {
                 bundled:      true,         // signals "do not flip flags on download"
               });
             }
-          }
+          });
         }
       }
     });
@@ -12531,6 +12852,14 @@ function _buildDocStatusPayload_(monthIso) {
     const crewChief   = String(r[7] || '').trim();
     if (!woId || !contractor || !contractNum || !borough) continue;
 
+    // Doc identity remap: SI / CP / month-end lifecycle rows are keyed
+    // by the BILLING tuple from the cutover on (raw before). WDL stays
+    // raw, so remap here — contractor-aware, gated on the row's date —
+    // and raw-M + raw-BK work collapses into ONE entry under the
+    // billing borough (one SI card, one CP row, one month-end line).
+    // PL stays raw: it's keyed by (date, contractor), no borough.
+    const billed = _billingRemapAsOf_(dateIso, contractNum, borough, contractor);
+
     const cdKey = dateIso + '|' + contractor + '|' + crewChief;
     if (!contractorDays[cdKey]) {
       contractorDays[cdKey] = {
@@ -12542,30 +12871,35 @@ function _buildDocStatusPayload_(monthIso) {
     const cdEntry = contractorDays[cdKey];
     cdEntry.wo_ids.add(woId);
 
-    const cKey = contractNum + '|' + borough;
+    const cKey = billed.contractNum + '|' + billed.borough;
     if (!cdEntry.contracts[cKey]) {
       cdEntry.contracts[cKey] = {
-        contract_num: contractNum, borough,
+        contract_num: billed.contractNum, borough: billed.borough,
         wo_ids: new Set(),
       };
     }
     cdEntry.contracts[cKey].wo_ids.add(woId);
 
     const wkStart = weekStartIsoFor(dateIso);
-    const wKey = wkStart + '|' + contractNum + '|' + borough;
+    const wKey = wkStart + '|' + billed.contractNum + '|' + billed.borough;
     if (!weekTuples[wKey]) {
       weekTuples[wKey] = {
-        week_start: wkStart, contractor, contract_num: contractNum, borough,
+        week_start: wkStart, contractor,
+        contract_num: billed.contractNum, borough: billed.borough,
         wo_ids: new Set(),
       };
     }
     weekTuples[wKey].wo_ids.add(woId);
 
+    // Month-end docs remap at MONTH granularity — the whole cutover
+    // month bills as one so its identity isn't split mid-month.
     const monthIso2 = dateIso.slice(0, 7);
-    const mKey = monthIso2 + '|' + contractNum + '|' + borough;
+    const billedMonth = _billingRemapForMonth_(monthIso2, contractNum, borough, contractor);
+    const mKey = monthIso2 + '|' + billedMonth.contractNum + '|' + billedMonth.borough;
     if (!monthTuples[mKey]) {
       monthTuples[mKey] = {
-        month: monthIso2, contractor, contract_num: contractNum, borough,
+        month: monthIso2, contractor,
+        contract_num: billedMonth.contractNum, borough: billedMonth.borough,
         wo_ids: new Set(),
       };
     }
