@@ -27,6 +27,9 @@ function isDocsPending(wo) {
 }
 
 export default function WODocsQueue({ wos, qbConnected, onDocsChange, onInvoiced }) {
+  // Collapsed by default: show ~5 rows in a scroll window so the calendar
+  // section below isn't pushed down; "Show all" removes the height cap.
+  const [expanded, setExpanded] = useState(false)
   const [contFilt, setContFilt] = useState(() => new Set())
   const toggleCont = (opt) => setContFilt(prev => {
     const next = new Set(prev)
@@ -69,9 +72,12 @@ export default function WODocsQueue({ wos, qbConnected, onDocsChange, onInvoiced
             : 'No pending WOs for this contractor. ✓'}
         </p>
       ) : (
-        <div className="overflow-x-auto">
+        <>
+        {/* Collapsed: cap at ~5 rows and scroll the rest (sticky header
+            stays visible). Expanded: no cap — the full list renders. */}
+        <div className={expanded ? 'overflow-x-auto' : 'overflow-auto max-h-[15rem]'}>
           <table className="w-full text-sm">
-            <thead>
+            <thead className="sticky top-0 bg-white z-10">
               <tr className="text-left text-[10px] font-extrabold uppercase tracking-widest text-slate-400 border-b border-slate-100">
                 <th className="py-2 px-3">WO #</th>
                 <th className="py-2 px-3">Contractor</th>
@@ -128,6 +134,18 @@ export default function WODocsQueue({ wos, qbConnected, onDocsChange, onInvoiced
             </tbody>
           </table>
         </div>
+        {rows.length > 5 && (
+          <div className="flex justify-center pt-1">
+            <button
+              type="button"
+              onClick={() => setExpanded(e => !e)}
+              className="text-xs font-semibold text-navy hover:underline"
+            >
+              {expanded ? 'Show less' : `Show all ${rows.length}`}
+            </button>
+          </div>
+        )}
+        </>
       )}
     </div>
   )

@@ -990,35 +990,42 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
 
   return (
     <div className="space-y-6">
-      {/* Completed-WO doc queue — outstanding CFR/Invoice work in one view,
-          fed by the SAME wos array + write endpoints as the WO Tracker so
-          the two stay 100% in sync. Sits above the month selector. */}
-      <WODocsQueue
-        wos={wos}
-        qbConnected={qbConnected}
-        onDocsChange={onDocsChange}
-        onInvoiced={onInvoiced}
-      />
+      {/* Section — WO Docs: completed WOs whose CFR/Invoice isn't done+sent.
+          Same wos array + write endpoints as the WO Tracker → 100% in sync. */}
+      <div className="space-y-3">
+        <h3 className="text-base font-black text-navy border-b border-slate-200 pb-1.5">WO Docs</h3>
+        <WODocsQueue
+          wos={wos}
+          qbConnected={qbConnected}
+          onDocsChange={onDocsChange}
+          onInvoiced={onInvoiced}
+        />
+      </div>
 
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setMonthIso(shiftMonth(monthIso, -1))}
-            className="btn-ghost text-sm px-3"
-          >‹ Prev</button>
-          <p className="text-lg font-black text-navy">{fmtMonth(monthIso)}</p>
-          <button
-            onClick={() => setMonthIso(shiftMonth(monthIso, +1))}
-            className="btn-ghost text-sm px-3"
-          >Next ›</button>
-          {monthIso !== todayMonthIso() && (
+      {/* Section — calendar-tracked docs, with its header right above the
+          month selector. */}
+      <div className="space-y-3">
+        <h3 className="text-base font-black text-navy border-b border-slate-200 pb-1.5">Daily, Weekly, Monthly Docs</h3>
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-2">
             <button
-              onClick={() => setMonthIso(todayMonthIso())}
+              onClick={() => setMonthIso(shiftMonth(monthIso, -1))}
               className="btn-ghost text-sm px-3"
-            >Today</button>
-          )}
+            >‹ Prev</button>
+            <p className="text-lg font-black text-navy">{fmtMonth(monthIso)}</p>
+            <button
+              onClick={() => setMonthIso(shiftMonth(monthIso, +1))}
+              className="btn-ghost text-sm px-3"
+            >Next ›</button>
+            {monthIso !== todayMonthIso() && (
+              <button
+                onClick={() => setMonthIso(todayMonthIso())}
+                className="btn-ghost text-sm px-3"
+              >Today</button>
+            )}
+          </div>
+          {error && <span className="text-xs text-red-600">⚠ {error}</span>}
         </div>
-        {error && <span className="text-xs text-red-600">⚠ {error}</span>}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
