@@ -2923,37 +2923,35 @@ function validateSignInData(dateStr) {
  * @param {string} weekStartStr - Sunday date in MM/DD/YYYY format
  */
 /**
- * YTD gross pay for an employee across ALL projects, up to and
- * including the payroll week end date. Trusts the per-row col 11
- * (Overtime Hours) written by handleSubmitSignIn_, which already
- * applies the day-of-week OT rule with same-day cross-group lookback.
- * Deriving OT here would silently disagree with col 11 if anyone
- * hand-edits a row's OT contribution (e.g. correcting historical
- * cross-contract rows the old per-shift logic mis-split).
+ * Total gross pay for an employee across ALL projects for a SINGLE
+ * Sun–Sat pay period (weekStart..weekEnd). This is the "Total Gross
+ * Pay (All Work)" figure on the certified payroll form — every hour the
+ * employee worked that week on any contract, not a year-to-date total.
+ * Trusts the per-row col 11 (Overtime Hours) written by
+ * handleSubmitSignIn_, which already applies the day-of-week OT rule
+ * with same-day cross-group lookback. Deriving OT here would silently
+ * disagree with col 11 if anyone hand-edits a row's OT contribution.
  *
- * Rates are resolved per pay-period week (Sun–Sat) AND per
- * classification using the week's end-date — so YTD stays correct
- * across rate-schedule boundaries AND across mid-year classification
- * changes (an employee who worked some weeks as LP and others as SAT
- * gets each bucket priced at the matching rate). Supplementals are
- * paid the same hours as wages (ST hours pair with ST supp, OT hours
- * pair with OT supp).
+ * Hours are bucketed per classification and priced with the rate
+ * effective on the week's end date, so an employee who worked more than
+ * one classification in the same week (e.g. some days LP, some SAT)
+ * gets each bucket priced at the matching rate. Supplementals are paid
+ * the same hours as wages (ST hours pair with ST supp, OT hours pair
+ * with OT supp).
  *
  * signInData:   full Daily Sign-In Data getValues() (incl. header row).
  * empName:      employee name as written in Sign-In Data col 6.
  * payrollRates: result of _loadPayrollRates_(ss). Empty array → 0.
- * weekEnd:      Date object marking end of the payroll week (YTD cutoff).
+ * weekStart:    Date object marking start of the payroll week (Sunday 00:00).
+ * weekEnd:      Date object marking end of the payroll week (Saturday 23:59).
  */
-function computeYtdGrossForEmployee_(signInData, empName, payrollRates, weekEnd) {
+function computePayPeriodGrossForEmployee_(signInData, empName, payrollRates, weekStart, weekEnd) {
   const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const target   = normName(empName);
   if (!target) return 0;
   if (!Array.isArray(payrollRates) || payrollRates.length === 0) return 0;
 
-  const yearStart = new Date(weekEnd.getFullYear(), 0, 1, 0, 0, 0);
-
-  // Bucket rows into Sun–Sat weeks so we can apply the rate effective on
-  // each week's end date. JS getDay(): Sun=0, Mon=1, ..., Sat=6.
+  // Week-end date used to resolve the rate schedule effective this week.
   const weekEndKey = (d) => {
     // Days until upcoming Saturday (inclusive). For Saturday itself, 0.
     const daysToSat = 6 - d.getDay();
@@ -2961,14 +2959,14 @@ function computeYtdGrossForEmployee_(signInData, empName, payrollRates, weekEnd)
     return { key: Utilities.formatDate(we, CONFIG.TIMEZONE, 'yyyy-MM-dd'), date: we };
   };
 
-  // Key by (weekEnd, classification) so a week with mixed classifications
-  // gets one rate-resolved bucket per classification.
-  const byWeekClass = {};
+  // Key by classification so a week with mixed classifications gets one
+  // rate-resolved bucket per classification.
+  const byClass = {};
   signInData.slice(1).forEach(row => {
     if (!row[0]) return;
     const rowDate = new Date(row[0]);
     if (isNaN(rowDate.getTime())) return;
-    if (rowDate < yearStart || rowDate > weekEnd) return;
+    if (rowDate < weekStart || rowDate > weekEnd) return;
     if (normName(row[6]) !== target) return;
     const cls = String(row[7] || '').trim();
     if (!cls) return;
@@ -2977,22 +2975,22 @@ function computeYtdGrossForEmployee_(signInData, empName, payrollRates, weekEnd)
     const ot = Number(row[11]) || 0;
     const st = Math.max(0, hours - ot);
     const { key, date: we } = weekEndKey(rowDate);
-    const wkClsKey = key + '|||' + cls;
-    if (!byWeekClass[wkClsKey]) {
-      byWeekClass[wkClsKey] = { weekEnd: we, classification: cls, st: 0, ot: 0 };
+    const clsKey = key + '|||' + cls;
+    if (!byClass[clsKey]) {
+      byClass[clsKey] = { weekEnd: we, classification: cls, st: 0, ot: 0 };
     }
-    byWeekClass[wkClsKey].st += st;
-    byWeekClass[wkClsKey].ot += ot;
+    byClass[clsKey].st += st;
+    byClass[clsKey].ot += ot;
   });
 
-  let ytd = 0;
-  Object.values(byWeekClass).forEach(({ weekEnd: we, classification: cls, st, ot }) => {
+  let total = 0;
+  Object.values(byClass).forEach(({ weekEnd: we, classification: cls, st, ot }) => {
     const rate = _resolvePayrollRate_(payrollRates, cls, we);
-    if (!rate) return; // No rate effective for this (week, classification) — skip silently in YTD
-    ytd += st * ((rate.st_rate || 0) + (rate.st_supp || 0))
-         + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
+    if (!rate) return; // No rate effective for this (week, classification) — skip silently
+    total += st * ((rate.st_rate || 0) + (rate.st_supp || 0))
+           + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
   });
-  return ytd;
+  return total;
 }
 
 
@@ -3004,7 +3002,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     return 0;
   }
   const weekStart = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]), 0, 0, 0);
-  const weekEnd   = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]) + 6, 23, 59, 59); // end of Sunday
+  const weekEnd   = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]) + 6, 23, 59, 59); // Saturday 23:59, end of Sun–Sat week
   
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
@@ -3229,14 +3227,15 @@ function generateCertifiedPayroll(weekStartStr, opts) {
       const stSupp = rateRow.st_supp || 0;
       const otSupp = rateRow.ot_supp || 0;
 
-      // YTD gross across all projects this year. Used to fill the
-      // "Total Gross Pay (All Work)" column on the certified payroll
-      // form. Resolves rates per-week AND per-classification so a YTD
-      // spanning a rate-schedule boundary OR a mid-year classification
-      // change reflects the actual rates paid. Same value goes on each
-      // of an employee's CP entries (per-person YTD, not per-class).
-      const ytdGross = computeYtdGrossForEmployee_(
-        data, empName, payrollRates, weekEnd
+      // Total gross across all projects for THIS pay period (Sun–Sat).
+      // Used to fill the "Total Gross Pay (All Work)" column on the
+      // certified payroll form — every hour worked that week on any
+      // contract, not year-to-date. Resolves rates per-classification so
+      // a week with mixed classifications reflects the actual rates paid.
+      // Same value goes on each of an employee's CP entries (per-person
+      // week total, not per-class).
+      const allWorkGross = computePayPeriodGrossForEmployee_(
+        data, empName, payrollRates, weekStart, weekEnd
       );
 
       // Sum this contract's per-day ST/OT from the col-10/col-11 split
@@ -3304,7 +3303,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         supp_st:         stSupp.toFixed(2),
         supp_ot:         otSupp.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
-        total_gross_pay: ytdGross.toFixed(2),   // YTD across all projects
+        total_gross_pay: allWorkGross.toFixed(2),   // this pay period, all projects
         net_pay:         '',
         deductions:      '',
         annualized_rate: ''
