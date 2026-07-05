@@ -9646,6 +9646,17 @@ function handleCreateMarkingItem_(body) {
   if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
   if (!cat)  return jsonResponse_({ error: 'Missing category' }, 400);
 
+  // Grid categories live in a specific intersection-grid cell, so both the
+  // intersection and its direction are mandatory (mirrors the frontend guard
+  // in MarkingFormModal). Keeps manual grid rows from landing location-less.
+  const GRID_CATS_ = ['HVX Crosswalk', 'Stop Line', 'Stop Msg'];
+  if (GRID_CATS_.indexOf(cat) !== -1) {
+    if (!String(d.intersection || '').trim())
+      return jsonResponse_({ error: 'Intersection is required for ' + cat + '.' }, 400);
+    if (!String(d.direction || '').trim())
+      return jsonResponse_({ error: 'Direction is required for ' + cat + '.' }, 400);
+  }
+
   const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const sheet = ss.getSheetByName('Marking Items');
   if (!sheet) return jsonResponse_({

@@ -193,6 +193,18 @@ export default function MarkingFormModal({
       setError('Color / Material is required for MMA items.')
       return
     }
+    // Grid categories (HVX Crosswalk / Stop Line / Stop Msg) must land in a
+    // specific cell of the intersection grid, so location is mandatory.
+    if (layout === 'grid') {
+      if (!form.intersection.trim()) {
+        setError('Intersection is required for Crosswalk / Stop Line / Stop Msg.')
+        return
+      }
+      if (!form.direction) {
+        setError('Direction is required for Crosswalk / Stop Line / Stop Msg.')
+        return
+      }
+    }
     const parsedStr = parseQty(form.quantity)
     if (parsedStr !== form.quantity) {
       // Reflect the resolved number in the input so the modal message
@@ -251,7 +263,7 @@ export default function MarkingFormModal({
 
           {layout === 'grid' && (
             <div className="grid grid-cols-[1fr_80px] gap-2">
-              <Field label="Intersection">
+              <Field label="Intersection" required>
                 <IntersectionSelect
                   value={form.intersection}
                   onChange={(v) => setField('intersection', v)}
@@ -259,13 +271,14 @@ export default function MarkingFormModal({
                   betweens={wo_betweens}
                 />
               </Field>
-              <Field label="Direction">
+              <Field label="Direction" required>
                 <select
                   value={form.direction}
                   onChange={e => setField('direction', e.target.value)}
                   className="field-input"
                 >
-                  {DIRECTIONS.map(d => <option key={d} value={d}>{d || '—'}</option>)}
+                  <option value="" disabled>—</option>
+                  {DIRECTIONS.filter(Boolean).map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
               </Field>
             </div>
