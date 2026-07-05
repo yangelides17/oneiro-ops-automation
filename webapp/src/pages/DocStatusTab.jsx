@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import GenerateDocModal from '../components/GenerateDocModal'
+import WODocsQueue from '../components/WODocsQueue'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
 /**
@@ -800,7 +801,7 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
 }
 
 // ── Main ──────────────────────────────────────────────────────
-export default function DocStatusTab() {
+export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoiced }) {
   const [monthIso, setMonthIso] = useState(todayMonthIso())
   const [data,    setData]      = useState(null)
   const [loading, setLoading]   = useState(true)
@@ -989,6 +990,16 @@ export default function DocStatusTab() {
 
   return (
     <div className="space-y-6">
+      {/* Completed-WO doc queue — outstanding CFR/Invoice work in one view,
+          fed by the SAME wos array + write endpoints as the WO Tracker so
+          the two stay 100% in sync. Sits above the month selector. */}
+      <WODocsQueue
+        wos={wos}
+        qbConnected={qbConnected}
+        onDocsChange={onDocsChange}
+        onInvoiced={onInvoiced}
+      />
+
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-2">
           <button
