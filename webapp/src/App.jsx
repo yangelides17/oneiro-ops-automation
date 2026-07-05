@@ -11,44 +11,95 @@ import {
   usePendingCounts,
 } from './lib/PendingCountsContext'
 
-// Crew mode = a soft lock that hides every page except Field Report.
-// Activated by visiting `?crew=1` once on this device; persists via
-// localStorage so reloads + bookmark-less reopens stay locked. Admins
-// can unlock with `?crew=0` or just use a different browser / private
-// window. This is *convention not security* — anyone with DevTools
-// can clear localStorage. Real auth is a separate conversation.
-const CREW_MODE_KEY = 'oneiroOps.crewMode'
+// Access gate. The site is locked behind a shared "door code" carried in
+// the user's link (`/?key=<code>`): one code grants 'admin' (full app),
+// another grants 'crew' (Nav + Field Report + Sign-In only). The code is
+// validated SERVER-SIDE (see server.js "Access gate") — it never lives in
+// this bundle — and the resolved role is what the client renders against.
+//
+// Role values: 'admin' | 'crew' | null (locked) | 'loading' (undecided).
+// Rotating a code in Railway instantly locks out old links on next load.
+const ACCESS_LOADING = 'loading'
 
-function useCrewMode() {
-  const [crewMode, setCrewMode] = useState(() => {
-    if (typeof window === 'undefined') return false
-    const params = new URLSearchParams(window.location.search)
-    const flag = params.get('crew')
-    if (flag === '1') {
-      localStorage.setItem(CREW_MODE_KEY, 'true')
-      return true
-    }
-    if (flag === '0') {
-      localStorage.removeItem(CREW_MODE_KEY)
-      return false
-    }
-    return localStorage.getItem(CREW_MODE_KEY) === 'true'
-  })
+function useAccess() {
+  const [role, setRole] = useState(ACCESS_LOADING)
 
-  // Strip the ?crew= param from the address bar after applying it so
-  // a casual glance at the URL doesn't expose the toggle. Done once
-  // on mount; subsequent navigations keep the clean URL.
   useEffect(() => {
     if (typeof window === 'undefined') return
+    let cancelled = false
+
     const params = new URLSearchParams(window.location.search)
-    if (!params.has('crew')) return
-    params.delete('crew')
-    const qs = params.toString()
-    const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash
-    window.history.replaceState(null, '', clean)
+    const key = params.get('key')
+
+    // Strip ?key= from the address bar so the code isn't left sitting in
+    // the URL / browser history after it's been redeemed.
+    const stripKey = () => {
+      params.delete('key')
+      const qs = params.toString()
+      const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash
+      window.history.replaceState(null, '', clean)
+    }
+
+    async function resolve() {
+      try {
+        if (key) {
+          // Redeem the code: server validates + sets the access cookie.
+          const r = await fetch('/api/access/login', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ key }),
+          })
+          stripKey()
+          const d = await r.json().catch(() => ({}))
+          if (!cancelled) setRole(d.role || null)
+          return
+        }
+        // No code in the link — check for an existing valid cookie.
+        const r = await fetch('/api/access/session')
+        const d = await r.json().catch(() => ({}))
+        if (!cancelled) setRole(d.role || null)
+      } catch {
+        // Network error: fail closed to the locked screen rather than
+        // flashing the app to someone who may not be authorized.
+        if (!cancelled) setRole(null)
+      }
+    }
+    resolve()
+    return () => { cancelled = true }
   }, [])
 
-  return crewMode
+  return role
+}
+
+// Full-screen gate shown while the role is undecided ('loading') or when
+// access is denied (null). Deliberately gives nothing away beyond "use
+// your link" — no hint that a code exists or what it looks like.
+function AccessGate({ locked }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-navy px-4">
+      <div className="max-w-sm w-full bg-white rounded-2xl shadow-xl p-8 text-center">
+        <div className="w-12 h-12 bg-gold rounded-xl flex items-center justify-center
+                        font-black text-navy text-lg mx-auto mb-4 select-none">O</div>
+        {locked ? (
+          <>
+            <h1 className="text-navy font-black text-lg">Access restricted</h1>
+            <p className="text-slate-500 text-sm mt-2 leading-relaxed">
+              This site is private. Please open it using the access link
+              your team shared with you.
+            </p>
+            <p className="text-slate-400 text-xs mt-4">
+              If you believe you should have access, contact your Oneiro Ops administrator.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="text-navy font-bold">Oneiro Ops</p>
+            <p className="text-slate-400 text-sm mt-2">Checking access…</p>
+          </>
+        )}
+      </div>
+    </div>
+  )
 }
 
 // Hook: catch the ?qb=connected | ?qb=error&msg=... query params left
@@ -106,13 +157,16 @@ function QbAuthToast({ toast, onDismiss }) {
   )
 }
 
+// `roles` gates which links each role sees. Crew is limited to Nav,
+// Field Report, and Sign-In; admins see everything. Keep this in sync
+// with the <Route> table in App() below.
 const NAV_ITEMS = [
-  { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null                },
-  { to: '/nav',          label: 'Nav',          end: false, badgeKey: null                },
-  { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null                },
-  { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review'  },
-  { to: '/field-report', label: 'Field Report', end: false, badgeKey: null                },
-  { to: '/sign-in',      label: 'Sign-In',      end: false, badgeKey: 'signins_pending'   },
+  { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null,               roles: ['admin']         },
+  { to: '/nav',          label: 'Nav',          end: false, badgeKey: null,               roles: ['admin', 'crew'] },
+  { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null,               roles: ['admin']         },
+  { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review', roles: ['admin']         },
+  { to: '/field-report', label: 'Field Report', end: false, badgeKey: null,               roles: ['admin', 'crew'] },
+  { to: '/sign-in',      label: 'Sign-In',      end: false, badgeKey: 'signins_pending',  roles: ['admin', 'crew'] },
 ]
 
 // Subtle amber pill matching the visual weight of the existing nav.
@@ -130,15 +184,14 @@ export function NavBadge({ n }) {
   )
 }
 
-function Header({ crewMode = false }) {
-  // Below sm: (640px) the five tabs collapse into a hamburger panel.
-  // At sm+ the inline tab row stays exactly as it was on desktop.
-  //
-  // Crew mode: the logo + brand bar still renders so the page looks
-  // like the same app, but the nav links + hamburger are hidden so
-  // crews can't tap into Dashboard / Approvals / etc.
+function Header({ role = 'admin' }) {
+  // Below sm: (640px) the tabs collapse into a hamburger panel. At sm+
+  // the inline tab row stays as it was on desktop. The link set is
+  // filtered by role, so crews see only their allowed pages (Nav, Field
+  // Report, Sign-In) and never a link into Dashboard / Approvals / etc.
   const [open, setOpen] = useState(false)
   const { counts } = usePendingCounts()
+  const items = NAV_ITEMS.filter(item => item.roles.includes(role))
 
   // Render label + optional badge. badgeKey is null for nav items that
   // shouldn't surface a count (Dashboard / Scan WO / Field Report).
@@ -166,11 +219,11 @@ function Header({ crewMode = false }) {
           </span>
         </div>
 
-        {!crewMode && (
+        {(
           <>
             {/* Desktop tab row (sm+) */}
             <nav className="hidden sm:flex items-center gap-1">
-              {NAV_ITEMS.map(item => (
+              {items.map(item => (
                 <NavLink
                   key={item.to}
                   to={item.to}
@@ -211,10 +264,10 @@ function Header({ crewMode = false }) {
       </div>
 
       {/* Slide-down nav panel (xs only). Tapping a link auto-closes. */}
-      {!crewMode && open && (
+      {open && (
         <nav className="sm:hidden bg-navy border-t border-white/10
                         px-4 py-2 flex flex-col gap-1">
-          {NAV_ITEMS.map(item => (
+          {items.map(item => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -279,24 +332,32 @@ function ColdStartCounts() {
 }
 
 export default function App() {
-  const crewMode = useCrewMode()
+  const role = useAccess()
   const { toast, dismissToast } = useQbAuthResult()
+
+  // Gate: undecided → spinner card; denied → locked card. Only a
+  // resolved 'admin' | 'crew' renders the app. Hooks above run first so
+  // the early return doesn't violate the rules of hooks.
+  if (role === ACCESS_LOADING) return <AccessGate locked={false} />
+  if (!role)                   return <AccessGate locked={true} />
+
+  const crewMode = role === 'crew'
   return (
     <PendingCountsProvider>
-      {/* Skip the cold-start counts request entirely in crew mode —
-          there are no nav badges to render, so the data isn't needed. */}
-      {!crewMode && <ColdStartCounts />}
+      <ColdStartCounts />
       <QbAuthToast toast={toast} onDismiss={dismissToast} />
       <div className="min-h-screen flex flex-col">
-        <Header crewMode={crewMode} />
+        <Header role={role} />
         <main className="flex-1">
           <Routes>
             {crewMode ? (
-              // Crew mode: only Field Report is reachable. Everything
-              // else bounces back. `replace` keeps the back button
-              // from yo-yo'ing between the blocked route and FR.
+              // Crew: only Nav, Field Report, and Sign-In are reachable.
+              // Everything else bounces to Field Report. `replace` keeps
+              // the back button from yo-yo'ing into a blocked route.
               <>
+                <Route path="/nav"          element={<NavTab />} />
                 <Route path="/field-report" element={<FieldReport />} />
+                <Route path="/sign-in"      element={<SignIn />} />
                 <Route path="*"             element={<Navigate to="/field-report" replace />} />
               </>
             ) : (

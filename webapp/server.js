@@ -2287,6 +2287,78 @@ app.post('/api/qb/invoice/:woId', async (req, res) => {
 })
 
 
+// ── Access gate ───────────────────────────────────────────────
+// Lightweight shared-code access control — a door code, not real auth
+// (no accounts, no passwords). Two codes live in Railway env vars:
+// ACCESS_KEY_ADMIN unlocks the full app, ACCESS_KEY_CREW unlocks the
+// crew view (Nav + Field Report + Sign-In only). A visitor arrives with
+// a code in their link (`/?key=<code>`); the client redeems it at
+// /api/access/login, which validates against the env vars and, on a
+// match, drops a long-lived HttpOnly cookie holding the raw code. Every
+// page load then calls /api/access/session, which RE-checks that cookie
+// against the CURRENT env vars — so rotating a code in Railway instantly
+// locks out everyone holding the old link (e.g. a departed employee),
+// with no redeploy.
+//
+// Fail-open by design: if NEITHER code is configured the gate is off and
+// everyone is treated as admin. That keeps local dev open and means
+// deploying this code can't brick the site before the env vars are set —
+// the gate only switches on once you set a code in Railway. The raw
+// /api/* data routes are intentionally NOT gated here (automations like
+// the QuickBooks callback and Apps Script uploads call them server-to-
+// server); this pass gates the UI only.
+const ACCESS_COOKIE = 'oneiro_access'
+const ACCESS_TTL_MS = 180 * 24 * 60 * 60 * 1000  // 180 days
+
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a))
+  const bb = Buffer.from(String(b))
+  if (ba.length !== bb.length) return false
+  return crypto.timingSafeEqual(ba, bb)
+}
+
+// Presented code → role ('admin' | 'crew' | null), compared in constant
+// time. Blank env vars never match, so an unset code can't be satisfied
+// by an empty cookie. Both unset → gate disabled (everyone is admin).
+function roleForCode(code) {
+  const admin = process.env.ACCESS_KEY_ADMIN || ''
+  const crew  = process.env.ACCESS_KEY_CREW  || ''
+  if (!admin && !crew) return 'admin'
+  const c = String(code || '')
+  if (admin && safeEqual(c, admin)) return 'admin'
+  if (crew  && safeEqual(c, crew))  return 'crew'
+  return null
+}
+
+// POST /api/access/login { key } — validate a presented code; on success
+// set the access cookie and return the granted role, else 401 + no cookie.
+app.post('/api/access/login', (req, res) => {
+  const key  = req.body?.key
+  const role = roleForCode(key)
+  if (!role) return res.status(401).json({ role: null })
+  res.cookie(ACCESS_COOKIE, String(key ?? ''), {
+    httpOnly: true,
+    secure:   process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge:   ACCESS_TTL_MS,
+    path:     '/',
+  })
+  res.json({ role })
+})
+
+// GET /api/access/session — re-validate the cookie against the CURRENT
+// env vars on every call, so a rotated code takes effect immediately.
+app.get('/api/access/session', (req, res) => {
+  res.json({ role: roleForCode(readCookie(req, ACCESS_COOKIE)) })
+})
+
+// POST /api/access/logout — clear the cookie (sign out / switch links).
+app.post('/api/access/logout', (req, res) => {
+  res.clearCookie(ACCESS_COOKIE, { path: '/' })
+  res.json({ role: null })
+})
+
+
 // ── Static file serving (production only) ────────────────────
 if (process.env.NODE_ENV === 'production') {
   const distDir = path.join(__dirname, 'dist')
