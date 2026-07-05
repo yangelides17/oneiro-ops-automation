@@ -38,3 +38,6 @@ Thumbs.db
 webapp/node_modules/
 webapp/dist/
 webapp/.vite/
+
+# Claude Code local state (worktrees, plans, settings)
+.claude/
