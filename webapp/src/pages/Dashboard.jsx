@@ -622,6 +622,10 @@ export default function Dashboard() {
   const [statusFilt, setStatusFilt] = useState(() => new Set())
   const [contFilt,   setContFilt]   = useState(() => new Set())
   const [boroughFilt,setBoroughFilt]= useState(() => new Set())
+  // Docs filter: cross-cutting "attention" predicates that don't match a
+  // single WO field (see DOC_FILTERS below). Same Set semantics as the
+  // other categories — OR within, AND across.
+  const [docFilt,    setDocFilt]    = useState(() => new Set())
   const [search,     setSearch]     = useState('')
   const [lastRefresh,setLastRefresh]= useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
@@ -648,9 +652,11 @@ export default function Dashboard() {
   const toggleStatus  = makeToggle(setStatusFilt)
   const toggleCont    = makeToggle(setContFilt)
   const toggleBorough = makeToggle(setBoroughFilt)
+  const toggleDoc     = makeToggle(setDocFilt)
   const clearStatus   = () => setStatusFilt(new Set())
   const clearCont     = () => setContFilt(new Set())
   const clearBorough  = () => setBoroughFilt(new Set())
+  const clearDoc      = () => setDocFilt(new Set())
 
   const load = async () => {
     setLoading(true)
@@ -769,6 +775,26 @@ export default function Dashboard() {
     return `${y}-${m}-${dd}` === todayLocal
   }
 
+  // ── Docs "attention" pseudo-filters ──────────────────────────
+  // Cross-cutting predicates on the per-WO docs lifecycle (cfr / invoice,
+  // each { done, sent }). Rendered as their own FilterBar row and matched
+  // via the same OR-within / AND-across model as the real categories.
+  const DOCS_INCOMPLETE = 'Completed · docs not done'   // filter 1
+  const DOCS_UNSENT     = 'Unsent CFR / Invoice'         // filter 2
+
+  // Filter 1: WO is Completed but the CFR and/or Invoice is still not Done.
+  function isCompletedDocsNotDone(wo) {
+    if (String(wo.status).toLowerCase() !== 'completed') return false
+    return !wo.docs?.cfr?.done || !wo.docs?.invoice?.done
+  }
+  // Filter 2: a CFR or Invoice is Done but not yet Sent — i.e. finished
+  // paperwork still waiting to go out. Docs that aren't Done yet don't
+  // count (they belong to filter 1's "not done" bucket instead).
+  function hasUnsentDoc(wo) {
+    const cfr = wo.docs?.cfr, inv = wo.docs?.invoice
+    return (!!cfr?.done && !cfr?.sent) || (!!inv?.done && !inv?.sent)
+  }
+
   // Filter + search WOs. Within a category: empty Set = no filter; a
   // populated Set means the WO must match one of its values (OR).
   // Across categories: AND. The Completed Today pseudo-status is a
@@ -790,6 +816,17 @@ export default function Dashboard() {
       }
       if (contFilt.size    > 0 && !contFilt.has(wo.contractor))   return false
       if (boroughFilt.size > 0 && !boroughFilt.has(wo.borough))   return false
+      if (docFilt.size > 0) {
+        let ok = false
+        for (const d of docFilt) {
+          if (d === DOCS_INCOMPLETE) {
+            if (isCompletedDocsNotDone(wo)) { ok = true; break }
+          } else if (d === DOCS_UNSENT) {
+            if (hasUnsentDoc(wo)) { ok = true; break }
+          }
+        }
+        if (!ok) return false
+      }
       if (search) {
         const q = search.toLowerCase()
         return (
@@ -800,7 +837,7 @@ export default function Dashboard() {
       }
       return true
     })
-  }, [data, statusFilt, contFilt, boroughFilt, search])
+  }, [data, statusFilt, contFilt, boroughFilt, docFilt, search])
 
   // Unique filter options
   const contractors = useMemo(() =>
@@ -924,6 +961,10 @@ export default function Dashboard() {
           boroughFilt={boroughFilt}
           toggleBorough={toggleBorough}
           clearBorough={clearBorough}
+          docFilt={docFilt}
+          toggleDoc={toggleDoc}
+          clearDoc={clearDoc}
+          docFilterOptions={[DOCS_INCOMPLETE, DOCS_UNSENT]}
           contractors={contractors}
           boroughs={boroughs}
           filteredWOs={filteredWOs}
@@ -985,6 +1026,7 @@ function OperationsTabContent({
   statusFilt, toggleStatus, clearStatus,
   contFilt, toggleCont, clearCont,
   boroughFilt, toggleBorough, clearBorough,
+  docFilt, toggleDoc, clearDoc, docFilterOptions,
   contractors, boroughs,
   filteredWOs,
   visibleCount, onShowMore, onShowAll,
@@ -1138,6 +1180,13 @@ function OperationsTabContent({
               selected={boroughFilt}
               onToggle={toggleBorough}
               onClear={clearBorough}
+            />
+            <FilterBar
+              label="Docs"
+              options={docFilterOptions}
+              selected={docFilt}
+              onToggle={toggleDoc}
+              onClear={clearDoc}
             />
           </div>
 
