@@ -8,7 +8,6 @@ import { opToday } from '../lib/dateOps'
 import RevenueTab from './RevenueTab'
 import ProductionTab from './ProductionTab'
 import DocStatusTab from './DocStatusTab'
-import NavTab from './NavTab'
 import DownloadDocumentsModal from '../components/DownloadDocumentsModal'
 import DocStatusChips from '../components/DocStatusChips'
 import FilterBar from '../components/FilterBar'
@@ -433,7 +432,6 @@ function WORow({ wo, flagged, qbConnected, onDocsChange, onChangeStatus, onDelet
 // existing `?tab=operations` URLs; the user-facing label is WO Tracker.
 const TABS = [
   { id: 'operations', label: 'WO Tracker' },
-  { id: 'nav',        label: 'Nav'        },
   { id: 'doc_status', label: 'Doc Status' },
   { id: 'production', label: 'Production' },
   { id: 'revenue',    label: 'Revenue'    },
@@ -772,7 +770,6 @@ export default function Dashboard() {
             {activeTab === 'revenue'    ? 'Revenue Dashboard'
               : activeTab === 'production' ? 'Production Dashboard'
               : activeTab === 'doc_status' ? 'Doc Status'
-              : activeTab === 'nav'        ? 'Nav'
               : 'Work Order Tracker'}
           </h1>
           {activeTab === 'operations' && lastRefresh && (
@@ -821,8 +818,6 @@ export default function Dashboard() {
           onDocsChange={onDocsChange}
           onInvoiced={onInvoiced}
         />
-      ) : activeTab === 'nav' ? (
-        <NavTab />
       ) : (
         <OperationsTabContent
           stats={stats}

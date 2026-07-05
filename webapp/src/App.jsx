@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Routes, Route, NavLink, Navigate } from 'react-router-dom'
 import Dashboard   from './pages/Dashboard'
+import NavTab      from './pages/NavTab'
 import FieldReport from './pages/FieldReport'
 import SignIn      from './pages/SignIn'
 import ScanWO      from './pages/ScanWO'
@@ -107,6 +108,7 @@ function QbAuthToast({ toast, onDismiss }) {
 
 const NAV_ITEMS = [
   { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null                },
+  { to: '/nav',          label: 'Nav',          end: false, badgeKey: null                },
   { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null                },
   { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review'  },
   { to: '/field-report', label: 'Field Report', end: false, badgeKey: null                },
@@ -300,6 +302,7 @@ export default function App() {
             ) : (
               <>
                 <Route path="/"             element={<Dashboard />} />
+                <Route path="/nav"          element={<NavTab />} />
                 <Route path="/scan-wo"      element={<ScanWO />} />
                 <Route path="/approvals"    element={<Approvals />} />
                 <Route path="/field-report" element={<FieldReport />} />
