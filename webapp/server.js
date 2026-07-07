@@ -76,13 +76,38 @@ async function callAppsScript(action, data = null) {
     throw new Error('APPS_SCRIPT_URL or APPS_SCRIPT_KEY env var not set')
   }
 
-  const body = { action, key, ...(data ? { data } : {}) }
+  const body    = { action, key, ...(data ? { data } : {}) }
+  const reqJson = JSON.stringify(body)
 
+  // ── Diagnostic instrumentation ──────────────────────────────
+  // Temporary detailed logging to characterise the "HTML instead of
+  // JSON" failures on heavy read actions (get_dashboard_data etc.).
+  // We want to know, per call: how long the round trip took, the final
+  // URL after redirects (googleusercontent echo vs back at /exec/doGet),
+  // the content-type + size, and — when HTML comes back — the actual
+  // human-readable Google error text (auth page? size limit? doGet
+  // template error?). All lines are prefixed [AS] for easy grep in the
+  // Railway logs. Remove once the root cause is confirmed.
+  const started = Date.now()
   const res = await fetch(url, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body)
+    body:    reqJson
   })
+
+  const text     = await res.text()
+  const elapsed  = Date.now() - started
+  const ctype    = res.headers.get('content-type') || ''
+  const clen     = res.headers.get('content-length') || ''
+  const trimmed  = text.trim()
+  const looksHtml = trimmed.startsWith('<')
+
+  console.log(
+    `[AS] action=${action} status=${res.status} redirected=${res.redirected} ` +
+    `elapsed=${elapsed}ms reqBytes=${reqJson.length} respBytes=${text.length} ` +
+    `contentLength=${clen || 'n/a'} contentType="${ctype}" ` +
+    `finalUrl=${res.url} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
+  )
 
   // Apps Script normally returns 200 + JSON. If the deployment is in a
   // bad state (fresh deploy that needs re-auth, URL pointing at a stale
@@ -90,9 +115,25 @@ async function callAppsScript(action, data = null) {
   // res.json() throws a cryptic "Unexpected token '<'" that bubbles to
   // the browser as a confusing JSON-parse error. Catch that shape and
   // raise something the user can actually act on.
-  const text = await res.text()
-  const trimmed = text.trim()
-  if (trimmed.startsWith('<')) {
+  if (looksHtml) {
+    // Strip tags/scripts/styles so the actual Google error message is
+    // legible in the logs — this is the piece that tells us WHY the
+    // response wasn't JSON (authorization page, "exceeded maximum
+    // execution", "No HTML file named FieldReport" from doGet, etc.).
+    const readable = text
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+    console.error(
+      `[AS] HTML-RESPONSE action=${action} status=${res.status} ` +
+      `elapsed=${elapsed}ms respBytes=${text.length} finalUrl=${res.url}\n` +
+      `[AS]   title="${titleMatch ? titleMatch[1].trim() : '(none)'}"\n` +
+      `[AS]   readable="${readable.slice(0, 600)}"`
+    )
     const status = res.status
     const redirected = res.redirected ? ' (redirected — Apps Script may need re-authorization)' : ''
     throw new Error(
@@ -106,12 +147,19 @@ async function callAppsScript(action, data = null) {
   try {
     json = JSON.parse(text)
   } catch (e) {
+    console.error(
+      `[AS] NON-JSON action=${action} status=${res.status} respBytes=${text.length} ` +
+      `head="${text.slice(0, 200).replace(/\n/g, ' ')}"`
+    )
     throw new Error(
       `Apps Script response wasn't JSON (action="${action}", status=${res.status}): ` +
       `${text.slice(0, 200)}`
     )
   }
-  if (json.error) throw new Error(json.error)
+  if (json.error) {
+    console.error(`[AS] JSON-ERROR action=${action} status=${res.status} error="${json.error}"`)
+    throw new Error(json.error)
+  }
   return json
 }
 
