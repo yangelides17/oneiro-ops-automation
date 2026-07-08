@@ -635,6 +635,34 @@ export default function RevenueTab() {
         </div>
       </div>
 
+      {/* Invoiced vs WIP — splits the Revenue total by whether a QuickBooks
+          invoice has been created for each WO. Invoiced ≈ what QB reports;
+          WIP is in-progress work + jobs awaiting CFR approval or invoice
+          generation. The two sum to the Revenue total above. */}
+      <div className="space-y-2">
+        <p className="section-label">Invoiced vs WIP</p>
+        <div className="grid grid-cols-3 gap-3">
+          <StatCard
+            label="Invoiced Revenue"
+            value={fmtUsd(totals.invoiced_revenue || 0)}
+            sub="QB invoice created"
+            color="text-green-700"
+          />
+          <StatCard
+            label="WIP Revenue"
+            value={fmtUsd(totals.wip_revenue || 0)}
+            sub="not yet invoiced"
+            color="text-amber-600"
+          />
+          <StatCard
+            label="% Revenue Invoiced"
+            value={`${Math.round((totals.pct_invoiced || 0) * 100)}%`}
+            sub={totals.revenue > 0 ? 'of period revenue' : '—'}
+            color="text-navy"
+          />
+        </div>
+      </div>
+
       <NeedsPricingPanel items={needs} />
 
       <DailyRevenueChart daily={daily} />

@@ -11675,6 +11675,10 @@ function _buildRevenuePayload_(startIso, endIso) {
       contract_num: _revMapped.contractNum,
       borough:      _revMapped.borough,
       location:     String(woRows[i][5] || '').trim(),
+      // Invoice Done? (0-idx col 44) — flipped to 'Yes' by recordQbInvoice_
+      // when a QuickBooks invoice is created against the WO. Drives the
+      // Invoiced-vs-WIP revenue split below.
+      invoiced:     String(woRows[i][44] || '').trim().toLowerCase() === 'yes',
     };
   }
 
@@ -11700,9 +11704,10 @@ function _buildRevenuePayload_(startIso, endIso) {
   const woMap           = {};   // woId → { contractor, location, revenue, items }
   const needsPricing    = [];
 
-  let totalRevenue   = 0;
-  let totalItems     = 0;
-  let unpricedCount  = 0;
+  let totalRevenue    = 0;
+  let invoicedRevenue = 0;   // revenue on WOs whose QB invoice is created
+  let totalItems      = 0;
+  let unpricedCount   = 0;
 
   for (let i = 1; i < miData.length; i++) {
     const r = miData[i];
@@ -11747,6 +11752,7 @@ function _buildRevenuePayload_(startIso, endIso) {
 
     const rev = Number(result.revenue) || 0;
     totalRevenue += rev;
+    if (meta.invoiced) invoicedRevenue += rev;   // Invoiced vs WIP split
 
     // daily
     let day = dailyMap[dateIso];
@@ -11847,9 +11853,15 @@ function _buildRevenuePayload_(startIso, endIso) {
   return {
     range: { start: startIso, end: endIso },
     totals: {
-      revenue:        totalRevenue,
-      items:          totalItems,
-      unpriced_items: unpricedCount,
+      revenue:          totalRevenue,
+      items:            totalItems,
+      unpriced_items:   unpricedCount,
+      // Invoiced = priced revenue on WOs with a QB invoice created;
+      // WIP = everything else (in-progress work, awaiting CFR approval
+      // or invoice generation). The two sum to `revenue`.
+      invoiced_revenue: invoicedRevenue,
+      wip_revenue:      totalRevenue - invoicedRevenue,
+      pct_invoiced:     totalRevenue > 0 ? invoicedRevenue / totalRevenue : 0,
     },
     daily,
     by_contractor: byContractor,
