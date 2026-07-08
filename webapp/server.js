@@ -68,38 +68,6 @@ const upload = multer({
 
 
 // ── Apps Script proxy helper ──────────────────────────────────
-//
-// Root cause of the intermittent "HTML instead of JSON" failures:
-// Apps Script web-app execution contention. Everything runs as one
-// user (executeAs USER_DEPLOYING) sharing a small pool of concurrent
-// execution slots. Heavy actions (generate_pl_for_doc 6-26s, 2.4MB
-// get_drive_file_bytes, time-driven triggers) saturate the slots, so
-// concurrent calls QUEUE — even tiny ones (get_pending_counts observed
-// at 15s). When a call's total latency crosses Google's ~30-35s
-// delivery ceiling, the echo can't be served and Google substitutes an
-// HTML error page (either a redirect back to /exec hitting the obsolete
-// doGet, or a googleusercontent 404 "Drive — unable to open the file").
-//
-// Mitigation: bound each attempt with a timeout and retry ONCE — but
-// only for read-only actions, so mutations (approve/generate/submit/…)
-// can never double-execute. Contention is transient, so the retry
-// usually lands in a fast window.
-
-// Read-only, side-effect-free actions that are safe to auto-retry.
-// Anything not matching (approve_*, generate_*, submit_*, set_*,
-// create_*/update_*/delete_*, upload_*, record_*, clear_*, save_*,
-// reupload_*, finalize_*, process_*, write_*) is treated as a mutation
-// and is NEVER retried.
-const AS_READONLY_ACTION_RE =
-  /^(get_|list_|check_|lookup_|reverse_geocode$|signin_header_for_file$)/
-
-// Abort an individual attempt before Google's ~30-35s delivery ceiling
-// so a stuck/queued read fails fast and we can retry into a fast window
-// instead of waiting for the inevitable HTML timeout page.
-const AS_ATTEMPT_TIMEOUT_MS = 28000
-
-const _sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
 async function callAppsScript(action, data = null) {
   const url = process.env.APPS_SCRIPT_URL
   const key = process.env.APPS_SCRIPT_KEY
@@ -108,83 +76,50 @@ async function callAppsScript(action, data = null) {
     throw new Error('APPS_SCRIPT_URL or APPS_SCRIPT_KEY env var not set')
   }
 
-  const body       = { action, key, ...(data ? { data } : {}) }
-  const reqJson    = JSON.stringify(body)
-  const retryable  = AS_READONLY_ACTION_RE.test(action)
-  const maxAttempts = retryable ? 2 : 1
+  const body    = { action, key, ...(data ? { data } : {}) }
+  const reqJson = JSON.stringify(body)
 
-  let lastErr
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await _callAppsScriptOnce(url, reqJson, action, attempt)
-    } catch (err) {
-      lastErr = err
-      // Only retry read-only actions, and only for the transient
-      // contention/timeout signatures (HTML page or aborted/network
-      // error) — not for genuine JSON {error:...} business failures,
-      // which are deterministic and would just fail again.
-      const transient = err.code === 'AS_HTML' || err.code === 'AS_FETCH'
-      if (attempt < maxAttempts && transient) {
-        console.warn(
-          `[AS] RETRY action=${action} attempt=${attempt} reason=${err.code} ` +
-          `msg="${(err.message || '').slice(0, 120)}"`
-        )
-        await _sleep(1000)   // let the contention burst subside slightly
-        continue
-      }
-      throw err
-    }
-  }
-  throw lastErr
-}
-
-// One attempt: fetch + parse, with the [AS] diagnostics. Throws errors
-// tagged with .code = 'AS_HTML' | 'AS_FETCH' | 'AS_NONJSON' | 'AS_BIZ'
-// so the caller can decide what's retryable.
-async function _callAppsScriptOnce(url, reqJson, action, attempt) {
+  // ── Diagnostic instrumentation ──────────────────────────────
+  // Temporary detailed logging to characterise the "HTML instead of
+  // JSON" failures on heavy read actions (get_dashboard_data etc.).
+  // We want to know, per call: how long the round trip took, the final
+  // URL after redirects (googleusercontent echo vs back at /exec/doGet),
+  // the content-type + size, and — when HTML comes back — the actual
+  // human-readable Google error text (auth page? size limit? doGet
+  // template error?). All lines are prefixed [AS] for easy grep in the
+  // Railway logs. Remove once the root cause is confirmed.
   const started = Date.now()
-  let res, text
-  try {
-    res = await fetch(url, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    reqJson,
-      signal:  AbortSignal.timeout(AS_ATTEMPT_TIMEOUT_MS),
-    })
-    text = await res.text()
-  } catch (e) {
-    const elapsed = Date.now() - started
-    const aborted = e.name === 'TimeoutError' || e.name === 'AbortError'
-    console.error(
-      `[AS] FETCH-ERROR action=${action} attempt=${attempt} elapsed=${elapsed}ms ` +
-      `${aborted ? 'timeout' : 'network'} err="${e.message}"`
-    )
-    const err = new Error(
-      aborted
-        ? `Apps Script call timed out after ${AS_ATTEMPT_TIMEOUT_MS}ms (action="${action}")`
-        : `Apps Script request failed (action="${action}"): ${e.message}`
-    )
-    err.code = 'AS_FETCH'
-    throw err
-  }
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    reqJson
+  })
 
-  const elapsed   = Date.now() - started
-  const ctype     = res.headers.get('content-type') || ''
-  const clen      = res.headers.get('content-length') || ''
-  const looksHtml = text.trim().startsWith('<')
+  const text     = await res.text()
+  const elapsed  = Date.now() - started
+  const ctype    = res.headers.get('content-type') || ''
+  const clen     = res.headers.get('content-length') || ''
+  const trimmed  = text.trim()
+  const looksHtml = trimmed.startsWith('<')
 
   console.log(
-    `[AS] action=${action} attempt=${attempt} status=${res.status} redirected=${res.redirected} ` +
+    `[AS] action=${action} status=${res.status} redirected=${res.redirected} ` +
     `elapsed=${elapsed}ms reqBytes=${reqJson.length} respBytes=${text.length} ` +
     `contentLength=${clen || 'n/a'} contentType="${ctype}" ` +
     `finalUrl=${res.url} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
   )
 
-  // Apps Script normally returns 200 + JSON. Under contention it crosses
-  // Google's ~30-35s delivery ceiling and returns an HTML error page
-  // instead (see helper header). Detect that shape and surface an
-  // actionable, retry-tagged error.
+  // Apps Script normally returns 200 + JSON. If the deployment is in a
+  // bad state (fresh deploy that needs re-auth, URL pointing at a stale
+  // version, Google outage), it returns an HTML login/error page and
+  // res.json() throws a cryptic "Unexpected token '<'" that bubbles to
+  // the browser as a confusing JSON-parse error. Catch that shape and
+  // raise something the user can actually act on.
   if (looksHtml) {
+    // Strip tags/scripts/styles so the actual Google error message is
+    // legible in the logs — this is the piece that tells us WHY the
+    // response wasn't JSON (authorization page, "exceeded maximum
+    // execution", "No HTML file named FieldReport" from doGet, etc.).
     const readable = text
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -194,42 +129,36 @@ async function _callAppsScriptOnce(url, reqJson, action, attempt) {
       .trim()
     const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
     console.error(
-      `[AS] HTML-RESPONSE action=${action} attempt=${attempt} status=${res.status} ` +
+      `[AS] HTML-RESPONSE action=${action} status=${res.status} ` +
       `elapsed=${elapsed}ms respBytes=${text.length} finalUrl=${res.url}\n` +
       `[AS]   title="${titleMatch ? titleMatch[1].trim() : '(none)'}"\n` +
       `[AS]   readable="${readable.slice(0, 600)}"`
     )
+    const status = res.status
     const redirected = res.redirected ? ' (redirected — Apps Script may need re-authorization)' : ''
-    const err = new Error(
+    throw new Error(
       `Apps Script returned HTML instead of JSON${redirected} — ` +
-      `action="${action}", status=${res.status}. ` +
+      `action="${action}", status=${status}. ` +
       `This usually means the Web App deployment needs to be re-authorized ` +
       `or APPS_SCRIPT_URL is pointing at a stale deployment.`
     )
-    err.code = 'AS_HTML'
-    throw err
   }
-
   let json
   try {
     json = JSON.parse(text)
   } catch (e) {
     console.error(
-      `[AS] NON-JSON action=${action} attempt=${attempt} status=${res.status} ` +
-      `respBytes=${text.length} head="${text.slice(0, 200).replace(/\n/g, ' ')}"`
+      `[AS] NON-JSON action=${action} status=${res.status} respBytes=${text.length} ` +
+      `head="${text.slice(0, 200).replace(/\n/g, ' ')}"`
     )
-    const err = new Error(
+    throw new Error(
       `Apps Script response wasn't JSON (action="${action}", status=${res.status}): ` +
       `${text.slice(0, 200)}`
     )
-    err.code = 'AS_NONJSON'
-    throw err
   }
   if (json.error) {
-    console.error(`[AS] JSON-ERROR action=${action} attempt=${attempt} status=${res.status} error="${json.error}"`)
-    const err = new Error(json.error)
-    err.code = 'AS_BIZ'   // deterministic business error — never retried
-    throw err
+    console.error(`[AS] JSON-ERROR action=${action} status=${res.status} error="${json.error}"`)
+    throw new Error(json.error)
   }
   return json
 }
