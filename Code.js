@@ -236,73 +236,7 @@ function setupTriggers_() {
     .onOpen()
     .create();
 
-  // Dashboard cache eviction on hand edits. Re-created here too because
-  // this function deletes every project trigger first.
-  _createDashboardCacheTrigger_();
-
-  Logger.log('⏰ Triggers set up: Scan Inbox (15min), Approved Docs (10min), onOpen menu, sheet-edit cache eviction');
-}
-
-
-// ═══════════════════════════════════════════════════════════════
-// DASHBOARD CACHE — evict on direct spreadsheet edits
-// ═══════════════════════════════════════════════════════════════
-//
-// Every mutation made through the webapp already evicts dashboard_v1 (see
-// _invalidateCacheKeys_ call sites). Edits typed straight into the
-// spreadsheet don't go through any handler, so without this the dashboard
-// would serve its cached payload for up to the 60s TTL after a hand edit.
-//
-// Must be an INSTALLABLE trigger: a simple onEdit(e) runs unauthorized and
-// can't be relied on to reach CacheService.
-
-const DASHBOARD_CACHE_EDIT_SHEETS_ = ['Work Order Tracker', 'Marking Items'];
-
-/**
- * Installable onEdit handler. Fires only for human edits in the Sheets UI
- * (not for writes made by this script or the Sheets API — those already
- * evict via their handlers), so it can't feed back on itself.
- */
-function onSheetEditEvictDashboardCache(e) {
-  try {
-    if (!e || !e.range) return;   // manual run from the editor
-    const sheetName = e.range.getSheet().getName();
-    if (DASHBOARD_CACHE_EDIT_SHEETS_.indexOf(sheetName) === -1) return;
-    // Drops dashboard_v1 outright and bumps the token, so the token-keyed
-    // revenue / production / doc-status payloads refresh too — a Marking
-    // Item edit moves those numbers as well.
-    _invalidateCacheKeys_(['dashboard_v1']);
-  } catch (err) {
-    // A trigger that throws emails the owner on every keystroke. Never.
-    Logger.log('⚠️ onSheetEditEvictDashboardCache: ' + err.message);
-  }
-}
-
-/** Idempotent: drops any existing copy before creating the trigger. */
-function _createDashboardCacheTrigger_() {
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === 'onSheetEditEvictDashboardCache') {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
-  ScriptApp.newTrigger('onSheetEditEvictDashboardCache')
-    .forSpreadsheet(SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID))
-    .onEdit()
-    .create();
-}
-
-/**
- * Run once from the Apps Script editor. Installs the onEdit trigger that
- * keeps the dashboard cache honest when someone edits the WO Tracker or
- * Marking Items by hand. Safe to re-run — it replaces its own trigger and
- * touches nothing else.
- */
-function setupDashboardCacheTrigger() {
-  _createDashboardCacheTrigger_();
-  const msg = '✅ Dashboard cache eviction installed for: ' +
-              DASHBOARD_CACHE_EDIT_SHEETS_.join(', ');
-  Logger.log(msg);
-  return msg;
+  Logger.log('⏰ Triggers set up: Scan Inbox (15min), Approved Docs (10min), onOpen menu');
 }
 
 
