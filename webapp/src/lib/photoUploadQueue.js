@@ -27,6 +27,10 @@ const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const COMPRESS_MAX_EDGE = 2048
 const COMPRESS_QUALITY  = 0.85
 const COMPRESS_SKIP_BELOW_BYTES = 500 * 1024
+
+// Max simultaneous /api/upload-photo requests. Each one occupies an Apps
+// Script execution slot shared with every other page in the app.
+const PHOTO_UPLOAD_CONCURRENCY = 3
 async function compressForUpload(file) {
   const type = String(file?.type || '').toLowerCase()
   if (type !== 'image/jpeg' && type !== 'image/png') return file
@@ -212,7 +216,7 @@ export function usePhotoUploadQueue(woId) {
       }))
       setItems([...pendingItems, ...historicItems])
       // Drain anything that was sitting in IndexedDB on next tick.
-      pendingItems.forEach(it => kick(it))
+      pendingItems.forEach(it => enqueueKick(it))
     }).catch(err => {
       if (!cancelled) {
         setHistoricError(err.message || 'Failed to load photos')
@@ -433,6 +437,38 @@ export function usePhotoUploadQueue(woId) {
     }
   }, [woId, patch])
 
+  // ── 2b. Upload pool ─────────────────────────────────────────
+  // Every kick() ends in a POST /api/upload-photo, which costs one Apps
+  // Script execution. Those all run as a single Google identity with a
+  // small pool of simultaneous executions shared with the rest of the
+  // app, so importing 10 photos used to fire 10 at once and starve the
+  // dashboard, approvals, and nav badges of slots. Three at a time keeps
+  // a crew's import fast without monopolising the backend.
+  const poolRef = useRef({ active: 0, queue: [] })
+
+  const drainPool = useCallback(() => {
+    const pool = poolRef.current
+    while (pool.active < PHOTO_UPLOAD_CONCURRENCY && pool.queue.length) {
+      const item = pool.queue.shift()
+      pool.active++
+      Promise.resolve(kick(item))
+        .catch(() => { /* kick() already surfaces its own errors */ })
+        .finally(() => { pool.active--; drainPool() })
+    }
+  }, [kick])
+
+  // Dedupe on the way in: kick() is idempotent via inFlightRef, but an
+  // item still sitting in this queue isn't in inFlightRef yet, so without
+  // this a double-add would burn a slot on a no-op.
+  const enqueueKick = useCallback((item) => {
+    if (!item || !item.id) return
+    const pool = poolRef.current
+    if (inFlightRef.current.has(item.id)) return
+    if (pool.queue.some(q => q.id === item.id)) return
+    pool.queue.push(item)
+    drainPool()
+  }, [drainPool])
+
   // ── 3. Public adders ────────────────────────────────────────
   const addCapture = useCallback((file, geo) => {
     if (!file || !woId) return
@@ -454,8 +490,8 @@ export function usePhotoUploadQueue(woId) {
       watermark_applied: false,
     }
     setItems(prev => [item, ...prev])
-    queueMicrotask(() => kick(item))
-  }, [woId, kick])
+    queueMicrotask(() => enqueueKick(item))
+  }, [woId, enqueueKick])
 
   const addLibrary = useCallback((files) => {
     if (!woId || !files || !files.length) return
@@ -477,8 +513,8 @@ export function usePhotoUploadQueue(woId) {
       filename: rec.filename, mime: rec.mime, watermark_applied: true,
     }))
     setItems(prev => [...newItems, ...prev])
-    queueMicrotask(() => newItems.forEach(kick))
-  }, [woId, kick])
+    queueMicrotask(() => newItems.forEach(enqueueKick))
+  }, [woId, enqueueKick])
 
   // Manual stamp path — legacy/library photos the user wants watermarked
   // with a hand-entered timestamp + coordinates (e.g. photos taken before
@@ -505,8 +541,8 @@ export function usePhotoUploadQueue(woId) {
       }
     })
     setItems(prev => [...newItems, ...prev])
-    queueMicrotask(() => newItems.forEach(kick))
-  }, [woId, kick])
+    queueMicrotask(() => newItems.forEach(enqueueKick))
+  }, [woId, enqueueKick])
 
   // ── 4. Delete (server-side trash if uploaded, local-only otherwise)
   const deleteOne = useCallback(async (id) => {
@@ -541,8 +577,8 @@ export function usePhotoUploadQueue(woId) {
     const item = itemsRef.current.find(i => i.id === id)
     if (!item) return
     patch(id, { status: 'pending', error: null })
-    kick(item)
-  }, [kick, patch])
+    enqueueKick(item)
+  }, [enqueueKick, patch])
 
   // ── 6. Resume on visibilitychange + online ──────────────────
   // Only re-kicks items that haven't started yet — NOT 'error' items.
@@ -554,7 +590,7 @@ export function usePhotoUploadQueue(woId) {
   useEffect(() => {
     const resume = () => {
       itemsRef.current.forEach(it => {
-        if (it.status === 'pending') kick(it)
+        if (it.status === 'pending') enqueueKick(it)
       })
     }
     const onVis    = () => { if (!document.hidden) resume() }
@@ -565,7 +601,7 @@ export function usePhotoUploadQueue(woId) {
       document.removeEventListener('visibilitychange', onVis)
       window.removeEventListener('online', onOnline)
     }
-  }, [kick])
+  }, [enqueueKick])
 
   // Aggregated counts the form uses for submit gating.
   const uploadedCount = items.filter(i => i.status === 'uploaded').length

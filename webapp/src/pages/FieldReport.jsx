@@ -1632,10 +1632,15 @@ export default function FieldReport() {
 
     if (!skipShiftCheck && crewChief.trim()) {
       try {
+        // This is an advisory prompt, so it must never hold the submit
+        // hostage. Without a deadline a stalled Apps Script response left
+        // the spinner up indefinitely: the catch below only fires on a
+        // rejection, and a hang is not a rejection.
         const res = await fetch('/api/field-report/check-shift-attribution', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ crew_chief: crewChief.trim(), work_date: effDate }),
+          signal: AbortSignal.timeout(8000),
         })
         const data = await res.json().catch(() => ({}))
         if (data && data.should_confirm && data.prior_date) {
@@ -1644,8 +1649,9 @@ export default function FieldReport() {
           return
         }
       } catch (err) {
-        // Network/server hiccup — fail open. Better to submit with the
-        // user's intended date than to block them on a soft warning.
+        // Network/server hiccup or the 8s timeout — fail open. Better to
+        // submit with the user's intended date than to block them on a
+        // soft warning.
         console.warn('shift-attribution check failed:', err)
       }
     }

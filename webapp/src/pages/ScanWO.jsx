@@ -199,9 +199,20 @@ export default function ScanWO() {
 
   // Periodically pull fresh committed-upload state from tracker. Picks
   // up cross-device uploads + admin deletions.
+  //
+  // Skipped while the tab is hidden: each tick is an Apps Script execution
+  // that reads the whole WO Tracker, and a truck dashboard left open on
+  // this page polled forever in the background. We refresh once on the way
+  // back so the user never sees stale rows.
   useEffect(() => {
-    const iv = setInterval(refreshCommitted, COMMITTED_REFRESH_MS)
-    return () => clearInterval(iv)
+    const tick = () => { if (!document.hidden) refreshCommitted() }
+    const iv = setInterval(tick, COMMITTED_REFRESH_MS)
+    const onVis = () => { if (!document.hidden) refreshCommitted() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      clearInterval(iv)
+      document.removeEventListener('visibilitychange', onVis)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -396,8 +407,16 @@ export default function ScanWO() {
     }
 
     tick()
-    const interval = setInterval(tick, POLL_INTERVAL_MS)
-    return () => { cancelled = true; clearInterval(interval) }
+    // Don't burn Apps Script executions polling a parse the user isn't
+    // watching; catch up immediately when they come back to the tab.
+    const interval = setInterval(() => { if (!document.hidden) tick() }, POLL_INTERVAL_MS)
+    const onVis = () => { if (!document.hidden) tick() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVis)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyItems])
 

@@ -1387,8 +1387,18 @@ Contact Oneiro Collection LLC to pay.     BALANCE DUE           ${amount.toLocal
  * race the 10-min cron. Without the lock, two concurrent invocations
  * each call file.makeCopy on the same approved doc before either one
  * trashes it — producing duplicate archive copies in every WO folder.
+ *
+ * The empty-folder check runs BEFORE the lock. The Python worker pokes
+ * this every 20s and almost every tick has nothing to do; taking a
+ * script-wide lock on each of those ticks made unrelated callers that
+ * DO take the lock (getOrCreateSubfolder_, on the photo/scan upload
+ * path) queue behind it for no reason. The impl re-enumerates the
+ * folder once it holds the lock, so this pre-flight is an optimisation
+ * only — it can never let two invocations process the same file.
  */
 function processApprovedDocuments() {
+  if (!_approvedDocsHasWork_()) return { archived: 0, errored: 0 };
+
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     Logger.log('ℹ️ processApprovedDocuments: another invocation holds the lock — skipping this run.');
@@ -1398,6 +1408,27 @@ function processApprovedDocuments() {
     return _processApprovedDocumentsImpl_();
   } finally {
     try { lock.releaseLock(); } catch (e) { /* never held */ }
+  }
+}
+
+/**
+ * Lock-free "is there anything to do?" probe. One Drive folder listing.
+ * 📨-prefixed files are already-sent rows, not work.
+ */
+function _approvedDocsHasWork_() {
+  try {
+    const approvedId = PropertiesService.getScriptProperties()
+                         .getProperty('APPROVED_SENT_ID');
+    if (!approvedId) return false;
+    const files = DriveApp.getFolderById(approvedId).getFiles();
+    while (files.hasNext()) {
+      if (!files.next().getName().startsWith('📨')) return true;
+    }
+    return false;
+  } catch (e) {
+    // Drive hiccup — fall through and let the locked impl decide.
+    Logger.log('⚠️ _approvedDocsHasWork_ probe failed: ' + e.message);
+    return true;
   }
 }
 
@@ -4367,11 +4398,23 @@ function _approvalSubtitleFromFilename_(docType, filename) {
 // four subfolders (Sign-In Logs, Production Logs, Field Reports,
 // Certified Payroll). Sorted newest-first. Webapp's Approvals page
 // uses this as its master list.
+//
+// Cached 60s under the rotating token: this walks five Drive folders and
+// fires on every Approvals mount plus every post-approve refresh. Every
+// handler that moves a file in or out of those folders bumps the token
+// (see _invalidateCacheKeys_), so an approve is reflected immediately.
 function handleListPendingApprovals_(body) {
-  const props          = PropertiesService.getScriptProperties();
-  const needsReviewId  = props.getProperty('NEEDS_REVIEW_ID');
+  const needsReviewId = PropertiesService.getScriptProperties()
+                          .getProperty('NEEDS_REVIEW_ID');
+  // Guard before the cache wrapper — a config error must never be cached.
   if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
 
+  const key = 'pending_approvals_v1_' + _getCacheToken_();
+  return jsonResponse_(
+    _withScriptCache_(key, 60, () => _buildPendingApprovalsPayload_(needsReviewId)));
+}
+
+function _buildPendingApprovalsPayload_(needsReviewId) {
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
   const approvals    = [];
 
@@ -4407,7 +4450,7 @@ function handleListPendingApprovals_(body) {
   // next to the "Process Approved Docs Now" worker button.
   let approved_docs_pending = null;
   try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
-  return jsonResponse_({ approvals, approved_docs_pending });
+  return { approvals, approved_docs_pending };
 }
 
 
@@ -4497,18 +4540,20 @@ function _countPendingSignins_() {
 // Each count is wrapped in try/catch so a misconfigured Drive prop only
 // nulls out the matching field, not the whole response. UI hides any
 // `null` field.
+//
+// Cached 60s under the rotating token — two Drive folder walks plus a
+// full Work Day Log read, fired on every app mount by ColdStartCounts.
 function handleGetPendingCounts_(_body) {
-  let approvals_review = null;
-  let approved_docs_pending = null;
-  let signins_pending = null;
-  try { approvals_review      = _countDocsNeedingReview_(); }   catch (e) {}
-  try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
-  try { signins_pending       = _countPendingSignins_(); }      catch (e) {}
-  return jsonResponse_({
-    approvals_review,
-    approved_docs_pending,
-    signins_pending,
-  });
+  const key = 'pending_counts_v1_' + _getCacheToken_();
+  return jsonResponse_(_withScriptCache_(key, 60, () => {
+    let approvals_review = null;
+    let approved_docs_pending = null;
+    let signins_pending = null;
+    try { approvals_review      = _countDocsNeedingReview_(); }   catch (e) {}
+    try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
+    try { signins_pending       = _countPendingSignins_(); }      catch (e) {}
+    return { approvals_review, approved_docs_pending, signins_pending };
+  }));
 }
 
 
@@ -4520,16 +4565,37 @@ function handleGetPendingCounts_(_body) {
 // the current month and returns just the pending-list length. The
 // pending list itself is all-time (oldest first); the month arg only
 // scopes the calendar cells, which we discard.
+//
+// The webapp fires this on EVERY app mount (ColdStartCounts), so it sits
+// behind every page. It shares a cache key with handleGetDocStatusCalendar_
+// — same builder, same month, same token — so whichever runs first warms
+// the other. The derived count also gets its own tiny key: if the shared
+// payload ever grows past what the cache can hold, the badge must not
+// silently fall back to a full rebuild on every page load.
 function handleGetDocStatusPendingCount_(_body) {
   try {
     const monthIso = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM');
-    const payload  = _buildDocStatusPayload_(monthIso);
-    const n = Array.isArray(payload && payload.pending) ? payload.pending.length : 0;
-    return jsonResponse_({ doc_status_pending: n });
+    const countKey = 'doc_status_pending_v1_' + _getCacheToken_() + '_' + monthIso;
+    const result = _withScriptCache_(countKey, 60, () => {
+      const payload = _withScriptCache_(_docStatusCacheKey_(monthIso), 60,
+                                        () => _buildDocStatusPayload_(monthIso));
+      const n = Array.isArray(payload && payload.pending) ? payload.pending.length : 0;
+      return { doc_status_pending: n };
+    });
+    return jsonResponse_(result);
   } catch (e) {
     Logger.log('get_doc_status_pending_count error: ' + e.message);
     return jsonResponse_({ doc_status_pending: null, error: e.message });
   }
+}
+
+
+// Shared by handleGetDocStatusCalendar_ and handleGetDocStatusPendingCount_
+// so the two can never drift onto different keys and each rebuild the
+// same payload. Folds in the rotating cache token, so any doc mutation
+// that calls _invalidateCacheKeys_ invalidates both at once.
+function _docStatusCacheKey_(monthEff) {
+  return 'doc_status_v1_' + _getCacheToken_() + '_' + monthEff;
 }
 
 
@@ -4669,6 +4735,10 @@ function handleApproveDoc_(body) {
       Logger.log('⚠️ Automation Log write failed on approve: ' + logErr);
     }
 
+    // The file just left Docs Needing Review — drop the cached approvals
+    // list and pending counts so the next fetch reflects the move.
+    _invalidateCacheKeys_([]);
+
     return jsonResponse_({ success: true, file_id: fileId });
   } catch (err) {
     Logger.log(`❌ handleApproveDoc_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
@@ -4743,6 +4813,8 @@ function handleApproveSignInWithBytes_(body) {
       Logger.log('⚠️ Automation Log write failed on signed approve: ' + logErr);
     }
 
+    _invalidateCacheKeys_([]);   // approvals list + pending counts changed
+
     return jsonResponse_({
       success:  true,
       file_id:  newFile.getId(),
@@ -4813,6 +4885,10 @@ function handleReuploadPendingApproval_(body) {
       Logger.log('⚠️ Automation Log write failed on reupload: ' + logErr);
     }
 
+    // File stays in Docs Needing Review but its size/created_at changed,
+    // so the cached approvals list is now wrong.
+    _invalidateCacheKeys_([]);
+
     // Same file_id — the caller bumps a cache-buster to re-fetch the PDF.
     return jsonResponse_({ success: true, file_id: fileId, filename: filename });
   } catch (err) {
@@ -4828,27 +4904,37 @@ function handleReuploadPendingApproval_(body) {
 //
 // Apps Script CacheService gives us a 6-hour, 100KB-per-key, in-memory
 // cache shared across executions. The dashboard handler does heavy
-// per-request work (sheet reads + Drive walks for any WO whose
-// Archive Folder URL hasn't been backfilled yet); caching its JSON
-// payload for 60 seconds turns most refreshes into ~50ms hits.
+// per-request work (several full sheet reads); caching its JSON payload
+// for 60 seconds turns most refreshes into ~50ms hits. Payloads over the
+// per-key cap are gzipped rather than skipped — see _withScriptCache_.
 //
 // Cache invalidation: WO/Marking-Item mutators call
 // _invalidateCacheKeys_(['dashboard_v1']) after writing. That also
 // bumps a global token used by parameterized cache keys (revenue,
 // which keys per date range), so we don't have to enumerate variants.
 
+// Entries larger than the 100KB cap are gzipped and stored under this
+// prefix. Plain entries are raw JSON and always start with '{' or '[',
+// so the marker can never collide with one — old entries written before
+// this change still read back fine.
+const _CACHE_GZ_PREFIX_ = 'gz:';
+const _CACHE_MAX_BYTES_ = 100 * 1024;
+
 /**
  * Wrap a producer function with CacheService. Returns the cached value
  * on hit, runs `fn()` and caches the JSON-stringified result on miss.
- * Falls through to `fn()` directly if the result exceeds the 100KB
- * per-entry cap (logs a warning rather than throwing).
+ *
+ * Payloads over the 100KB per-entry cap are gzipped rather than skipped.
+ * The dashboard payload is ~180KB of highly repetitive JSON, which used
+ * to silently disable its own cache — every refresh paid a full rebuild.
+ * gzip takes it to ~20KB (base64 re-inflates that by 4/3).
  */
 function _withScriptCache_(key, ttlSec, fn) {
   const cache = CacheService.getScriptCache();
   try {
     const hit = cache.get(key);
     if (hit) {
-      try { return JSON.parse(hit); }
+      try { return JSON.parse(_cacheDecode_(hit)); }
       catch (e) { /* corrupt entry — fall through to recompute */ }
     }
   } catch (e) {
@@ -4860,16 +4946,89 @@ function _withScriptCache_(key, ttlSec, fn) {
   const value = fn();
   try {
     const payload = JSON.stringify(value);
-    if (payload.length <= 100 * 1024) {
-      cache.put(key, payload, ttlSec);
+    const entry   = payload.length <= _CACHE_MAX_BYTES_
+      ? payload
+      : _cacheEncodeGzip_(payload);
+    if (entry.length <= _CACHE_MAX_BYTES_) {
+      cache.put(key, entry, ttlSec);
     } else {
       Logger.log('⚠️ _withScriptCache_ skip put for ' + key +
-                 ' (size=' + payload.length + ' bytes exceeds 100KB cap)');
+                 ' (size=' + payload.length + ' bytes, gzipped=' + entry.length +
+                 ' bytes, still exceeds 100KB cap)');
     }
   } catch (e) {
     Logger.log('⚠️ _withScriptCache_ put failed for ' + key + ': ' + e.message);
   }
   return value;
+}
+
+/** JSON string → 'gz:'-prefixed base64 of its gzipped bytes. */
+function _cacheEncodeGzip_(payload) {
+  const gz = Utilities.gzip(Utilities.newBlob(payload, 'application/json'));
+  return _CACHE_GZ_PREFIX_ + Utilities.base64Encode(gz.getBytes());
+}
+
+/** Inverse of _cacheEncodeGzip_; passes plain entries through untouched. */
+function _cacheDecode_(entry) {
+  if (entry.indexOf(_CACHE_GZ_PREFIX_) !== 0) return entry;
+  const bytes = Utilities.base64Decode(entry.slice(_CACHE_GZ_PREFIX_.length));
+  // ungzip needs the blob's content type to be gzip, else it refuses.
+  const blob  = Utilities.newBlob(bytes, 'application/x-gzip');
+  return Utilities.ungzip(blob).getDataAsString();
+}
+
+/**
+ * Run once from the Apps Script editor after deploying the gzip cache.
+ * Confirms the compress → store → fetch → decompress round trip survives
+ * CacheService for a payload well over the 100KB cap, and reports the
+ * compression ratio the dashboard will actually get.
+ *
+ * The cache path is fail-safe (a decode error falls through to recompute),
+ * so a failure here means "caching is silently off", not "the app broke".
+ */
+function verifyCacheGzip() {
+  // Shaped like the real dashboard payload: many similar rows, which is
+  // what makes it compress well. ~200KB of JSON.
+  const rows = [];
+  for (let i = 0; i < 900; i++) {
+    rows.push({
+      id: 'RM-' + (40000 + i), contractor: 'Metro Express',
+      contract_num: '84125MBTP701/EXT', borough: 'Manhattan',
+      status: 'Completed', folder_url: 'https://drive.google.com/drive/folders/abc' + i,
+    });
+  }
+  const value = { wos: rows, generated: new Date().toISOString() };
+  const raw   = JSON.stringify(value);
+
+  const key = 'verify_cache_gzip_' + Date.now();
+  let readBack = null;
+  const produced = _withScriptCache_(key, 60, () => value);
+  try { readBack = CacheService.getScriptCache().get(key); } catch (e) {}
+
+  const stored     = readBack ? readBack.length : 0;
+  const compressed = !!(readBack && readBack.indexOf(_CACHE_GZ_PREFIX_) === 0);
+  // The real test: a second call must be served from cache, not rebuilt.
+  let rebuilt = false;
+  const second = _withScriptCache_(key, 60, () => { rebuilt = true; return value; });
+
+  const ok = compressed && !rebuilt &&
+             second && second.wos && second.wos.length === rows.length &&
+             second.wos[0].id === rows[0].id;
+
+  const msg = [
+    'rawBytes=' + raw.length + ' (cap=' + _CACHE_MAX_BYTES_ + ')',
+    'storedBytes=' + stored,
+    'compressed=' + compressed,
+    'ratio=' + (stored ? (raw.length / stored).toFixed(1) + 'x' : 'n/a'),
+    'servedFromCache=' + !rebuilt,
+    'roundTripIntact=' + (second && second.wos && second.wos.length === rows.length),
+    ok ? '✅ PASS' : '❌ FAIL',
+  ].join('  ');
+
+  try { CacheService.getScriptCache().remove(key); } catch (e) {}
+  Logger.log('verifyCacheGzip: ' + msg);
+  if (produced !== value) Logger.log('⚠️ first call did not return the produced value');
+  return msg;
 }
 
 /**
@@ -5445,6 +5604,11 @@ function handleSubmitSignIn_(body) {
       ['Timestamp', 'Source', 'Action', 'Related', 'Details', 'Status', 'User', 'Next Steps'],
       'Automation Log'
     );
+
+    // A new sign-in landed in Docs Needing Review — the cached approvals
+    // list and signins_pending count are both stale now. The idempotency
+    // key below is not token-keyed, so a replay still short-circuits.
+    _invalidateCacheKeys_([]);
 
     const result = { success: true, filename: writtenName, source };
     if (_cache) {
@@ -6057,6 +6221,8 @@ function handleApproveDocSkipSignoff_(body) {
     } catch (logErr) {
       Logger.log('⚠️ Automation Log write failed on skip-signoff: ' + logErr);
     }
+
+    _invalidateCacheKeys_([]);   // approvals list + pending counts changed
 
     return jsonResponse_({ success: true, file_id: fileId });
   } catch (err) {
@@ -10182,30 +10348,17 @@ function finalizeMarkingStatus_(ss, woId, dateOfWork, crewChief) {
 
 
 // ═══════════════════════════════════════════════════════════════
-// 9. WEB APP — Crew Field Report
+// 9. WEB APP — action handlers
 // ═══════════════════════════════════════════════════════════════
-
-/**
- * Serves the crew field report single-page web app.
- *
- * Deploy settings (Apps Script → Deploy → New Deployment → Web App):
- *   Execute as:  Me (script owner)
- *   Who has access: Anyone with the link
- *
- * The Apps Script URL is the app's only security layer.
- * The UPLOAD_SECRET key is injected at serve time so the browser
- * can authenticate its doPost calls without it appearing in source.
- */
-function doGet(e) {
-  const template = HtmlService.createTemplateFromFile('FieldReport');
-  template.scriptUrl = ScriptApp.getService().getUrl();
-  template.apiKey    = PropertiesService.getScriptProperties()
-                         .getProperty('UPLOAD_SECRET') || '';
-  return template.evaluate()
-    .setTitle('Oneiro — Field Report')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0, maximum-scale=1.0');
-}
+//
+// There is deliberately no doGet. This script is a POST-only JSON API:
+// the Node webapp (callAppsScript) and the Python worker both POST, and
+// the crew field report is now served by webapp/src/pages/FieldReport.jsx.
+// The old doGet rendered a FieldReport.html template that .claspignore
+// never shipped, so it threw on every invocation — and because Google
+// falls back to /exec when a slow response can't be delivered, that
+// exception showed up in the logs as if it were the failure's cause.
+// Removing it keeps the logs honest.
 
 
 // ── action: get_active_wos ────────────────────────────────────
@@ -11687,14 +11840,8 @@ function _buildDashboardPayload_() {
     });
   }
 
-  // ── Drive folder URLs: prefer the persisted Archive Folder URL on
-  // col 43; fall back to a read-only Drive walk only when the cell is
-  // empty (newly-created WOs that haven't archived a doc yet, or
-  // pre-backfill rows). The walk path is the ~150ms-per-WO cost we're
-  // designing this whole change to avoid; getWOFolder_ writes the URL
-  // back the first time it's resolved so subsequent refreshes stay fast.
-  const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
-  const archiveRoot = archiveId ? DriveApp.getFolderById(archiveId) : null;
+  // Drive folder URLs come straight off col 43 (Archive Folder URL).
+  // No Drive access from this builder at all — see the read below.
 
   // Format a Date cell as YYYY-MM-DD, leaving non-date values untouched.
   const fmtDate = (v) => {
@@ -11704,15 +11851,6 @@ function _buildDashboardPayload_() {
     return v == null ? '' : String(v);
   };
 
-  // Lookup so the fallback Drive-walk path can write the resolved URL
-  // back to the WO row. The map below loses the original allRows index;
-  // this precomputes it so we can find the right row for the setValue.
-  const rowIdxByWoId = {};
-  for (let i = 1; i < allRows.length; i++) {
-    const id = String(allRows[i][0] || '').trim();
-    if (id) rowIdxByWoId[id] = i;
-  }
-
   const wos = allRows.slice(1)
     .filter(r => r[0])   // skip blank rows
     .map(r => {
@@ -11720,25 +11858,15 @@ function _buildDashboardPayload_() {
       const workType  = String(r[10] || '');
       const isMMA     = workType.toUpperCase() === 'MMA';
       const counts    = miCounts[woId] || { total: 0, completed: 0 };
-      let folderUrl = String(r[42] || '').trim() || null;
-      if (!folderUrl && archiveRoot) {
-        const folder = findWOFolder_(archiveRoot, woId, ss, allRows);
-        if (folder) {
-          folderUrl = folder.getUrl();
-          // Self-heal: cache the URL on the row so we don't pay the
-          // ~150ms Drive walk again on the next dashboard refresh.
-          // Wrapped in try/catch — cache failure must never break the
-          // dashboard read.
-          try {
-            const rowIdx = rowIdxByWoId[woId];
-            if (rowIdx != null) {
-              woSheet.getRange(rowIdx + 1, 43).setValue(folderUrl);
-            }
-          } catch (e) {
-            Logger.log('⚠️ dashboard folder-url cache write failed for ' + woId + ': ' + e.message);
-          }
-        }
-      }
+      // Pure read. Col 43 is written when the folder is created, not here:
+      // archiveWOFile_ persists it as soon as a new WO's source PDF is
+      // archived, getWOFolder_ does the same on any downstream doc, and
+      // backfillArchiveFolderUrls() filled the historical rows. The
+      // dashboard used to walk Drive (~150ms/WO) and setValue back into
+      // the sheet on every load — a write inside a read path, paid on
+      // every refresh, for a value that is already persisted at creation.
+      // A WO with no archived doc yet simply has no folder to link to.
+      const folderUrl = String(r[42] || '').trim() || null;
       // Per-doc-type lifecycle flags. Only CFR + Invoice still live
       // on the WO row. PL/SI/CP moved to the Doc Lifecycle Log; their
       // entries in the `docs` payload are kept (always false) so the
@@ -13022,9 +13150,8 @@ function handleGetDocStatusCalendar_(body) {
     ? monthRaw
     : Utilities.formatDate(today, CONFIG.TIMEZONE, 'yyyy-MM');
 
-  const token = _getCacheToken_();
-  const key = 'doc_status_v1_' + token + '_' + monthEff;
-  const payload = _withScriptCache_(key, 60, () => _buildDocStatusPayload_(monthEff));
+  const payload = _withScriptCache_(_docStatusCacheKey_(monthEff), 60,
+                                    () => _buildDocStatusPayload_(monthEff));
   return jsonResponse_(payload);
 }
 
@@ -13517,11 +13644,16 @@ function handleListWOPhotos_(body) {
 
   // First pass: collect image-file refs + created dates only — cheap, no
   // thumbnail fetch. We sort newest-first and then pull thumbnails for at
-  // most MAX_THUMBS files. getThumbnail() is a per-file Drive round-trip,
-  // so a folder with dozens of photos would otherwise serialise dozens of
-  // them (slow gallery load, and a pathological folder could brush the
-  // 6-min execution limit). 120 covers any realistic WO.
-  const MAX_THUMBS = 120;
+  // most MAX_THUMBS files. getThumbnail() is a per-file Drive round-trip
+  // (~250-400ms), and they run serially — at 120 that is 30-48s, which
+  // lands inside the window where the web app's response gets replaced by
+  // an HTML error page. 25 keeps the worst case under ~10s and is more
+  // than a crew needs to review a WO's work.
+  //
+  // Do NOT "fix" the overflow by returning an empty thumbnail_b64: the
+  // client has no URL fallback (PhotoThumb renders previewUrl ||
+  // thumbnail_b64 || null), so those tiles would render blank.
+  const MAX_THUMBS = 25;
   const refs = [];
   const it = folder.getFiles();
   while (it.hasNext()) {

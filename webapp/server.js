@@ -21,6 +21,7 @@ import multer   from 'multer'
 import archiver from 'archiver'
 import crypto   from 'crypto'
 import { fileURLToPath } from 'url'
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 import 'dotenv/config'
 
 import {
@@ -67,6 +68,28 @@ const upload = multer({
 })
 
 
+// ── Event-loop lag monitor ────────────────────────────────────
+// callAppsScript measures its own latency with Date.now() around an
+// await, which runs on the event loop. If this process is CPU-blocked
+// (pdf-lib parses synchronously; zlib eats the libuv threadpool that
+// DNS also uses), that timer inflates even when Apps Script answered
+// promptly — so `elapsed` alone cannot tell "Google was slow" apart
+// from "we couldn't get back to the socket". This histogram can.
+//
+// Reading the two together:
+//   high elapsed + high elMax  → this Node process was blocked
+//   high elapsed + low  elMax  → Apps Script really was slow
+const loopLag = monitorEventLoopDelay({ resolution: 10 })
+loopLag.enable()
+
+// In-flight counters, logged with each call so a slow request can be
+// correlated with whatever else was running at the time.
+let asInFlight = 0
+let batchDownloadsActive = 0
+
+const ms = (ns) => Math.round(ns / 1e6)
+
+
 // ── Apps Script proxy helper ──────────────────────────────────
 async function callAppsScript(action, data = null) {
   const url = process.env.APPS_SCRIPT_URL
@@ -80,23 +103,40 @@ async function callAppsScript(action, data = null) {
   const reqJson = JSON.stringify(body)
 
   // ── Diagnostic instrumentation ──────────────────────────────
-  // Temporary detailed logging to characterise the "HTML instead of
-  // JSON" failures on heavy read actions (get_dashboard_data etc.).
-  // We want to know, per call: how long the round trip took, the final
-  // URL after redirects (googleusercontent echo vs back at /exec/doGet),
-  // the content-type + size, and — when HTML comes back — the actual
-  // human-readable Google error text (auth page? size limit? doGet
-  // template error?). All lines are prefixed [AS] for easy grep in the
-  // Railway logs. Remove once the root cause is confirmed.
+  // Characterises the "HTML instead of JSON" failures. Per call we log:
+  // how long the round trip took, split into time-to-headers (ttfb) vs
+  // time spent draining the body; peak event-loop lag during the call;
+  // how many other Apps Script calls and zip streams were in flight; the
+  // final URL after redirects; content-type + size; and, when HTML comes
+  // back, the human-readable Google error text. All lines are prefixed
+  // [AS] for easy grep in the Railway logs.
+  //
+  // NOTE: no timeout and no retry here, deliberately. A blanket 28s
+  // AbortSignal was tried and reverted (644d17a) — list_documents_for_batch
+  // legitimately runs longer, so the timeout turned a slow-but-working
+  // call into a guaranteed failure.
   const started = Date.now()
-  const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    reqJson
-  })
+  loopLag.reset()
+  asInFlight++
+  let res, text, tHeaders
+  try {
+    res = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    reqJson
+    })
+    tHeaders = Date.now()
+    text = await res.text()
+  } finally {
+    asInFlight--
+  }
 
-  const text     = await res.text()
-  const elapsed  = Date.now() - started
+  const finished = Date.now()
+  const elapsed  = finished - started
+  const ttfbMs   = tHeaders - started
+  const bodyMs   = finished - tHeaders
+  const elMaxMs  = ms(loopLag.max)
+  const elMeanMs = Number.isFinite(loopLag.mean) ? ms(loopLag.mean) : 0
   const ctype    = res.headers.get('content-type') || ''
   const clen     = res.headers.get('content-length') || ''
   const trimmed  = text.trim()
@@ -104,7 +144,10 @@ async function callAppsScript(action, data = null) {
 
   console.log(
     `[AS] action=${action} status=${res.status} redirected=${res.redirected} ` +
-    `elapsed=${elapsed}ms reqBytes=${reqJson.length} respBytes=${text.length} ` +
+    `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
+    `elMax=${elMaxMs}ms elMean=${elMeanMs}ms ` +
+    `asInFlight=${asInFlight} zips=${batchDownloadsActive} ` +
+    `reqBytes=${reqJson.length} respBytes=${text.length} ` +
     `contentLength=${clen || 'n/a'} contentType="${ctype}" ` +
     `finalUrl=${res.url} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
   )
@@ -119,7 +162,7 @@ async function callAppsScript(action, data = null) {
     // Strip tags/scripts/styles so the actual Google error message is
     // legible in the logs — this is the piece that tells us WHY the
     // response wasn't JSON (authorization page, "exceeded maximum
-    // execution", "No HTML file named FieldReport" from doGet, etc.).
+    // execution", a googleusercontent 404, etc.).
     const readable = text
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -130,7 +173,10 @@ async function callAppsScript(action, data = null) {
     const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
     console.error(
       `[AS] HTML-RESPONSE action=${action} status=${res.status} ` +
-      `elapsed=${elapsed}ms respBytes=${text.length} finalUrl=${res.url}\n` +
+      `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
+      `elMax=${elMaxMs}ms zips=${batchDownloadsActive} ` +
+      `respBytes=${text.length} finalUrl=${res.url}\n` +
+      `[AS]   verdict=${elMaxMs > 1000 ? 'node-blocked (event loop stalled)' : 'apps-script-slow'}\n` +
       `[AS]   title="${titleMatch ? titleMatch[1].trim() : '(none)'}"\n` +
       `[AS]   readable="${readable.slice(0, 600)}"`
     )
@@ -1628,6 +1674,11 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
   const filters  = req.body || {}
   const markSent = !!filters.mark_sent
 
+  // Counted so the [AS] log lines can attribute a latency spike on some
+  // unrelated endpoint to a zip stream running concurrently.
+  batchDownloadsActive++
+  res.on('close', () => { batchDownloadsActive-- })
+
   // Cancel detection: listen on RES (not req). req.close fires when the
   // incoming request stream ends, which for a POST happens once express
   // has parsed the body — that's BEFORE our handler runs. Using req
@@ -1662,7 +1713,12 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     res.setHeader('Cache-Control', 'no-store')
     res.flushHeaders()
 
-    const archive = archiver('zip', { zlib: { level: 9 } })
+    // level 0 (store), not 9. The entries are PDFs, which are already
+    // deflate-compressed internally — level 9 bought ~nothing in size and
+    // cost a lot of CPU. Worse, zlib runs on libuv's 4-thread pool, which
+    // is the same pool Node's DNS getaddrinfo uses, so compressing a large
+    // batch starved every outbound Apps Script fetch of a lookup thread.
+    const archive = archiver('zip', { zlib: { level: 0 } })
     archive.on('warning', (e) => console.warn('archiver warning:', e.message))
     // Don't call res.end() in the error handler — archiver's pipe will
     // unpipe and let the response surface the error naturally. Manually
@@ -1884,13 +1940,46 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
  *
  * Falls back to the original buffer on:
  *   - non-PDF inputs (Invoice_*.txt artifacts, magic-byte check)
+ *   - PDFs that provably carry no AcroForm (see canHaveAcroForm)
  *   - PDFs with no form fields (nothing to do)
  *   - pdf-lib parse errors (defensive)
  */
+/**
+ * Cheap, CONSERVATIVE pre-check: could this PDF possibly have an AcroForm?
+ *
+ * Returns false only when we can prove it cannot, so a false answer is
+ * always safe to act on. Getting this backwards is dangerous: a PDF whose
+ * fields we fail to rename keeps its generic field names, and when a prime
+ * merges several of our docs the same-named fields collapse into one value
+ * — the exact bug prepPdfForDelivery exists to prevent.
+ *
+ * Two literals matter:
+ *   /AcroForm — present uncompressed when the catalog is a plain object.
+ *   /ObjStm   — a compressed object stream, which CAN hide the catalog
+ *               (and therefore /AcroForm) from a raw byte scan. PDF 1.5+.
+ *
+ * An object stream's own dictionary is never itself compressed, so /ObjStm
+ * always appears in the clear. If NEITHER literal is present, there is no
+ * object stream to hide a catalog in and no visible /AcroForm — hence no
+ * form.
+ *
+ * Do not "simplify" this to a /AcroForm check. Verified against pdf-lib:
+ * a PDF saved with object streams (its default) carries form fields while
+ * the /AcroForm literal is absent from the raw bytes, so the one-literal
+ * scan skips a document that genuinely needs renaming.
+ */
+function canHaveAcroForm(buf) {
+  return buf.includes('/AcroForm') || buf.includes('/ObjStm')
+}
+
 async function prepPdfForDelivery(buf, filename) {
   if (!buf || buf.length < 5 || buf.slice(0, 5).toString() !== '%PDF-') {
     return buf
   }
+  // PDFDocument.load is synchronous CPU work despite the async signature,
+  // and it parses the whole file before we can ask whether it even has a
+  // form. Skip that cost for PDFs that provably have none.
+  if (!canHaveAcroForm(buf)) return buf
   try {
     const { PDFDocument, PDFName } = await import('pdf-lib')
     const doc = await PDFDocument.load(buf, { updateMetadata: false })
