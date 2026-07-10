@@ -6621,6 +6621,32 @@ const _MONTH_END_BY_KEY_ = Object.freeze(
   MONTH_END_DOCS_.reduce((m, d) => { m[d.key] = d; return m; }, {})
 );
 
+// ── Payroll-month bucketing for month-end docs ────────────────────
+// Month-end documents (Employee Utilization, Certificates) cover
+// PAYROLL weeks, not calendar days. A payroll week runs Sunday→Saturday
+// and belongs entirely to the month of its SUNDAY. So work on Aug 1
+// (week of Jul 26) files under July, and work on Jul 1–4 (week of
+// Jun 28) files under June. Every day lands in exactly one payroll
+// month, so nothing is double-counted across two forms.
+//
+// This is what decides both WHICH (contract, borough, prime) pairs owe
+// a form for a month AND which employees are counted on it. A pair whose
+// first-ever work is Jul 1 owes June's EU + Certificates, not July's.
+//
+// Note the last Sunday of month M is exactly weekStartIsoFor(last day of
+// M), so the existing "due once the month's final week begins" gate
+// already lines up with the last payroll week — no change needed there.
+function _weekStartIsoOf_(dateIso) {
+  const d = (dateIso instanceof Date) ? dateIso : new Date(String(dateIso) + 'T12:00:00');
+  if (isNaN(d.getTime())) return '';
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - d.getDay());
+  return Utilities.formatDate(start, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+}
+function _payrollMonthIso_(dateIso) {
+  const ws = _weekStartIsoOf_(dateIso);
+  return ws ? ws.slice(0, 7) : '';
+}
+
 // ── Employee Utilization race buckets ─────────────────────────────
 // Order and keys mirror the printed form's columns (see
 // workers/fill_utilization.py PAINTER_FIELDS: [TOT, B, H, A, NA, FEM]),
@@ -7016,13 +7042,14 @@ function _scanWorkDayLogForDate_(ss, dateIso) {
 }
 
 /**
- * Read every Work Day Log row for a given month (YYYY-MM) that matches
- * a (contractNum, borough) pair. Month-end analogue of
+ * Read every Work Day Log row in a given PAYROLL month (YYYY-MM) that
+ * matches a (contractNum, borough) pair. Month-end analogue of
  * _scanWorkDayLogForDate_ — used to reverse-engineer contractor +
  * WO IDs when a manual Mark Done flips a month-end doc whose Log row
- * doesn't exist yet. The target tuple is the month-end DOC identity:
- * BILLING at MONTH granularity from the cutover month on (the whole
- * cutover month bills as one — see _billingRemapForMonth_), raw before.
+ * doesn't exist yet. Rows are bucketed by _payrollMonthIso_, so the
+ * spill-over days of a straddling week land on the month that owns the
+ * week. The target tuple is the month-end DOC identity: BILLING at
+ * MONTH granularity from the cutover month on, raw before.
  * Returns [{ wo_id, contractor }, ...].
  */
 function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractorSlug) {
@@ -7044,7 +7071,7 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractor
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
     const iso = ymd(r[0]);
-    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    if (!iso || _payrollMonthIso_(iso) !== monthIso) continue;
     const rowCn  = String(r[3] || '').split('/')[0].trim();
     const rowBor = String(r[4] || '').trim();
     const rowCo  = String(r[2] || '').trim();
@@ -7068,19 +7095,20 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractor
  * Monthly Workforce Utilization Form (one per contract·borough·prime).
  *
  * Counts DISTINCT employees who signed in on that (contract, borough,
- * contractor) during monthIso. An employee working 12 days counts once;
- * an employee on two contracts counts once under each. Hours are
- * irrelevant — a 0-hour crew member was still utilized.
+ * contractor) during the PAYROLL month monthIso — see _payrollMonthIso_,
+ * so a week straddling the month boundary is counted whole, on the month
+ * that owns its Sunday. An employee working 12 days counts once; an
+ * employee on two contracts counts once under each. Hours are irrelevant
+ * — a 0-hour crew member was still utilized.
  *
  * Employee names live ONLY in Daily Sign-In Data; the Work Day Log
  * (which built these rows) has none. So we join sign-in → registry by
  * normalized name, and key sign-in rows through _billingRemapForMonth_
- * — the same helper that minted the row's identity. That single call is
- * what reconciles a cutover month, where sign-in rows written before
- * the cutover still carry the raw borough while later ones carry the
- * billing borough, yet all belong to one month-end form. Using
- * _billingRemapAsOf_ here would strand the earlier rows under a key no
- * breakdown row uses.
+ * on the PAYROLL month — the same helper and the same month that minted
+ * the row's identity, so the keys agree by construction. (The billing
+ * cutover was deployed on a Sunday, i.e. a payroll-week boundary, so a
+ * week never straddles it and a sign-in row's stored borough always
+ * matches what its payroll month remaps to.)
  *
  * `wdlData` is the caller's already-read Work Day Log values.
  */
@@ -7108,7 +7136,7 @@ function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
   for (let i = 1; i < siData.length; i++) {
     const r = siData[i];
     const iso = ymd(r[0]);
-    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    if (!iso || _payrollMonthIso_(iso) !== monthIso) continue;
     const name = _normNameKey_(r[6]);
     if (!name) continue;
     // cols: 2 = Prime Contractor (raw, never remapped), 3/4 = Contract/Borough
@@ -7126,7 +7154,7 @@ function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
   for (let i = 1; i < wdlData.length; i++) {
     const r = wdlData[i];
     const iso = ymd(r[0]);
-    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    if (!iso || _payrollMonthIso_(iso) !== monthIso) continue;
     if (String(r[8] || '').trim() === 'Submitted') continue;
     const k = keyOf(r[3], r[4], String(r[2] || '').trim());
     (pendingByKey[k] = pendingByKey[k] || new Set()).add(iso);
@@ -13122,13 +13150,17 @@ function _buildDocStatusPayload_(monthIso) {
     }
     weekTuples[wKey].wo_ids.add(woId);
 
-    // Month-end docs remap at MONTH granularity — the whole cutover
-    // month bills as one so its identity isn't split mid-month.
+    // Month-end docs (EU / Certificates) bucket by PAYROLL month, not
+    // calendar month: a Sun–Sat week belongs whole to the month of its
+    // Sunday, so Aug 1 files under July and Jul 1–4 file under June. A
+    // pair whose only work is Jul 1 therefore owes JUNE's docs.
+    // They remap at MONTH granularity — the whole cutover month bills as
+    // one so its identity isn't split mid-month.
     // The prime CONTRACTOR is part of the key (unconditionally, no cutover
     // gate): two primes can share a (contract, borough) — e.g. Metro AND
     // Denville on 701·BK — and each needs its own month-end docs. Without
     // the contractor they collide and one is dropped.
-    const monthIso2 = dateIso.slice(0, 7);
+    const monthIso2 = _payrollMonthIso_(dateIso);
     const billedMonth = _billingRemapForMonth_(monthIso2, contractNum, borough, contractor);
     const mKey = monthIso2 + '|' + contractor + '|' + billedMonth.contractNum + '|' + billedMonth.borough;
     if (!monthTuples[mKey]) {
@@ -13239,11 +13271,15 @@ function _buildDocStatusPayload_(monthIso) {
     cell.status = allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
   });
 
-  // Month-end docs (EU / CTC / CMP / LLC) for the viewed month, surfaced
-  // on the calendar's last week. One breakdown row per (contract, borough)
-  // pair that worked the month, each carrying the four docs' Done/Sent
-  // state. Only populated once the month's final week has begun (they're
-  // due at month end) — and only for months that actually had work.
+  // Month-end docs (EU / Certificates) for the viewed month, surfaced on
+  // the calendar's last week. One breakdown row per (contract, borough,
+  // prime) that worked the PAYROLL month — see _payrollMonthIso_, so the
+  // straddling week counts whole on the month owning its Sunday. Each row
+  // carries the docs' Done/Sent state. Only populated once the month's
+  // final week has begun (they're due at month end) — and only for months
+  // that actually had work. Note that final week runs into the next
+  // calendar month, so the counts firm up as its sign-ins land; the
+  // "awaiting sign-in" warning on each row tracks exactly that.
   const contractIdMap = _readContractIdMap_(ss);
   const monthEndDue = todayIso >= monthLastWeekStartIso(monthIso);
   const monthEndBreakdown = (!monthEndDue ? [] : Object.values(monthTuples)
