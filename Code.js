@@ -292,10 +292,24 @@ function _createDashboardCacheTrigger_() {
 }
 
 /**
- * Run once from the Apps Script editor. Installs the onEdit trigger that
- * keeps the dashboard cache honest when someone edits the WO Tracker or
- * Marking Items by hand. Safe to re-run — it replaces its own trigger and
- * touches nothing else.
+ * Installs the onEdit trigger that keeps the dashboard cache honest when
+ * someone edits the WO Tracker or Marking Items by hand. Safe to re-run —
+ * it replaces its own trigger and touches nothing else.
+ *
+ * ⚠️ This throws unless the manifest grants
+ *    https://www.googleapis.com/auth/script.scriptapp
+ * which appsscript.json deliberately does NOT include. Adding an oauthScope
+ * forces the deploying user to re-authorize, and until they do, a
+ * USER_DEPLOYING + ANYONE_ANONYMOUS web app answers every request with an
+ * authorization HTML page — the exact "HTML instead of JSON" failure this
+ * whole change set exists to prevent. Not worth it for one trigger.
+ *
+ * Install it by hand instead (one time, no scope change):
+ *   Editor → Triggers → + Add Trigger
+ *   function: onSheetEditEvictDashboardCache · deployment: Head
+ *   event source: From spreadsheet · event type: On edit
+ *
+ * The HANDLER needs no extra scope — only this installer does.
  */
 function setupDashboardCacheTrigger() {
   _createDashboardCacheTrigger_();
