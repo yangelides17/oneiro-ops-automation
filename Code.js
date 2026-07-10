@@ -702,7 +702,11 @@ function generateDailyDocuments(dateStr, opts) {
   Logger.log(`📋 Processing ${Object.keys(byWorkOrder).length} work orders for ${targetDate.toDateString()}`);
 
   // Generate Production Log (Metro Express format)
-  const plOpts = (opts && opts.contractorFilter) ? { contractorFilter: opts.contractorFilter } : undefined;
+  const plOpts = (opts && (opts.contractorFilter || opts.hasCrewChiefFilter))
+    ? { contractorFilter:   opts.contractorFilter,
+        hasCrewChiefFilter: !!opts.hasCrewChiefFilter,
+        crewChiefSlug:      opts.crewChiefSlug }
+    : undefined;
   const plFiles = generateProductionLog_(targetDate, todaysEntries, byWorkOrder, woData, ss, plOpts) || [];
 
   // Per-doc generation (PL only) skips Field Reports + Invoices — those
@@ -1039,7 +1043,17 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
 
   const generated = [];
 
-  const buckets = Object.values(byContractorChief).filter(b => enabled.includes(b.contractor));
+  let buckets = Object.values(byContractorChief).filter(b => enabled.includes(b.contractor));
+  // Per-doc PL generation targets ONE (contractor, chief) pending item.
+  // Narrow to that chief so a click doesn't regenerate every crew's PL.
+  // Compare on the SLUG (the doc_id form) — buckets hold the raw chief
+  // name. Blank chief ('') is a legitimate bucket, so gate on the flag,
+  // never on truthiness. No flag = bulk/cron path = keep every bucket.
+  if (opts && opts.hasCrewChiefFilter) {
+    const wantSlug = String(opts.crewChiefSlug || '');
+    buckets = buckets.filter(b =>
+      String(b.chief || '').replace(/[^A-Za-z0-9]/g, '') === wantSlug);
+  }
   if (buckets.length === 0) {
     Logger.log(`No enabled-contractor sign-ins on ${targetDayStr} — no Production Logs generated.`);
     return generated;
@@ -3077,15 +3091,20 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     return 0;
   }
   
-  // Group by Contract # + Borough (which maps to Contract ID).
-  // Post-cutover rows carry the BILLING tuple in cols 3/4 (written at
-  // sign-in submit), so these buckets are billing buckets — raw-BK and
-  // raw-M work for the same prime lands in ONE bucket → ONE CP.
+  // Group by BILLING Contract # + Borough. Post-cutover rows already
+  // carry the billing tuple in cols 3/4 (written at sign-in submit), so
+  // `_billingRemapAsOf_` is a no-op on them. Routing every row through
+  // the era-aware helper anyway means a stray raw tuple (e.g. a hand-
+  // edited 701·BK row) is normalized to its billing identity (M / QU)
+  // BEFORE bucketing — so each bucket is exactly one prime's billing
+  // tuple, its file/doc_id are billing-keyed, and the Doc Status pill
+  // (also billing-keyed) flips. This is why the old contractor-split is
+  // gone: the split now happens upstream, at the tuple level.
   const byContract = {};
   weekEntries.forEach(row => {
-    const contractNum = String(row[3]).split('/')[0]; // Strip suffix
-    const borough = row[4];
-    const key = `${contractNum}|${borough}`;
+    const dateIso = Utilities.formatDate(new Date(row[0]), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    const billed  = _billingRemapAsOf_(dateIso, row[3], row[4], row[2]);
+    const key = `${billed.contractNum}|${billed.borough}`;
     if (!byContract[key]) byContract[key] = [];
     byContract[key].push(row);
   });
@@ -3112,49 +3131,32 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   };
   const classificationName = code => CLASSIFICATION_NAMES[String(code).trim().toUpperCase()] || String(code).trim();
 
-  // For each contract group, generate certified payroll entries.
-  //
-  // Sub-prime billing remap: when a (raw contract, borough) has a
-  // remap rule (sub-prime work on a contract the prime didn't win),
-  // split this bucket by contractor so each sub-prime gets their own
-  // CP billed under their own contract. Without remap, the bucket
-  // runs once for all contractors combined (existing behavior — one
-  // CP per (contract, borough)).
-  let cpSubBucketsGenerated = 0;
-  Object.entries(byContract).forEach(([key, rawEntries]) => {
-    const [rawContractNum, rawBorough] = key.split('|');
+  // For each billing bucket, generate certified payroll entries. Each
+  // bucket is exactly one prime's billing tuple (the grouping above
+  // normalized every row to its billing identity), so there is no
+  // per-contractor split here.
+  let cpBucketsGenerated = 0;
+  Object.entries(byContract).forEach(([key, entries]) => {
+    const [contractNum, borough] = key.split('|');
 
-    const subBuckets = _hasBillingRemap_(rawContractNum, rawBorough)
-      ? Object.entries(rawEntries.reduce((acc, r) => {
-          const co = String(r[2] || '').trim();
-          (acc[co] = acc[co] || []).push(r);
-          return acc;
-        }, {})).map(([contractor, entries]) => {
-          const m = _billingRemap_(rawContractNum, rawBorough, contractor);
-          return { contractor, contractNum: m.contractNum, borough: m.borough, entries };
-        })
-      : [{ contractor: null, contractNum: rawContractNum, borough: rawBorough, entries: rawEntries }];
-
-  subBuckets.forEach(({ contractor: bucketContractor, contractNum, borough, entries }) => {
-    cpSubBucketsGenerated++;
-
-    // Guard: merging boroughs within ONE prime is intended post-cutover;
-    // merging two PRIMES onto one CP never is. If a non-split bucket
-    // (billing tuple, or a raw tuple with no remap rule) ever holds >1
-    // distinct DSID contractor — e.g. a second genuine 701-M prime
-    // appears alongside remapped Metro-BK rows — log loudly so it's
-    // caught in review. Generation continues (existing behavior).
-    if (!bucketContractor) {
-      const _distinctContractors = Array.from(new Set(
-        entries.map(r => String(r[2] || '').trim()).filter(Boolean)
-      ));
-      if (_distinctContractors.length > 1) {
-        Logger.log('🚨 Certified Payroll: bucket ' + contractNum + '|' + borough +
-                   ' (week of ' + weekStartStr + ') contains ' + _distinctContractors.length +
-                   ' distinct contractors (' + _distinctContractors.join(', ') +
-                   ') merged onto ONE CP — verify this is intended; the billing remap must never merge two primes.');
-      }
+    // A certified payroll is ONE prime's wage certification — two
+    // distinct primes must never share a CP. Merging boroughs within one
+    // prime is fine (that's the billing rollup), but if a bucket holds
+    // >1 distinct DSID contractor (e.g. Metro-BK remapped to M landing
+    // alongside a genuine 701·M prime), REFUSE: emit no file and leave
+    // the Doc Status pill red for review rather than ship an invalid
+    // merged document.
+    const _distinctContractors = Array.from(new Set(
+      entries.map(r => String(r[2] || '').trim()).filter(Boolean)
+    ));
+    if (_distinctContractors.length > 1) {
+      Logger.log('🚨 Certified Payroll: bucket ' + contractNum + '|' + borough +
+                 ' (week of ' + weekStartStr + ') holds ' + _distinctContractors.length +
+                 ' distinct primes (' + _distinctContractors.join(', ') +
+                 ') — REFUSING to generate a merged two-prime CP. No file produced.');
+      return;   // skip this bucket; counter stays unincremented
     }
+    cpBucketsGenerated++;
 
     // Look up Contract ID from lookup table (uses MAPPED contract+borough
     // when remap applied, so the right contract's registration/project
@@ -3375,28 +3377,19 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     // The form still prints "WEEK ENDING DATE" (Saturday) in its header
     // because that's the standard payroll convention on the form itself.
     //
-    // Filename carries this bucket's DOC identity: post-cutover buckets
-    // are billing-keyed (DSID cols 3/4 are billing), so the filename is
-    // billing-named and the archive stores it into every raw folder it
-    // covers. Pre-cutover raw buckets that hit the sub-prime split keep
-    // the RAW key + a contractor slug to disambiguate the two PDFs that
-    // share it — without the slug they'd collide in Drive and one would
-    // clobber the other.
-    const _cpRawContract = bucketContractor ? rawContractNum : contractNum;
-    const _cpRawBorough  = bucketContractor ? rawBorough     : borough;
-    const _cpContractorSlug = bucketContractor
-      ? '_' + bucketContractor.replace(/[^A-Za-z0-9]/g, '')
-      : '';
-    const cpJsonName = `Certified_Payroll_${_cpRawContract}_${_cpRawBorough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}${_cpContractorSlug}.json`;
+    // Filename carries this bucket's DOC identity — the bucket is always
+    // billing-keyed (rows were normalized to their billing tuple before
+    // grouping), so the filename is billing-named and the archive stores
+    // it into every raw folder it covers.
+    const cpJsonName = `Certified_Payroll_${contractNum}_${borough}_${Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd')}.json`;
     cpFolder.createFile(cpJsonName, JSON.stringify(cpJson, null, 2), MimeType.PLAIN_TEXT);
     Logger.log(`✅ Certified payroll JSON exported: ${cpJsonName}`);
     // ─────────────────────────────────────────────────────────────────────────
 
-    Logger.log(`✅ Certified payroll entries created for ${contractNum}/${borough}${bucketContractor ? ' (' + bucketContractor + ')' : ''}: ${sortedEntries.length} entries (one per employee × classification)`);
-  });
+    Logger.log(`✅ Certified payroll entries created for ${contractNum}/${borough}: ${sortedEntries.length} entries (one per employee × classification)`);
   });
 
-  const contractCount = cpSubBucketsGenerated;
+  const contractCount = cpBucketsGenerated;
 
   // Flag for human review
   const logSheet = ss.getSheetByName('Automation Log');
@@ -8568,7 +8561,9 @@ function handleGeneratePLForDoc_(body) {
     const [yyyy, mm, dd] = parsed.anchor.split('-');
     const dateMmDd = `${mm}/${dd}/${yyyy}`;
     const result = generateDailyDocuments(dateMmDd, {
-      contractorFilter:           parsed.contractor,
+      contractorFilter:            parsed.contractor,
+      hasCrewChiefFilter:          true,
+      crewChiefSlug:               parsed.crew_chief,   // slug; '' = blank-chief bucket
       skipFieldReportsAndInvoices: true,
     });
     const files = (result && result.generated) || [];
@@ -13165,6 +13160,15 @@ function _buildDocStatusPayload_(monthIso) {
   const wdlSheet = ss.getSheetByName('Work Day Log');
   const wdlData  = wdlSheet ? wdlSheet.getDataRange().getValues() : [];
 
+  // WO Tracker is the authority for a WO's contractor. The PL generator
+  // (generateProductionLog_) and the archiver both resolve the PL
+  // contractor from here, so the pending-list PL doc_id MUST derive its
+  // contractor from the same source — not Work Day Log col 2, which can
+  // drift (whitespace, alias, a genuinely different string) and silently
+  // leave the Done pill unflipped. Fall back to WDL only when the WO is
+  // absent from the Tracker.
+  const woTrackerMap = _buildWOTrackerMap_(ss);
+
   // Per-contractor PL eligibility: only contractors in
   // CONFIG.PRODUCTION_LOG_CONTRACTORS need PLs. Other primes' breakdown
   // entries get pl_required=false and the calendar/popover/pending list
@@ -13246,10 +13250,15 @@ function _buildDocStatusPayload_(monthIso) {
     // PL stays raw: it's keyed by (date, contractor), no borough.
     const billed = _billingRemapAsOf_(dateIso, contractNum, borough, contractor);
 
-    const cdKey = dateIso + '|' + contractor + '|' + crewChief;
+    // PL identity contractor: authoritative WO Tracker value, matching
+    // the generator + archiver. Falls back to the WDL contractor only
+    // when the WO isn't on the Tracker.
+    const plContractor = (woTrackerMap[woId] && woTrackerMap[woId].contractor) || contractor;
+
+    const cdKey = dateIso + '|' + plContractor + '|' + crewChief;
     if (!contractorDays[cdKey]) {
       contractorDays[cdKey] = {
-        date: dateIso, contractor, crew_chief: crewChief,
+        date: dateIso, contractor: plContractor, crew_chief: crewChief,
         wo_ids: new Set(),
         contracts: {},
       };
