@@ -87,6 +87,19 @@ const MONTH_END_DOCS = [
 const MONTH_END_KEYS = new Set(MONTH_END_DOCS.map(d => d.key))
 const MONTH_END_NOTE = Object.fromEntries(MONTH_END_DOCS.map(d => [d.key, d.note || '']))
 
+// Render the Employee Utilization counts as one transcribable line, in
+// the printed form's column order using its own abbreviations:
+//   "TOT 12 · B 3 · H 4 · FEM 2"
+// Zero-count races are omitted to keep it short; TOT always shows (an
+// all-White crew renders "TOT 5" alone, since the form has no White
+// column). OTH covers registry gaps and never hides from the total.
+function utilizationLine(u) {
+  const parts = [`TOT ${u.total}`]
+  ;(u.buckets || []).forEach(b => { if (b.count > 0) parts.push(`${b.key} ${b.count}`) })
+  if (u.other > 0) parts.push(`OTH ${u.other}`)
+  return parts.join(' · ')
+}
+
 // A month-end pending item is anchored to a whole month, not a week.
 // Detect it from the missing flag's doc key and pull the month out of
 // the doc_id (e.g. "EU_2026-06_84125MBTP701_BK" → "2026-06"). Returns
@@ -488,6 +501,17 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
                       <p className="text-[11px] text-slate-500">
                         <span className="font-semibold">Contract ID:</span> <span className="font-mono">{row.contract_id}</span>
                       </p>
+                    )}
+                    {row.utilization && (
+                      <div className="space-y-0.5">
+                        <p className="text-[11px] text-slate-500">
+                          <span className="font-semibold">Employee Utilization:</span>{' '}
+                          <span className="font-mono">{utilizationLine(row.utilization)}</span>
+                        </p>
+                        {(row.utilization.warnings || []).map((w, wi) => (
+                          <p key={wi} className="text-[10px] text-amber-600">⚠ {w}</p>
+                        ))}
+                      </div>
                     )}
                     <div className="space-y-1.5 pl-2 border-l-2 border-slate-300/60">
                       {(row.docs || []).map((mdoc) => (

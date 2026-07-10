@@ -6621,6 +6621,38 @@ const _MONTH_END_BY_KEY_ = Object.freeze(
   MONTH_END_DOCS_.reduce((m, d) => { m[d.key] = d; return m; }, {})
 );
 
+// ── Employee Utilization race buckets ─────────────────────────────
+// Order and keys mirror the printed form's columns (see
+// workers/fill_utilization.py PAINTER_FIELDS: [TOT, B, H, A, NA, FEM]),
+// so the Doc Status modal reads straight across onto the paper form.
+// WHITE is deliberately absent: the form has no White column, it only
+// feeds the Total. Each employee carries exactly ONE Race value
+// (Employee Registry pick list: White, Black, Hispanic, Asian,
+// Native American, Female).
+const _UTIL_RACE_BUCKETS_ = Object.freeze([
+  { key: 'B',   label: 'Black' },
+  { key: 'H',   label: 'Hispanic' },
+  { key: 'A',   label: 'Asian' },
+  { key: 'NA',  label: 'Native American' },
+  { key: 'FEM', label: 'Female' },
+]);
+
+// Race cell → bucket key | 'WHITE' (Total only) | null (Other).
+// A null return NEVER drops the employee — they still count toward the
+// Total and surface under "OTH" so a bad cell can't silently shrink a
+// number that goes on a government form.
+function _utilRaceBucket_(raw) {
+  switch (String(raw || '').trim().toLowerCase()) {
+    case 'white':           return 'WHITE';
+    case 'black':           return 'B';
+    case 'hispanic':        return 'H';
+    case 'asian':           return 'A';
+    case 'native american': return 'NA';
+    case 'female':          return 'FEM';
+    default:                return null;
+  }
+}
+
 /**
  * Build a month-end Doc ID:
  *   <KEY>_<YYYY-MM>_<contractNum>_<borough>_<contractorSlug>
@@ -6688,6 +6720,53 @@ function _readContractIdMap_(ss) {
     map[cn + '|' + bor] = id;
   }
   return map;
+}
+
+/**
+ * Build a (normalized employee name → Race string) map from the
+ * Employee Registry, for the month-end Employee Utilization counts.
+ *
+ * The Registry has no setup function and is read positionally elsewhere
+ * (r[1] = Name), so the Race column's index is NOT hardcoded — we scan
+ * the header row for it. A registry with no Race column yields
+ * hasRaceCol:false and an empty map; callers then bucket everyone as
+ * "Other" and warn, rather than throwing on the dashboard's hot path.
+ *
+ * Cached 5 min in CacheService, mirroring handleListEmployees_.
+ */
+function _readEmployeeRaceMap_(ss) {
+  const cache  = CacheService.getScriptCache();
+  const cached = cache.get('doc_util_race_v1');
+  if (cached) return JSON.parse(cached);
+
+  const out = { byName: {}, hasRaceCol: false };
+  const sheet = ss.getSheetByName('Employee Registry');
+  if (!sheet) return out;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return out;
+
+  const header  = data[0].map(h => String(h || '').trim());
+  const raceIdx = header.findIndex(h => /^race$/i.test(h));
+  // Name header is not guaranteed; fall back to the positional col B
+  // that every other Registry reader assumes.
+  const nameIdxFound = header.findIndex(h => /^name$/i.test(h));
+  const nameIdx = nameIdxFound === -1 ? 1 : nameIdxFound;
+
+  if (raceIdx === -1) {
+    Logger.log('⚠ Employee Registry has no "Race" column — utilization counts will bucket everyone as Other.');
+    cache.put('doc_util_race_v1', JSON.stringify(out), 300);
+    return out;
+  }
+  out.hasRaceCol = true;
+
+  for (let i = 1; i < data.length; i++) {
+    const key = _normNameKey_(data[i][nameIdx]);
+    if (!key) continue;
+    out.byName[key] = String(data[i][raceIdx] || '').trim();
+  }
+  cache.put('doc_util_race_v1', JSON.stringify(out), 300);
+  return out;
 }
 
 /**
@@ -6981,6 +7060,118 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractor
     });
   }
   return out;
+}
+
+/**
+ * Attach Employee Utilization race counts to each month-end breakdown
+ * row, so the Doc Status modal can show the numbers that go on the
+ * Monthly Workforce Utilization Form (one per contract·borough·prime).
+ *
+ * Counts DISTINCT employees who signed in on that (contract, borough,
+ * contractor) during monthIso. An employee working 12 days counts once;
+ * an employee on two contracts counts once under each. Hours are
+ * irrelevant — a 0-hour crew member was still utilized.
+ *
+ * Employee names live ONLY in Daily Sign-In Data; the Work Day Log
+ * (which built these rows) has none. So we join sign-in → registry by
+ * normalized name, and key sign-in rows through _billingRemapForMonth_
+ * — the same helper that minted the row's identity. That single call is
+ * what reconciles a cutover month, where sign-in rows written before
+ * the cutover still carry the raw borough while later ones carry the
+ * billing borough, yet all belong to one month-end form. Using
+ * _billingRemapAsOf_ here would strand the earlier rows under a key no
+ * breakdown row uses.
+ *
+ * `wdlData` is the caller's already-read Work Day Log values.
+ */
+function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
+  const race = _readEmployeeRaceMap_(ss);
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const m = String(v || '').trim().match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  // Identity of a month-end row: billed contract + billed borough +
+  // raw contractor slug. Metro and Denville share 701·BK and each files
+  // their own form, so the contractor cannot be dropped from the key.
+  const keyOf = (cn, bor, contractor) => {
+    const billed = _billingRemapForMonth_(monthIso, cn, bor, contractor);
+    return billed.contractNum + '|' + billed.borough + '|' + _slugify_(contractor);
+  };
+
+  // ── Pass 1: distinct signed-in employees per key ────────────────
+  const namesByKey = {};
+  const siSheet = ss.getSheetByName('Daily Sign-In Data');
+  const siData  = siSheet ? siSheet.getDataRange().getValues() : [];
+  for (let i = 1; i < siData.length; i++) {
+    const r = siData[i];
+    const iso = ymd(r[0]);
+    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    const name = _normNameKey_(r[6]);
+    if (!name) continue;
+    // cols: 2 = Prime Contractor (raw, never remapped), 3/4 = Contract/Borough
+    const k = keyOf(r[3], r[4], String(r[2] || '').trim());
+    (namesByKey[k] = namesByKey[k] || new Set()).add(name);
+  }
+
+  // ── Pass 2: worked days still awaiting sign-in, per key ─────────
+  // Read the Work Day Log's own Sign-In Status (col 8) rather than
+  // diffing dates against the sign-in sheet: sign-in submit matches WDL
+  // rows by WO + crew chief, NOT by date, because the shift start date
+  // may have been kebab-edited or opDay-shifted. A date diff would fire
+  // false "missing sign-in" warnings on exactly those rows.
+  const pendingByKey = {};
+  for (let i = 1; i < wdlData.length; i++) {
+    const r = wdlData[i];
+    const iso = ymd(r[0]);
+    if (!iso || iso.slice(0, 7) !== monthIso) continue;
+    if (String(r[8] || '').trim() === 'Submitted') continue;
+    const k = keyOf(r[3], r[4], String(r[2] || '').trim());
+    (pendingByKey[k] = pendingByKey[k] || new Set()).add(iso);
+  }
+
+  // ── Fold onto each breakdown row ────────────────────────────────
+  breakdownRows.forEach(row => {
+    // row.contract_num / row.borough are already billed; row.contractor raw.
+    const k = row.contract_num + '|' + row.borough + '|' + _slugify_(row.contractor);
+    const names = namesByKey[k] || new Set();
+
+    const counts = {};
+    _UTIL_RACE_BUCKETS_.forEach(b => { counts[b.key] = 0; });
+    let other = 0, missingRegistry = 0;
+
+    names.forEach(nm => {
+      const known  = Object.prototype.hasOwnProperty.call(race.byName, nm);
+      const bucket = known ? _utilRaceBucket_(race.byName[nm]) : null;
+      if (bucket === 'WHITE') return;            // Total only — no form column
+      if (bucket === null) {
+        other++;
+        if (!known || !String(race.byName[nm] || '').trim()) missingRegistry++;
+        return;
+      }
+      counts[bucket]++;
+    });
+
+    const warnings = [];
+    const pending = pendingByKey[k];
+    if (pending && pending.size > 0) {
+      warnings.push(pending.size + ' worked day(s) awaiting sign-in — counts may be low');
+    }
+    if (!race.hasRaceCol) {
+      warnings.push('Race column not found in Employee Registry');
+    } else if (missingRegistry > 0) {
+      warnings.push(missingRegistry + ' employee(s) missing from / blank race in Employee Registry');
+    }
+
+    row.utilization = {
+      total:    names.size,                      // includes White and Other
+      buckets:  _UTIL_RACE_BUCKETS_.map(b => ({ key: b.key, count: counts[b.key] })),
+      other:    other,
+      warnings: warnings,
+    };
+  });
 }
 
 /**
@@ -13076,6 +13267,14 @@ function _buildDocStatusPayload_(monthIso) {
       }),
     }))
     .sort((a, b) => (a.contract_num + a.borough).localeCompare(b.contract_num + b.borough));
+
+  // Employee Utilization counts for the modal. Gated on a non-empty
+  // breakdown — which only happens once the month's final week has
+  // begun — so the full Daily Sign-In Data read stays off the dashboard's
+  // hot path for the rest of the month.
+  if (monthEndBreakdown.length > 0) {
+    _attachUtilizationCounts_(ss, monthIso, monthEndBreakdown, wdlData);
+  }
 
   let meAllFull = monthEndBreakdown.length > 0, meAllEmpty = true;
   monthEndBreakdown.forEach(row => {
