@@ -14,12 +14,26 @@ matching the value the Node service sends. Reachable only over Railway's
 private network in production.
 """
 import json
+import socket
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fill_form import DOC_KIND_TEMPLATE, fill_acroform
+
+
+class _DualStackServer(ThreadingHTTPServer):
+    # Railway's private network is IPv6-only; bind :: dual-stack so the web
+    # service can reach us over railway.internal (and IPv4 localhost too).
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
 
 
 def _make_handler(service, get_template, key):
@@ -74,6 +88,6 @@ def _make_handler(service, get_template, key):
 
 def start_fill_server(service, get_template, port: int, key: str):
     """Start the fill HTTP server in a daemon thread. Returns the server."""
-    httpd = ThreadingHTTPServer(('0.0.0.0', port), _make_handler(service, get_template, key))
+    httpd = _DualStackServer(('::', port), _make_handler(service, get_template, key))
     threading.Thread(target=httpd.serve_forever, daemon=True, name='fill-server').start()
     return httpd
