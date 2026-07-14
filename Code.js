@@ -13715,8 +13715,8 @@ function _buildDocStatusPayload_(monthIso) {
   // gated (above) to the Sunday after the month's last payroll week; the
   // heavy Employee-Utilization read below stays gated to that same date.
   const monthEndPendingDue = todayIso >= addDaysIso(monthLastWeekStartIso(monthIso), 7);
-  const monthEndBreakdown = Object.values(monthTuples)
-    .filter(mt => mt.month === monthIso)
+  const buildMEBreakdown = (monIso) => Object.values(monthTuples)
+    .filter(mt => mt.month === monIso)
     .map(mt => ({
       contractor:   mt.contractor,
       contract_num: mt.contract_num,
@@ -13736,30 +13736,46 @@ function _buildDocStatusPayload_(monthIso) {
       }),
     }))
     .sort((a, b) => (a.contract_num + a.borough).localeCompare(b.contract_num + b.borough));
+  const meStatus = (rows) => {
+    let allFull = rows.length > 0, allEmpty = true;
+    rows.forEach(row => (row.docs || []).forEach(m => {
+      if (!(m.done && m.sent)) allFull = false;
+      if (m.done || m.sent)    allEmpty = false;
+    }));
+    return allFull ? 'green' : (allEmpty ? 'gray' : 'amber');
+  };
 
-  // Employee Utilization counts for the modal. The breakdown now populates
-  // all month, so gate the counts explicitly on the month-end due date
-  // (Sunday after the last payroll week) to keep the full Daily Sign-In
-  // Data read off the dashboard's hot path until the docs are actionable.
+  const monthEndBreakdown = buildMEBreakdown(monthIso);
+  // Employee Utilization counts for the modal. The breakdown populates all
+  // month, so gate the counts explicitly on the due date (Sunday after the
+  // last payroll week) to keep the full Daily Sign-In Data read off the hot path.
   if (monthEndBreakdown.length > 0 && monthEndPendingDue) {
     _attachUtilizationCounts_(ss, monthIso, monthEndBreakdown, wdlData);
   }
-
-  let meAllFull = monthEndBreakdown.length > 0, meAllEmpty = true;
-  monthEndBreakdown.forEach(row => {
-    row.docs.forEach(m => {
-      const full  = m.done && m.sent;
-      const empty = !m.done && !m.sent;
-      if (!full)  meAllFull  = false;
-      if (!empty) meAllEmpty = false;
-    });
-  });
   const monthEndPanel = {
-    month:     monthIso,
-    status:    meAllFull ? 'green' : (meAllEmpty ? 'gray' : 'amber'),
-    breakdown: monthEndBreakdown,
-    due:       monthEndPendingDue,   // gates the "Generate All" button (Sun after last payroll week)
+    month:      monthIso,
+    week_start: monthLastWeekStartIso(monthIso),   // the last-week cell it attaches to
+    status:     meStatus(monthEndBreakdown),
+    breakdown:  monthEndBreakdown,
+    due:        monthEndPendingDue,                // gates the "Generate All" button
   };
+
+  // Previous month's month-end docs attach to ITS last payroll week — which
+  // the calendar renders as the LEADING week of this grid when it straddles
+  // (e.g. the July grid shows "Jun 28 – Jul 4", June's last week). Without
+  // this the bullets vanish when you page to the next month. No utilization
+  // attach here — the extra full Daily Sign-In read isn't worth it for the
+  // straddling week (the bullets + Done/Sent + Generate All don't need it).
+  const [_meY, _meM] = monthIso.split('-').map(Number);
+  const prevMonthIso  = Utilities.formatDate(new Date(_meY, _meM - 2, 1), CONFIG.TIMEZONE, 'yyyy-MM');
+  const prevBreakdown = buildMEBreakdown(prevMonthIso);
+  const monthEndPrevPanel = prevBreakdown.length > 0 ? {
+    month:      prevMonthIso,
+    week_start: monthLastWeekStartIso(prevMonthIso),
+    status:     meStatus(prevBreakdown),
+    breakdown:  prevBreakdown,
+    due:        todayIso >= addDaysIso(monthLastWeekStartIso(prevMonthIso), 7),
+  } : null;
 
   // Pending list (all-time, FIFO oldest first). We emit one entry per
   // "missing" doc — so a (date, contract, borough) where both PL and
@@ -13875,7 +13891,8 @@ function _buildDocStatusPayload_(monthIso) {
     month: monthIso,
     days:   Object.values(dayCellByDate).sort((a, b) => a.date < b.date ? -1 : 1),
     weeks:  Object.values(weekCellByStart).sort((a, b) => a.week_start < b.week_start ? -1 : 1),
-    month_end: monthEndPanel,
+    month_end:      monthEndPanel,
+    month_end_prev: monthEndPrevPanel,   // prev month's panel for the straddling leading week
     pending,
   };
 }

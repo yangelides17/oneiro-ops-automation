@@ -658,7 +658,7 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
 // The month's last worked week additionally carries the month-end docs:
 // CP bullets stay left-justified; the 8 month-end bullets sit to the
 // right in two columns, and that cell's color rolls up both.
-function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCellClick }) {
+function WeekCalendar({ monthIso, weeks, monthEndByWeek, loading, onCellClick }) {
   const weekByStart = useMemo(() => {
     const m = {}
     ;(weeks || []).forEach(w => { m[w.week_start] = w })
@@ -683,22 +683,21 @@ function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCel
     cursor.setDate(cursor.getDate() + 7)
   }
 
-  const meBullets = summarizeMonthEnd(monthEnd?.breakdown)
-
   return (
     <div className={`card p-4 ${loading ? 'opacity-60 transition-opacity' : ''}`}>
       <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-1">Week of</p>
       <div className="space-y-1">
         {cells.map(c => {
           const cell = c.cell
-          // The last calendar week carries the month-end docs — even when
-          // it had no CP work. Then it's still clickable (opens the
-          // month-end popover) and shows only the month-end bullets.
-          const isLastWeek = c.week_start === lastWeekStart && meBullets.length > 0
+          // A week carries month-end docs when it's the last payroll week of
+          // SOME month — this month's, or the previous month's straddling
+          // leading week. Then it's clickable even with no CP work.
+          const me = monthEndByWeek[c.week_start]
+          const meBullets = me ? summarizeMonthEnd(me.breakdown) : []
+          const isLastWeek = meBullets.length > 0
           const clickable = !!cell || isLastWeek
-          const effectiveCell = cell || (isLastWeek ? { week_start: c.week_start, breakdown: [] } : null)
           const status = isLastWeek
-            ? combinedLastWeekStatus(cell, monthEnd)
+            ? combinedLastWeekStatus(cell, me)
             : (cell?.status || 'gray')
           const bg = STATUS_BG[status] || STATUS_BG.gray
           // CP bullets always render (even "– No Work" on the last week
@@ -940,13 +939,16 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   // The month's last CALENDAR week (Sunday of the week containing the
   // month's last day) — the card that carries the month-end docs, even
   // if that week had no CP work.
-  const lastWeekStart = useMemo(() => {
-    const [y, m] = monthIso.split('-').map(Number)
-    const lastDay = new Date(y, m, 0)
-    const sun = new Date(lastDay)
-    sun.setDate(lastDay.getDate() - lastDay.getDay())
-    return `${sun.getFullYear()}-${String(sun.getMonth() + 1).padStart(2, '0')}-${String(sun.getDate()).padStart(2, '0')}`
-  }, [monthIso])
+  // Month-end panels keyed by the week cell they attach to (each panel's
+  // last-payroll-week Sunday). Includes the previous month's panel so its
+  // docs still show on the straddling leading week when you page forward.
+  const monthEndByWeek = useMemo(() => {
+    const m = {}
+    for (const panel of [data?.month_end, data?.month_end_prev]) {
+      if (panel?.week_start) m[panel.week_start] = panel
+    }
+    return m
+  }, [data])
 
   // Apply a done/sent flip to `data` immutably — used for both the
   // optimistic update and the revert on failure.
@@ -1027,26 +1029,47 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         })
         return { ...cell, status: allFull ? 'green' : (allEmpty ? 'gray' : 'amber') }
       }
-      // Month-end cluster: flip the matching doc, then recolor.
-      let month_end = prev.month_end
-      if (month_end?.breakdown) {
-        const breakdown = month_end.breakdown.map(updateMonthEndRow)
+      // Month-end clusters (viewed month + the previous month's straddling
+      // week): flip the matching doc, then recolor. A doc lives in exactly
+      // one panel, so applying to both is safe.
+      const updateMEPanel = (panel) => {
+        if (!panel?.breakdown) return panel
+        const breakdown = panel.breakdown.map(updateMonthEndRow)
         let allFull = breakdown.length > 0, allEmpty = true
         breakdown.forEach(row => {
           ;(row.docs || []).forEach(m => {
-            const full  = m.done && m.sent
-            const empty = !m.done && !m.sent
-            if (!full)  allFull  = false
-            if (!empty) allEmpty = false
+            if (!(m.done && m.sent)) allFull  = false
+            if (m.done || m.sent)    allEmpty = false
           })
         })
-        month_end = { ...month_end, breakdown, status: allFull ? 'green' : (allEmpty ? 'gray' : 'amber') }
+        return { ...panel, breakdown, status: allFull ? 'green' : (allEmpty ? 'gray' : 'amber') }
       }
+      const month_end      = updateMEPanel(prev.month_end)
+      const month_end_prev = updateMEPanel(prev.month_end_prev)
+      // Optimistically reconcile the pending list so the "Mark Done" / "Mark
+      // Sent" buttons update it instantly (mirrors the server rule: a doc
+      // shows a "Done" item while !done, then a "Sent" item while done &&
+      // !sent, then nothing — except Sign-Ins, which have no Sent stage).
+      const pending = (prev.pending || []).flatMap(p => {
+        if (p.doc_id !== docId) return [p]
+        const m = (p.missing && p.missing[0]) || ''
+        const prefix = m.replace(/ (Done|Sent)$/, '')
+        if (flag === 'done' && value === true) {
+          return prefix === 'SI' ? [] : [{ ...p, missing: [prefix + ' Sent'] }]
+        }
+        if (flag === 'sent' && value === true) return []
+        if (flag === 'done' && value === false && / Sent$/.test(m)) {
+          return [{ ...p, missing: [prefix + ' Done'] }]
+        }
+        return [p]
+      })
       return {
         ...prev,
         days:  days?.map(recolorDay),
         weeks: weeks?.map(recolorWeek),
         month_end,
+        month_end_prev,
+        pending,
       }
   }
 
@@ -1091,7 +1114,7 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   const activeDayCell = activeDay ? (data?.days?.find(d => d.date === activeDay) || null) : null
   const activeWeekCell = activeWeek
     ? (data?.weeks?.find(w => w.week_start === activeWeek)
-        || (activeWeek === lastWeekStart ? { week_start: activeWeek, breakdown: [] } : null))
+        || (monthEndByWeek[activeWeek] ? { week_start: activeWeek, breakdown: [] } : null))
     : null
 
   const onPendingMark = (docId, flag, value) => flip(docId, flag, value)
@@ -1229,7 +1252,7 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         </div>
         <div className="space-y-3">
           <p className="section-label">Certified Payroll + Month-End Docs</p>
-          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} monthEnd={data?.month_end} lastWeekStart={lastWeekStart} loading={loading} onCellClick={setActiveWeek} />
+          <WeekCalendar monthIso={monthIso} weeks={data?.weeks} monthEndByWeek={monthEndByWeek} loading={loading} onCellClick={setActiveWeek} />
           <PendingList kind="week" pending={data?.pending} loading={loading} onMark={onPendingMark} onGenerate={onPendingGenerate} />
         </div>
       </div>
@@ -1245,8 +1268,8 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
       {activeWeekCell && (
         <WeekCellPopover
           cell={activeWeekCell}
-          monthEnd={data?.month_end}
-          showMonthEnd={activeWeek === lastWeekStart}
+          monthEnd={monthEndByWeek[activeWeek]}
+          showMonthEnd={!!monthEndByWeek[activeWeek]}
           onClose={() => setActiveWeek(null)}
           onFlip={flip}
           isPending={isPending}
