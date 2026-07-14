@@ -13759,12 +13759,13 @@ function _buildDocStatusPayload_(monthIso) {
   const prevBreakdown = buildMEBreakdown(prevMonthIso);
   const prevDue       = todayIso >= addDaysIso(monthLastWeekStartIso(prevMonthIso), 7);
 
-  // Employee Utilization counts for the popover. Gated on the due date so the
-  // read stays off the hot path until the docs are actionable. Read the Daily
-  // Sign-In Data sheet ONCE and attach to whichever panels are due (viewed
-  // month + the previous month's straddling week) — no double read.
-  const _attachCurrent = monthEndBreakdown.length > 0 && monthEndPendingDue;
-  const _attachPrev    = prevBreakdown.length > 0 && prevDue;
+  // Employee Utilization counts for the popover. These accumulate all month
+  // (like the contract breakdown) — NOT gated on the due date — so the last
+  // week shows counts as work lands rather than staying blank until the
+  // Sunday after the last payroll week. Read the Daily Sign-In Data sheet
+  // ONCE and attach to both panels (viewed month + previous month) from it.
+  const _attachCurrent = monthEndBreakdown.length > 0;
+  const _attachPrev    = prevBreakdown.length > 0;
   if (_attachCurrent || _attachPrev) {
     const siSheet = ss.getSheetByName('Daily Sign-In Data');
     const siData  = siSheet ? siSheet.getDataRange().getValues() : [];
