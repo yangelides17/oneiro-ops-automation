@@ -7160,6 +7160,10 @@ function _upsertDocLifecycleRow_(ss, payload) {
   } else if (payload.done === false) {
     updates.push({ col: 8, val: '' });
     updates.push({ col: 11, val: '' });
+    // Sent implies Done: clearing Done also clears Sent (+ Sent At), so the
+    // log can't hold Sent=Yes with Done blank (which locks the Sent pill).
+    updates.push({ col: 9,  val: '' });
+    updates.push({ col: 12, val: '' });
   }
   if (payload.sent === true) {
     updates.push({ col: 9, val: 'Yes' });

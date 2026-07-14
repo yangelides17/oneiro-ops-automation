@@ -910,19 +910,26 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   // optimistic update and the revert on failure.
   const applyFlag = (prev, docId, flag, value) => {
       if (!prev) return prev
+      // Set the flag on a doc; clearing DONE also clears SENT (Sent implies
+      // Done), matching the server cascade + DocStatusChips behavior.
+      const applyTo = (obj) => {
+        const next = { ...obj, [flag]: value }
+        if (flag === 'done' && value === false && next.sent) next.sent = false
+        return next
+      }
       // Day breakdown: flip PL on the contractor row OR SI on any matching
       // contract sub-entry. Either match-or-pass-through.
       const updateDayBreakdown = (b) => {
         let next = b
         if (b.pl && b.pl.doc_id === docId) {
-          next = { ...next, pl: { ...next.pl, [flag]: value } }
+          next = { ...next, pl: applyTo(next.pl) }
         }
         if (Array.isArray(b.contracts)) {
           let touched = false
           const contracts = b.contracts.map(c => {
             if (c.si && c.si.doc_id === docId) {
               touched = true
-              return { ...c, si: { ...c.si, [flag]: value } }
+              return { ...c, si: applyTo(c.si) }
             }
             return c
           })
@@ -932,14 +939,14 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
       }
       const updateWeekBreakdown = (b) => {
         if (!b.cp || b.cp.doc_id !== docId) return b
-        return { ...b, cp: { ...b.cp, [flag]: value } }
+        return { ...b, cp: applyTo(b.cp) }
       }
       // Month-end docs: flip the matching doc on any pair row.
       const updateMonthEndRow = (row) => {
         if (!Array.isArray(row.docs)) return row
         let touched = false
         const docs = row.docs.map(m => {
-          if (m.doc_id === docId) { touched = true; return { ...m, [flag]: value } }
+          if (m.doc_id === docId) { touched = true; return applyTo(m) }
           return m
         })
         return touched ? { ...row, docs } : row
