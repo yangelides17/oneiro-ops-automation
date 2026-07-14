@@ -5,7 +5,7 @@
 
 export const MARKING_CATEGORIES = [
   // WO Top Table
-  'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
+  'Double Yellow Line', 'Double White Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
   'Solid Lines', 'Rail Road X/Diamond', 'Others',
   // Intersection Grid
   'HVX Crosswalk', 'Stop Msg', 'Stop Line',
@@ -48,6 +48,7 @@ export const CATEGORY_UNITS = {
 
   // ── Linear Feet (lines, crosswalks, stop lines) ──────────────
   'Double Yellow Line':  'LF',
+  'Double White Line':   'LF',
   'Lane Lines':          'LF',
   'Solid Lines':         'LF',
   '4" Line':             'LF',
@@ -90,6 +91,21 @@ export const CATEGORY_UNITS = {
 }
 
 export const UNIT_OPTIONS = ['SF', 'LF', 'EA']
+
+// Display-only aliases. The KEY is the canonical stored/routing string
+// (unchanged everywhere — sheet value, pricing, unit, and PDF routing all
+// still key on it); the VALUE is only what the crew sees in the UI. Apply
+// via displayCategory() at render leaves ONLY, never in state/payloads/keys.
+// Editing a value here changes the visible label and nothing else.
+export const CATEGORY_DISPLAY_OVERRIDES = {
+  'Speed Hump Markings': 'Speed Bump Arrow',
+}
+
+// Presentation transform: canonical category string -> what the user sees.
+// Falls through to the raw string for everything not aliased.
+export function displayCategory(category) {
+  return CATEGORY_DISPLAY_OVERRIDES[category] || category
+}
 
 export function unitForCategory(category) {
   return CATEGORY_UNITS[category] || null

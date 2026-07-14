@@ -11,6 +11,7 @@ import {
   NEEDS_PRICING_REASON_LABEL,
   REVENUE_BUCKETS,
 } from '../lib/pricing'
+import { displayCategory } from '../lib/markingCategories'
 
 // ── Date range helpers ────────────────────────────────────────
 // Range picker presets: server defaults to MTD when start/end are
@@ -489,7 +490,7 @@ function NeedsPricingPanel({ items }) {
                         <td className="py-1.5 px-3 font-mono text-slate-600">{it.contract_num || '—'}</td>
                         <td className="py-1.5 px-3 text-slate-600">{it.borough || '—'}</td>
                         <td className="py-1.5 px-3 font-mono text-slate-500">{it.item_id}</td>
-                        <td className="py-1.5 px-3 text-slate-700">{it.category}</td>
+                        <td className="py-1.5 px-3 text-slate-700">{displayCategory(it.category)}</td>
                         <td className="py-1.5 px-3 text-slate-600">{it.qty}</td>
                         <td className="py-1.5 px-3 text-slate-500">{it.unit}</td>
                       </tr>

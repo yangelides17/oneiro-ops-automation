@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   MARKING_CATEGORIES, UNIT_OPTIONS,
-  unitForCategory, unitIsLocked, pickLayout,
+  unitForCategory, unitIsLocked, pickLayout, displayCategory,
 } from '../lib/markingCategories'
 import { parseQty } from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
@@ -455,7 +455,12 @@ function CategorySelect({ value, onChange }) {
     const q = query.trim().toLowerCase()
     const list = isLegacy ? [`Legacy: ${value}`, ...MARKING_CATEGORIES] : MARKING_CATEGORIES
     if (!q) return list
-    return list.filter(c => c.toLowerCase().indexOf(q) !== -1)
+    // Match against BOTH the raw category and its display alias so a
+    // search for e.g. "bump"/"arrow" still finds "Speed Hump Markings"
+    // (shown as "Speed Bump Arrow"). pick()/keys still use the raw string.
+    return list.filter(c =>
+      c.toLowerCase().indexOf(q) !== -1 ||
+      displayCategory(c).toLowerCase().indexOf(q) !== -1)
   }, [query, isLegacy, value])
 
   const pick = (c) => {
@@ -476,7 +481,7 @@ function CategorySelect({ value, onChange }) {
         className="field-input w-full text-left flex items-center justify-between"
       >
         <span className={value ? 'text-slate-800' : 'text-slate-400'}>
-          {value || 'Select a marking type'}
+          {value ? displayCategory(value) : 'Select a marking type'}
         </span>
         <span className="text-slate-400 text-xs ml-2">▾</span>
       </button>
@@ -507,7 +512,7 @@ function CategorySelect({ value, onChange }) {
                               hover:bg-slate-50
                               ${isSelected ? 'bg-navy/5 font-semibold text-navy' : 'text-slate-700'}`}
                 >
-                  {c}
+                  {displayCategory(c)}
                 </button>
               )
             })}

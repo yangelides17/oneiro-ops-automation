@@ -5,6 +5,7 @@ import {
   CartesianGrid,
 } from 'recharts'
 import { opToday } from '../lib/dateOps'
+import { displayCategory } from '../lib/markingCategories'
 
 // ── Date range presets (mirror RevenueTab) ────────────────────
 const PRESETS = [
@@ -310,7 +311,7 @@ function CategoryBreakdown({ rows }) {
                       <div key={r.category + '|' + r.unit}>
                         <div className="flex justify-between text-xs mb-0.5">
                           <span className="text-slate-700 font-medium truncate max-w-[60%]">
-                            {r.category}
+                            {displayCategory(r.category)}
                           </span>
                           <span className="text-slate-500 whitespace-nowrap">
                             {fmtNum(r.qty)} {r.unit} · {r.items} item{r.items === 1 ? '' : 's'}

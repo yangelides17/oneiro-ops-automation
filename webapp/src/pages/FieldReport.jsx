@@ -6,7 +6,7 @@ import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
 import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
-  pickLayout, rowIsCompletable, rowRequiresColor,
+  pickLayout, rowIsCompletable, rowRequiresColor, displayCategory,
 } from '../lib/markingCategories'
 import { parseQty }    from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
@@ -290,7 +290,7 @@ function MarkingItemRow({
   const onEnterBlur = (e) => { if (e.key === 'Enter') e.target.blur() }
 
   const CategoryBox = (
-    <input type="text" readOnly value={item.category ?? ''}
+    <input type="text" readOnly value={displayCategory(item.category ?? '')}
       placeholder="Marking Type" className={RO} />
   )
   // type="text" + full QWERTY keyboard (no inputMode override) — gives
@@ -1768,7 +1768,7 @@ export default function FieldReport() {
       rowRequiresColor(i) && !String(i.color_material || '').trim()
     )
     if (missingColor.length > 0) {
-      const labels = missingColor.slice(0, 6).map(i => `• ${i.category}`).join('\n')
+      const labels = missingColor.slice(0, 6).map(i => `• ${displayCategory(i.category)}`).join('\n')
       const more = missingColor.length > 6 ? `\n…and ${missingColor.length - 6} more` : ''
       raiseError(
         `Color / Material is required for MMA items. ` +
@@ -1785,8 +1785,9 @@ export default function FieldReport() {
       const bad = markingItems.filter(i => !rowIsCompletable(i))
       if (bad.length > 0) {
         const labels = bad.slice(0, 6).map(i => {
-          const base = i.intersection ? `${i.intersection} ${i.direction || ''} ${i.category}`.trim()
-                                      : i.category
+          const cat = displayCategory(i.category)
+          const base = i.intersection ? `${i.intersection} ${i.direction || ''} ${cat}`.trim()
+                                      : cat
           return `• ${base}`
         }).join('\n')
         const more = bad.length > 6 ? `\n…and ${bad.length - 6} more` : ''
@@ -2374,7 +2375,7 @@ export default function FieldReport() {
                     onEdit={(it) => setFormModal({ mode: 'edit', item: it })}
                     onDelete={(it) => setDeleteConfirm({
                       ids:   [it.item_id],
-                      label: `${it.category}${it.intersection ? ` — ${it.intersection} ${it.direction}` : ''}`
+                      label: `${displayCategory(it.category)}${it.intersection ? ` — ${it.intersection} ${it.direction}` : ''}`
                     })}
                     onStartBulk={enterBulkMode}
                     forceUnlock={editMode}

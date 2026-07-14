@@ -45,9 +45,14 @@ match. When no row matches, the item is flagged `no_rate`.
 | 24" Line | 6.0 | LF |
 | Lane Lines | 1.0 | LF |
 | Double Yellow Line | 2.0 | LF |
+| Double White Line | 2.0 | LF |
 
-Standard width / 4 across all contractors. Double Yellow gets 2.0
-because it's a paired stripe; Lane Lines is treated as a 4" base.
+Standard width / 4 across all contractors. Double Yellow and Double
+White get 2.0 because they're paired stripes; Lane Lines is treated as
+a 4" base. Double White bills identically to Double Yellow (its own
+invoice line at the 4" rate × 2); it differs only on the printed docs —
+General Remarks on the CFR, folded ×2 into the 4" Lines row on the PL
+(see `docs/marking_type_mapping.md`).
 
 ## `line12` — crosswalk / stop line $/LF base rate
 

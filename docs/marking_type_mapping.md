@@ -10,11 +10,32 @@ CFR is the source of truth for category names; the PL template's
 printed labels drift slightly and get reconciled via a rename map
 inside `Code.js`.
 
+**Double White Line** (bills like `Double Yellow Line`: `line4` group ×
+2.0, unit LF) is deliberately handled differently per surface:
+- **Invoice (QB):** its own line at the 4" rate × 2 (same as Double Yellow).
+- **CFR:** *not* a top-table cell — called out in **General Remarks**
+  ("Double White Line: {LF} LF", raw run length) via
+  `buildMarkingRemarksSegments_`, mirroring PED MEN / Color Surface, so
+  DOT + prime see it explicitly.
+- **Production Log:** folded into the **4" Lines** row at **2×** qty
+  (`PL_CATEGORY_MAP_` + `PL_FOLD_MULTIPLIER_`), matching the crew's old
+  manual "4" line × 2" practice. Double Yellow keeps its own PL row at raw
+  qty and is unaffected.
+
+**Webapp display alias:** the picker/read-back shows `Speed Hump Markings`
+as **"Speed Bump Arrow"** (`CATEGORY_DISPLAY_OVERRIDES` /
+`displayCategory()` in `webapp/src/lib/markingCategories.js`). This is a
+UI label only — the stored value, pricing, unit, and PDF routing all still
+use the canonical `Speed Hump Markings` (CFR field `Text_15`, PL row
+`Speed Hump Marking`). Edit the alias value to change the label; no data
+or routing impact.
+
 ## Confirmed mappings
 
 | Marking Items category | Unit | CFR top-table label | PL row label                     |
 |------------------------|------|---------------------|----------------------------------|
 | Double Yellow Line     | LF   | Double Yellow Line  | Double Yellow Line (Center Line) |
+| Double White Line      | LF   | (General Remarks)   | 4" Lines *(folded, qty ×2)*      |
 | Lane Lines             | LF   | Lane Line           | Lane Lines 4" (Skips)            |
 | 4" Line                | LF   | 4" Line             | 4" Lines                         |
 | 6" Line                | LF   | 6" Line             | 6" Lines                         |

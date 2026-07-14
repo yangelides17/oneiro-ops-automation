@@ -19,6 +19,7 @@ export const PRICING_GROUP_BY_CATEGORY = {
   '24" Line':           'line4',
   'Lane Lines':         'line4',
   'Double Yellow Line': 'line4',
+  'Double White Line':  'line4',
 
   // line12 — Crosswalk + Stop Line bulk rate
   'HVX Crosswalk':      'line12',
@@ -80,6 +81,7 @@ export const LINE_WIDTH_MULTIPLIER = {
   '24" Line':           6.0,
   'Lane Lines':         1.0,
   'Double Yellow Line': 2.0,
+  'Double White Line':  2.0,
 }
 
 // Standard NYC DOT thermo unit table. `null` = unit count not yet known —

@@ -259,6 +259,56 @@ function setupTriggers_() {
 // tagged data on prod (this function only sets headers + validations
 // for the original schema — it doesn't touch col 16).
 
+// Canonical Marking Type list for the sheet dropdown. Shared by
+// setupMarkingItems() and refreshMarkingTypeValidation() so the two can't
+// drift. Mirror of MARKING_CATEGORIES in webapp/src/lib/markingCategories.js
+// (the webapp is the crew's real entry point; this only backs the sheet's
+// picker). `strict: false` on the dropdown means new categories are never
+// rejected — this list just controls what the dropdown suggests.
+const MARKING_TYPE_LIST_ = [
+  // WO Page 1 — Top Table
+  'Double Yellow Line', 'Double White Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
+  'Solid Lines', 'Rail Road X/Diamond', 'Others',
+  // WO Page 1 — Intersection Grid
+  'HVX Crosswalk', 'Stop Msg', 'Stop Line',
+  // Page 2 — detailed lines
+  '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
+  // Page 2 — messages
+  'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
+  // Page 2 — railroad
+  'Railroad (RR)', 'Railroad (X)',
+  // Page 2 — arrows
+  'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
+  // Page 2 — miscellaneous
+  'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
+  // Page 2 — bike lane (old/new preform bike symbol; both map to the
+  // same Bike Symbol CFR/PL field and sum, but price differently)
+  'Bike Lane Arrow', 'Old Bike Symbol (w/ rider)', 'New Bike Symbol (just bike)',
+  'Bike Lane Green Bar',
+  // Preform pedestrian symbol
+  'Pedestrian Men',
+  // MMA
+  'Bike Lane', 'Pedestrian Space', 'Bus Lane',
+];
+
+// Re-apply the Marking Type dropdown (col 5) on the Marking Items sheet
+// from MARKING_TYPE_LIST_, without any of setupMarkingItems()'s other
+// side effects. Run once from the Apps Script editor after adding a new
+// marking category (e.g. "Double White Line") so the sheet's picker
+// suggests it. `strict: false` — never rejects manually typed values.
+function refreshMarkingTypeValidation() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Marking Items');
+  if (!sheet) throw new Error('Marking Items sheet not found');
+  const MAX_ROWS = 2000;
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(MARKING_TYPE_LIST_, true)
+    .setAllowInvalid(true)   // strict:false — picker/suggestion, not a gate
+    .build();
+  sheet.getRange(2, 5, MAX_ROWS - 1, 1).setDataValidation(rule);
+  Logger.log('↻ Marking Type dropdown refreshed (' + MARKING_TYPE_LIST_.length + ' categories)');
+}
+
 function setupMarkingItems() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const MAX_ROWS = 2000;
@@ -301,32 +351,9 @@ function setupMarkingItems() {
   // Canonical marking categories — covers Page 1 (scan time) + Page 2
   // (Contractor Field Report) + MMA types. `strict: false` turns the
   // dropdown into a picker/suggestion list so manually added items can
-  // introduce new categories without being rejected.
-  const MARKING_CATEGORIES = [
-    // WO Page 1 — Top Table
-    'Double Yellow Line', 'Lane Lines', 'Gores', 'Messages', 'Arrows',
-    'Solid Lines', 'Rail Road X/Diamond', 'Others',
-    // WO Page 1 — Intersection Grid
-    'HVX Crosswalk', 'Stop Msg', 'Stop Line',
-    // Page 2 — detailed lines
-    '4" Line', '6" Line', '8" Line', '12" Line', '16" Line', '24" Line',
-    // Page 2 — messages
-    'Only Msg', 'Bus Msg', 'Bump Msg', 'Custom Msg', '20 MPH Msg',
-    // Page 2 — railroad
-    'Railroad (RR)', 'Railroad (X)',
-    // Page 2 — arrows
-    'L/R Arrow', 'Straight Arrow', 'Combination Arrow', 'Combination Arrow (L/R)',
-    // Page 2 — miscellaneous
-    'Speed Hump Markings', 'Shark Teeth 12x18', 'Shark Teeth 24x36',
-    // Page 2 — bike lane (old/new preform bike symbol; both map to the
-    // same Bike Symbol CFR/PL field and sum, but price differently)
-    'Bike Lane Arrow', 'Old Bike Symbol (w/ rider)', 'New Bike Symbol (just bike)',
-    'Bike Lane Green Bar',
-    // Preform pedestrian symbol
-    'Pedestrian Men',
-    // MMA
-    'Bike Lane', 'Pedestrian Space', 'Bus Lane',
-  ];
+  // introduce new categories without being rejected. Shared with
+  // refreshMarkingTypeValidation() via the module-level list.
+  const MARKING_CATEGORIES = MARKING_TYPE_LIST_;
 
   // Column indices (1-based) for the 15-col schema:
   //   A  1 Item ID         E  5 Marking Type    I   9 Quantity Completed
@@ -834,6 +861,10 @@ function parseTimeToMinutes_(timeStr) {
 const PL_CATEGORY_MAP_ = {
   // LF
   'Double Yellow Line':  'Double Yellow Line (Center Line)',
+  // Double White Line has no dedicated PL row — it folds into the 4" Lines
+  // row at 2× qty (see PL_FOLD_MULTIPLIER_), replicating how the crew used
+  // to hand-log double-white as "4" Line" with the quantity doubled.
+  'Double White Line':   '4" Lines',
   'Lane Lines':          'Lane Lines 4" (Skips)',
   '4" Line':             '4" Lines',
   '6" Line':             '6" Lines',
@@ -863,6 +894,16 @@ const PL_CATEGORY_MAP_ = {
   // Old + new preform bike symbols share the PL row; aggregator sums them.
   'Old Bike Symbol (w/ rider)':  'Bicycle Lane Symbol',
   'New Bike Symbol (just bike)': 'Bicycle Lane Symbol',
+};
+
+
+// Line types printed folded into another PL row at a MULTIPLIED quantity
+// (double-width lines that share the 4" Lines row). A double-white run of
+// 100 LF prints as 200 LF of 4" line. Double Yellow is intentionally absent
+// here — it keeps its OWN PL row at raw qty; only categories listed below
+// get their qty scaled when summed in aggregateMarkingItemsForPL_.
+const PL_FOLD_MULTIPLIER_ = {
+  'Double White Line': 2,
 };
 
 
@@ -954,10 +995,13 @@ function aggregateMarkingItemsForPL_(ss, woId, targetDateIso, crewChief) {
     // written as "{n} PED MEN" so it's unmistakably PED MEN, not PED XING.
     if (category === 'Pedestrian Men') { pedMenSum += qty; return; }
 
-    // Standard rename; unmapped categories drop silently
+    // Standard rename; unmapped categories drop silently. Double-width
+    // line types (PL_FOLD_MULTIPLIER_) are scaled as they fold into their
+    // shared row — e.g. Double White Line adds 2× into the 4" Lines row.
     const plLabel = PL_CATEGORY_MAP_[category];
     if (!plLabel) return;
-    out.markings[plLabel] = (out.markings[plLabel] || 0) + qty;
+    const foldMult = PL_FOLD_MULTIPLIER_[category] || 1;
+    out.markings[plLabel] = (out.markings[plLabel] || 0) + qty * foldMult;
   });
 
   if (crosswalkSum > 0 || stopLineSum > 0) {
@@ -9215,6 +9259,7 @@ const CATEGORY_UNITS_ = {
 
   // LF (linear feet) — lines, crosswalks, stop lines
   'Double Yellow Line':  'LF',
+  'Double White Line':   'LF',
   'Lane Lines':          'LF',
   'Solid Lines':         'LF',
   '4" Line':             'LF',
@@ -9294,6 +9339,7 @@ const PRICING_GROUP_BY_CATEGORY_ = Object.freeze({
   '24" Line':           'line4',
   'Lane Lines':         'line4',
   'Double Yellow Line': 'line4',
+  'Double White Line':  'line4',
 
   // line12 (Crosswalk + Stop Line bulk rate)
   'HVX Crosswalk':      'line12',
@@ -9349,6 +9395,7 @@ const LINE_WIDTH_MULTIPLIER_ = Object.freeze({
   '24" Line':           6.0,
   'Lane Lines':         1.0,
   'Double Yellow Line': 2.0,
+  'Double White Line':  2.0,
 });
 
 // Standard NYC DOT thermo unit table. `null` = unit count not yet
@@ -11735,11 +11782,15 @@ function mapCategoryToCFR_(category) {
   // No top-table cell in the CFR template for these. HVX Crosswalk /
   // Stop Line land in the grid; Pedestrian Men has no CFR field at all
   // and is surfaced in General Remarks ("PED MEN: {n}") instead.
+  // Double White Line likewise has no top-table cell — it's called out in
+  // General Remarks ("Double White Line: {n} LF", see
+  // buildMarkingRemarksSegments_) so DOT/prime see it explicitly rather
+  // than baked into the 4" Line field.
   // Stop Msg used to live here but the CFR has BOTH a top-table roll-up
   // cell (page0_field23) AND a per-intersection grid cell, so it gets
   // aggregated into the top_table dict and additionally split
   // per-intersection in the grid loop below.
-  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1, 'Pedestrian Men': 1 };
+  const GRID_ONLY = { 'HVX Crosswalk': 1, 'Stop Line': 1, 'Pedestrian Men': 1, 'Double White Line': 1 };
 
   const c = String(category || '').trim();
   if (!c) return null;
@@ -11846,6 +11897,8 @@ function aggregateMarkingItemsForCFR_(ss, woId) {
 /**
  * Build the General Remarks segments for completed markings that have NO
  * dedicated CFR field, in priority order:
+ *   0. Double White— "Double White Line: {LF} LF"  (raw run length; folds
+ *      into the 4" Lines row on the PL but is called out here on the CFR)
  *   1. Color Surface — "Color Surface Completed: {SF} SQFT {Color}, …"
  *      (per-color breakdown across Bike Lane / Bus Lane / Pedestrian Space)
  *   2. PED MEN       — "PED MEN: {n}"  (Pedestrian Men symbol count)
@@ -11884,6 +11937,7 @@ function buildMarkingRemarksSegments_(ss, woId) {
   const sfColorOrder = [];       // first-seen color order
   let   sfNoColor = 0;           // SF with no color recorded
   let   pedMen = 0;
+  let   doubleWhite = 0;         // Double White Line LF (raw run length)
   const others = [];
 
   items.forEach(r => {
@@ -11906,6 +11960,13 @@ function buildMarkingRemarksSegments_(ss, woId) {
       if (!isNaN(qty) && qty > 0) pedMen += qty;
       return;
     }
+    // Double White Line has no CFR top-table field (see mapCategoryToCFR_);
+    // call it out in remarks at the raw run length the crew entered —
+    // consistent with how Double Yellow Line shows raw on the CFR.
+    if (category === 'Double White Line') {
+      if (!isNaN(qty) && qty > 0) doubleWhite += qty;
+      return;
+    }
     if (category === 'Others') {
       if (isNaN(qty) || qty <= 0) return;
       const desc = String(r[7] || '').trim();
@@ -11914,6 +11975,8 @@ function buildMarkingRemarksSegments_(ss, woId) {
     }
   });
 
+  // 0. Double White Line — called out first so DOT/prime see it up front
+  if (doubleWhite > 0) segments.push(`Double White Line: ${fmt(doubleWhite)} LF`);
   // 1. Color Surface — per-color breakdown
   const colorParts = sfColorOrder.map(c => `${fmt(sfByColor[c])} SQFT ${c}`);
   if (sfNoColor > 0) colorParts.push(`${fmt(sfNoColor)} SQFT`);
