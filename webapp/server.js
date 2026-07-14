@@ -502,6 +502,49 @@ app.post('/api/tools/generate-cp-for-doc', async (req, res) => {
 })
 
 /**
+ * POST /api/tools/generate-month-end-doc  { doc_id }
+ * Fills a month-end doc (Employee Utilization / Certificates) and streams
+ * the PDF back as a download — the user prints & signs by hand. Deliberately
+ * NOT routed through Approvals. Apps Script supplies the field values
+ * (build_month_end_fill); the Python worker's fill endpoint renders the PDF
+ * with the proven pypdf + PyMuPDF process (correct /AP, still editable) so
+ * we reuse the exact fill pipeline the other doc types use.
+ *
+ * Env: WORKER_FILL_URL (worker service base URL), FILL_SERVER_KEY (shared).
+ */
+app.post('/api/tools/generate-month-end-doc', async (req, res) => {
+  try {
+    const { doc_id } = req.body || {}
+    if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
+
+    const spec = await callAppsScript('build_month_end_fill', { doc_id })
+    if (!spec || spec.error) return res.status(400).json({ error: (spec && spec.error) || 'Could not build fill spec' })
+
+    const fillBase = process.env.WORKER_FILL_URL
+    if (!fillBase) return res.status(500).json({ error: 'WORKER_FILL_URL not configured on this server' })
+
+    const wr = await fetch(fillBase.replace(/\/$/, '') + '/fill', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Fill-Key': process.env.FILL_SERVER_KEY || '' },
+      body:    JSON.stringify({ doc_kind: spec.doc_kind, fields: spec.fields, filename: spec.filename }),
+    })
+    if (!wr.ok) {
+      const t = await wr.text().catch(() => '')
+      throw new Error(`Fill service error ${wr.status}: ${t.slice(0, 200)}`)
+    }
+    const out = Buffer.from(await wr.arrayBuffer())
+
+    const safeName = String(spec.filename || 'month-end.pdf').replace(/[\r\n"]/g, '')
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`)
+    res.send(out)
+  } catch (err) {
+    console.error('POST /api/tools/generate-month-end-doc error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is

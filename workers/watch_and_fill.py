@@ -49,6 +49,10 @@ TEMPLATE_FILES = {
     'certified_payroll':        'Certified Payroll Report Template_FORM.pdf',
     'signin':                   'Employee Daily Sign In Log Template_FORM.pdf',
     'contractor_field_report':  'Thermo Contractor Field Report Template_FORM.pdf',
+    # Month-end docs — filled on demand via the fill endpoint (fill_server.py),
+    # not the Drive watch loop.
+    'employee_utilization':     'Monthly Employee Utilization Form Template_FORM.pdf',
+    'certificates':             'All Certificates Template_FORM.pdf',
 }
 
 # MIME types we treat as scanned Work Order documents in the Scan Inbox
@@ -1175,6 +1179,22 @@ def main():
         scan_once(service, folder_map, scan_inbox_id, processed, tmp_dir)
         log("Done.")
         return
+
+    # On-demand month-end fill endpoint (EU / Certificates). The Node webapp
+    # POSTs {doc_kind, fields, filename} and streams the returned PDF as a
+    # browser download. Only starts when a port is configured (Railway sets
+    # PORT; FILL_SERVER_PORT overrides). Shares this process's Drive service.
+    fill_port = int(os.environ.get('FILL_SERVER_PORT') or os.environ.get('PORT') or 0)
+    fill_key  = os.environ.get('FILL_SERVER_KEY', '')
+    if fill_port and fill_key:   # require an auth key so we never expose it unauthenticated
+        try:
+            from fill_server import start_fill_server
+            start_fill_server(service, get_template, fill_port, fill_key)
+            log(f"🧾  Month-end fill endpoint listening on :{fill_port}")
+        except Exception as e:
+            log(f"⚠ fill server failed to start: {e}")
+    elif fill_port:
+        log("ℹ️  Month-end fill endpoint disabled — set FILL_SERVER_KEY to enable it.")
 
     log(f"👀  Watching: {', '.join(watching)}")
     log(f"   Polling every {POLL_SECONDS}s  (Ctrl+C to stop)\n")

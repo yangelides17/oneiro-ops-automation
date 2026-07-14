@@ -4091,6 +4091,8 @@ function doPost(e) {
       return handleGeneratePLForDoc_(body);
     } else if (action === 'generate_cp_for_doc') {
       return handleGenerateCPForDoc_(body);
+    } else if (action === 'build_month_end_fill') {
+      return handleBuildMonthEndFill_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
     } else if (action === 'list_employees') {
@@ -7466,6 +7468,124 @@ function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
       warnings: warnings,
     };
   });
+}
+
+
+/**
+ * Build a delivery-agnostic fill spec for a month-end doc (Employee
+ * Utilization 'EU' or Certificates 'CERT') from its lifecycle doc_id.
+ * Returns { doc_kind, template_file_id, filename, fields, warnings } — the
+ * PDF field-name → value map plus the template + download name. The caller
+ * owns delivery: today the webapp fills the template with pdf-lib and streams
+ * a browser download; a future path can reuse `fields` to write a
+ * {_type:'employee_utilization'|'certificates', ...} JSON to the worker queue.
+ *
+ * Fills ONLY the fields confirmed with the user — contract identifiers,
+ * contractor name, the Painter · Journey-Level counts (EU), and any
+ * "Last Day of Month" date (Certs). Every signature, plain "Date", and
+ * notary field is left blank for the signer/notary.
+ */
+function _buildMonthEndFillSpec_(docId) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const p = _parseMonthEndDocId_(docId);
+  if (!p) return { error: 'Not a month-end doc_id: ' + docId };
+
+  const meta = _resolveDocLifecycleMetadata_(ss, docId);          // raw contractor display name
+  const contractorDisplay = (meta && meta.contractor) || p.contractor || '';
+
+  const [yy, mm]  = p.monthIso.split('-').map(Number);
+  const monthName = Utilities.formatDate(new Date(yy, mm - 1, 1), CONFIG.TIMEZONE, 'MMMM');
+  const lastDay   = Utilities.formatDate(new Date(yy, mm, 0),     CONFIG.TIMEZONE, 'MMMM d, yyyy');
+
+  const pinBorough     = p.contractNum + '-' + p.borough;        // e.g. 84125MBTP701-M
+  const regNo          = _readContractIdMap_(ss)[p.contractNum + '|' + p.borough] || '';
+  const contractorName = CONFIG.EMPLOYER.name;
+
+  const shortNum       = (String(p.contractNum).match(/\d+$/) || [p.contractNum])[0];  // 84125MBTP701 -> 701
+  const contractorSlug = _slugify_(contractorDisplay) || _slugify_(p.contractor);
+
+  // Resolve the template PDF by name inside the ⚙️ Templates folder.
+  const templatesId  = PropertiesService.getScriptProperties().getProperty('TEMPLATES_ID');
+  const templateName = p.key === 'EU'
+    ? 'Monthly Employee Utilization Form Template_FORM.pdf'
+    : 'All Certificates Template_FORM.pdf';
+  let templateFileId = '';
+  if (templatesId) {
+    const it = DriveApp.getFolderById(templatesId).getFilesByName(templateName);
+    if (it.hasNext()) templateFileId = it.next().getId();
+  }
+
+  const warnings = [];
+  let fields = {};
+  let filename = '';
+
+  if (p.key === 'EU') {
+    // Painter journey-level demographic counts from the shared computation.
+    const wdlSheet = ss.getSheetByName('Work Day Log');
+    const wdlData  = wdlSheet ? wdlSheet.getDataRange().getValues() : [];
+    const row = { contract_num: p.contractNum, borough: p.borough, contractor: contractorDisplay };
+    _attachUtilizationCounts_(ss, p.monthIso, [row], wdlData);
+    const u = row.utilization || { total: 0, buckets: [], warnings: [] };
+    (u.warnings || []).forEach(w => warnings.push(w));
+    const byKey = {};
+    (u.buckets || []).forEach(b => { byKey[b.key] = b.count; });
+    const cell = n => (n > 0 ? String(n) : '');   // TOT always; buckets only when > 0
+
+    fields = {
+      'Month':            monthName,
+      'Year':             String(yy),
+      'Contractor':       contractorName,
+      'Contract Number':  pinBorough,
+      'painter_jl_tot':   String(u.total || 0),
+      'painter_jl_b':     cell(byKey['B']),
+      'painter_jl_h':     cell(byKey['H']),
+      'painter_jl_a':     cell(byKey['A']),
+      'painter_jl_na':    cell(byKey['NA']),
+      'painter_jl_fem':   cell(byKey['FEM']),
+    };
+    filename = 'EU_' + monthName + '_' + yy + '_Contract_' + shortNum + '_' + p.borough + '_' + contractorSlug + '.pdf';
+  } else {
+    // Certificate packet — identifiers + contractor + "None" + last-day date.
+    fields = {
+      'Comptroller’s Reg. No':            regNo,   // field name uses a curly apostrophe
+      'Comptrollers Number':                   regNo,
+      'Contract Number':                       pinBorough,
+      'Contractor 1':                          contractorName,
+      'Contractor 2':                          contractorName,
+      'Name of Contractor or Subcontractor':   contractorName,
+      'Contractor':                            contractorName,
+      'Names of Subcontractors':               'None',
+      'Last Day of Month':                     lastDay,
+    };
+    filename = 'Certs_' + monthName + '_' + yy + '_Contract_' + shortNum + '_' + p.borough + '_' + contractorSlug + '.pdf';
+  }
+
+  return {
+    doc_kind:         p.key,
+    template_file_id: templateFileId,
+    filename:         filename,
+    fields:           fields,
+    warnings:         warnings,
+  };
+}
+
+/**
+ * action: build_month_end_fill — body { doc_id }.
+ * Returns the fill spec for the webapp to render + download.
+ */
+function handleBuildMonthEndFill_(body) {
+  const d = body.data || {};
+  const docId = String(d.doc_id || '').trim();
+  if (!docId) return jsonResponse_({ error: 'Missing doc_id' }, 400);
+  try {
+    const spec = _buildMonthEndFillSpec_(docId);
+    if (spec.error) return jsonResponse_({ error: spec.error }, 400);
+    // Note: the worker resolves the actual template by doc_kind, so a blank
+    // template_file_id here is not fatal (it's only a forward-compat hint).
+    return jsonResponse_(spec);
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
 }
 
 /**

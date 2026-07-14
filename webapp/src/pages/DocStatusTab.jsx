@@ -753,22 +753,33 @@ function PendingActionButton({ item, onMark }) {
   )
 }
 
-// ── Generate button (for PL Done / CP Done pending items) ─────
+// ── Generate button (PL/CP open a modal; EU/CERT fill + download) ─────
 function PendingGenerateButton({ item, onGenerate }) {
-  const handle = () => onGenerate?.(item)
+  const [busy, setBusy] = useState(false)
+  const handle = async () => {
+    if (busy) return
+    setBusy(true)
+    try { await onGenerate?.(item) } finally { setBusy(false) }
+  }
   return (
     <button
       type="button"
       onClick={handle}
-      className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center bg-green-500 text-white border-green-500 hover:bg-green-600"
+      disabled={busy}
+      className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center bg-green-500 text-white border-green-500 hover:bg-green-600 ${busy ? 'opacity-60 cursor-wait' : ''}`}
     >
-      Generate
+      {busy ? '…' : 'Generate'}
     </button>
   )
 }
 
+// Month-end docs (EU / Certificates) generate a filled PDF for download;
+// PL / CP open the generation modal.
+const isMonthEndItem = (it) =>
+  it && (it.missing?.[0] === 'EU Done' || it.missing?.[0] === 'CERT Done')
+
 const canGenerateForItem = (it) =>
-  it && (it.missing?.[0] === 'PL Done' || it.missing?.[0] === 'CP Done')
+  it && (it.missing?.[0] === 'PL Done' || it.missing?.[0] === 'CP Done' || isMonthEndItem(it))
 
 // ── Pending list ──────────────────────────────────────────────
 function PendingList({ kind, pending, loading, onMark, onGenerate }) {
@@ -1054,7 +1065,35 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
 
   const onPendingMark = (docId, flag, value) => flip(docId, flag, value)
 
-  const onPendingGenerate = (item) => { setPaystub(null); setPendingItem(item) }
+  // Month-end docs fill + download in place; PL/CP open the modal.
+  const downloadMonthEndDoc = async (item) => {
+    try {
+      const res = await fetch('/api/tools/generate-month-end-doc', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ doc_id: item.doc_id }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Request failed (HTTP ${res.status})`)
+      }
+      const blob = await res.blob()
+      const cd = res.headers.get('Content-Disposition') || ''
+      const m = cd.match(/filename="?([^"]+)"?/)
+      const filename = m ? m[1] : 'month-end.pdf'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setFlipError(e.message || 'Could not generate document — please retry.')
+    }
+  }
+  const onPendingGenerate = (item) => {
+    if (isMonthEndItem(item)) return downloadMonthEndDoc(item)
+    setPaystub(null); setPendingItem(item)
+  }
   const closeGenerateModal = () => {
     setPendingItem(null)
     setPaystub(null)
