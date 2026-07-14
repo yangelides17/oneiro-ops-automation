@@ -312,7 +312,7 @@ function combinedLastWeekStatus(cell, monthEnd) {
 }
 
 // ── Day cell popover (PL + SI per breakdown) ──────────────────
-function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
+function DayCellPopover({ cell, onClose, onFlip, isPending, anchorRect }) {
   const wrapRef = useRef(null)
   useEffect(() => {
     const handler = (e) => {
@@ -380,6 +380,7 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                           <TogglePill
                             label="Done"
                             on={c.si.done}
+                            pending={isPending(c.si.doc_id, 'done')}
                             onClick={() => onFlip(c.si.doc_id, 'done', !c.si.done)}
                           />
                         </div>
@@ -389,12 +390,14 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
                             <TogglePill
                               label="Done"
                               on={b.pl.done}
+                              pending={isPending(b.pl.doc_id, 'done')}
                               onClick={() => onFlip(b.pl.doc_id, 'done', !b.pl.done)}
                             />
                             <TogglePill
                               label="Sent"
                               on={b.pl.sent}
                               disabled={!b.pl.done}
+                              pending={isPending(b.pl.doc_id, 'sent')}
                               onClick={() => onFlip(b.pl.doc_id, 'sent', !b.pl.sent)}
                             />
                           </div>
@@ -416,7 +419,7 @@ function DayCellPopover({ cell, onClose, onFlip, anchorRect }) {
 // On the month's last worked week (showMonthEnd), the CP entries render
 // at the top and the month-end docs (one section per pair, all four
 // docs) render underneath — everything in one popover.
-function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
+function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip, isPending }) {
   const wrapRef = useRef(null)
   useEffect(() => {
     const handler = (e) => {
@@ -471,12 +474,14 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
                   <TogglePill
                     label="Done"
                     on={b.cp.done}
+                    pending={isPending(b.cp.doc_id, 'done')}
                     onClick={() => onFlip(b.cp.doc_id, 'done', !b.cp.done)}
                   />
                   <TogglePill
                     label="Sent"
                     on={b.cp.sent}
                     disabled={!b.cp.done}
+                    pending={isPending(b.cp.doc_id, 'sent')}
                     onClick={() => onFlip(b.cp.doc_id, 'sent', !b.cp.sent)}
                   />
                 </div>
@@ -527,12 +532,14 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip }) {
                             <TogglePill
                               label="Done"
                               on={mdoc.done}
+                              pending={isPending(mdoc.doc_id, 'done')}
                               onClick={() => onFlip(mdoc.doc_id, 'done', !mdoc.done)}
                             />
                             <TogglePill
                               label="Sent"
                               on={mdoc.sent}
                               disabled={!mdoc.done}
+                              pending={isPending(mdoc.doc_id, 'sent')}
                               onClick={() => onFlip(mdoc.doc_id, 'sent', !mdoc.sent)}
                             />
                           </div>
@@ -595,7 +602,7 @@ function DayCalendar({ monthIso, days, loading, onCellClick }) {
               key={c.key}
               type="button"
               disabled={!clickable}
-              onClick={() => clickable && onCellClick(cell)}
+              onClick={() => clickable && onCellClick(c.date)}
               className={`h-[80px] rounded-md border text-left p-1.5 transition-all
                           flex flex-col items-stretch overflow-hidden
                           ${bg}
@@ -671,7 +678,7 @@ function WeekCalendar({ monthIso, weeks, monthEnd, lastWeekStart, loading, onCel
               key={c.week_start}
               type="button"
               disabled={!clickable}
-              onClick={() => clickable && onCellClick(effectiveCell)}
+              onClick={() => clickable && onCellClick(c.week_start)}
               className={`w-full rounded-md border text-left transition-all
                           flex flex-col items-stretch overflow-hidden
                           ${isLastWeek ? 'min-h-[80px] p-2.5' : 'h-[80px] p-1.5'}
@@ -832,8 +839,26 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   const [loading, setLoading]   = useState(true)
   const [error,   setError]     = useState(null)
 
+  // Popover targets hold the cell KEY (date / week_start), not a snapshot —
+  // the live cell is derived from `data` at render so optimistic flips show
+  // in the open modal without a close/reopen.
   const [activeDay,  setActiveDay]  = useState(null)
   const [activeWeek, setActiveWeek] = useState(null)
+
+  // Per-pill in-flight guard (Set of `${docId}|${flag}`): each pill shows its
+  // own "…" while its request runs; different pills/docs flip in parallel.
+  // inFlightRef coalesces the post-burst reconcile; flipError surfaces a
+  // failed save so nothing is dropped unnoticed.
+  const [pendingFlags, setPendingFlags] = useState(() => new Set())
+  const inFlightRef = useRef(0)
+  const [flipError, setFlipError] = useState('')
+  const monthIsoRef = useRef(monthIso)
+  useEffect(() => { monthIsoRef.current = monthIso }, [monthIso])
+  useEffect(() => {
+    if (!flipError) return
+    const t = setTimeout(() => setFlipError(''), 4000)
+    return () => clearTimeout(t)
+  }, [flipError])
 
   // GenerateDocModal state — `pendingItem` is the pending-list row the
   // user clicked Generate on; null = modal closed.
@@ -881,10 +906,9 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
     return `${sun.getFullYear()}-${String(sun.getMonth() + 1).padStart(2, '0')}-${String(sun.getDate()).padStart(2, '0')}`
   }, [monthIso])
 
-  // Optimistic flip + revert on failure
-  const flip = async (docId, flag, value) => {
-    // Optimistically mutate the local data.
-    setData(prev => {
+  // Apply a done/sent flip to `data` immutably — used for both the
+  // optimistic update and the revert on failure.
+  const applyFlag = (prev, docId, flag, value) => {
       if (!prev) return prev
       // Day breakdown: flip PL on the contractor row OR SI on any matching
       // contract sub-entry. Either match-or-pass-through.
@@ -975,18 +999,51 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         weeks: weeks?.map(recolorWeek),
         month_end,
       }
-    })
+  }
 
+  // Silent reconcile after a burst of flips settles: refresh the pending
+  // list + canonical state without the loading dim, and without clobbering
+  // an optimistic change that's still in flight.
+  const reconcile = async () => {
+    const iso = monthIsoRef.current
     try {
-      await flipDocFlags([{ doc_id: docId, [flag]: value }])
-      // Refetch in the background to pick up server-canonical state +
-      // updated pending list. Doesn't block the optimistic UI.
-      load(monthIso)
+      const d = await fetchDocStatus(iso)
+      if (inFlightRef.current === 0 && iso === monthIsoRef.current) setData(d)
     } catch (e) {
-      console.warn('flip failed, reverting:', e.message)
-      load(monthIso)   // revert by hard refetch
+      // Keep optimistic state; a later flip/reconcile or month load corrects it.
     }
   }
+
+  // Optimistic pill flip. Per-pill in-flight guard lets different pills/docs
+  // flip in parallel; the server serializes writes (LockService) so nothing
+  // duplicates. Reverts + surfaces a visible error on failure.
+  const flip = async (docId, flag, value) => {
+    const key = docId + '|' + flag
+    if (pendingFlags.has(key)) return
+    setData(prev => applyFlag(prev, docId, flag, value))
+    setPendingFlags(prev => { const n = new Set(prev); n.add(key); return n })
+    inFlightRef.current++
+    try {
+      await flipDocFlags([{ doc_id: docId, [flag]: value }])
+    } catch (e) {
+      setData(prev => applyFlag(prev, docId, flag, !value))
+      setFlipError("Couldn't save that change — please retry.")
+    } finally {
+      setPendingFlags(prev => { const n = new Set(prev); n.delete(key); return n })
+      if (--inFlightRef.current === 0) reconcile()
+    }
+  }
+
+  const isPending = (docId, flag) => pendingFlags.has(docId + '|' + flag)
+
+  // Live popover cells derived from current `data` (activeDay/activeWeek are
+  // keys). An optimistic flip mutates `data`, so the open modal re-renders
+  // with fresh pill state — no close/reopen needed.
+  const activeDayCell = activeDay ? (data?.days?.find(d => d.date === activeDay) || null) : null
+  const activeWeekCell = activeWeek
+    ? (data?.weeks?.find(w => w.week_start === activeWeek)
+        || (activeWeek === lastWeekStart ? { week_start: activeWeek, breakdown: [] } : null))
+    : null
 
   const onPendingMark = (docId, flag, value) => flip(docId, flag, value)
 
@@ -1073,21 +1130,29 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         </div>
       </div>
 
-      {activeDay && (
+      {activeDayCell && (
         <DayCellPopover
-          cell={activeDay}
+          cell={activeDayCell}
           onClose={() => setActiveDay(null)}
           onFlip={flip}
+          isPending={isPending}
         />
       )}
-      {activeWeek && (
+      {activeWeekCell && (
         <WeekCellPopover
-          cell={activeWeek}
+          cell={activeWeekCell}
           monthEnd={data?.month_end}
-          showMonthEnd={activeWeek.week_start === lastWeekStart}
+          showMonthEnd={activeWeek === lastWeekStart}
           onClose={() => setActiveWeek(null)}
           onFlip={flip}
+          isPending={isPending}
         />
+      )}
+
+      {flipError && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white text-sm font-semibold px-4 py-2 rounded-xl shadow-lg">
+          ⚠ {flipError}
+        </div>
       )}
 
       <GenerateDocModal

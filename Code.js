@@ -1792,23 +1792,36 @@ function handleSetDocStatus_(body) {
   const updates = Array.isArray(d.updates) ? d.updates : [];
   if (updates.length === 0) return jsonResponse_({ updated: 0 });
 
-  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  let total = 0;
-  updates.forEach(u => {
-    const docId = String(u.doc_id || '').trim();
-    if (!docId) return;
-    const flags = {};
-    if (u.done === true)  flags.done = true;
-    if (u.done === false) flags.done = false;
-    if (u.sent === true)  flags.sent = true;
-    if (u.sent === false) flags.sent = false;
-    if (flags.done == null && flags.sent == null) return;
-    _setDocLifecycleStatus_(ss, docId, flags);
-    total++;
-  });
+  // Serialize Doc Lifecycle Log writes. Each pill click is its own request
+  // (execution); DONE then SENT fired in quick succession would otherwise
+  // both read "no row" and both appendRow, creating duplicate rows. The
+  // same script lock also guards the archive path (processApprovedDocuments),
+  // so a flip can't append alongside an in-flight archive either.
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(20000); } catch (e) {
+    return jsonResponse_({ error: 'Could not acquire lock — try again' }, 503);
+  }
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    let total = 0;
+    updates.forEach(u => {
+      const docId = String(u.doc_id || '').trim();
+      if (!docId) return;
+      const flags = {};
+      if (u.done === true)  flags.done = true;
+      if (u.done === false) flags.done = false;
+      if (u.sent === true)  flags.sent = true;
+      if (u.sent === false) flags.sent = false;
+      if (flags.done == null && flags.sent == null) return;
+      _setDocLifecycleStatus_(ss, docId, flags);
+      total++;
+    });
 
-  if (total > 0) _invalidateCacheKeys_(['dashboard_v1']);
-  return jsonResponse_({ updated: total });
+    if (total > 0) _invalidateCacheKeys_(['dashboard_v1']);
+    return jsonResponse_({ updated: total });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
@@ -7079,10 +7092,13 @@ function _upsertDocLifecycleRow_(ss, payload) {
   if (!docId) return;
 
   const data = sheet.getDataRange().getValues();
-  let foundRow = 0;
+  // Collect ALL rows for this docId — normally one, but a pre-lock race may
+  // have left duplicates. Cols: 7=Done, 8=Sent, 9=File ID, 10=Done At, 11=Sent At.
+  const matchRows = [];   // 1-based sheet row numbers
   for (let i = 1; i < data.length; i++) {
-    if (String(data[i][0] || '').trim() === docId) { foundRow = i + 1; break; }
+    if (String(data[i][0] || '').trim() === docId) matchRows.push(i + 1);
   }
+  const foundRow = matchRows.length ? matchRows[0] : 0;
 
   const now = new Date();
   const woIdsCsv = Array.isArray(payload.wo_ids)
@@ -7111,7 +7127,26 @@ function _upsertDocLifecycleRow_(ss, payload) {
   }
 
   // Update existing row in place. Only mutate explicitly-supplied fields.
-  const r = data[foundRow - 1];
+  // Work on a mutable copy of the survivor (first-matched) row.
+  const r = data[foundRow - 1].slice();
+
+  // Self-heal any duplicate rows for this docId left by a pre-lock race:
+  // OR-merge each extra's Done/Sent (+ timestamps, + a File ID) into the
+  // survivor, then delete the extras bottom-up (all extras are BELOW the
+  // survivor, so its row number is unaffected). No LockService here — this
+  // helper is also reached under the archive lock; the caller holds the lock.
+  if (matchRows.length > 1) {
+    const yes = v => String(v || '').toLowerCase() === 'yes';
+    for (let k = 1; k < matchRows.length; k++) {
+      const dup = data[matchRows[k] - 1];
+      if (yes(dup[7]) && !yes(r[7])) { r[7] = 'Yes'; if (!r[10]) r[10] = dup[10] || now; }
+      if (yes(dup[8]) && !yes(r[8])) { r[8] = 'Yes'; if (!r[11]) r[11] = dup[11] || now; }
+      if (!r[9] && dup[9]) r[9] = dup[9];
+    }
+    // Persist merged survivor (H..L), then drop the extras.
+    sheet.getRange(foundRow, 8, 1, 5).setValues([[r[7], r[8], r[9], r[10], r[11]]]);
+    for (let k = matchRows.length - 1; k >= 1; k--) sheet.deleteRow(matchRows[k]);
+  }
   const updates = [];
   if (payload.doc_type   !== undefined) updates.push({ col: 2,  val: payload.doc_type });
   if (payload.anchor     !== undefined) updates.push({ col: 3,  val: payload.anchor });
