@@ -4093,6 +4093,8 @@ function doPost(e) {
       return handleGenerateCPForDoc_(body);
     } else if (action === 'build_month_end_fill') {
       return handleBuildMonthEndFill_(body);
+    } else if (action === 'build_month_end_fill_all') {
+      return handleBuildMonthEndFillAll_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
     } else if (action === 'list_employees') {
@@ -7583,6 +7585,53 @@ function handleBuildMonthEndFill_(body) {
     // Note: the worker resolves the actual template by doc_kind, so a blank
     // template_file_id here is not fatal (it's only a forward-compat hint).
     return jsonResponse_(spec);
+  } catch (err) {
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+/**
+ * action: build_month_end_fill_all — body { doc_ids: [...] }.
+ * Builds one fill spec per doc_id and groups them by kind for the webapp's
+ * "Generate All" (combined EU PDF + combined Certs PDF, zipped). Returns
+ * { groups: [{ doc_kind, combined_filename, items:[{fields}] }], zip_name }.
+ */
+function handleBuildMonthEndFillAll_(body) {
+  const d = body.data || {};
+  const docIds = Array.isArray(d.doc_ids) ? d.doc_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
+  if (docIds.length === 0) return jsonResponse_({ error: 'No doc_ids' }, 400);
+  try {
+    // Month/Year label from the first parseable doc_id.
+    let monthLabel = '', yearLabel = '';
+    for (let i = 0; i < docIds.length; i++) {
+      const p = _parseMonthEndDocId_(docIds[i]);
+      if (p) {
+        const [yy, mm] = p.monthIso.split('-').map(Number);
+        monthLabel = Utilities.formatDate(new Date(yy, mm - 1, 1), CONFIG.TIMEZONE, 'MMMM');
+        yearLabel  = String(yy);
+        break;
+      }
+    }
+
+    const byKind = {};   // doc_kind -> [ { fields } ]
+    docIds.forEach(docId => {
+      const spec = _buildMonthEndFillSpec_(docId);
+      if (spec.error || !spec.doc_kind) return;
+      (byKind[spec.doc_kind] = byKind[spec.doc_kind] || []).push({ fields: spec.fields });
+    });
+
+    const nameByKind = {
+      EU:   'All_Employee_Utilization_' + monthLabel + '_' + yearLabel + '.pdf',
+      CERT: 'All_Certificates_' + monthLabel + '_' + yearLabel + '.pdf',
+    };
+    const groups = Object.keys(byKind).map(kind => ({
+      doc_kind:          kind,
+      combined_filename: nameByKind[kind] || ('All_' + kind + '_' + monthLabel + '_' + yearLabel + '.pdf'),
+      items:             byKind[kind],
+    }));
+    if (groups.length === 0) return jsonResponse_({ error: 'Nothing to generate' }, 400);
+
+    return jsonResponse_({ groups: groups, zip_name: 'Month_End_Docs_' + monthLabel + '_' + yearLabel + '.zip' });
   } catch (err) {
     return jsonResponse_({ error: String(err && err.message || err) }, 500);
   }
@@ -13709,6 +13758,7 @@ function _buildDocStatusPayload_(monthIso) {
     month:     monthIso,
     status:    meAllFull ? 'green' : (meAllEmpty ? 'gray' : 'amber'),
     breakdown: monthEndBreakdown,
+    due:       monthEndPendingDue,   // gates the "Generate All" button (Sun after last payroll week)
   };
 
   // Pending list (all-time, FIFO oldest first). We emit one entry per

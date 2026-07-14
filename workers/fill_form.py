@@ -9,6 +9,10 @@ Used by the on-demand month-end fill endpoint (fill_server.py) for the
 Employee Utilization + Certificate docs. Same appearance pipeline the
 Drive-watched fillers use (fill_certified_payroll, fill_signin, …).
 """
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
 from pypdf import PdfReader, PdfWriter
 
 from _appearances import normalize_acroform_dr, regenerate_appearances
@@ -43,4 +47,32 @@ def fill_acroform(template_path: str, fields: dict, output_path: str) -> str:
         writer.write(fh)
 
     regenerate_appearances(output_path)   # PyMuPDF /AP bake + NeedAppearances=false
+    return output_path
+
+
+def merge_filled(template_path: str, list_of_fields: list, output_path: str) -> str:
+    """Fill the same template once per field-set and concatenate them into
+    one PDF (all EUs → one doc, all Certs → one doc).
+
+    Every source shares the template's field names, so before appending we
+    rename each source's widget /T names with a unique per-source suffix
+    (_suffix_widget_names) — otherwise pypdf dedupes by name and every page
+    shows the LAST source's values. Same rename-then-merge recipe as
+    fill_production_log.py; /AP is already baked, so NO flatten is needed."""
+    from fill_production_log import _suffix_widget_names   # lazy: avoid import cycle
+
+    final = PdfWriter()
+    with tempfile.TemporaryDirectory() as td:
+        for i, fields in enumerate(list_of_fields or []):
+            tmp = str(Path(td) / f'{i}.pdf')
+            fill_acroform(template_path, fields, tmp)   # bakes /AP for this source
+            w = PdfWriter()
+            w.append(PdfReader(tmp))
+            _suffix_widget_names(w, f'_d{i}')            # keep colliding names independent
+            buf = BytesIO()
+            w.write(buf)
+            buf.seek(0)
+            final.append(PdfReader(buf))
+    with open(output_path, 'wb') as fh:
+        final.write(fh)
     return output_path

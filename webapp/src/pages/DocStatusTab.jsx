@@ -419,7 +419,33 @@ function DayCellPopover({ cell, onClose, onFlip, isPending, anchorRect }) {
 // On the month's last worked week (showMonthEnd), the CP entries render
 // at the top and the month-end docs (one section per pair, all four
 // docs) render underneath — everything in one popover.
-function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip, isPending }) {
+// "Generate All" for the month's outstanding (not-Done) EU + Cert docs.
+// Hidden when nothing is outstanding.
+function MonthEndGenerateAllButton({ meRows, onGenerateAll }) {
+  const [busy, setBusy] = useState(false)
+  const outstanding = (meRows || [])
+    .flatMap(r => r.docs || [])
+    .filter(d => !d.done)
+    .map(d => d.doc_id)
+  if (outstanding.length === 0) return null
+  const handle = async () => {
+    if (busy) return
+    setBusy(true)
+    try { await onGenerateAll(outstanding) } finally { setBusy(false) }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      disabled={busy}
+      className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border bg-navy text-white border-navy hover:opacity-90 transition-all ${busy ? 'opacity-60 cursor-wait' : ''}`}
+    >
+      {busy ? 'Generating…' : `⬇ Generate All (${outstanding.length})`}
+    </button>
+  )
+}
+
+function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip, isPending, onGenerateAll }) {
   const wrapRef = useRef(null)
   useEffect(() => {
     const handler = (e) => {
@@ -492,9 +518,14 @@ function WeekCellPopover({ cell, monthEnd, showMonthEnd, onClose, onFlip, isPend
           {/* Month-End Documents — underneath, one section per pair */}
           {meRows.length > 0 && (
             <div className="pt-2 border-t-2 border-slate-200 space-y-3">
-              <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
-                Month-End Documents · {fmtMonth(monthEnd.month)}
-              </p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-500">
+                  Month-End Documents · {fmtMonth(monthEnd.month)}
+                </p>
+                {monthEnd?.due && (
+                  <MonthEndGenerateAllButton meRows={meRows} onGenerateAll={onGenerateAll} />
+                )}
+              </div>
               {meRows.map((row, i) => {
                 const rowBg = STATUS_BG[monthEndRowStatus(row)]
                 return (
@@ -1090,6 +1121,33 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
       setFlipError(e.message || 'Could not generate document — please retry.')
     }
   }
+  // "Generate All" — fill every outstanding month-end doc, combined into one
+  // EU PDF + one Certs PDF, delivered as a single ZIP.
+  const downloadMonthEndAll = async (docIds) => {
+    if (!docIds || docIds.length === 0) return
+    try {
+      const res = await fetch('/api/tools/generate-month-end-all', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ doc_ids: docIds }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Request failed (HTTP ${res.status})`)
+      }
+      const blob = await res.blob()
+      const cd = res.headers.get('Content-Disposition') || ''
+      const m = cd.match(/filename="?([^"]+)"?/)
+      const filename = m ? m[1] : 'Month_End_Docs.zip'
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setFlipError(e.message || 'Could not generate documents — please retry.')
+    }
+  }
   const onPendingGenerate = (item) => {
     if (isMonthEndItem(item)) return downloadMonthEndDoc(item)
     setPaystub(null); setPendingItem(item)
@@ -1192,6 +1250,7 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
           onClose={() => setActiveWeek(null)}
           onFlip={flip}
           isPending={isPending}
+          onGenerateAll={downloadMonthEndAll}
         />
       )}
 

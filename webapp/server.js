@@ -545,6 +545,55 @@ app.post('/api/tools/generate-month-end-doc', async (req, res) => {
 })
 
 /**
+ * POST /api/tools/generate-month-end-all  { doc_ids }
+ * "Generate All" for a month: fills every given month-end doc, merges all
+ * EUs into one PDF and all Certs into one PDF (collision-safe, in the
+ * worker), and streams a single ZIP of the combined PDFs for download.
+ */
+app.post('/api/tools/generate-month-end-all', async (req, res) => {
+  try {
+    const { doc_ids } = req.body || {}
+    if (!Array.isArray(doc_ids) || doc_ids.length === 0) return res.status(400).json({ error: 'No doc_ids' })
+
+    const spec = await callAppsScript('build_month_end_fill_all', { doc_ids })
+    if (!spec || spec.error) return res.status(400).json({ error: (spec && spec.error) || 'Could not build fill spec' })
+    const groups = Array.isArray(spec.groups) ? spec.groups : []
+    if (groups.length === 0) return res.status(400).json({ error: 'Nothing outstanding to generate' })
+
+    const fillBase = process.env.WORKER_FILL_URL
+    if (!fillBase) return res.status(500).json({ error: 'WORKER_FILL_URL not configured on this server' })
+
+    // Fill + merge each group (EU, CERT) into one combined PDF via the worker.
+    const files = []
+    for (const g of groups) {
+      const wr = await fetch(fillBase.replace(/\/$/, '') + '/fill-batch', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Fill-Key': process.env.FILL_SERVER_KEY || '' },
+        body:    JSON.stringify({ doc_kind: g.doc_kind, items: g.items, combined_filename: g.combined_filename }),
+      })
+      if (!wr.ok) {
+        const t = await wr.text().catch(() => '')
+        throw new Error(`Fill service error ${wr.status}: ${t.slice(0, 200)}`)
+      }
+      files.push({ name: g.combined_filename, buf: Buffer.from(await wr.arrayBuffer()) })
+    }
+
+    const zipName = String(spec.zip_name || 'Month_End_Docs.zip').replace(/[\r\n"]/g, '')
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`)
+    const archive = archiver('zip', { zlib: { level: 0 } })   // PDFs already compressed
+    archive.on('warning', (e) => console.warn('archiver warning:', e.message))
+    archive.on('error', (e) => { console.error('archiver error:', e.message); try { res.end() } catch (_) {} })
+    archive.pipe(res)
+    for (const f of files) archive.append(f.buf, { name: f.name })
+    await archive.finalize()
+  } catch (err) {
+    console.error('POST /api/tools/generate-month-end-all error:', err.message)
+    if (!res.headersSent) res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is

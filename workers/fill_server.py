@@ -20,7 +20,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from fill_form import DOC_KIND_TEMPLATE, fill_acroform
+from fill_form import DOC_KIND_TEMPLATE, fill_acroform, merge_filled
 
 
 class _DualStackServer(ThreadingHTTPServer):
@@ -55,7 +55,8 @@ def _make_handler(service, get_template, key):
                 self._send(404, b'{"error":"not found"}')
 
         def do_POST(self):
-            if self.path.rstrip('/') != '/fill':
+            route = self.path.rstrip('/')
+            if route not in ('/fill', '/fill-batch'):
                 return self._send(404, b'{"error":"not found"}')
             if key and self.headers.get('X-Fill-Key') != key:
                 return self._send(401, b'{"error":"unauthorized"}')
@@ -63,17 +64,23 @@ def _make_handler(service, get_template, key):
                 n = int(self.headers.get('Content-Length') or 0)
                 data = json.loads(self.rfile.read(n) or b'{}')
                 doc_kind = str(data.get('doc_kind') or '').upper()
-                fields   = data.get('fields') or {}
-                filename = str(data.get('filename') or 'month-end.pdf')
                 doc_type = DOC_KIND_TEMPLATE.get(doc_kind)
                 if not doc_type:
                     return self._send(400, json.dumps({'error': f'unknown doc_kind {doc_kind!r}'}).encode())
-
                 template = get_template(service, doc_type)
+
                 with tempfile.TemporaryDirectory() as td:
-                    out = Path(td) / 'filled.pdf'
-                    fill_acroform(str(template), fields, str(out))
+                    out = Path(td) / 'out.pdf'
+                    if route == '/fill-batch':
+                        # Combine every item's filled doc into one PDF.
+                        items    = data.get('items') or []
+                        filename = str(data.get('combined_filename') or 'combined.pdf')
+                        merge_filled(str(template), [it.get('fields') or {} for it in items], str(out))
+                    else:
+                        filename = str(data.get('filename') or 'month-end.pdf')
+                        fill_acroform(str(template), data.get('fields') or {}, str(out))
                     pdf = out.read_bytes()
+
                 safe = filename.replace('"', '').replace('\r', '').replace('\n', '')
                 self._send(200, pdf, 'application/pdf',
                            {'Content-Disposition': f'attachment; filename="{safe}"'})
