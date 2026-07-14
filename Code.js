@@ -13282,6 +13282,18 @@ function _buildDocStatusPayload_(monthIso) {
     const [my, mn] = monIso.split('-').map(Number);
     return weekStartIsoFor(new Date(my, mn, 0));  // Sunday of week holding the last day
   };
+  // ISO date + N calendar days, in CONFIG.TIMEZONE. Noon-anchored so the
+  // whole-day arithmetic is DST-safe. Used to compute when a CP / month-end
+  // doc becomes actionable: a Sun–Sat payroll week's CP can't be completed
+  // until payroll runs (Thursday night after the week ends = Sunday + 11);
+  // month-end docs wait until the month's last payroll week is complete
+  // (the Sunday after = last-week Sunday + 7) so the final Saturday's work
+  // is captured.
+  const addDaysIso = (iso, n) => {
+    const d = new Date(iso + 'T12:00:00');
+    d.setDate(d.getDate() + n);
+    return Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  };
 
   // Walk Work Day Log → group at TWO granularities:
   //   contractorDays[dateIso|contractor|crewChief] = per-crew PL shell
@@ -13489,9 +13501,14 @@ function _buildDocStatusPayload_(monthIso) {
   // calendar month, so the counts firm up as its sign-ins land; the
   // "awaiting sign-in" warning on each row tracks exactly that.
   const contractIdMap = _readContractIdMap_(ss);
-  const monthEndDue = todayIso >= monthLastWeekStartIso(monthIso);
-  const monthEndBreakdown = (!monthEndDue ? [] : Object.values(monthTuples)
-    .filter(mt => mt.month === monthIso))
+  // Populate the month-end breakdown from the first day of the month's
+  // first payroll week (accumulating as work lands), mirroring how CP
+  // bullets show from the first day worked. The pending PROMPT is still
+  // gated (above) to the Sunday after the month's last payroll week; the
+  // heavy Employee-Utilization read below stays gated to that same date.
+  const monthEndPendingDue = todayIso >= addDaysIso(monthLastWeekStartIso(monthIso), 7);
+  const monthEndBreakdown = Object.values(monthTuples)
+    .filter(mt => mt.month === monthIso)
     .map(mt => ({
       contractor:   mt.contractor,
       contract_num: mt.contract_num,
@@ -13512,11 +13529,11 @@ function _buildDocStatusPayload_(monthIso) {
     }))
     .sort((a, b) => (a.contract_num + a.borough).localeCompare(b.contract_num + b.borough));
 
-  // Employee Utilization counts for the modal. Gated on a non-empty
-  // breakdown — which only happens once the month's final week has
-  // begun — so the full Daily Sign-In Data read stays off the dashboard's
-  // hot path for the rest of the month.
-  if (monthEndBreakdown.length > 0) {
+  // Employee Utilization counts for the modal. The breakdown now populates
+  // all month, so gate the counts explicitly on the month-end due date
+  // (Sunday after the last payroll week) to keep the full Daily Sign-In
+  // Data read off the dashboard's hot path until the docs are actionable.
+  if (monthEndBreakdown.length > 0 && monthEndPendingDue) {
     _attachUtilizationCounts_(ss, monthIso, monthEndBreakdown, wdlData);
   }
 
@@ -13591,13 +13608,18 @@ function _buildDocStatusPayload_(monthIso) {
       if (plDone && !plSent) pushPending(cdProxy, 'day', cd.date, plId, ['PL Sent']);
     }
   });
-  // Week-kind pending: CP Done, CP Sent
+  // Week-kind pending: CP Done, CP Sent. A CP can't be completed until
+  // payroll is run — the Thursday after the Sun–Sat week ends (week_start
+  // + 11). Before then the calendar bullets still show (separate path
+  // above), but we don't prompt for a task the admin can't do yet. "Sent"
+  // stays ungated: an already-done CP is always sendable.
   Object.values(weekTuples).forEach(w => {
     const cpId = _docLifecycleId_('Certified Payroll', w.week_start, w.contract_num, w.borough);
     const cp = logById[cpId];
     const cpDone = cp && cp.done;
     const cpSent = cp && cp.sent;
-    if (!cpDone) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
+    const cpDue  = todayIso >= addDaysIso(w.week_start, 11);
+    if (!cpDone && cpDue) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
     if (cpDone && !cpSent) pushPending(w, 'week', w.week_start, cpId, ['CP Sent']);
   });
   // Month-end pending (all-time, week-kind). Only surfaces once the
@@ -13606,14 +13628,17 @@ function _buildDocStatusPayload_(monthIso) {
   // the client labels them "Month of <Month Year>". One entry per
   // missing flag per doc; Sent only surfaces once Done is set.
   Object.values(monthTuples).forEach(mt => {
-    const mws = monthLastWeekStartIso(mt.month);
-    if (todayIso < mws) return;   // not due until the last week arrives
+    const mws   = monthLastWeekStartIso(mt.month);
+    // Not due until the month's last payroll week is COMPLETE — the Sunday
+    // after that week ends (mws + 7) — so a contract worked on the final
+    // Saturday is captured before we prompt. "Sent" stays ungated.
+    const meDue = todayIso >= addDaysIso(mws, 7);
     MONTH_END_DOCS_.forEach(md => {
       const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough, mt.contractor);
       const rec = logById[id];
       const done = rec && rec.done;
       const sent = rec && rec.sent;
-      if (!done) pushPending(mt, 'week', mws, id, [md.key + ' Done']);
+      if (!done && meDue) pushPending(mt, 'week', mws, id, [md.key + ' Done']);
       if (done && !sent) pushPending(mt, 'week', mws, id, [md.key + ' Sent']);
     });
   });
