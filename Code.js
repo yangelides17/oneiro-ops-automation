@@ -13150,6 +13150,7 @@ function handleListDocumentsForBatch_(body) {
           doc_type:     _DOC_TYPE_INTERNAL_TO_FRIENDLY_[docType],
           wo_ids:       coveredWoIds,
           work_date:    fileDate,
+          crew_chief:   fileChief,   // multi-crew disambiguation in the manifest
           doc_id:       logState.doc_id,
           done:         true,
           sent:         allSent,

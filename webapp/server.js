@@ -2341,15 +2341,20 @@ function buildBatchManifest(filters, listing) {
     lines.push('')
   }
 
-  // ── Production Logs
+  // ── Production Logs (crew chief shown so same-date multi-crew logs are
+  // distinguishable — otherwise two identical dates look like a duplicate).
   const plFiles = files.filter(f => f.doc_type === 'Production Log')
-    .sort((a, b) => dateCompare(a.work_date, b.work_date))
+    .sort((a, b) => dateCompare(a.work_date, b.work_date)
+                    || String(a.crew_chief || '').localeCompare(String(b.crew_chief || '')))
   if (plFiles.length) {
     lines.push(sectionRule)
     lines.push(`Production Logs for: (${plFiles.length})`)
     lines.push(sectionRule)
     plFiles.forEach(f => {
-      lines.push(`${bullet}${f.work_date || '?'}`)
+      const chief = f.crew_chief
+        ? `  —  Crew: ${String(f.crew_chief).replace(/([a-z0-9])([A-Z])/g, '$1 $2')}`
+        : ''
+      lines.push(`${bullet}${f.work_date || '?'}${chief}`)
     })
     lines.push('')
   }
