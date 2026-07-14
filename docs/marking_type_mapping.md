@@ -56,10 +56,14 @@ or routing impact.
 | Straight Arrow         | EA   | Straight Arrows     | Straight Arrow                   |
 | Combination Arrow      | EA   | Combination Arrows  | Combination Arrow                |
 | Combination Arrow (L/R)| EA   | Combination Arrows *(summed with Combination Arrow)* | Combination Arrow *(summed with Combination Arrow)* |
-| Speed Hump Markings    | EA   | Speed Hump Markings | Speed Hump Marking               |
+| Speed Hump Markings ¹  | EA   | Speed Hump Markings | Speed Hump Marking               |
 | Shark Teeth 24x36      | EA   | Shark Teeth 24x36   | Sharks Teeth 24" 36"             |
 | Bike Lane Arrow        | EA   | Bike Lane Arrows    | Bicycle Lane Arrow               |
 | Bike Lane Symbol       | EA   | Bike Lane Symbols   | Bicycle Lane Symbol              |
+
+¹ Displays as **"Speed Bump Arrow"** in the webapp UI only; the stored
+value + all routing stay `Speed Hump Markings` (see display-alias note
+above).
 
 ## SF categories — NOT in the grid; flow through Color Surface Treatment rows
 
