@@ -12090,9 +12090,10 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues, opts
 
   // General Remarks composition. The CFR field renders single-line, so we
   // join every segment with " | ". Priority order (highest first):
-  //   1. Color Surface  2. PED MEN  3. Other Markings  4. Reported Issues.
-  // The first three come from completed markings that have no dedicated
-  // CFR field; the issues are the accumulated per-submit notes.
+  //   0. Double White Line  1. Color Surface  2. PED MEN
+  //   3. Other Markings  4. Reported Issues.
+  // Segments 0-3 come from completed markings that have no dedicated CFR
+  // field; the issues are the accumulated per-submit notes.
   const markingSegments = buildMarkingRemarksSegments_(ss, d.wo_id);
   const issueSegments = String(aggregatedIssues || '')
     .split(/\r?\n/)
