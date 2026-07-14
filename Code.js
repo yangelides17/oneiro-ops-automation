@@ -7382,7 +7382,7 @@ function _scanWorkDayLogForMonth_(ss, monthIso, contractNum, borough, contractor
  *
  * `wdlData` is the caller's already-read Work Day Log values.
  */
-function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
+function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData, siData) {
   const race = _readEmployeeRaceMap_(ss);
   const ymd = (v) => {
     if (v instanceof Date && !isNaN(v.getTime())) {
@@ -7400,9 +7400,12 @@ function _attachUtilizationCounts_(ss, monthIso, breakdownRows, wdlData) {
   };
 
   // ── Pass 1: distinct signed-in employees per key ────────────────
+  // Caller may pass siData (read once, reused across months); else read it.
   const namesByKey = {};
-  const siSheet = ss.getSheetByName('Daily Sign-In Data');
-  const siData  = siSheet ? siSheet.getDataRange().getValues() : [];
+  if (!siData) {
+    const siSheet = ss.getSheetByName('Daily Sign-In Data');
+    siData = siSheet ? siSheet.getDataRange().getValues() : [];
+  }
   for (let i = 1; i < siData.length; i++) {
     const r = siData[i];
     const iso = ymd(r[0]);
@@ -13746,12 +13749,29 @@ function _buildDocStatusPayload_(monthIso) {
   };
 
   const monthEndBreakdown = buildMEBreakdown(monthIso);
-  // Employee Utilization counts for the modal. The breakdown populates all
-  // month, so gate the counts explicitly on the due date (Sunday after the
-  // last payroll week) to keep the full Daily Sign-In Data read off the hot path.
-  if (monthEndBreakdown.length > 0 && monthEndPendingDue) {
-    _attachUtilizationCounts_(ss, monthIso, monthEndBreakdown, wdlData);
+
+  // Previous month's month-end docs attach to ITS last payroll week — which
+  // the calendar renders as the LEADING week of this grid when it straddles
+  // (e.g. the July grid shows "Jun 28 – Jul 4", June's last week). Without
+  // this the bullets vanish when you page to the next month.
+  const [_meY, _meM] = monthIso.split('-').map(Number);
+  const prevMonthIso  = Utilities.formatDate(new Date(_meY, _meM - 2, 1), CONFIG.TIMEZONE, 'yyyy-MM');
+  const prevBreakdown = buildMEBreakdown(prevMonthIso);
+  const prevDue       = todayIso >= addDaysIso(monthLastWeekStartIso(prevMonthIso), 7);
+
+  // Employee Utilization counts for the popover. Gated on the due date so the
+  // read stays off the hot path until the docs are actionable. Read the Daily
+  // Sign-In Data sheet ONCE and attach to whichever panels are due (viewed
+  // month + the previous month's straddling week) — no double read.
+  const _attachCurrent = monthEndBreakdown.length > 0 && monthEndPendingDue;
+  const _attachPrev    = prevBreakdown.length > 0 && prevDue;
+  if (_attachCurrent || _attachPrev) {
+    const siSheet = ss.getSheetByName('Daily Sign-In Data');
+    const siData  = siSheet ? siSheet.getDataRange().getValues() : [];
+    if (_attachCurrent) _attachUtilizationCounts_(ss, monthIso,     monthEndBreakdown, wdlData, siData);
+    if (_attachPrev)    _attachUtilizationCounts_(ss, prevMonthIso, prevBreakdown,     wdlData, siData);
   }
+
   const monthEndPanel = {
     month:      monthIso,
     week_start: monthLastWeekStartIso(monthIso),   // the last-week cell it attaches to
@@ -13759,22 +13779,12 @@ function _buildDocStatusPayload_(monthIso) {
     breakdown:  monthEndBreakdown,
     due:        monthEndPendingDue,                // gates the "Generate All" button
   };
-
-  // Previous month's month-end docs attach to ITS last payroll week — which
-  // the calendar renders as the LEADING week of this grid when it straddles
-  // (e.g. the July grid shows "Jun 28 – Jul 4", June's last week). Without
-  // this the bullets vanish when you page to the next month. No utilization
-  // attach here — the extra full Daily Sign-In read isn't worth it for the
-  // straddling week (the bullets + Done/Sent + Generate All don't need it).
-  const [_meY, _meM] = monthIso.split('-').map(Number);
-  const prevMonthIso  = Utilities.formatDate(new Date(_meY, _meM - 2, 1), CONFIG.TIMEZONE, 'yyyy-MM');
-  const prevBreakdown = buildMEBreakdown(prevMonthIso);
   const monthEndPrevPanel = prevBreakdown.length > 0 ? {
     month:      prevMonthIso,
     week_start: monthLastWeekStartIso(prevMonthIso),
     status:     meStatus(prevBreakdown),
     breakdown:  prevBreakdown,
-    due:        todayIso >= addDaysIso(monthLastWeekStartIso(prevMonthIso), 7),
+    due:        prevDue,
   } : null;
 
   // Pending list (all-time, FIFO oldest first). We emit one entry per
