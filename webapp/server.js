@@ -487,9 +487,12 @@ app.post('/api/tools/generate-pl-for-doc', async (req, res) => {
  */
 app.post('/api/tools/generate-cp-for-doc', async (req, res) => {
   try {
-    const { doc_id } = req.body || {}
+    const { doc_id, paystub } = req.body || {}
     if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
-    const data = await callAppsScript('generate_cp_for_doc', { doc_id })
+    // `paystub` (optional) = { employees: [{ name, gross_pay, net_pay, deductions }] }
+    // from the Upload Paystub step; Apps Script uses it to auto-fill
+    // Withholdings & Net Pay and to run the gross-pay verification.
+    const data = await callAppsScript('generate_cp_for_doc', { doc_id, paystub })
     if (data && data.error) return res.status(400).json(data)
     res.json(data)
   } catch (err) {
@@ -1335,6 +1338,153 @@ Rules:
     })
   } catch (err) {
     console.error('POST /api/signin-queue/parse-upload error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/tools/paystub/parse
+ * Reads a payroll paystub with Claude vision so the CP Generate modal can
+ * auto-fill each employee's Withholdings & Deductions and Net Pay (today
+ * transcribed by hand from payrollforconstruction.com). Standard input is
+ * the "Pre-Check Register" (one page, every employee, two rows each), as a
+ * PDF or a JPEG/PNG screenshot; individual check stubs are also handled.
+ *
+ * Employee names are resolved against the Employee Registry closed list
+ * (same closed-list trick as /api/signin-queue/parse-upload) so the "Last,
+ * First M" register spelling maps to the exact registry name the CP data
+ * joins on.
+ *
+ * Returns { employees: [{ name, employee_number, gross_pay, net_pay,
+ * deductions }], filename }. No persistence — the caller passes the result
+ * straight into POST /api/tools/generate-cp-for-doc.
+ */
+app.post('/api/tools/paystub/parse', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' })
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on this server' })
+    }
+    const mime = req.file.mimetype || 'application/pdf'
+    const ALLOWED = ['application/pdf', 'image/jpeg', 'image/png']
+    if (!ALLOWED.includes(mime)) {
+      return res.status(400).json({ error: 'Unsupported file type (got ' + mime + '). Upload a PDF, JPEG, or PNG.' })
+    }
+    const base64 = req.file.buffer.toString('base64')
+    // PDFs go in a `document` block; images in an `image` block.
+    const sourceBlock = mime === 'application/pdf'
+      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }
+      : { type: 'image',    source: { type: 'base64', media_type: mime,              data: base64 } }
+
+    // Closed employee list for exact name resolution (see parse-upload).
+    let employeeList = []
+    try {
+      const empRes = await callAppsScript('list_employees')
+      employeeList = (empRes && Array.isArray(empRes.employees))
+        ? empRes.employees.map(e => String(e.name || '').trim()).filter(Boolean)
+        : []
+    } catch (e) {
+      console.warn('Paystub upload: could not fetch employee list:', e.message)
+    }
+    const employeeListText = employeeList.length
+      ? employeeList.map(n => `  - ${n}`).join('\n')
+      : '  (registry currently empty — return the name as printed)'
+
+    const prompt = `You are extracting per-employee pay figures from a construction payroll paystub produced by payrollforconstruction.com. Return ONLY valid JSON — no markdown fences, no commentary.
+
+The document is USUALLY a "Pre-Check Register": a single table listing every employee for one weekly pay period. Each employee occupies TWO stacked rows:
+  - Row 1 columns: REG (hours) | QTY | REG Wages | Taxable Add | Tx Uni Frng | Gross Pay | FICA | State | Union | Net Pay
+  - Row 2 columns: OVT (hours) | OTH | OVT Wages | Non-Tax Add | Emp Fringe | Tot Taxable | Federal | Local | Misc | Pay Method
+Each employee block is preceded by an employee number and a name like "Angelides , Stamatis D".
+
+For EACH employee return:
+  - gross_pay: the number in the "Gross Pay" column (row 1) — the full weekly gross across all work.
+  - net_pay:   the number in the "Net Pay" column (row 1).
+  - deductions: gross_pay minus net_pay. (Sanity-check: it should also equal FICA + State + Union + Federal + Local + Misc summed across both rows — if that sum disagrees, still return gross_pay - net_pay.)
+  - employee_number: the payroll ID printed with the block (e.g. "3540"), or null.
+
+If instead the document is an individual check stub (one employee per page, with a "Summary" block), read Gross Pay, Total Deductions, and Net Pay directly from that Summary; deductions = Total Deductions.
+
+IGNORE any totals/summary rows at the bottom of a register (rows labeled "Employees:", "Total Checks", "Total Direct Deposits", "Total Adjustments"). Only return real employees.
+
+Schema:
+{
+  "employees": [
+    {
+      "name":            "<EXACTLY one name from the Employee Registry below — see Name matching rules>",
+      "employee_number": "<the payroll ID printed for this employee, or null>",
+      "gross_pay":       <number, no $ or commas>,
+      "net_pay":         <number, no $ or commas>,
+      "deductions":      <number, no $ or commas>
+    }
+  ]
+}
+
+Employee Registry (the ONLY valid values for employees[].name):
+${employeeListText}
+
+Name matching rules:
+- The register prints names "Last , First M". For each, find the SINGLE registry entry above whose person matches (account for last/first order, middle initials, accents, abbreviations, minor misspellings — pick the best fit).
+- Return that registry entry verbatim — exact capitalization and spelling as listed above.
+- If the registry list is empty, return the name as printed on the paystub.
+- Skip a row only if it has no employee at all.
+
+Numbers:
+- Strip "$" and thousands separators; "1,529.55" → 1529.55.
+- Never wrap the JSON in markdown fences.`
+
+    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'x-api-key':         process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type':      'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 4096,
+        messages: [{
+          role: 'user',
+          content: [ sourceBlock, { type: 'text', text: prompt } ],
+        }],
+      }),
+    })
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text()
+      throw new Error(`Anthropic API error ${apiRes.status}: ${errText.slice(0, 300)}`)
+    }
+    const apiJson = await apiRes.json()
+    const textBlock = (apiJson.content || []).find(b => b.type === 'text')
+    if (!textBlock) throw new Error('Anthropic response had no text block')
+
+    let raw = String(textBlock.text || '').trim()
+    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim()
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (e) {
+      throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
+    }
+
+    // Normalize into a clean numeric array; drop rows missing a name.
+    const num = v => {
+      const n = Number(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''))
+      return isFinite(n) ? n : null
+    }
+    const employees = (Array.isArray(parsed.employees) ? parsed.employees : [])
+      .map(e => ({
+        name:            String(e.name || '').trim(),
+        employee_number: e.employee_number != null ? String(e.employee_number).trim() : null,
+        gross_pay:       num(e.gross_pay),
+        net_pay:         num(e.net_pay),
+        deductions:      num(e.deductions),
+      }))
+      .filter(e => e.name)
+
+    res.json({ employees, filename: req.file.originalname })
+  } catch (err) {
+    console.error('POST /api/tools/paystub/parse error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })

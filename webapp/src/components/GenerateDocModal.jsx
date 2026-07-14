@@ -21,8 +21,12 @@ import { useEffect, useState } from 'react'
  *   description   ReactNode     — preflight info shown in idle state
  *   confirmLabel  string?       — button text (default 'Generate')
  *   onConfirm     async fn      — runs the request. Resolve with
- *                                 `{ message, files? }` for success,
- *                                 throw `Error(message)` for failure.
+ *                                 `{ message, files?, warnings? }` for
+ *                                 success, throw `Error(message)` for
+ *                                 failure.
+ *   idleExtra     ReactNode?    — extra content rendered under the
+ *                                 description in the idle state (e.g. an
+ *                                 optional file-upload affordance).
  *   onClose       fn            — fires only when state allows dismiss
  *                                 (idle Cancel, success/error OK).
  */
@@ -33,10 +37,12 @@ export default function GenerateDocModal({
   confirmLabel = 'Generate',
   onConfirm,
   onClose,
+  idleExtra = null,
 }) {
-  const [state,   setState]   = useState('idle')   // 'idle' | 'submitting' | 'success' | 'error'
-  const [message, setMessage] = useState('')
-  const [files,   setFiles]   = useState([])
+  const [state,    setState]    = useState('idle')   // 'idle' | 'submitting' | 'success' | 'error'
+  const [message,  setMessage]  = useState('')
+  const [files,    setFiles]    = useState([])
+  const [warnings, setWarnings] = useState([])
 
   // Reset state every time the modal is (re)opened.
   useEffect(() => {
@@ -44,6 +50,7 @@ export default function GenerateDocModal({
       setState('idle')
       setMessage('')
       setFiles([])
+      setWarnings([])
     }
   }, [open])
 
@@ -77,6 +84,7 @@ export default function GenerateDocModal({
       const msg = (result && result.message) || 'Done.'
       setMessage(msg)
       setFiles((result && result.files) || [])
+      setWarnings((result && result.warnings) || [])
       setState('success')
     } catch (err) {
       setMessage(err?.message || 'Something went wrong.')
@@ -118,6 +126,9 @@ export default function GenerateDocModal({
           {state === 'idle' && (
             <div className="text-slate-500 text-sm leading-relaxed">{description}</div>
           )}
+          {state === 'idle' && idleExtra && (
+            <div className="pt-1">{idleExtra}</div>
+          )}
           {state === 'submitting' && (
             <p className="text-slate-500 text-sm leading-relaxed">
               Working on it… don't close this tab.
@@ -130,6 +141,24 @@ export default function GenerateDocModal({
                 <ul className="text-[11px] font-mono text-slate-500 bg-slate-50 rounded-lg p-2 text-left space-y-0.5 max-h-[120px] overflow-y-auto">
                   {files.map((f, i) => <li key={i} className="truncate">• {f}</li>)}
                 </ul>
+              )}
+              {warnings.length > 0 && (
+                <div className="text-left bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1">
+                  <p className="text-[12px] font-bold text-amber-700">
+                    ⚠ Gross pay didn’t match the paystub for {warnings.length} employee{warnings.length === 1 ? '' : 's'}
+                  </p>
+                  <p className="text-[10px] text-amber-600">
+                    Net Pay &amp; Withholdings were still filled. Check that this week’s hours are recorded correctly.
+                  </p>
+                  <ul className="text-[11px] text-amber-800 space-y-0.5 max-h-[120px] overflow-y-auto">
+                    {warnings.map((w, i) => (
+                      <li key={i} className="tabular-nums">
+                        <span className="font-semibold">{w.name}</span>: computed ${w.expected} vs paystub ${w.paystub}
+                        <span className="text-amber-500"> (Δ ${w.delta})</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           )}

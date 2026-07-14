@@ -3048,7 +3048,24 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   }
   const weekStart = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]), 0, 0, 0);
   const weekEnd   = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]) + 6, 23, 59, 59); // Saturday 23:59, end of Sun–Sat week
-  
+
+  // Optional paystub auto-fill (from the CP Generate modal's "Upload
+  // Paystub" step). When present, each employee's Withholdings &
+  // Deductions + Net Pay are filled from the paystub instead of left
+  // blank, and their computed all-work gross is cross-checked against
+  // the paystub gross — a discrepancy warns (via opts.warningsOut) but
+  // never blocks generation. Values are week-level per person and repeat
+  // on each of that person's classification rows.
+  const _psNorm = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const paystubByName = {};
+  if (opts && opts.paystub && Array.isArray(opts.paystub.employees)) {
+    opts.paystub.employees.forEach(e => {
+      const n = _psNorm(e && e.name);
+      if (n) paystubByName[n] = e;
+    });
+  }
+  const warnedNames = {};   // dedupe gross warnings across a person's multiple classification rows
+
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const data = signInSheet.getDataRange().getValues();
@@ -3296,6 +3313,38 @@ function generateCertifiedPayroll(weekStartStr, opts) {
       // with ST supp, OT hours always pair with OT supp.
       const grossPay = (totalST * (stRate + stSupp)) + (totalOT * (otRate + otSupp));
 
+      // Paystub auto-fill for this employee (week-level: net pay &
+      // withholdings, same on each of the person's classification rows).
+      const ps = paystubByName[normName(empName)];
+      let netPayStr     = '';
+      let deductionsStr = '';
+      if (ps) {
+        const psNet   = Number(ps.net_pay);
+        const psGross = Number(ps.gross_pay);
+        let   psDed   = Number(ps.deductions);
+        if (!isFinite(psDed) && isFinite(psGross) && isFinite(psNet)) psDed = psGross - psNet;
+        if (isFinite(psNet)) netPayStr     = psNet.toFixed(2);
+        if (isFinite(psDed)) deductionsStr = psDed.toFixed(2);
+
+        // Gross verification: computed all-work gross vs paystub gross
+        // (a proxy for hours being recorded correctly). Tolerance =
+        // max($1, 0.5%). Warn once per employee; still fill the values.
+        if (isFinite(psGross)) {
+          const tol = Math.max(1, allWorkGross * 0.005);
+          if (Math.abs(allWorkGross - psGross) > tol && !warnedNames[normName(empName)]) {
+            warnedNames[normName(empName)] = true;
+            if (opts && Array.isArray(opts.warningsOut)) {
+              opts.warningsOut.push({
+                name:     empName,
+                expected: allWorkGross.toFixed(2),
+                paystub:  psGross.toFixed(2),
+                delta:    (allWorkGross - psGross).toFixed(2),
+              });
+            }
+          }
+        }
+      }
+
       cpSheet.appendRow([
         weekStart, weekEnd,
         contractNum, borough, contractId,
@@ -3310,9 +3359,11 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         info.days[6] || 0, // Sat
         totalST, totalOT,
         stRate, otRate, grossPay,
-        '', '', '', // Total gross, withholdings, net — need payroll software data
+        // Total gross (all work), withholdings, net — filled from the
+        // uploaded paystub when provided, else left blank for manual entry.
+        (ps ? allWorkGross.toFixed(2) : ''), deductionsStr, netPayStr,
         stSupp, otSupp,
-        'Pending Verification', '', // Match status
+        (ps && !warnedNames[normName(empName)] ? 'Verified (paystub)' : 'Pending Verification'), '', // Match status
         'No', ''   // Sent status
       ]);
 
@@ -3337,8 +3388,8 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         supp_ot:         otSupp.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
         total_gross_pay: allWorkGross.toFixed(2),   // this pay period, all projects
-        net_pay:         '',
-        deductions:      '',
+        net_pay:         netPayStr,                 // from uploaded paystub when provided
+        deductions:      deductionsStr,             // from uploaded paystub when provided
         annualized_rate: ''
       });
     });
@@ -8823,8 +8874,11 @@ function handleGenerateCPForDoc_(body) {
   try {
     const [yyyy, mm, dd] = parsed.anchor.split('-');
     const weekStartMmDd = `${mm}/${dd}/${yyyy}`;
+    const warningsOut = [];
     const groupCount = generateCertifiedPayroll(weekStartMmDd, {
       contractFilter: { contractNum: parsed.contractNum, borough: parsed.borough },
+      paystub:     d.paystub || null,   // optional { employees: [...] } from the Upload Paystub step
+      warningsOut,                       // mutated with gross-discrepancy warnings
     });
     if (!groupCount) {
       return jsonResponse_({
@@ -8840,6 +8894,7 @@ function handleGenerateCPForDoc_(body) {
                parsed.borough + ' (week of ' + parsed.anchor +
                '). Review the filled PDF in the Approvals tab — Done flips automatically when archived.',
       contract_groups: groupCount,
+      warnings: warningsOut,   // gross-pay discrepancies flagged during paystub auto-fill
     });
   } catch (err) {
     return jsonResponse_({ error: String(err && err.message || err) }, 500);

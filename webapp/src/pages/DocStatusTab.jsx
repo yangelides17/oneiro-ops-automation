@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import GenerateDocModal from '../components/GenerateDocModal'
+import PaystubUpload from '../components/PaystubUpload'
 import WODocsQueue from '../components/WODocsQueue'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
@@ -837,6 +838,8 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   // GenerateDocModal state — `pendingItem` is the pending-list row the
   // user clicked Generate on; null = modal closed.
   const [pendingItem, setPendingItem] = useState(null)
+  // Parsed paystub rows for the CP generate modal (null = none uploaded).
+  const [paystub, setPaystub] = useState(null)
 
   // Push the pending count into the shared context so the Doc Status
   // tab in Dashboard's TabStrip can show a badge. Sourced via useEffect
@@ -987,9 +990,10 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
 
   const onPendingMark = (docId, flag, value) => flip(docId, flag, value)
 
-  const onPendingGenerate = (item) => setPendingItem(item)
+  const onPendingGenerate = (item) => { setPaystub(null); setPendingItem(item) }
   const closeGenerateModal = () => {
     setPendingItem(null)
+    setPaystub(null)
     // Refetch so any state changes (e.g. Doc Lifecycle Log row created
     // by an upsert during generation) are reflected.
     load(monthIso)
@@ -1003,13 +1007,17 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
     const res = await fetch(url, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ doc_id: pendingItem.doc_id }),
+      body:    JSON.stringify({
+        doc_id: pendingItem.doc_id,
+        // Optional paystub auto-fill — CP only, when one was uploaded.
+        ...(isCp && paystub ? { paystub: { employees: paystub } } : {}),
+      }),
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok || body.error) {
       throw new Error(body.error || `Request failed (HTTP ${res.status})`)
     }
-    return { message: body.message, files: body.files || [] }
+    return { message: body.message, files: body.files || [], warnings: body.warnings || [] }
   }
 
   return (
@@ -1108,6 +1116,9 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         ) : null}
         onConfirm={handleGenerateConfirm}
         onClose={closeGenerateModal}
+        idleExtra={pendingItem?.missing?.[0] === 'CP Done'
+          ? <PaystubUpload onParsed={setPaystub} />
+          : null}
       />
     </div>
   )
