@@ -12555,13 +12555,127 @@ const _DOC_TYPE_INTERNAL_TO_FRIENDLY_ = Object.freeze({
 
 const MAX_BATCH_FILES_ = 500;
 
+/**
+ * Payroll-period batch listing: all Certified Payroll + Sign-In docs for a
+ * single payroll week (Sun–Sat) or a whole payroll month, read straight from
+ * the Doc Lifecycle Log (which stores each archived doc's Drive file_id in
+ * col 9 — no Drive walk). Zip is organized Week → Contractor → "cn - Borough".
+ *
+ * data: { granularity:'week'|'month', week_start?:'YYYY-MM-DD', month?:'YYYY-MM',
+ *         contractors?:[], doc_types?:['Certified Payroll','Sign-In'] }
+ */
+function handlePayrollPeriodBatch_(d) {
+  const granularity = String(d.granularity || '').trim();
+  if (granularity !== 'week' && granularity !== 'month') {
+    return jsonResponse_({ error: 'payroll_period requires granularity week | month' }, 400);
+  }
+  const weekStart = String(d.week_start || '').trim();
+  const monthIso  = String(d.month || '').trim();
+  if (granularity === 'week' && !/^\d{4}-\d{2}-\d{2}$/.test(weekStart)) {
+    return jsonResponse_({ error: 'week granularity requires week_start (YYYY-MM-DD)' }, 400);
+  }
+  if (granularity === 'month' && !/^\d{4}-\d{2}$/.test(monthIso)) {
+    return jsonResponse_({ error: 'month granularity requires month (YYYY-MM)' }, 400);
+  }
+
+  const contractorsFilter = Array.isArray(d.contractors)
+    ? d.contractors.map(s => String(s).trim()).filter(Boolean) : [];
+  const contractorSet = contractorsFilter.length ? new Set(contractorsFilter) : null;
+
+  // Only CP + Sign-In; default both. (Sign-Ins-without-CP is a valid pick.)
+  const ALLOWED_TYPES_ = { 'Certified Payroll': 1, 'Sign-In': 1 };
+  const wantTypes = (Array.isArray(d.doc_types) && d.doc_types.length
+    ? d.doc_types.map(s => String(s).trim()) : Object.keys(ALLOWED_TYPES_))
+    .filter(t => ALLOWED_TYPES_[t]);
+  if (wantTypes.length === 0) {
+    return jsonResponse_({ error: 'doc_types must include Certified Payroll and/or Sign-In' }, 400);
+  }
+  const wantSet = new Set(wantTypes);
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const { rows } = _readDocLifecycle_(ss);
+
+  // "Jun 7 – Jun 13" from a Sunday ISO.
+  const weekLabel = (wkIso) => {
+    const [y, m, dd] = wkIso.split('-').map(Number);
+    const fmt = (x) => Utilities.formatDate(x, CONFIG.TIMEZONE, 'MMM d');
+    return fmt(new Date(y, m - 1, dd)) + ' – ' + fmt(new Date(y, m - 1, dd + 6));
+  };
+
+  const files = [];
+  const missing = [];
+  const seen = new Set();
+
+  rows.forEach(r => {
+    const dt = String(r.doc_type || '').trim();
+    if (dt !== 'Certified Payroll' && dt !== 'Sign-In') return;
+    if (!wantSet.has(dt)) return;
+    const anchor = String(r.anchor || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(anchor)) return;
+
+    // CP anchor is the week-start Sunday; SI anchor is the individual day.
+    const wk = (dt === 'Certified Payroll') ? anchor : _weekStartIsoOf_(anchor);
+    if (granularity === 'week') { if (wk !== weekStart) return; }
+    else if (_payrollMonthIso_(anchor) !== monthIso) return;
+
+    const contractor = String(r.contractor || '').trim();
+    if (contractorSet && !contractorSet.has(contractor)) return;
+
+    const cn  = String(r.contract_num || '').trim();
+    const bor = String(r.borough || '').trim();
+    const filename = (dt === 'Certified Payroll' ? 'Certified_Payroll_' : 'SignIn_')
+      + cn + '_' + bor + '_' + anchor + '.pdf';
+
+    if (!r.file_id) {
+      missing.push({ doc_type: dt, contractor: contractor, contract_num: cn, borough: bor,
+        work_date: anchor, reason: 'Not archived yet (no file in Drive)' });
+      return;
+    }
+    if (seen.has(r.file_id)) return;
+    seen.add(r.file_id);
+
+    files.push({
+      file_id:      r.file_id,
+      filename:     filename,
+      contractor:   contractor,
+      contract_num: cn,
+      borough:      bor,
+      doc_type:     dt,
+      wo_ids:       Array.isArray(r.wo_ids) ? r.wo_ids : [],
+      work_date:    anchor,
+      doc_id:       r.doc_id,
+      done:         !!r.done,
+      sent:         !!r.sent,
+      zip_path:     'Week of ' + weekLabel(wk) + '/' + (contractor || 'Unknown')
+        + '/' + cn + ' - ' + getBoroughName_(bor) + '/' + filename,
+    });
+  });
+
+  files.sort((a, b) => (a.zip_path < b.zip_path ? -1 : a.zip_path > b.zip_path ? 1 : 0));
+
+  const capped = files.length > MAX_BATCH_FILES_ ? files.slice(0, MAX_BATCH_FILES_) : files;
+  const counts = { total: capped.length, by_doc_type: {}, by_contractor: {} };
+  capped.forEach(f => {
+    counts.by_doc_type[f.doc_type]     = (counts.by_doc_type[f.doc_type]     || 0) + 1;
+    counts.by_contractor[f.contractor] = (counts.by_contractor[f.contractor] || 0) + 1;
+  });
+
+  const warnings = [];
+  if (files.length > MAX_BATCH_FILES_) warnings.push('Result capped at ' + MAX_BATCH_FILES_ + ' files.');
+
+  return jsonResponse_({ files: capped, counts, missing, warnings, truncated: files.length > MAX_BATCH_FILES_ });
+}
+
 function handleListDocumentsForBatch_(body) {
   const d = body.data || {};
   const mode = String(d.mode || '').trim();
-  const validModes = { unsent: 1, wo_numbers: 1, date_range: 1 };
+  const validModes = { unsent: 1, wo_numbers: 1, date_range: 1, payroll_period: 1 };
   if (!validModes[mode]) {
-    return jsonResponse_({ error: 'mode must be one of unsent | wo_numbers | date_range' }, 400);
+    return jsonResponse_({ error: 'mode must be one of unsent | wo_numbers | date_range | payroll_period' }, 400);
   }
+  // Payroll-period mode is a self-contained Doc Lifecycle Log lookup — it
+  // doesn't use the WO-Tracker-driven enumeration below.
+  if (mode === 'payroll_period') return handlePayrollPeriodBatch_(d);
 
   const contractorsFilter = Array.isArray(d.contractors)
     ? d.contractors.map(s => String(s).trim()).filter(Boolean)

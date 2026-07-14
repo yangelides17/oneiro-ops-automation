@@ -21,9 +21,9 @@ const ALL_DOC_TYPES = ['CFR', 'Production Log', 'Sign-In', 'Certified Payroll', 
 // SI is hidden from the unsent picker — admin gets a checkbox to bundle
 // SIs alongside CP instead. Other modes still expose SI as a regular pill.
 const docTypesForMode = (mode) =>
-  mode === 'unsent'
-    ? ALL_DOC_TYPES.filter(dt => dt !== 'Sign-In')
-    : ALL_DOC_TYPES
+  mode === 'unsent'           ? ALL_DOC_TYPES.filter(dt => dt !== 'Sign-In')
+  : mode === 'payroll_period' ? ['Certified Payroll', 'Sign-In']
+  : ALL_DOC_TYPES
 
 const MODES = [
   { id: 'unsent',     title: 'Unsent backlog',
@@ -32,7 +32,36 @@ const MODES = [
     sub: 'Comma-separated list — collect everything for those WOs' },
   { id: 'date_range', title: 'Date range',
     sub: 'Every doc whose work-end date falls in the chosen window' },
+  { id: 'payroll_period', title: 'Payroll period',
+    sub: 'All Certified Payroll + Sign-Ins for a payroll week or month' },
 ]
+
+// Recent payroll weeks (Sundays), newest first — value = ISO Sunday.
+function recentWeeks(n = 16) {
+  const out = []
+  const base = new Date(); base.setHours(12, 0, 0, 0)
+  base.setDate(base.getDate() - base.getDay())   // this week's Sunday
+  const fmt = (x) => x.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+  for (let i = 0; i < n; i++) {
+    const s = new Date(base); s.setDate(base.getDate() - i * 7)
+    const e = new Date(s);    e.setDate(s.getDate() + 6)
+    out.push({ value: isoOf(s), label: `${fmt(s)} – ${fmt(e)}` })
+  }
+  return out
+}
+// Recent payroll months, newest first — value = YYYY-MM.
+function recentMonths(n = 12) {
+  const out = []
+  const now = new Date()
+  for (let i = 0; i < n; i++) {
+    const m = new Date(now.getFullYear(), now.getMonth() - i, 1)
+    out.push({
+      value: `${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, '0')}`,
+      label: m.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+    })
+  }
+  return out
+}
 
 const isoOf = (d) => {
   const y = d.getFullYear()
@@ -66,6 +95,12 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   // Mode-specific extras
   const [includeSIsWithCP, setIncludeSIsWithCP] = useState(false)   // unsent + CP
   const [includePhotos,    setIncludePhotos]    = useState(false)   // wo_numbers
+  // payroll_period
+  const [granularity, setGranularity] = useState('week')   // 'week' | 'month'
+  const [periodWeek,  setPeriodWeek]  = useState('')       // ISO Sunday
+  const [periodMonth, setPeriodMonth] = useState('')       // YYYY-MM
+  const weekOpts  = useMemo(() => recentWeeks(16), [])
+  const monthOpts = useMemo(() => recentMonths(12), [])
   // Preview
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError,   setPreviewError]   = useState(null)
@@ -91,9 +126,18 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   // prior mode the admin may have abandoned.
   useEffect(() => {
     setSelectedContractors([])
-    setSelectedDocTypes([])
     setIncludeSIsWithCP(false)
     setIncludePhotos(false)
+    if (mode === 'payroll_period') {
+      // Pre-select both doc types (deselect CP for Sign-Ins only) and default
+      // to the most recent week/month.
+      setSelectedDocTypes(['Certified Payroll', 'Sign-In'])
+      setGranularity('week')
+      setPeriodWeek(recentWeeks(1)[0]?.value || '')
+      setPeriodMonth(recentMonths(1)[0]?.value || '')
+    } else {
+      setSelectedDocTypes([])
+    }
   }, [mode])
 
   // ── Filter payload built from current state ───────────────────
@@ -118,8 +162,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     if (mode === 'unsent' && selectedDocTypes.indexOf('Certified Payroll') !== -1 && includeSIsWithCP) {
       f.include_sis_with_cp = true
     }
+    if (mode === 'payroll_period') {
+      f.granularity = granularity
+      if (granularity === 'week') f.week_start = periodWeek
+      else                        f.month      = periodMonth
+    }
     return f
-  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos])
+  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos, granularity, periodWeek, periodMonth])
 
   // ── Step transitions ──────────────────────────────────────────
   const goToStep = async (next) => {
@@ -154,6 +203,8 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     if (mode === 'wo_numbers' && filters.wo_ids.length === 0) return false
     if (mode === 'date_range' && (!dateStart || !dateEnd))    return false
     if (mode === 'date_range' && dateStart > dateEnd)         return false
+    if (mode === 'payroll_period' && granularity === 'week'  && !periodWeek)  return false
+    if (mode === 'payroll_period' && granularity === 'month' && !periodMonth) return false
     return true
   })()
 
@@ -442,6 +493,47 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                   </div>
                 </div>
               )}
+
+              {mode === 'payroll_period' && (
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
+                      Period
+                    </label>
+                    <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden">
+                      {['week', 'month'].map(g => (
+                        <button
+                          key={g}
+                          type="button"
+                          onClick={() => setGranularity(g)}
+                          className={`text-sm font-semibold px-4 py-1.5 transition-all ${
+                            granularity === g ? 'bg-navy text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          {g === 'week' ? 'Payroll week' : 'Month'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-1">
+                      {granularity === 'week' ? 'Week' : 'Month'}
+                    </label>
+                    {granularity === 'week' ? (
+                      <select value={periodWeek} onChange={e => setPeriodWeek(e.target.value)} className="field-input">
+                        {weekOpts.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
+                      </select>
+                    ) : (
+                      <select value={periodMonth} onChange={e => setPeriodMonth(e.target.value)} className="field-input">
+                        {monthOpts.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                      </select>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Certified Payroll + Sign-Ins for the selected period. Deselect a doc type above to narrow it (e.g. Sign-Ins only, to reconcile a CP).
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -523,7 +615,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       <div className="text-[11px] text-amber-700 max-h-32 overflow-y-auto space-y-0.5">
                         {preview.missing.slice(0, 25).map((m, i) => (
                           <p key={i} className="font-mono">
-                            {m.wo_id} — {m.doc_type} — {m.reason}
+                            {(m.wo_id || [m.contract_num, m.borough, m.work_date].filter(Boolean).join(' ') || '—')} — {m.doc_type} — {m.reason}
                           </p>
                         ))}
                         {preview.missing.length > 25 && (
