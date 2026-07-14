@@ -2990,6 +2990,19 @@ function validateSignInData(dateStr) {
  * weekStart:    Date object marking start of the payroll week (Sunday 00:00).
  * weekEnd:      Date object marking end of the payroll week (Saturday 23:59).
  */
+/**
+ * Round a dollar amount to whole cents, half-UP on the third decimal
+ * (.005 and above rounds the cent up). Uses a tiny epsilon nudge so an
+ * exact half that floating-point stores a hair low (e.g. 104.285 held as
+ * 104.28499999…) still rounds up as intended — plain toFixed(2)/Math.round
+ * would drop those to 104.28. Sign-preserving; gross is always positive.
+ */
+function _roundCents_(n) {
+  const v = Number(n) || 0;
+  const s = v < 0 ? -1 : 1;
+  return s * Math.round((Math.abs(v) + 1e-9) * 100) / 100;
+}
+
 function computePayPeriodGrossForEmployee_(signInData, empName, payrollRates, weekStart, weekEnd) {
   const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const target   = normName(empName);
@@ -3035,7 +3048,7 @@ function computePayPeriodGrossForEmployee_(signInData, empName, payrollRates, we
     total += st * ((rate.st_rate || 0) + (rate.st_supp || 0))
            + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
   });
-  return total;
+  return _roundCents_(total);
 }
 
 
@@ -3310,8 +3323,9 @@ function generateCertifiedPayroll(weekStartStr, opts) {
 
       // Gross pay = ST hours × (st_rate + st_supp) + OT hours × (ot_rate + ot_supp).
       // Supplementals are paid per-hour-worked, ST hours always pair
-      // with ST supp, OT hours always pair with OT supp.
-      const grossPay = (totalST * (stRate + stSupp)) + (totalOT * (otRate + otSupp));
+      // with ST supp, OT hours always pair with OT supp. Rounded half-up
+      // to cents (.005 → up) so the sheet + form print the same value.
+      const grossPay = _roundCents_((totalST * (stRate + stSupp)) + (totalOT * (otRate + otSupp)));
 
       // Paystub auto-fill for this employee (week-level: net pay &
       // withholdings, same on each of the person's classification rows).
@@ -3327,10 +3341,13 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         if (isFinite(psDed)) deductionsStr = psDed.toFixed(2);
 
         // Gross verification: computed all-work gross vs paystub gross
-        // (a proxy for hours being recorded correctly). Tolerance =
-        // max($1, 0.5%). Warn once per employee; still fill the values.
+        // (a proxy for hours being recorded correctly). Tolerance is a
+        // couple cents so tiny rounding differences between our system and
+        // the payroll software don't warn, while any real hour discrepancy
+        // (≥ a fraction of an hour × rate = dollars) still does. Warn once
+        // per employee; still fill the values.
         if (isFinite(psGross)) {
-          const tol = Math.max(1, allWorkGross * 0.005);
+          const tol = 0.02;
           if (Math.abs(allWorkGross - psGross) > tol && !warnedNames[normName(empName)]) {
             warnedNames[normName(empName)] = true;
             if (opts && Array.isArray(opts.warningsOut)) {
