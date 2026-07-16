@@ -519,7 +519,8 @@ def process_wo_scan(service, file_meta: dict, tmp_dir: Path) -> bool:
     return any_success
 
 
-def upload_pdf(service, local_path: Path, parent_folder_id: str) -> str:
+def upload_pdf(service, local_path: Path, parent_folder_id: str,
+               overwrite_file_id: str | None = None) -> str:
     """Upload a filled PDF to Google Drive.
 
     On Railway: routes through the Apps Script Web App proxy (doPost in Code.js),
@@ -528,13 +529,65 @@ def upload_pdf(service, local_path: Path, parent_folder_id: str) -> str:
 
     Locally: uploads directly via the Drive API using the OAuth credentials
     obtained during --setup (no proxy needed when running as yourself).
+
+    When `overwrite_file_id` is given (regenerate-in-place), the existing
+    file's bytes are REPLACED instead of creating a new file — the id, name,
+    created-date, and parent folder are preserved. On Railway this reuses the
+    existing `reupload_pending_approval` Apps Script action.
     """
     upload_url = os.environ.get('APPS_SCRIPT_UPLOAD_URL')
     if upload_url:
         upload_key = os.environ.get('APPS_SCRIPT_UPLOAD_KEY', '')
+        if overwrite_file_id:
+            return _overwrite_via_proxy(local_path, overwrite_file_id, upload_url, upload_key)
         return _upload_via_proxy(local_path, parent_folder_id, upload_url, upload_key)
     else:
+        if overwrite_file_id:
+            return _overwrite_direct(service, local_path, overwrite_file_id)
         return _upload_direct(service, local_path, parent_folder_id)
+
+
+def _overwrite_via_proxy(local_path: Path, file_id: str, url: str, key: str) -> str:
+    """Replace an existing pending PDF's bytes in place via the Apps Script
+    proxy's `reupload_pending_approval` action. Returns the (unchanged) id.
+    """
+    import requests, base64, json as _json
+
+    encoded = base64.b64encode(local_path.read_bytes()).decode('utf-8')
+    payload = _json.dumps({
+        'action': 'reupload_pending_approval',
+        'key':    key,
+        'data':   {'file_id': file_id, 'bytes_b64': encoded},
+    })
+    resp = requests.post(
+        url, data=payload,
+        headers={'Content-Type': 'application/json'},
+        timeout=60, allow_redirects=True,
+    )
+    log(f"  📡  Overwrite proxy response: HTTP {resp.status_code}, {len(resp.content)} bytes")
+    if not resp.content.strip():
+        raise RuntimeError(
+            f"Overwrite proxy returned an empty response (HTTP {resp.status_code}). "
+            f"Check APPS_SCRIPT_UPLOAD_URL / _KEY and that doPost is deployed.")
+    resp.raise_for_status()
+    try:
+        result = resp.json()
+    except Exception:
+        snippet = resp.text[:300].replace('\n', ' ')
+        raise RuntimeError(f"Overwrite proxy returned non-JSON: {snippet!r}")
+    if 'error' in result:
+        raise RuntimeError(f"Overwrite proxy error: {result['error']}")
+    return result.get('file_id', file_id)
+
+
+def _overwrite_direct(service, local_path: Path, file_id: str) -> str:
+    """Replace an existing file's content in place via the Drive API (local
+    dev). Empty metadata → keeps name / parents / created-date."""
+    from googleapiclient.http import MediaFileUpload
+    media = MediaFileUpload(str(local_path), mimetype='application/pdf')
+    updated = service.files().update(
+        fileId=file_id, media_body=media, fields='id').execute()
+    return updated.get('id', file_id)
 
 
 def _upload_via_proxy(local_path: Path, folder_id: str, url: str, key: str) -> str:
@@ -954,6 +1007,11 @@ def process_file(service, file_meta: dict, folder_id: str, tmp_dir: Path) -> boo
         log(f"  ⚠️   Unknown _type={doc_type!r} — skipping")
         return True  # mark as seen so we don't retry forever
 
+    # Regenerate-in-place: when the fill-job carries an overwrite target,
+    # replace that existing pending PDF's bytes instead of creating a new
+    # Drive file (keeps its id / name / created-date / queue position).
+    overwrite_id = str(data.get('_overwrite_file_id') or '').strip()
+
     try:
         # Pass the source JSON's filename so the filler can name the
         # output PDF `<JSON stem>_FILLED.pdf` — the Apps Script archive
@@ -965,8 +1023,12 @@ def process_file(service, file_meta: dict, folder_id: str, tmp_dir: Path) -> boo
         return False
 
     try:
-        new_id = upload_pdf(service, pdf_path, folder_id)
-        log(f"  ✅  Uploaded → {pdf_path.name}  (Drive ID: {new_id})")
+        new_id = upload_pdf(service, pdf_path, folder_id,
+                            overwrite_file_id=overwrite_id or None)
+        if overwrite_id:
+            log(f"  ♻️   Overwrote in place → {pdf_path.name}  (Drive ID: {new_id})")
+        else:
+            log(f"  ✅  Uploaded → {pdf_path.name}  (Drive ID: {new_id})")
         pdf_path.unlink()   # clean up local temp file
     except Exception as e:
         log(f"  ❌  Upload failed: {e}")

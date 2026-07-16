@@ -898,8 +898,8 @@ app.post('/api/approvals/:fileId/skip-signoff', async (req, res) => {
  * Replaces a pending-approval PDF (sitting in a Docs Needing Review
  * subfolder) with a new signed/rescanned version. Multipart field:
  *   file — the replacement PDF (raw scan or chosen PDF; no OCR/parse).
- * Apps Script recreates the file with the SAME name in the SAME folder
- * and trashes the original, so a NEW file_id comes back.
+ * Apps Script overwrites the file's content IN PLACE via Drive.Files.update,
+ * so the SAME file_id / name / created-date / folder are preserved.
  */
 app.post('/api/approvals/:fileId/reupload', upload.single('file'), async (req, res) => {
   try {
@@ -913,6 +913,47 @@ app.post('/api/approvals/:fileId/reupload', upload.single('file'), async (req, r
     res.json(data)   // { success, file_id, filename }
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/reupload error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/approvals/:fileId/regenerate
+ * Rebuilds a pending document (CFR or Production Log) from the CURRENT
+ * system data and overwrites the reviewed PDF in place. Asynchronous: this
+ * queues the fill-job (tagged with the target file_id); the Railway worker
+ * refills the template and overwrites the same file a few seconds later.
+ * The client then polls /meta until the bytes change and refreshes preview.
+ */
+app.post('/api/approvals/:fileId/regenerate', async (req, res) => {
+  try {
+    const data = await callAppsScript('regenerate_pending_doc', {
+      file_id: req.params.fileId,
+    })
+    if (data && data.error) return res.status(400).json(data)
+    res.json(data)   // { success, doc_type, message }
+  } catch (err) {
+    console.error(`POST /api/approvals/${req.params.fileId}/regenerate error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/approvals/:fileId/meta
+ * Lightweight Drive metadata { md5, size, modified_time } used by the
+ * Regenerate flow to poll for the in-place overwrite landing (md5 changes)
+ * without streaming the PDF bytes.
+ */
+app.get('/api/approvals/:fileId/meta', async (req, res) => {
+  try {
+    const data = await callAppsScript('get_drive_file_meta', {
+      file_id: req.params.fileId,
+    })
+    if (data && data.error) return res.status(500).json(data)
+    res.setHeader('Cache-Control', 'no-store')
+    res.json(data)   // { md5, size, modified_time }
+  } catch (err) {
+    console.error(`GET /api/approvals/${req.params.fileId}/meta error:`, err.message)
     res.status(500).json({ error: err.message })
   }
 })

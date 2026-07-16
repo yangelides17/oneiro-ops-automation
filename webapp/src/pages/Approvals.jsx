@@ -9,7 +9,13 @@ import GenerateDocModal from '../components/GenerateDocModal'
 import SignInHoursEditor from '../components/SignInHoursEditor'
 import SignInHeaderCard from '../components/SignInHeaderCard'
 import ReuploadModal from '../components/ReuploadModal'
+import ConfirmModal from '../components/ConfirmModal'
 import { usePendingCounts } from '../lib/PendingCountsContext'
+
+// Doc types whose data-driven PDF can be rebuilt from current system data
+// and overwritten in place. CP + SI are not yet supported.
+const REGENERABLE_TYPES = new Set(['field_report', 'production_log'])
+const canRegenerate = (item) => !!item && REGENERABLE_TYPES.has(item.doc_type)
 
 // Manually-uploaded sign-in PDFs (filename ends in _MANUAL.pdf) come
 // from the Sign-In tab's "Upload PDF" path. The principal usually
@@ -161,6 +167,11 @@ export default function Approvals() {
   // replaces content in place (same file_id), so the URL is otherwise
   // unchanged and react-pdf wouldn't re-fetch.
   const [pdfVersion, setPdfVersion] = useState(0)
+  // Regenerate flow: confirm dialog + the file_id currently being rebuilt
+  // (drives the "Regenerating…" label + a busy banner) + any error.
+  const [regenConfirmOpen, setRegenConfirmOpen] = useState(false)
+  const [regenBusyId, setRegenBusyId] = useState(null)
+  const [regenError, setRegenError] = useState('')
 
   // Gate any approve action when the hours editor has unsaved edits.
   const confirmDiscardEdits = () =>
@@ -255,6 +266,65 @@ export default function Approvals() {
   const handleReuploaded = () => {
     setReuploadOpen(false)
     setPdfVersion(v => v + 1)
+  }
+
+  // Fetch the current binary md5 for a pending file (used to detect when
+  // the async worker overwrite has landed). Returns '' on failure.
+  const fetchMd5 = async (fileId) => {
+    try {
+      const m = await fetch(`/api/approvals/${encodeURIComponent(fileId)}/meta`)
+        .then(r => r.json())
+      return (m && m.md5) || ''
+    } catch { return '' }
+  }
+
+  // Poll until the file's md5 differs from the pre-regenerate snapshot,
+  // i.e. the worker has overwritten the bytes in place. Returns true on
+  // change, false on timeout.
+  const pollForBytesChange = async (fileId, beforeMd5) => {
+    const deadline = Date.now() + 90_000   // ~90s ceiling
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2500))
+      const md5 = await fetchMd5(fileId)
+      if (md5 && md5 !== beforeMd5) return true
+    }
+    return false
+  }
+
+  // Regenerate the selected pending doc (CFR / Production Log) from current
+  // system data and overwrite it in place. Asynchronous: queue the rebuild,
+  // then poll until the worker refills the same file, then refresh preview.
+  const handleRegenerate = async () => {
+    setRegenConfirmOpen(false)
+    if (!selected || regenBusyId) return
+    const fileId = selected.file_id
+    setRegenError('')
+    setActionError('')
+    const beforeMd5 = await fetchMd5(fileId)
+    setRegenBusyId(fileId)
+    try {
+      const res = await fetch(
+        `/api/approvals/${encodeURIComponent(fileId)}/regenerate`,
+        { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      // beforeMd5 should be non-empty for a real pending file; if the meta
+      // call failed, fall back to a fixed wait before refreshing.
+      const changed = beforeMd5
+        ? await pollForBytesChange(fileId, beforeMd5)
+        : (await new Promise(r => setTimeout(r, 10_000)), true)
+      if (changed) {
+        setPdfVersion(v => v + 1)   // re-fetch the overwritten bytes
+        refresh()                    // pick up new size/created_at in the list
+      } else {
+        setRegenError('Still regenerating — the worker may be busy. The preview ' +
+          'will refresh on its own shortly, or reselect this doc in a moment.')
+      }
+    } catch (err) {
+      setRegenError(err.message || 'Regenerate failed')
+    } finally {
+      setRegenBusyId(null)
+    }
   }
 
   const openInDrive = () => {
@@ -394,7 +464,7 @@ export default function Approvals() {
                   <button
                     type="button"
                     onClick={() => setReuploadOpen(true)}
-                    disabled={approving}
+                    disabled={approving || !!regenBusyId}
                     title="Replace this PDF with a signed/rescanned version"
                     className="text-xs font-bold px-3 py-1.5 rounded-lg
                                bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors
@@ -402,10 +472,23 @@ export default function Approvals() {
                   >
                     Reupload
                   </button>
+                  {canRegenerate(selected) && (
+                    <button
+                      type="button"
+                      onClick={() => setRegenConfirmOpen(true)}
+                      disabled={approving || !!regenBusyId}
+                      title="Rebuild this document from current system data and replace it in place"
+                      className="text-xs font-bold px-3 py-1.5 rounded-lg
+                                 bg-blue-100 text-blue-800 hover:bg-blue-200 transition-colors
+                                 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {regenBusyId === selected.file_id ? 'Regenerating…' : 'Regenerate'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={handleApprove}
-                    disabled={approving}
+                    disabled={approving || !!regenBusyId}
                     className="text-xs font-bold px-4 py-1.5 rounded-lg
                                bg-green-600 text-white hover:bg-green-700 transition-colors
                                disabled:opacity-50 disabled:cursor-not-allowed"
@@ -440,6 +523,23 @@ export default function Approvals() {
                 <div className="bg-red-50 border border-red-200 text-red-700 text-xs
                                 px-3 py-2 rounded-lg mb-3">
                   {actionError}
+                </div>
+              )}
+
+              {regenBusyId === selected.file_id && (
+                <div className="bg-blue-50 border border-blue-200 text-blue-800 text-xs
+                                px-3 py-2 rounded-lg mb-3 flex items-center gap-2">
+                  <span className="inline-block w-3 h-3 border-2 border-blue-400
+                                   border-t-transparent rounded-full animate-spin" />
+                  Regenerating from current data — the preview updates automatically
+                  once the worker refills it (usually a few seconds).
+                </div>
+              )}
+
+              {regenError && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs
+                                px-3 py-2 rounded-lg mb-3">
+                  {regenError}
                 </div>
               )}
 
@@ -510,6 +610,23 @@ export default function Approvals() {
           allowScan={selected.doc_type === 'signin'}
           onClose={() => setReuploadOpen(false)}
           onReuploaded={handleReuploaded}
+        />
+      )}
+
+      {/* Regenerate confirmation — rebuilds the doc from current system
+          data and overwrites it in place. */}
+      {regenConfirmOpen && selected && (
+        <ConfirmModal
+          title="Regenerate this document?"
+          message={
+            `This rebuilds the ${docTypeMeta(selected.doc_type).label} from the current ` +
+            `system data and replaces the reviewed PDF in place (same file, same spot in ` +
+            `the queue). Make sure you've saved your data corrections first.`
+          }
+          confirmLabel="Regenerate"
+          cancelLabel="Cancel"
+          onConfirm={handleRegenerate}
+          onCancel={() => setRegenConfirmOpen(false)}
         />
       )}
     </div>

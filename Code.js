@@ -732,7 +732,10 @@ function generateDailyDocuments(dateStr, opts) {
   const plOpts = (opts && (opts.contractorFilter || opts.hasCrewChiefFilter))
     ? { contractorFilter:   opts.contractorFilter,
         hasCrewChiefFilter: !!opts.hasCrewChiefFilter,
-        crewChiefSlug:      opts.crewChiefSlug }
+        crewChiefSlug:      opts.crewChiefSlug,
+        // Regenerate-in-place: tag the emitted JSON so the worker overwrites
+        // this exact pending PDF's bytes instead of creating a new file.
+        overwriteFileId:    opts.overwriteFileId }
     : undefined;
   const plFiles = generateProductionLog_(targetDate, todaysEntries, byWorkOrder, woData, ss, plOpts) || [];
 
@@ -1198,6 +1201,14 @@ function generateProductionLog_(targetDate, allEntries, byWorkOrder, woData, ss,
       })),
       work_orders: workOrdersJson,
     };
+
+    // Regenerate-in-place: when the caller targets a specific pending PDF
+    // (single contractor+chief bucket, via hasCrewChiefFilter), tell the
+    // worker to overwrite that file's bytes in place rather than create a
+    // new Drive file. Only ever set on the narrowed per-doc path.
+    if (opts && opts.overwriteFileId) {
+      logJson._overwrite_file_id = String(opts.overwriteFileId);
+    }
 
     // Filename includes a contractor slug + (when this bucket carries a
     // crew chief) a chief slug. The archive parser uses both to route
@@ -4125,6 +4136,10 @@ function doPost(e) {
       return handleApproveSignInWithBytes_(body);
     } else if (action === 'reupload_pending_approval') {
       return handleReuploadPendingApproval_(body);
+    } else if (action === 'regenerate_pending_doc') {
+      return handleRegeneratePendingDoc_(body);
+    } else if (action === 'get_drive_file_meta') {
+      return handleGetDriveFileMeta_(body);
     } else if (action === 'set_waterblast_confirmed') {
       return handleSetWaterblastConfirmed_(body);
     } else if (action === 'generate_daily_documents') {
@@ -5016,6 +5031,215 @@ function handleReuploadPendingApproval_(body) {
   } catch (err) {
     Logger.log(`❌ handleReuploadPendingApproval_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
+  }
+}
+
+
+// ── Regenerate a pending document in place ─────────────────────
+//
+// The admin corrected the underlying data in the system (field report /
+// marking items / sign-in) and wants the doc under review rebuilt from
+// that updated data — overwriting the SAME Drive file, not a new upload.
+//
+// Because no PDF is filled in Apps Script (the Python worker on Railway
+// fills templates), this is a two-phase, asynchronous operation:
+//   1. This handler re-runs the matching JSON generator, tagging the
+//      emitted fill-job with `_overwrite_file_id = <this file>`.
+//   2. The worker fills the template and overwrites this exact file's
+//      bytes in place (via the existing reupload_pending_approval path),
+//      preserving file id / name / created-date / queue position.
+// The webapp then polls get_drive_file_meta until the bytes change and
+// refreshes the preview.
+//
+// Supported doc types: production_log, field_report (CFR). CP / SI are
+// not yet supported and are rejected with REGEN_UNSUPPORTED.
+//
+// body.data: { file_id }
+function handleRegeneratePendingDoc_(body) {
+  const d      = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let step = 'getFileById';
+  try {
+    const file = _withDriveRetry_('getFileById regen', () => DriveApp.getFileById(fileId));
+
+    step = 'isTrashed';
+    if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
+
+    // Parent gate — doc_type is derived from the (authoritative) parent
+    // subfolder, not the client, so a stale/forged doc_type can't route a
+    // regenerate at the wrong file.
+    step = 'parent gate';
+    const parents = file.getParents();
+    if (!parents.hasNext()) return jsonResponse_({ error: 'File has no parent folder' }, 500);
+    const docType = _docTypeFromSubfolderName_(parents.next().getName());
+    if (!docType) {
+      return jsonResponse_({ error: 'File is not in a Docs Needing Review subfolder' }, 403);
+    }
+
+    const filename = file.getName();
+
+    if (docType === 'production_log') {
+      step = 'parse PL filename';
+      const p = _parsePLPendingFilename_(filename);
+      if (!p || !p.contractorSlug) {
+        return jsonResponse_({
+          error: 'Could not determine the contractor/date for this Production Log from its filename.',
+          error_code: 'REGEN_PARSE_FAILED',
+        }, 400);
+      }
+      const contractor = _resolvePLContractorFromSlug_(p.contractorSlug);
+      if (!contractor) {
+        return jsonResponse_({
+          error: 'Contractor "' + p.contractorSlug.replace(/_/g, ' ') +
+                 '" is not configured for Production Logs.',
+          error_code: 'PL_NOT_REQUIRED',
+        }, 400);
+      }
+
+      // Same completeness gate the manual PL generator uses — a missing
+      // Sign-In means the regenerated PL would be incomplete.
+      step = 'validate SI done';
+      const v = _validateAllSIsDoneForContractorDay_(ss, contractor, p.anchor);
+      if (!v.ok) {
+        return jsonResponse_({ error: v.error, error_code: v.error_code, missing: v.missing || [] }, 400);
+      }
+
+      step = 'regen PL';
+      const [yyyy, mm, dd] = p.anchor.split('-');
+      const result = generateDailyDocuments(`${mm}/${dd}/${yyyy}`, {
+        contractorFilter:            contractor,
+        hasCrewChiefFilter:          true,
+        crewChiefSlug:               p.chiefSlug,   // '' = blank-chief bucket
+        skipFieldReportsAndInvoices: true,
+        overwriteFileId:             fileId,
+      });
+      const files = (result && result.generated) || [];
+      if (files.length === 0) {
+        return jsonResponse_({
+          error: 'No Production Log was regenerated — the sign-in data for ' + p.anchor +
+                 ' may have changed. Check the day still has crew for ' + contractor + '.',
+          error_code: 'NO_OUTPUT',
+        }, 400);
+      }
+      _invalidateCacheKeys_([]);
+      return jsonResponse_({
+        success: true, doc_type: docType,
+        message: 'Production Log queued for regeneration — the reviewed PDF updates in place ' +
+                 'once the worker refills it (a few seconds).',
+      });
+    }
+
+    if (docType === 'field_report') {
+      step = 'parse CFR filename';
+      const p = _parseCFRPendingFilename_(filename);
+      if (!p) {
+        return jsonResponse_({
+          error: 'Could not determine the WO / date for this CFR from its filename.',
+          error_code: 'REGEN_PARSE_FAILED',
+        }, 400);
+      }
+
+      step = 'load WO row';
+      const woSheet = ss.getSheetByName('Work Order Tracker');
+      const woData  = woSheet.getDataRange().getValues();
+      let woRow = null;
+      for (let i = 1; i < woData.length; i++) {
+        if (String(woData[i][0] || '').trim() === p.woId) { woRow = woData[i]; break; }
+      }
+      if (!woRow) return jsonResponse_({ error: 'WO not found: ' + p.woId }, 404);
+
+      step = 'regen CFR';
+      // Mirror handleEditCompletedWO_'s replace_cfr shape: install_to keeps
+      // the doc's own date (updated variant keeps its _Updated_ date), and
+      // general remarks come from the WO's accumulated Issues (col 22).
+      const synthD = {
+        wo_id: p.woId,
+        date: p.updatedDate || p.origDate,
+        issues: '',
+        photos_uploaded: String(woRow[23] || '').toLowerCase() === 'yes',
+      };
+      generateContractorFieldReportJson_(
+        synthD, woRow, ss, String(woRow[22] || '').trim(),
+        { filename: p.stem + '.json', overwriteFileId: fileId }
+      );
+      _invalidateCacheKeys_([]);
+      return jsonResponse_({
+        success: true, doc_type: docType,
+        message: 'CFR queued for regeneration — the reviewed PDF updates in place once the ' +
+                 'worker re-merges it (a few seconds).',
+      });
+    }
+
+    return jsonResponse_({
+      error: 'Regenerate is not yet available for ' + docType + ' documents.',
+      error_code: 'REGEN_UNSUPPORTED',
+    }, 400);
+  } catch (err) {
+    Logger.log(`❌ handleRegeneratePendingDoc_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
+  }
+}
+
+// Parse a pending Production Log PDF filename into its generator identity.
+// `Production_Log_<YYYY-MM-DD>_<contractorSlug>[_chief-<slug>]_FILLED.pdf`
+// Returns { anchor, contractorSlug, chiefSlug } or null. contractorSlug is
+// '' for legacy contractor-less filenames (not regenerable).
+function _parsePLPendingFilename_(filename) {
+  let s = String(filename || '').replace(/\.pdf$/i, '').replace(/_(FILLED|MANUAL)$/i, '');
+  let chiefSlug = '';
+  const cm = s.match(/_chief-([A-Za-z0-9]+)$/);
+  if (cm) { chiefSlug = cm[1]; s = s.slice(0, cm.index); }
+  const m = s.match(/^Production_Log_(\d{4}-\d{2}-\d{2})(?:_(.+))?$/);
+  if (!m) return null;
+  return { anchor: m[1], contractorSlug: m[2] || '', chiefSlug: chiefSlug };
+}
+
+// Parse a pending CFR PDF filename into its generator identity.
+// `CFR_<wo>_<YYYY-MM-DD>[_Updated_<YYYY-MM-DD>]_FILLED.pdf`
+// Returns { woId, origDate, updatedDate, stem } or null. `stem` is the
+// JSON filename base (no _FILLED / .pdf) so the regenerated job reuses it.
+function _parseCFRPendingFilename_(filename) {
+  const s = String(filename || '').replace(/\.pdf$/i, '').replace(/_(FILLED|MANUAL)$/i, '');
+  const m = s.match(/^CFR_(.+?)_(\d{4}-\d{2}-\d{2})(?:_Updated_(\d{4}-\d{2}-\d{2}))?$/);
+  if (!m) return null;
+  return { woId: m[1], origDate: m[2], updatedDate: m[3] || '', stem: s };
+}
+
+// Resolve a Production_Log filename's contractor slug back to the enabled
+// contractor's display name (the slug is display.replace(/\s+/g,'_')).
+function _resolvePLContractorFromSlug_(slug) {
+  const want = String(slug || '');
+  const enabled = (CONFIG.PRODUCTION_LOG_CONTRACTORS || [])
+    .map(s => String(s).trim()).filter(Boolean);
+  return enabled.find(c => c.replace(/\s+/g, '_') === want) || '';
+}
+
+// ── Lightweight Drive file metadata (for the regenerate completion poll) ──
+// Returns the binary md5 + size + modifiedTime so the webapp can poll until
+// an in-place overwrite lands (md5 changes) without streaming the bytes.
+// body.data: { file_id }
+function handleGetDriveFileMeta_(body) {
+  const d      = body.data || {};
+  const fileId = String(d.file_id || '').trim();
+  if (!fileId) return jsonResponse_({ error: 'Missing file_id' }, 400);
+  try {
+    const meta = _withDriveRetry_('files.get meta', () =>
+      Drive.Files.get(fileId, {
+        fields: 'md5Checksum,size,modifiedTime,trashed',
+        supportsAllDrives: true,
+      }));
+    if (meta.trashed) return jsonResponse_({ error: 'File is trashed' }, 404);
+    return jsonResponse_({
+      md5:           meta.md5Checksum || '',
+      size:          meta.size || '',
+      modified_time: meta.modifiedTime || '',
+    });
+  } catch (err) {
+    Logger.log(`❌ handleGetDriveFileMeta_ failed: ${err}`);
+    return jsonResponse_({ error: String(err && err.message || err) }, 500);
   }
 }
 
@@ -12097,6 +12321,12 @@ function generateContractorFieldReportJson_(d, woRow, ss, aggregatedIssues, opts
     crew_chief:        'Stamati Angelides',
     contractor_notes:  'Oneiro Collection - WBE',
   };
+
+  // Regenerate-in-place: tag the job so the worker overwrites the pending
+  // CFR PDF's bytes (same Drive file id) instead of creating a new file.
+  if (opts && opts.overwriteFileId) {
+    payload._overwrite_file_id = String(opts.overwriteFileId);
+  }
 
   const isoDate  = (d.date || '').slice(0, 10) || 'unknown';
   // Default filename matches what handleFinalizeFieldReportDocs_ emits.
