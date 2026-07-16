@@ -268,25 +268,29 @@ export default function Approvals() {
     setPdfVersion(v => v + 1)
   }
 
-  // Fetch the current binary md5 for a pending file (used to detect when
-  // the async worker overwrite has landed). Returns '' on failure.
-  const fetchMd5 = async (fileId) => {
+  // Snapshot a pending file's "was it overwritten yet?" signature for the
+  // regenerate poll. We key on modifiedTime (not md5): the worker's in-place
+  // overwrite (Drive.Files.update) ALWAYS bumps modifiedTime — even when the
+  // rebuilt PDF is byte-identical (e.g. the admin regenerated without changing
+  // any data). md5 alone would miss that case and the poll would falsely
+  // time out. Returns '' on failure.
+  const fetchFileSig = async (fileId) => {
     try {
       const m = await fetch(`/api/approvals/${encodeURIComponent(fileId)}/meta`)
         .then(r => r.json())
-      return (m && m.md5) || ''
+      return (m && m.modified_time) || ''
     } catch { return '' }
   }
 
-  // Poll until the file's md5 differs from the pre-regenerate snapshot,
-  // i.e. the worker has overwritten the bytes in place. Returns true on
+  // Poll until the file's modifiedTime differs from the pre-regenerate
+  // snapshot, i.e. the worker has overwritten it in place. Returns true on
   // change, false on timeout.
-  const pollForBytesChange = async (fileId, beforeMd5) => {
+  const pollForOverwrite = async (fileId, beforeSig) => {
     const deadline = Date.now() + 90_000   // ~90s ceiling
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 2500))
-      const md5 = await fetchMd5(fileId)
-      if (md5 && md5 !== beforeMd5) return true
+      const sig = await fetchFileSig(fileId)
+      if (sig && sig !== beforeSig) return true
     }
     return false
   }
@@ -300,7 +304,7 @@ export default function Approvals() {
     const fileId = selected.file_id
     setRegenError('')
     setActionError('')
-    const beforeMd5 = await fetchMd5(fileId)
+    const beforeSig = await fetchFileSig(fileId)
     setRegenBusyId(fileId)
     try {
       const res = await fetch(
@@ -308,10 +312,10 @@ export default function Approvals() {
         { method: 'POST' })
       const data = await res.json().catch(() => ({}))
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-      // beforeMd5 should be non-empty for a real pending file; if the meta
+      // beforeSig should be non-empty for a real pending file; if the meta
       // call failed, fall back to a fixed wait before refreshing.
-      const changed = beforeMd5
-        ? await pollForBytesChange(fileId, beforeMd5)
+      const changed = beforeSig
+        ? await pollForOverwrite(fileId, beforeSig)
         : (await new Promise(r => setTimeout(r, 10_000)), true)
       if (changed) {
         setPdfVersion(v => v + 1)   // re-fetch the overwritten bytes
