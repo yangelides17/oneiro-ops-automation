@@ -10427,15 +10427,18 @@ function handleCreateMarkingItem_(body) {
 /**
  * Patch one or more editable fields on an existing row.
  *
- * Status / Date Completed rule: Status only ever changes in response to a
- * QUANTITY change. Clearing quantity to 0/null/empty forces Status back to
- * 'Pending' and clears Date Completed (a Completed row can't look done with
- * no measurement). Changing quantity to a different positive value on a
- * Completed row reopens it to 'Pending' so crews re-confirm at next submit.
- * Editing any non-quantity field (intersection, direction, category,
- * description, etc.) is treated as a data-entry fix and never changes
- * Status or Date Completed. (`preserve_completion` additionally keeps a
- * positive-qty change from wiping Date Completed in the admin edit flow.)
+ * Status / Date Completed rule: the ONLY edit that changes Status is
+ * clearing quantity to 0/null/empty — that forces Status back to 'Pending'
+ * and clears Date Completed (a Completed row can't look done with no
+ * measurement; it's the explicit "didn't get done" signal). Every other
+ * edit — including changing quantity to a different POSITIVE value — is
+ * treated as a same-day data-entry correction and leaves Status + Date
+ * Completed intact. A Completed item is never reopened by a positive qty
+ * change, because Date Completed buckets the whole quantity into one day;
+ * additional production done on a DIFFERENT day must be logged as a new
+ * marking item instance, not by editing this one (which would re-stamp all
+ * of it to the new day). Editing non-quantity fields (intersection,
+ * direction, category, description, etc.) likewise never changes Status.
  *
  * body.data: { item_id, <any patchable field> }
  *   patchable: work_type, section, category, intersection, direction,
@@ -10455,17 +10458,15 @@ function handleUpdateMarkingItem_(body) {
 
   const data = sheet.getDataRange().getValues();
   let rowNum = 0;
-  let currentRow = null;
   for (let i = 1; i < data.length; i++) {
     if (String(data[i][0] || '').trim() === itemId) {
       rowNum = i + 1;
-      currentRow = data[i];
       break;
     }
   }
   if (!rowNum) return jsonResponse_({ error: 'item_id not found: ' + itemId }, 404);
 
-  // Column indices. 1-based for setValue; 0-based (IDX) for currentRow reads.
+  // Column indices (1-based, for setValue).
   const COL = {
     work_type:     3,
     section:       4,
@@ -10480,14 +10481,6 @@ function handleUpdateMarkingItem_(body) {
     status:        13,
     notes:         15,
   };
-  const IDX = {
-    work_type: 2, section: 3, category: 4, intersection: 5, direction: 6,
-    description: 7, quantity: 8, unit: 9, color_material: 10, status: 12,
-    notes: 14,
-  };
-
-  const wasCompleted    = String(currentRow[IDX.status] || '') === 'Completed';
-  let   quantityChanged = false;
 
   // If the patch changes the category, auto-derive the new unit from
   // the CATEGORY_UNITS_ map. If the new category is variable (e.g.
@@ -10505,8 +10498,8 @@ function handleUpdateMarkingItem_(body) {
   }
 
   // Write each patchable string field present in the request. These are
-  // all non-quantity fields, so changing them never reopens a Completed
-  // row (see the quantity-only reopen rule below).
+  // all non-quantity fields, so changing them never affects Status or
+  // Date Completed (see the Status rule above).
   ['work_type','section','category','intersection','direction','description',
    'unit','color_material','notes'].forEach(key => {
     if (d[key] === undefined) return;
@@ -10516,38 +10509,19 @@ function handleUpdateMarkingItem_(body) {
   if (d.quantity !== undefined) {
     const q      = parseFloat(d.quantity);
     const hasQty = !isNaN(q) && q > 0;
-    const cur    = currentRow[IDX.quantity];
-    const curStr = (cur === '' || cur == null) ? '' : String(cur);
-    const newStr = hasQty ? String(q) : '';
-    if (curStr !== newStr) quantityChanged = true;
     sheet.getRange(rowNum, COL.quantity).setValue(hasQty ? q : '');
 
-    // Clearing a qty flips a previously-Completed row back to Pending
-    // immediately and clears Date Completed. Setting a positive qty to a
-    // different number is handled by the quantity-driven reopen rule below
-    // (via quantityChanged).
+    // Clearing a qty to 0/blank is the only edit that touches Status: it
+    // flips a previously-Completed row back to Pending and clears Date
+    // Completed (the explicit "didn't get done" signal). Changing qty to a
+    // different POSITIVE value is a same-day correction — Status and Date
+    // Completed are deliberately left intact so the item stays bucketed on
+    // its original day. (Additional production from another day belongs in
+    // a NEW marking item, not an edit of this one — see doc comment above.)
     if (!hasQty) {
       sheet.getRange(rowNum, COL.status).setValue('Pending');
       sheet.getRange(rowNum, COL.date_completed).setValue('');
     }
-  }
-
-  // Reopen a Completed row ONLY when the Quantity actually changed to a
-  // new positive value — the measured work is different, so crews should
-  // re-confirm at next submit. Edits to any OTHER field (intersection,
-  // direction, category, description, etc.) are treated as data-entry
-  // fixes and leave Status + Date Completed intact, so a corrected item
-  // never has to be re-submitted. (Clearing qty to 0/blank already flips
-  // to Pending above — the explicit "didn't get done" signal.)
-  //
-  // EXCEPTION: the admin "edit completed WO" flow on the Field Report
-  // page passes `preserve_completion: true` so even a qty change doesn't
-  // wipe Date Completed (which would re-bucket the work to a different day
-  // in Production Log + Dashboard rollups). Clearing qty to 0/blank still
-  // flips to Pending above — that overrides the preserve flag.
-  if (wasCompleted && quantityChanged && !d.preserve_completion) {
-    sheet.getRange(rowNum, COL.status).setValue('Pending');
-    sheet.getRange(rowNum, COL.date_completed).setValue('');
   }
 
   SpreadsheetApp.flush();

@@ -75,6 +75,12 @@ export default function MarkingFormModal({
   // Pending confirmation when validateQty flags an out-of-range value —
   // shape: { message, parsedStr } or null.
   const [qtyConfirm, setQtyConfirm] = useState(null)
+  // Pending confirmation when a crew edits the QUANTITY of an
+  // already-Completed item — shape: { parsedStr } or null. A quantity
+  // edit is a same-day correction that stays on the item's original date;
+  // this blocking modal makes the crew acknowledge that so they don't use
+  // it to log a different day's production (which belongs in a new item).
+  const [completedEditConfirm, setCompletedEditConfirm] = useState(null)
 
   const layout = useMemo(
     () => pickLayout({ category: form.category, work_type: workType }),
@@ -85,12 +91,12 @@ export default function MarkingFormModal({
   useEffect(() => {
     const handler = (e) => {
       if (e.key !== 'Escape') return
-      if (saving || qtyConfirm) return
+      if (saving || qtyConfirm || completedEditConfirm) return
       onClose?.()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [saving, qtyConfirm, onClose])
+  }, [saving, qtyConfirm, completedEditConfirm, onClose])
 
   // When category changes, auto-update the unit from the category map
   // (variable categories like "Others" keep the user's last pick).
@@ -180,6 +186,24 @@ export default function MarkingFormModal({
     }
   }
 
+  // Final gate before persist: if this edit changes the QUANTITY of an
+  // already-Completed item to a new positive value, make the crew confirm
+  // (the change corrects the item's original day; it does NOT move it to
+  // today). Clearing qty to 0/blank is exempt — that's the "didn't get
+  // done" → Pending path. `deferred` (admin edit-completed-WO batch) is
+  // exempt too — it flows through a separate server handler.
+  function persistWithCompletedGate(parsedStr) {
+    const origQty = item?.quantity
+    const newQty  = (parsedStr === '' || parsedStr == null) ? null : parseFloat(parsedStr)
+    const changedToPositive =
+      newQty != null && newQty > 0 && String(newQty) !== String(origQty ?? '')
+    if (isEdit && !deferred && item?.status === 'Completed' && changedToPositive) {
+      setCompletedEditConfirm({ parsedStr })
+      return
+    }
+    persist(parsedStr)
+  }
+
   // Save click — parses Qty arithmetic, runs the same out-of-range
   // validation the inline grid uses, then either prompts for confirm
   // (out of range) or persists immediately.
@@ -216,7 +240,7 @@ export default function MarkingFormModal({
       setQtyConfirm({ message: check.message, parsedStr })
       return
     }
-    persist(parsedStr)
+    persistWithCompletedGate(parsedStr)
   }
 
   return (
@@ -224,7 +248,7 @@ export default function MarkingFormModal({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
-      onClick={() => { if (!saving && !qtyConfirm) onClose?.() }}
+      onClick={() => { if (!saving && !qtyConfirm && !completedEditConfirm) onClose?.() }}
     >
       <div
         className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 space-y-4 max-h-[92vh] overflow-y-auto"
@@ -400,9 +424,24 @@ export default function MarkingFormModal({
         onConfirm={() => {
           const { parsedStr } = qtyConfirm
           setQtyConfirm(null)
-          persist(parsedStr)
+          persistWithCompletedGate(parsedStr)
         }}
         onCancel={() => setQtyConfirm(null)}
+      />
+    )}
+
+    {completedEditConfirm && (
+      <ConfirmModal
+        title="This item is already complete"
+        message={`Logged as complete for ${item?.date_completed || 'its recorded day'}. Changing the quantity here corrects that day's record — it will NOT move to today. To log additional work done on a different day, cancel and use "Add marking" to create a new entry.`}
+        confirmLabel={`Yes, correct ${item?.date_completed || 'that day'}'s record`}
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          const { parsedStr } = completedEditConfirm
+          setCompletedEditConfirm(null)
+          persist(parsedStr)
+        }}
+        onCancel={() => setCompletedEditConfirm(null)}
       />
     )}
     </>
