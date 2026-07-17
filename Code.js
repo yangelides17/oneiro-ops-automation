@@ -14805,12 +14805,22 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     cats.forEach(cat => {
       const bucket = acc[cat];
       if (bucket.raw_qty <= 0) return;
-      // rate × qty = amount on every row. Rate = revenue / raw_qty,
-      // which equals base × multiplier (line4 / line12 / L&S) or just
-      // base (color_surface) under uniform contracts. Blends if the
-      // contract rate changed mid-WO — same math priceMarkingItem_
-      // already produces, just decomposed at category granularity.
-      const rate = round4(bucket.revenue / bucket.raw_qty);
+      // Rate = revenue / raw_qty, which equals base × multiplier (line4 /
+      // line12 / L&S) or just base (color_surface) under uniform
+      // contracts. Blends if the contract rate changed mid-WO — same math
+      // priceMarkingItem_ already produces, just decomposed at category
+      // granularity.
+      //
+      // qty and rate are authoritative; amount is DERIVED from them.
+      // QB revalidates Amount == UnitPrice × Qty on every line and
+      // rejects the whole invoice (ValidationFault 6070) if they
+      // disagree by even a cent. Rounding all three independently off
+      // the raw accumulators drifts them apart whenever raw_qty carries
+      // more than 2dp or the rate blends past 4dp, so amount must be
+      // computed from the same rounded values we actually send.
+      const qty    = round2(bucket.raw_qty);
+      const rate   = round4(bucket.revenue / bucket.raw_qty);
+      const amount = round2(qty * rate);
       const unitOut = bucket.unit
         || (group === 'color_surface' ? 'SF'
            : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
@@ -14831,13 +14841,16 @@ function aggregateRevenueByWoForQB_(ss, woId) {
         category:    cat,
         group,
         label:       _QB_GROUP_LABEL[group],
-        qty:         round2(bucket.raw_qty),
+        qty,
         unit_label:  unitOut,
         rate,
-        amount:      round2(bucket.revenue),
+        amount,
         description,
       });
-      totalRevenue += bucket.revenue;
+      // Sum the rounded line amounts, not the raw revenue — totals.revenue
+      // is what gets recorded to the WO Tracker as Invoice Amount, so it
+      // has to match the invoice QB actually issues.
+      totalRevenue += amount;
     });
   });
 
