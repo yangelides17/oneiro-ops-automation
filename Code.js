@@ -9960,8 +9960,46 @@ function _payrollWeekNumber_(weekStart) {
 
 
 /**
+ * Round a $/unit rate to 4dp — the precision QB accepts for UnitPrice.
+ * Also scrubs the binary-float noise in `base * mult` (0.65 * 1.5
+ * evaluates to 0.9750000000000001).
+ */
+function _rate4_(n) {
+  return Math.round(Number(n) * 10000) / 10000;
+}
+
+
+/**
+ * Multiply qty × rate into dollars, rounded half-up to cents, using
+ * scaled integers rather than binary floats.
+ *
+ * This has to match QuickBooks' decimal arithmetic exactly, because QB
+ * revalidates Amount == UnitPrice × Qty on every invoice line and
+ * rejects the whole invoice (ValidationFault 6070) on a 1¢ disagreement.
+ * Floats can't represent a rate like 0.975, so the direct expression
+ * `801 * 0.65 * 1.5` evaluates to 780.97499999999990905 and rounds DOWN
+ * to 780.97, while QB computes 780.975 exactly and rounds half-up to
+ * 780.98. Every odd LF of a 0.975 rate lands on such a half-cent tie.
+ *
+ * qty carries ≤2dp and rate ≤4dp, so both scale to exact integers and
+ * the product is exact well inside 2^53 at any real-world quantity.
+ */
+function _money2_(qty, rate) {
+  const q     = Math.round(Number(qty)  * 100);     // hundredths
+  const r     = Math.round(Number(rate) * 10000);   // ten-thousandths
+  const micro = q * r;                              // 1e-6 dollars, exact
+  return Math.floor((micro + 5000) / 10000) / 100;  // half-up to cents
+}
+
+
+/**
  * Compute revenue for one Marking Item. Returns
- *   { revenue: <number>, group: <string>, reason: <string|null> }
+ *   { revenue: <number>, group: <string>, reason: <string|null>,
+ *     rate: <number|undefined> }
+ *
+ * `rate` is the $/unit actually applied ( base × multiplier ), at 4dp.
+ * Carried out so the QB line builder can bill at the item's real rate
+ * instead of back-deriving one from revenue / qty.
  *
  * `reason` semantics (precedence):
  *   'unit_migration'    — Bike Lane Green Bar entered as EA (legacy);
@@ -10010,33 +10048,38 @@ function priceMarkingItem_(item, woMeta, rates) {
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
       const mult = LINE_WIDTH_MULTIPLIER_[cat];
       if (mult == null) return { revenue: 0, group, reason: 'no_unit_count' };
-      return { revenue: qty * base * mult, group, reason: null };
+      const rate4 = _rate4_(base * mult);
+      return { revenue: _money2_(qty, rate4), group, reason: null, rate: rate4 };
     }
     case 'line12': {
       const base = rateRow.rates.line12;
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
       const mult = LINE12_MULTIPLIER_[cat];
       if (mult == null) return { revenue: 0, group, reason: 'no_unit_count' };
-      return { revenue: qty * base * mult, group, reason: null };
+      const rate12 = _rate4_(base * mult);
+      return { revenue: _money2_(qty, rate12), group, reason: null, rate: rate12 };
     }
     case 'preformed': {
       const base  = rateRow.rates.preformed;
       const units = PREFORMED_UNIT_COUNT_[cat];
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
       if (units == null) return { revenue: 0, group, reason: 'no_unit_count' };
-      return { revenue: qty * base * units, group, reason: null };
+      const ratePre = _rate4_(base * units);
+      return { revenue: _money2_(qty, ratePre), group, reason: null, rate: ratePre };
     }
     case 'extruded': {
       const base  = rateRow.rates.extruded;
       const units = EXTRUDED_UNIT_COUNT_[cat];
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
       if (units == null) return { revenue: 0, group, reason: 'no_unit_count' };
-      return { revenue: qty * base * units, group, reason: null };
+      const rateExt = _rate4_(base * units);
+      return { revenue: _money2_(qty, rateExt), group, reason: null, rate: rateExt };
     }
     case 'color_surface': {
       const base = rateRow.rates.color_surface;
       if (base == null) return { revenue: 0, group, reason: 'no_rate' };
-      return { revenue: qty * base, group, reason: null };
+      const rateCs = _rate4_(base);
+      return { revenue: _money2_(qty, rateCs), group, reason: null, rate: rateCs };
     }
     default:
       return { revenue: 0, group: 'unpriced', reason: 'unpriced_category' };
@@ -14778,7 +14821,9 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     }
 
     if (!acc[item.category]) {
-      acc[item.category] = { group, raw_qty: 0, unit: item.unit, revenue: 0 };
+      acc[item.category] = {
+        group, raw_qty: 0, unit: item.unit, revenue: 0, rate: priced.rate,
+      };
     }
     acc[item.category].raw_qty += qty;
     acc[item.category].revenue += priced.revenue;
@@ -14789,7 +14834,6 @@ function aggregateRevenueByWoForQB_(ss, woId) {
   // (so all line4 rows precede line12, etc.) then alphabetic within
   // each group.
   const round2 = (n) => Math.round(n * 100) / 100;
-  const round4 = (n) => Math.round(n * 10000) / 10000;
 
   const lines = [];
   let totalRevenue = 0;
@@ -14805,22 +14849,21 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     cats.forEach(cat => {
       const bucket = acc[cat];
       if (bucket.raw_qty <= 0) return;
-      // Rate = revenue / raw_qty, which equals base × multiplier (line4 /
-      // line12 / L&S) or just base (color_surface) under uniform
-      // contracts. Blends if the contract rate changed mid-WO — same math
-      // priceMarkingItem_ already produces, just decomposed at category
-      // granularity.
+      // Rate is the one priceMarkingItem_ actually applied (base ×
+      // multiplier, 4dp) — carried through rather than back-derived as
+      // revenue / raw_qty. Back-deriving would average the rate across
+      // items, and an item bills at its own rate, never a blend. Every
+      // item in a category resolves to the same rate today (one rate per
+      // category per contract), so the bucket rate is that rate.
       //
-      // qty and rate are authoritative; amount is DERIVED from them.
-      // QB revalidates Amount == UnitPrice × Qty on every line and
-      // rejects the whole invoice (ValidationFault 6070) if they
-      // disagree by even a cent. Rounding all three independently off
-      // the raw accumulators drifts them apart whenever raw_qty carries
-      // more than 2dp or the rate blends past 4dp, so amount must be
-      // computed from the same rounded values we actually send.
+      // qty and rate are authoritative; amount is DERIVED from them via
+      // exact integer math. QB revalidates Amount == UnitPrice × Qty on
+      // every line and rejects the whole invoice (ValidationFault 6070)
+      // on a 1¢ disagreement — see _money2_ for why floats can't be
+      // trusted to agree with QB's decimal arithmetic on a half-cent tie.
       const qty    = round2(bucket.raw_qty);
-      const rate   = round4(bucket.revenue / bucket.raw_qty);
-      const amount = round2(qty * rate);
+      const rate   = bucket.rate;
+      const amount = _money2_(qty, rate);
       const unitOut = bucket.unit
         || (group === 'color_surface' ? 'SF'
            : (group === 'line4' || group === 'line12' ? 'LF' : 'EA'));
