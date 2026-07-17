@@ -10017,8 +10017,15 @@ function _money2_(qty, rate) {
 function priceMarkingItem_(item, woMeta, rates) {
   const cat = String(item.category || '').trim();
   const qty = Number(item.quantity);
-  if (!cat || isNaN(qty) || qty <= 0) {
+  if (!cat) {
     return { revenue: 0, group: 'unpriced', reason: 'unpriced_category' };
+  }
+  // Blank, zero, or text-formatted quantity. Number() rather than
+  // parseFloat() deliberately: parseFloat('1,200') is 1 and parseFloat
+  // ('5 SF') is 5, either of which would silently bill a wrong quantity.
+  // Number() gives NaN, which surfaces the bad cell instead.
+  if (isNaN(qty) || qty <= 0) {
+    return { revenue: 0, group: 'unpriced', reason: 'bad_qty' };
   }
 
   // Bike Lane Green Bar legacy unit migration: anything still entered
@@ -10111,11 +10118,11 @@ function expandDirLetters_(val) {
  * the Marking Items sheet. Called from handleWriteWO_ after the Tracker
  * row is appended.
  *
- * Row schema (17 cols) — set up by setupMarkingItems():
- *   A Item ID  B Work Order #  C Work Type  D Section  E Sort Order
- *   F Category  G Intersection  H Direction  I Description
- *   J Planned  K Unit  L Quantity Completed  M Color/Material
- *   N Date Completed  O Status  P Added By  Q Notes
+ * Row schema (15 cols) — set up by setupMarkingItems():
+ *   A Item ID  B Work Order #  C Work Type  D WO Section
+ *   E Marking Type  F Intersection  G Direction  H Description
+ *   I Quantity Completed  J Unit  K Color/Material
+ *   L Date Completed  M Status  N Added By  O Notes
  *
  * Expansion rules (per user requirement: one row per discrete marking):
  *   - Top Table: one row per non-empty {category, description}
@@ -12786,17 +12793,31 @@ function _buildRevenuePayload_(startIso, endIso) {
 
   const laborDaily = Object.keys(laborDailyMap).sort().map(k => laborDailyMap[k]);
 
+  // Round every dollar figure at the emission boundary. Each accumulator
+  // above is a raw float sum — 1000 × 0.07 lands on 69.99999999999966 —
+  // and all of these render as currency. Rounding here rather than per
+  // item is deliberate: the invoice rounds once per category line, so
+  // rounding the dashboard per item would widen the gap between them.
+  daily.forEach(d => {
+    d.revenue = _round2_(d.revenue);
+    Object.keys(d.by_group).forEach(g => { d.by_group[g] = _round2_(d.by_group[g]); });
+  });
+  byContractor.forEach(c => { c.revenue = _round2_(c.revenue); });
+  byGroup.forEach(g      => { g.revenue = _round2_(g.revenue); });
+  topWos.forEach(w       => { w.revenue = _round2_(w.revenue); });
+  laborDaily.forEach(d   => { d.mma = _round2_(d.mma); d.thermo = _round2_(d.thermo); });
+
   return {
     range: { start: startIso, end: endIso },
     totals: {
-      revenue:          totalRevenue,
+      revenue:          _round2_(totalRevenue),
       items:            totalItems,
       unpriced_items:   unpricedCount,
       // Invoiced = priced revenue on WOs with a QB invoice created;
       // WIP = everything else (in-progress work, awaiting CFR approval
       // or invoice generation). The two sum to `revenue`.
-      invoiced_revenue: invoicedRevenue,
-      wip_revenue:      totalRevenue - invoicedRevenue,
+      invoiced_revenue: _round2_(invoicedRevenue),
+      wip_revenue:      _round2_(totalRevenue - invoicedRevenue),
       pct_invoiced:     totalRevenue > 0 ? invoicedRevenue / totalRevenue : 0,
     },
     daily,
@@ -12806,9 +12827,9 @@ function _buildRevenuePayload_(startIso, endIso) {
     needs_pricing: needsPricing,
     labor_daily:   laborDaily,
     labor_totals:  {
-      mma:    laborMmaTotal,
-      thermo: laborThermoTotal,
-      total:  laborMmaTotal + laborThermoTotal,
+      mma:    _round2_(laborMmaTotal),
+      thermo: _round2_(laborThermoTotal),
+      total:  _round2_(laborMmaTotal + laborThermoTotal),
     },
   };
 }
@@ -14663,31 +14684,6 @@ function resolveWOSubfolder_(wo_id, subfolderName, maxAttempts) {
 //   30 = Invoice Sent?      (legacy; kept at "No" — QB now tracks)
 //   50 = QB Invoice ID      (Intuit's internal Id; for building view URL)
 
-// Per-group equivalent qty: convert each item's raw qty to the unit
-// the pricing group is denominated in. Returns null if the category
-// doesn't belong to this group or the multiplier is missing.
-function _qbEquivalentQty_(group, category, qty) {
-  if (qty == null || isNaN(qty)) return null;
-  if (group === 'line4') {
-    const m = LINE_WIDTH_MULTIPLIER_[category];
-    return m == null ? null : qty * m;
-  }
-  if (group === 'line12') {
-    const m = LINE12_MULTIPLIER_[category];
-    return m == null ? null : qty * m;
-  }
-  if (group === 'preformed') {
-    const u = PREFORMED_UNIT_COUNT_[category];
-    return u == null ? null : qty * u;
-  }
-  if (group === 'extruded') {
-    const u = EXTRUDED_UNIT_COUNT_[category];
-    return u == null ? null : qty * u;
-  }
-  if (group === 'color_surface') return qty;
-  return null;
-}
-
 const _QB_GROUP_ORDER = ['line4', 'line12', 'preformed', 'extruded', 'color_surface'];
 const _QB_GROUP_LABEL = Object.freeze({
   line4:         '4" Line group',
@@ -14696,23 +14692,24 @@ const _QB_GROUP_LABEL = Object.freeze({
   extruded:      'Extruded L&S',
   color_surface: 'Color Surface',
 });
-const _QB_UNIT_LABEL = Object.freeze({
-  line4:         'LF (4" equiv)',
-  line12:        'LF (12" equiv)',
-  preformed:     'Units',
-  extruded:      'Units',
-  color_surface: 'SF',
-});
 
 /**
  * Aggregate one WO's Completed marking items into the QB invoice
- * payload shape — one line per non-empty pricing group with
- * { qty, rate, amount, description }. Math reconciles penny-perfect to
- * priceMarkingItem_'s revenue numbers: per group,
- *   amount  = Σ priceMarkingItem_(item).revenue
- *   qty     = Σ item.qty × multiplier[item.category]
- *   rate    = amount / qty   (= contract rate when uniform, weighted
- *                              blend when items spanned a rate change)
+ * payload shape — one line per category with { qty, rate, amount,
+ * description }. Per line:
+ *   qty    = Σ item.quantity        (raw units, 2dp)
+ *   rate   = the $/unit priceMarkingItem_ applied — base × multiplier,
+ *            4dp. Carried through, never averaged: an item bills at its
+ *            own rate. Every item in a category resolves to the same
+ *            rate today (one rate row per contractor/contract/borough).
+ *   amount = _money2_(qty, rate)    — QB revalidates Amount ==
+ *            UnitPrice × Qty and rejects the invoice on a 1¢ mismatch.
+ *
+ * Note this rounds once per CATEGORY, while the Revenue dashboard rounds
+ * once per ITEM. Σ round(qtyᵢ × rate) ≠ round(Σqtyᵢ × rate), so the two
+ * can differ by ~1¢ per line. That is inherent — QB forces the invoice's
+ * grouping — and is measured by the reconciliation harness rather than
+ * eliminated.
  *
  * Returns:
  *   {
@@ -14747,6 +14744,22 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     return m ? m[1] : s;
   };
 
+  // Strict formatter for ITEM dates — mirrors the Revenue dashboard's
+  // `fmt` (_buildRevenuePayload_), which resolves anything that isn't a
+  // real yyyy-MM-dd to '' and skips the row. fmtDate above falls back to
+  // the raw cell text, which is fine for the WO's own start/end display
+  // but must never reach _resolveRateRow_: an unparseable date arrives
+  // there as null, matches every dated rate row, and silently bills at
+  // the NEWEST rate. Keep the two paths agreeing on what counts as a
+  // usable date.
+  const fmtItemDate = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const m = String(v || '').trim().match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+
   const contractor      = String(woRow[1]  || '').trim();
   // Apply billing remap so sub-prime work on a contract they didn't
   // win is priced against — and posted to — the contract they DID win.
@@ -14771,7 +14784,7 @@ function aggregateRevenueByWoForQB_(ss, woId) {
   const rates  = _loadContractPricing_(ss);
   const woMeta = { contractor, contract_num: contractNum, borough };
 
-  // Per-category accumulators: acc[category] = { group, raw_qty, unit, revenue }
+  // Per-category accumulators: acc[category] = { group, raw_qty, unit, rate }
   const acc = {};
   const needsPricing = [];
   let totalItems = 0;
@@ -14780,17 +14793,33 @@ function aggregateRevenueByWoForQB_(ss, woId) {
     const r = miData[i];
     if (String(r[1] || '').trim() !== woId) continue;
     if (String(r[12] || '').toLowerCase() !== 'completed') continue;
-    const qty = parseFloat(r[8]);
-    if (isNaN(qty) || qty <= 0) continue;
 
     const item = {
       item_id:        String(r[0] || '').trim(),
       category:       String(r[4] || '').trim(),
-      quantity:       qty,
+      // Raw cell — priceMarkingItem_ coerces with Number() and flags a
+      // blank / zero / text-formatted quantity as reason='bad_qty'. The
+      // dashboard hands it the raw cell too; parsing it differently here
+      // is how the two paths used to disagree on what was billable.
+      quantity:       r[8],
       unit:           String(r[9] || '').trim(),
-      date_completed: fmtDate(r[11]),
+      date_completed: fmtItemDate(r[11]),
     };
     const group = PRICING_GROUP_BY_CATEGORY_[item.category] || 'unpriced';
+
+    // No usable Date Completed → no defensible rate. Refuse rather than
+    // let _resolveRateRow_ fall through to the newest rate row.
+    if (!item.date_completed) {
+      needsPricing.push({
+        item_id:  item.item_id,
+        category: item.category,
+        qty:      item.quantity,
+        unit:     item.unit,
+        reason:   'no_date',
+      });
+      continue;
+    }
+
     const priced = priceMarkingItem_(item, woMeta, rates);
 
     if (priced.reason || group === 'unpriced') {
@@ -14804,29 +14833,14 @@ function aggregateRevenueByWoForQB_(ss, woId) {
       continue;
     }
 
-    // _qbEquivalentQty_ as a "is this category priceable for the QB
-    // line builder?" gate — returns null for categories without a
-    // known multiplier (e.g. Custom Msg in extruded). Still send to
-    // needs_pricing if so.
-    const equivQty = _qbEquivalentQty_(group, item.category, qty);
-    if (equivQty == null) {
-      needsPricing.push({
-        item_id:  item.item_id,
-        category: item.category,
-        qty:      item.quantity,
-        unit:     item.unit,
-        reason:   'no_unit_count',
-      });
-      continue;
-    }
+    const qty = Number(r[8]);
 
     if (!acc[item.category]) {
       acc[item.category] = {
-        group, raw_qty: 0, unit: item.unit, revenue: 0, rate: priced.rate,
+        group, raw_qty: 0, unit: item.unit, rate: priced.rate,
       };
     }
     acc[item.category].raw_qty += qty;
-    acc[item.category].revenue += priced.revenue;
     totalItems += 1;
   }
 

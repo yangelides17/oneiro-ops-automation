@@ -139,4 +139,6 @@ export const NEEDS_PRICING_REASON_LABEL = {
   no_unit_count:     'Unit count missing from extruded table',
   unpriced_category: 'Category requires manual pricing',
   unit_migration:    'Bike Lane Green Bar entered as EA — re-enter as SF',
+  no_date:           'Date Completed is blank — fill it in so the item bills at the right rate',
+  bad_qty:           'Quantity is blank, zero, or not a number',
 }
