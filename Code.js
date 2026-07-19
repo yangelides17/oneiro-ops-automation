@@ -9484,7 +9484,11 @@ const CATEGORY_UNITS_ = {
   // LF (linear feet) — lines, crosswalks, stop lines
   'Double Yellow Line':  'LF',
   'Double White Line':   'LF',
-  'Lane Lines':          'LF',
+  // Lane Lines / Skips are counted in EA, where each EA is one 10' skip
+  // of 4" line. Billed via the line4 group at multiplier 10 (see
+  // LINE_WIDTH_MULTIPLIER_). A physically 15'/20' skip is a fractional
+  // EA (1.5 / 2.0).
+  'Lane Lines':          'EA',
   'Solid Lines':         'LF',
   '4" Line':             'LF',
   '6" Line':             'LF',
@@ -9617,7 +9621,10 @@ const LINE_WIDTH_MULTIPLIER_ = Object.freeze({
   '12" Line':           3.0,
   '16" Line':           4.0,
   '24" Line':           6.0,
-  'Lane Lines':         1.0,
+  // Lane Lines are entered in EA (10' skips), not LF. Each skip is 10 LF
+  // of 4" line, so the multiplier converts EA -> LF-equivalent: qty(EA)
+  // × base($/LF) × 10 = the LF revenue for the same footage.
+  'Lane Lines':         10,
   'Double Yellow Line': 2.0,
   'Double White Line':  2.0,
 });

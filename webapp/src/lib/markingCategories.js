@@ -49,7 +49,7 @@ export const CATEGORY_UNITS = {
   // ── Linear Feet (lines, crosswalks, stop lines) ──────────────
   'Double Yellow Line':  'LF',
   'Double White Line':   'LF',
-  'Lane Lines':          'LF',
+  'Lane Lines':          'EA',   // 10' skips — each EA is one 10 LF skip of 4" line
   'Solid Lines':         'LF',
   '4" Line':             'LF',
   '6" Line':             'LF',
@@ -99,6 +99,7 @@ export const UNIT_OPTIONS = ['SF', 'LF', 'EA']
 // Editing a value here changes the visible label and nothing else.
 export const CATEGORY_DISPLAY_OVERRIDES = {
   'Speed Hump Markings': 'Speed Bump Arrow',
+  'Lane Lines': "Lane Lines (10' Skips)",
 }
 
 // Presentation transform: canonical category string -> what the user sees.

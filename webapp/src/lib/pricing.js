@@ -79,7 +79,7 @@ export const LINE_WIDTH_MULTIPLIER = {
   '12" Line':           3.0,
   '16" Line':           4.0,
   '24" Line':           6.0,
-  'Lane Lines':         1.0,
+  'Lane Lines':         10,     // entered in EA (10' skips): qty × base × 10
   'Double Yellow Line': 2.0,
   'Double White Line':  2.0,
 }
