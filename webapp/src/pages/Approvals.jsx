@@ -163,6 +163,9 @@ export default function Approvals() {
   // Controls the Reupload modal (replace the pending PDF with a signed/
   // rescanned version).
   const [reuploadOpen, setReuploadOpen] = useState(false)
+  // Certified Payroll: confirm before approving without an electronic
+  // signature (guards against pushing a still-unsigned CP through).
+  const [cpSkipConfirmOpen, setCpSkipConfirmOpen] = useState(false)
   // Bumped after a reupload to cache-bust the PDF viewer — the reupload
   // replaces content in place (same file_id), so the URL is otherwise
   // unchanged and react-pdf wouldn't re-fetch.
@@ -204,12 +207,14 @@ export default function Approvals() {
       setSigningItem(selected)
       return
     }
-    // Certified Payroll: same modal, different signing endpoint.
+    // Certified Payroll: admins wet-sign + reupload the signed copy, so the
+    // primary action approves WITHOUT a second electronic overlay. Reupload
+    // leaves no filename marker (unlike sign-in's _MANUAL), so we can't tell a
+    // signed reupload from a still-blank generated CP — a confirm guards against
+    // approving an unsigned sheet. Electronic sign-off stays available via the
+    // kebab (openCertPayrollSignoff).
     if (selected.doc_type === 'certified_payroll') {
-      setSigningItem({
-        ...selected,
-        signUrl: `/api/approvals/${encodeURIComponent(selected.file_id)}/approve-cert-payroll`,
-      })
+      setCpSkipConfirmOpen(true)
       return
     }
     // Everything else: direct approve.
@@ -256,6 +261,16 @@ export default function Approvals() {
     if (!signingItem) return
     removeApprovedAndAdvance(signingItem.file_id)
     setSigningItem(null)
+  }
+
+  // Certified Payroll electronic sign-off (kebab fallback): opens the same
+  // PrincipalSignModal used for sign-ins, bound to the CP signing endpoint.
+  const openCertPayrollSignoff = () => {
+    if (!selected) return
+    setSigningItem({
+      ...selected,
+      signUrl: `/api/approvals/${encodeURIComponent(selected.file_id)}/approve-cert-payroll`,
+    })
   }
 
   // Called by ReuploadModal after the PDF content is replaced in place.
@@ -499,9 +514,9 @@ export default function Approvals() {
                   >
                     {approving
                       ? 'Approving…'
-                      : isManualSignIn(selected)
+                      : (isManualSignIn(selected) || selected.doc_type === 'certified_payroll')
                           ? 'Approve (skip sign-off)'
-                          : (selected.doc_type === 'signin' || selected.doc_type === 'certified_payroll')
+                          : selected.doc_type === 'signin'
                               ? 'Approve & Sign'
                               : 'Approve'}
                   </button>
@@ -519,6 +534,15 @@ export default function Approvals() {
                             onClick: () => { if (confirmDiscardEdits()) doSkipSignoff() },
                           }]
                     } />
+                  )}
+                  {/* Certified Payroll override — primary action skips sign-off
+                      (admins wet-sign + reupload); the electronic overlay stays
+                      available here for the occasional in-app signature. */}
+                  {selected.doc_type === 'certified_payroll' && !approving && (
+                    <RowKebab items={[{
+                      label:   'Approve with sign-off',
+                      onClick: openCertPayrollSignoff,
+                    }]} />
                   )}
                 </div>
               </div>
@@ -614,6 +638,25 @@ export default function Approvals() {
           allowScan={selected.doc_type === 'signin'}
           onClose={() => setReuploadOpen(false)}
           onReuploaded={handleReuploaded}
+        />
+      )}
+
+      {/* Certified Payroll approve-without-sign-off confirmation. Reupload
+          keeps the same filename, so there's no marker proving the PDF was
+          signed — this guards against approving a still-blank CP. */}
+      {cpSkipConfirmOpen && selected && (
+        <ConfirmModal
+          title="Approve without electronic sign-off?"
+          message={
+            `This moves the Certified Payroll to ✅ Approved Docs with no ` +
+            `electronic signature overlay. Make sure the signed copy has been ` +
+            `reuploaded first. To add an in-app signature instead, cancel and use ` +
+            `“Approve with sign-off” from the ⋮ menu.`
+          }
+          confirmLabel="Approve (skip sign-off)"
+          cancelLabel="Cancel"
+          onConfirm={() => { setCpSkipConfirmOpen(false); doSkipSignoff() }}
+          onCancel={() => setCpSkipConfirmOpen(false)}
         />
       )}
 
