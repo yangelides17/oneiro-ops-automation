@@ -266,7 +266,15 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
       const res = await fetch('/api/documents/batch-download', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ ...filters, mark_sent: markSent }),
+        // batch_token rides along so the server zips the listing we
+        // previewed instead of recomputing one. It lives on `preview`
+        // itself, so it can never drift out of sync with what's on
+        // screen — clearing the preview clears the token with it.
+        body:    JSON.stringify({
+          ...filters,
+          mark_sent:   markSent,
+          batch_token: preview?.batch_token,
+        }),
         signal:  controller.signal,
       })
       if (!res.ok) {

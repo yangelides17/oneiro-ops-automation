@@ -30,6 +30,7 @@ import {
   buildInvoiceViewUrl, qbInvoiceExists,
 } from './server/qb.js'
 import { assertQbItemsConfigured } from './server/qbItems.js'
+import { putListing, resolveListing } from './server/batchListingCache.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
@@ -1932,7 +1933,12 @@ app.post('/api/doc-status/flags', async (req, res) => {
 app.post('/api/documents/list-batch', async (req, res) => {
   try {
     const data = await callAppsScript('list_documents_for_batch', req.body)
-    res.json(data)
+    // Hand back a token so batch-download can zip exactly THIS listing
+    // rather than recomputing a fresh — and possibly different — one.
+    // Only worth minting when there's something to download; an empty or
+    // errored listing can't be submitted from the modal anyway.
+    const usable = !data.error && Array.isArray(data.files) && data.files.length > 0
+    res.json(usable ? { ...data, batch_token: putListing(req.body || {}, data) } : data)
   } catch (err) {
     console.error('POST /api/documents/list-batch error:', err.message)
     res.status(500).json({ error: err.message })
@@ -1978,8 +1984,25 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
   })
 
   try {
-    // Resolve the file list first (small JSON payload).
-    const listing = await callAppsScript('list_documents_for_batch', filters)
+    // Prefer the listing the admin actually previewed and approved. The
+    // Apps Script archive walk behind it is the single most expensive call
+    // in this flow, and recomputing it could return a different set than
+    // the one on screen — a doc that flipped Done/Sent in between, a
+    // re-archived file, a different slice at the 500-file cap — which then
+    // decides what gets zipped AND what gets flagged Sent. On any miss we
+    // recompute exactly as before: slower, never wrong.
+    const cached = resolveListing(filters.batch_token, filters)
+    let listing, manifestFilters
+    if (cached.listing) {
+      listing = cached.listing
+      manifestFilters = cached.filters
+      console.log('batch-download: reusing previewed listing ' +
+        `(age=${Math.round(cached.ageMs / 1000)}s files=${(listing.files || []).length})`)
+    } else {
+      console.log(`batch-download: no usable cached listing (${cached.reason}) — recomputing`)
+      listing = await callAppsScript('list_documents_for_batch', filters)
+      manifestFilters = filters
+    }
     const files = Array.isArray(listing.files) ? listing.files : []
     if (files.length === 0) {
       return res.status(400).json({
@@ -2012,8 +2035,10 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     })
     archive.pipe(res)
 
-    // Build & append manifest first so it lives at the zip root.
-    const manifest = buildBatchManifest(filters, listing)
+    // Build & append manifest first so it lives at the zip root. Built
+    // from the filters the listing was PRODUCED with, so the manifest can
+    // never describe a different filter set than the files beside it.
+    const manifest = buildBatchManifest(manifestFilters, listing)
     archive.append(manifest, { name: 'MANIFEST.txt' })
 
     // Determine zip-path layout: contractor folders only when more
