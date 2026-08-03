@@ -2574,24 +2574,44 @@ function getWOFolder_(archiveRoot, woId, ss) {
  */
 function findWOFolder_(archiveRoot, woId, ss, woRowsCache) {
   const woData = woRowsCache || ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
-  const woRow  = woData.find(r => r[0] === woId);
-  if (!woRow) return null;
-  const contractor  = woRow[1] || 'General';
-  const contractNum = String(woRow[2]).split('/')[0];
-  const borough     = woRow[3];
-  const location    = woRow[5];
+  const parts = _woFolderPathParts_(woId, woData);
+  if (!parts) return null;
 
-  const cIt = archiveRoot.getFoldersByName(contractor);
+  const cIt = archiveRoot.getFoldersByName(parts.contractor);
   if (!cIt.hasNext()) return null;
   const contractorFolder = cIt.next();
 
-  const cnIt = contractorFolder.getFoldersByName(`${contractNum} - ${getBoroughName_(borough)}`);
+  const cnIt = contractorFolder.getFoldersByName(parts.contract);
   if (!cnIt.hasNext()) return null;
   const contractFolder = cnIt.next();
 
-  const woIt = contractFolder.getFoldersByName(`${woId} - ${location}`);
+  const woIt = contractFolder.getFoldersByName(parts.wo);
   if (!woIt.hasNext()) return null;
   return woIt.next();
+}
+
+/**
+ * The three archive-path folder names for a WO — { contractor, contract,
+ * wo } — or null when the WO isn't in the tracker. Single source of truth
+ * for findWOFolder_ and the batch-listing folder index, which have to
+ * agree on exactly which folders a WO resolves to.
+ *
+ * Reads the tracker cells RAW, deliberately: the row match is a strict
+ * `===` against an untrimmed cell, and the contractor / contract /
+ * location segments aren't trimmed either. Other call sites (e.g. the
+ * batch handler's allWos) DO trim, so the two disagree for whitespace-
+ * padded or numeric cells. That is a latent bug worth fixing on its own,
+ * but "cleaning it up" here would silently change which folders resolve
+ * — and therefore which documents ship.
+ */
+function _woFolderPathParts_(woId, woData) {
+  const woRow = woData.find(r => r[0] === woId);
+  if (!woRow) return null;
+  return {
+    contractor: woRow[1] || 'General',
+    contract:   `${String(woRow[2]).split('/')[0]} - ${getBoroughName_(woRow[3])}`,
+    wo:         `${woId} - ${woRow[5]}`,
+  };
 }
 
 
@@ -2844,9 +2864,13 @@ function _persistGeocode_(ss, woId, result) {
  * is a comma-list "RM-1, RM-2") resolve each WO's actual location, and
  * — post-cutover, when Daily Sign-In Data cols 3/4 carry the BILLING
  * tuple — each WO's raw source (contract, borough) for archive routing.
+ *
+ * Optional `woRowsCache` is the Tracker's getDataRange().getValues() —
+ * pass it when the caller already holds that snapshot so we don't re-read
+ * the whole sheet. Omitting it preserves the original behaviour exactly.
  */
-function _buildWOTrackerMap_(ss) {
-  const woData = ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
+function _buildWOTrackerMap_(ss, woRowsCache) {
+  const woData = woRowsCache || ss.getSheetByName('Work Order Tracker').getDataRange().getValues();
   const byId = {};
   woData.slice(1).forEach(r => {
     if (!r[0]) return;
@@ -2876,10 +2900,14 @@ function _splitWOIds_(cell) {
  * keep filing into the raw source-job folders, so the raw key is the
  * contract here. WOs missing from the Tracker fall back to the sign-in
  * row's own values so nothing silently drops.
+ *
+ * Optional `scan` = { signInRows, woById } lets a caller that already
+ * holds those two snapshots skip both full-sheet reads. Callers that omit
+ * it read the sheets themselves, exactly as before.
  */
-function getWOsForDate_(date, ss) {
-  const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
-  const woById = _buildWOTrackerMap_(ss);
+function getWOsForDate_(date, ss, scan) {
+  const data   = (scan && scan.signInRows) || ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+  const woById = (scan && scan.woById)     || _buildWOTrackerMap_(ss);
   const wosByContract = {};
   const seen = new Set();
   data.slice(1).forEach(row => {
@@ -2912,12 +2940,14 @@ function getWOsForDate_(date, ss) {
  * all RAW, from the WO Tracker — so the Cert Payroll archive path can
  * fan the billing-named file out into each raw source folder. WOs
  * missing from the Tracker fall back to the sign-in row's own values.
+ *
+ * Optional `scan` = { signInRows, woById } — see getWOsForDate_.
  */
-function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss) {
+function getWOsForPayrollWeek_(contractNum, borough, weekStart, ss, scan) {
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 6);
-  const data = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
-  const woById = _buildWOTrackerMap_(ss);
+  const data   = (scan && scan.signInRows) || ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+  const woById = (scan && scan.woById)     || _buildWOTrackerMap_(ss);
   const wantCn  = String(contractNum || '').trim();
   const wantBor = String(borough || '').trim();
   const wos = [];
@@ -4820,6 +4850,88 @@ function _withDriveRetry_(label, fn, attempts) {
     }
   }
   throw lastErr;
+}
+
+
+/**
+ * Per-execution Drive lookup cache: file listings by folder, and
+ * subfolder-by-name resolutions.
+ *
+ * Built for handleListDocumentsForBatch_, which otherwise re-walks the
+ * same folders relentlessly: the Sign-Ins master folders are enumerated
+ * once per Certified Payroll file (~80× for a typical unsent batch),
+ * every WO folder is walked twice (CFR pass, then Invoice pass), and the
+ * same contractor / contract folders are re-resolved once per WO and
+ * again once per group.
+ *
+ * Deliberately backed by DriveApp, not the advanced Drive service. All
+ * of the win here comes from caching, not from switching APIs, and
+ * DriveApp gives the SAME enumeration order callers have today — which
+ * matters because `files` order decides which entries survive the
+ * MAX_BATCH_FILES_ cap. Both APIs are formally unordered, so swapping in
+ * Drive.Files.list could silently reshuffle a batch.
+ *
+ * File records are { id, name, mimeType, size }; mimeType/size are lazy
+ * since most callers filter on name and never ask.
+ *
+ * Never masks a failure with an empty result. Downstream, an empty
+ * listing reads as "no documents matched" and a null folder is skipped
+ * outright — either would silently drop documents from a batch — so
+ * Drive errors propagate instead of being cached.
+ */
+function _makeDriveFolderIndex_() {
+  const fileCache   = {};   // folderId → [file records]
+  const folderCache = {};   // "<folderId> <name>" → Folder | null (ids have no spaces)
+
+  const fileRec = (f) => {
+    let mt, sz;
+    return {
+      id:   f.getId(),
+      name: f.getName(),
+      get mimeType() { if (mt === undefined) mt = f.getMimeType(); return mt; },
+      get size()     { if (sz === undefined) sz = Number(f.getSize() || 0); return sz; },
+    };
+  };
+
+  return {
+    /**
+     * File records in `folder`, cached. Same iteration order as
+     * folder.getFiles(), which callers depend on: `files` order decides
+     * which entries survive the MAX_BATCH_FILES_ cap. Only cached after
+     * a COMPLETE enumeration, so a mid-walk Drive error propagates
+     * instead of being frozen in as a short (or empty) listing.
+     */
+    files: (folder) => {
+      const id = folder.getId();
+      if (fileCache[id]) return fileCache[id];
+      const out = [];
+      const it = folder.getFiles();
+      while (it.hasNext()) out.push(fileRec(it.next()));
+      fileCache[id] = out;
+      return out;
+    },
+    /**
+     * First subfolder of `parent` named `name`, or null — memoized.
+     *
+     * Deliberately delegates to getFoldersByName rather than filtering a
+     * cached child listing by name. Drive's name matching is NOT plain
+     * JS string equality (a `title =` query matches case-insensitively,
+     * which is what getOrCreateSubfolder_ relies on to avoid creating
+     * duplicates), so reimplementing it with `===` would silently fail
+     * to resolve a folder whose case drifted from its tracker cell — and
+     * in the master-doc pass a null folder is skipped with no `missing`
+     * entry, quietly dropping a whole contract's documents from a batch.
+     * Same call, same semantics, just not repeated per WO and per group.
+     */
+    folderByName: (parent, name) => {
+      const k = parent.getId() + ' ' + String(name);
+      if (folderCache[k] === undefined) {
+        const it = parent.getFoldersByName(String(name));
+        folderCache[k] = it.hasNext() ? it.next() : null;
+      }
+      return folderCache[k];
+    },
+  };
 }
 
 
@@ -13047,13 +13159,58 @@ function handleListDocumentsForBatch_(body) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const woSheet = ss.getSheetByName('Work Order Tracker');
   if (!woSheet) return jsonResponse_({ error: 'Work Order Tracker not found' }, 500);
-  ensureWoTrackerExtraCols_(woSheet);
+  // NOTE: deliberately no ensureWoTrackerExtraCols_ here. It is a write
+  // path (it setValues the header row) and this is a read-only listing
+  // handler — the headers are ensured on every archive/scan path that
+  // actually populates those columns.
 
   const archiveId = PropertiesService.getScriptProperties().getProperty('ARCHIVE_ID');
   if (!archiveId) return jsonResponse_({ error: 'ARCHIVE_ID property not set' }, 500);
   const archiveRoot = DriveApp.getFolderById(archiveId);
 
   const data = woSheet.getDataRange().getValues();
+
+  // One folder enumeration per folder per request — see the docstring on
+  // _makeDriveFolderIndex_ for what this replaces.
+  const folderIdx = _makeDriveFolderIndex_();
+
+  // Snapshots shared by every getWOsForDate_ / getWOsForPayrollWeek_ call
+  // below. Without this each call re-reads BOTH Daily Sign-In Data and the
+  // Work Order Tracker — the latter being `data`, which we already hold.
+  // The handler performs no writes, so one snapshot is valid throughout
+  // (and is strictly more consistent than re-reading per file, which could
+  // straddle a concurrent edit).
+  // signInRows stays lazy: a CFR/Invoice-only request never reaches the
+  // master-doc loop, and reading it eagerly would both waste a full-sheet
+  // read and turn a missing 'Daily Sign-In Data' tab into a failure for
+  // request shapes that never touched it before.
+  let signInRowsCache = null;
+  const scan = {
+    get signInRows() {
+      if (signInRowsCache === null) {
+        signInRowsCache = ss.getSheetByName('Daily Sign-In Data').getDataRange().getValues();
+      }
+      return signInRowsCache;
+    },
+    woById: _buildWOTrackerMap_(ss, data),
+  };
+  // Memoized per distinct date / (contract, borough, week). Every consumer
+  // below is read-only (.map to ids, key iteration), so sharing is safe.
+  const woDateMemo = {};
+  const wosForDate = (iso) => {
+    if (woDateMemo[iso] === undefined) {
+      woDateMemo[iso] = getWOsForDate_(new Date(iso + 'T12:00:00'), ss, scan);
+    }
+    return woDateMemo[iso];
+  };
+  const woWeekMemo = {};
+  const wosForWeek = (cn, bor, iso) => {
+    const k = cn + '|' + bor + '|' + iso;
+    if (woWeekMemo[k] === undefined) {
+      woWeekMemo[k] = getWOsForPayrollWeek_(cn, bor, new Date(iso + 'T12:00:00'), ss, scan);
+    }
+    return woWeekMemo[k];
+  };
 
   // Doc Lifecycle Log → authoritative state for PL / SI / CP. The
   // legacy per-WO Done/Sent columns on the WO Tracker for those types
@@ -13149,12 +13306,27 @@ function handleListDocumentsForBatch_(body) {
 
   // Master-copy folder cache, contractor folder cache, WO folder cache —
   // each Drive walk is the slowest part of this handler so we memoize.
+  // The lookups themselves go through folderIdx, so the archive-root and
+  // contractor listings are enumerated once and shared: getMasters and
+  // getWoFolder used to resolve the very same contractor + contract
+  // folders independently, once per group and once per WO.
   const wofolderCache = {};
   const masterCache = {};   // key contractor|contractNum|borough → { prodFolder, cpFolder }
   const getWoFolder = (w) => {
     const k = w.wo_id;
     if (wofolderCache[k] !== undefined) return wofolderCache[k];
-    const f = findWOFolder_(archiveRoot, k, ss, data);
+    // Same path segments findWOFolder_ walks — shared so the two can't
+    // drift — but resolved through the cached folder listings.
+    // Deliberately NOT wrapped in try/catch: findWOFolder_ didn't swallow
+    // Drive errors here either, and turning one into "archive folder not
+    // found" would quietly drop a document from the batch.
+    const parts = _woFolderPathParts_(w.wo_id, data);
+    let f = null;
+    if (parts) {
+      const cFolder  = folderIdx.folderByName(archiveRoot, parts.contractor);
+      const ctFolder = cFolder && folderIdx.folderByName(cFolder, parts.contract);
+      f = ctFolder && folderIdx.folderByName(ctFolder, parts.wo);
+    }
     wofolderCache[k] = f || null;
     return wofolderCache[k];
   };
@@ -13163,18 +13335,14 @@ function handleListDocumentsForBatch_(body) {
     if (masterCache[k] !== undefined) return masterCache[k];
     let prod = null, cp = null, signin = null;
     try {
-      const cIt = archiveRoot.getFoldersByName(contractor);
-      if (cIt.hasNext()) {
-        const cFolder = cIt.next();
-        const cnIt = cFolder.getFoldersByName(`${contractNum} - ${getBoroughName_(borough)}`);
-        if (cnIt.hasNext()) {
-          const ctFolder = cnIt.next();
-          const plIt = ctFolder.getFoldersByName('Production Logs');
-          if (plIt.hasNext()) prod = plIt.next();
-          const cpIt = ctFolder.getFoldersByName('Certified Payroll');
-          if (cpIt.hasNext()) cp = cpIt.next();
-          const siIt = ctFolder.getFoldersByName('Sign-Ins');
-          if (siIt.hasNext()) signin = siIt.next();
+      const cFolder = folderIdx.folderByName(archiveRoot, contractor);
+      if (cFolder) {
+        const ctFolder = folderIdx.folderByName(
+          cFolder, `${contractNum} - ${getBoroughName_(borough)}`);
+        if (ctFolder) {
+          prod   = folderIdx.folderByName(ctFolder, 'Production Logs');
+          cp     = folderIdx.folderByName(ctFolder, 'Certified Payroll');
+          signin = folderIdx.folderByName(ctFolder, 'Sign-Ins');
         }
       }
     } catch (e) {
@@ -13250,11 +13418,11 @@ function handleListDocumentsForBatch_(body) {
       const canonical = `WO_${w.wo_id}.pdf`;
       let canonicalHit = null;
       let fallbackHit  = null;
-      const fIter = folder.getFiles();
-      while (fIter.hasNext()) {
-        const f = fIter.next();
-        if (f.getMimeType() !== 'application/pdf') continue;
-        const name = f.getName();
+      const woFiles = folderIdx.files(folder);
+      for (let fi = 0; fi < woFiles.length; fi++) {
+        const f = woFiles[fi];
+        if (f.mimeType !== 'application/pdf') continue;
+        const name = f.name;
         if (name === canonical) { canonicalHit = f; break; }
         if (!_isAuxDocName_(name) && !fallbackHit) fallbackHit = f;
       }
@@ -13264,10 +13432,10 @@ function handleListDocumentsForBatch_(body) {
         return;
       }
       pushFile({
-        file_id:      target.getId(),
-        filename:     target.getName(),
-        mime_type:    target.getMimeType(),
-        size:         target.getSize(),
+        file_id:      target.id,
+        filename:     target.name,
+        mime_type:    target.mimeType,
+        size:         target.size,
         contractor:   w.contractor,
         contract_num: w.contract_num,
         borough:      w.borough,
@@ -13298,19 +13466,19 @@ function handleListDocumentsForBatch_(body) {
         return;
       }
       let foundAny = false;
-      const fIter = folder.getFiles();
-      while (fIter.hasNext()) {
-        const f = fIter.next();
-        const name = f.getName();
+      const invFiles = folderIdx.files(folder);
+      for (let fi = 0; fi < invFiles.length; fi++) {
+        const f = invFiles[fi];
+        const name = f.name;
         if (!/^Invoice_/i.test(name)) continue;
         // Restrict to invoices that mention this WO id, so we don't
         // grab a sibling WO's invoice if more than one was filed.
         if (name.toUpperCase().indexOf(w.wo_id.toUpperCase()) === -1) continue;
         pushFile({
-          file_id:      f.getId(),
+          file_id:      f.id,
           filename:     name,
-          mime_type:    f.getMimeType(),
-          size:         f.getSize(),
+          mime_type:    f.mimeType,
+          size:         f.size,
           contractor:   w.contractor,
           contract_num: w.contract_num,
           borough:      w.borough,
@@ -13347,6 +13515,9 @@ function handleListDocumentsForBatch_(body) {
     Object.keys(woGroups).forEach(gk => {
       if (files.length >= MAX_BATCH_FILES_) return;
       const groupWos = woGroups[gk];
+      // Depends only on the group — built once here rather than rebuilt
+      // for every file in the master folder below.
+      const inScopeIds = new Set(groupWos.map(w => w.wo_id));
       const [contractor, contractNum, borough] = gk.split('|');
       const masters = getMasters(contractor, contractNum, borough);
       const masterFolder = docType === 'Production Log' ? masters.prod
@@ -13369,11 +13540,11 @@ function handleListDocumentsForBatch_(body) {
       // selected scope (wo_numbers / date_range / unsent semantics
       // applied below per-file via the Log lookup).
 
-      const fIter = masterFolder.getFiles();
-      while (fIter.hasNext()) {
+      const masterFiles = folderIdx.files(masterFolder);
+      for (let mi = 0; mi < masterFiles.length; mi++) {
         if (files.length >= MAX_BATCH_FILES_) break;
-        const f = fIter.next();
-        const name = f.getName();
+        const f = masterFiles[mi];
+        const name = f.name;
         if (!masterPrefix.test(name)) continue;
         const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
         if (!dm) continue;
@@ -13414,14 +13585,14 @@ function handleListDocumentsForBatch_(body) {
         // lists its BK-sourced WOs too.
         let coveredWoIds;
         if (docType === 'Production Log') {
-          const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
+          const map = wosForDate(fileDate);
           const keyMatch = Object.keys(map).find(k => {
             const parts = k.split('|');
             return parts[0] === contractor && parts[1] === contractNum && parts[2] === borough;
           });
           coveredWoIds = keyMatch ? map[keyMatch].map(x => x.id) : [];
         } else if (docType === 'Sign-In') {
-          const map = getWOsForDate_(new Date(fileDate + 'T12:00:00'), ss);
+          const map = wosForDate(fileDate);
           coveredWoIds = [];
           Object.keys(map).forEach(k => {
             const [kCo, kCn, kBor] = k.split('|');
@@ -13431,7 +13602,7 @@ function handleListDocumentsForBatch_(body) {
             map[k].forEach(x => coveredWoIds.push(x.id));
           });
         } else {
-          const wos = getWOsForPayrollWeek_(fileCn, fileBor, new Date(fileDate + 'T12:00:00'), ss);
+          const wos = wosForWeek(fileCn, fileBor, fileDate);
           coveredWoIds = wos.map(x => x.id);
         }
         if (coveredWoIds.length === 0) continue;
@@ -13440,7 +13611,6 @@ function handleListDocumentsForBatch_(body) {
         // with the user's selected list. date_range and unsent gate
         // the file via its own date / Log state, not via the WO list.
         if (mode === 'wo_numbers') {
-          const inScopeIds = new Set(groupWos.map(w => w.wo_id));
           if (!coveredWoIds.some(id => inScopeIds.has(id))) continue;
         }
 
@@ -13477,10 +13647,10 @@ function handleListDocumentsForBatch_(body) {
         const allSent = !!logState.sent;
 
         pushFile({
-          file_id:      f.getId(),
+          file_id:      f.id,
           filename:     name,
-          mime_type:    f.getMimeType(),
-          size:         f.getSize(),
+          mime_type:    f.mimeType,
+          size:         f.size,
           contractor,
           // Manifest shows the doc's own identity tuple (from its
           // filename), not the raw folder it happened to be walked in.
@@ -13527,11 +13697,13 @@ function handleListDocumentsForBatch_(body) {
           // doc_id so each sheet lands in the bundle once.
           const bundledSiDocIds = new Set();
           siFolders.forEach(siFolder => {
-            const siIter = siFolder.getFiles();
-            while (siIter.hasNext()) {
+            // Cached: this same folder is otherwise re-enumerated in full
+            // for every CP file in the batch.
+            const siFiles = folderIdx.files(siFolder);
+            for (let si = 0; si < siFiles.length; si++) {
               if (files.length >= MAX_BATCH_FILES_) break;
-              const sf = siIter.next();
-              const sname = sf.getName();
+              const sf = siFiles[si];
+              const sname = sf.name;
               const spm = sname.match(/^SignIn_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})/i);
               if (!spm) continue;
               const [, siCn, siBor, sDate] = spm;
@@ -13552,11 +13724,11 @@ function handleListDocumentsForBatch_(body) {
               if (bundledSiDocIds.has(siState.doc_id)) continue;
               bundledSiDocIds.add(siState.doc_id);
               pushFile({
-                file_id:      sf.getId(),
+                file_id:      sf.id,
                 filename:     sname,
                 zip_path:     bundleDir + '/' + sname,
-                mime_type:    sf.getMimeType(),
-                size:         sf.getSize(),
+                mime_type:    sf.mimeType,
+                size:         sf.size,
                 contractor,
                 contract_num: siCn,
                 borough:      siBor,
@@ -13588,21 +13760,20 @@ function handleListDocumentsForBatch_(body) {
       if (!folder) return;
       let photosFolder = null;
       try {
-        const it = folder.getFoldersByName('Photos');
-        if (it.hasNext()) photosFolder = it.next();
+        photosFolder = folderIdx.folderByName(folder, 'Photos');
       } catch (e) { /* ignore */ }
       if (!photosFolder) return;
       const bundleDir = w.wo_id + '/Photos';
-      const fIt = photosFolder.getFiles();
-      while (fIt.hasNext()) {
+      const photoFiles = folderIdx.files(photosFolder);
+      for (let pi = 0; pi < photoFiles.length; pi++) {
         if (files.length >= MAX_BATCH_FILES_) break;
-        const f = fIt.next();
+        const f = photoFiles[pi];
         pushFile({
-          file_id:      f.getId(),
-          filename:     f.getName(),
-          zip_path:     bundleDir + '/' + f.getName(),
-          mime_type:    f.getMimeType(),
-          size:         f.getSize(),
+          file_id:      f.id,
+          filename:     f.name,
+          zip_path:     bundleDir + '/' + f.name,
+          mime_type:    f.mimeType,
+          size:         f.size,
           contractor:   w.contractor,
           contract_num: w.contract_num,
           borough:      w.borough,
