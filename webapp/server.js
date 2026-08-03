@@ -1959,6 +1959,16 @@ app.post('/api/documents/list-batch', async (req, res) => {
  *   5. On success and mark_sent=true, fire-and-forget set_docs_sent
  *      to flip Sent flags for every (wo_id, doc_type) covered.
  */
+// How many get_drive_file_bytes calls may be in flight at once while
+// building a zip. Deliberately conservative: each is a full Apps Script
+// invocation, and Apps Script throttles concurrent executions per user —
+// under sustained load its /exec starts returning HTML 404s for every
+// action, which takes the whole site down until the load stops.
+//
+// Overridable from the Railway env so this can be dialled back — or set
+// to 1, restoring the old strictly-serial behaviour — without a deploy.
+const BATCH_FETCH_WINDOW = Math.max(1, Number(process.env.BATCH_FETCH_WINDOW) || 4)
+
 app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async (req, res) => {
   const filters  = req.body || {}
   const markSent = !!filters.mark_sent
@@ -2085,12 +2095,46 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       return candidate
     }
 
+    // Byte fetching is the long pole here: one Apps Script round trip per
+    // file, each base64-inflated ~33%, and it used to run strictly one at
+    // a time — so a 100-file batch was 100 sequential round trips.
+    //
+    // Keep a small window of fetches in flight while still APPENDING in
+    // listing order, so zip entry order is completely unchanged.
+    // prepPdfForDelivery deliberately stays serial in the append loop: it
+    // is synchronous CPU on the main thread, so running several at once
+    // buys no parallelism and only blocks the event loop harder — which
+    // would in turn stall the very fetches we just parallelised.
+    //
+    // fetchOne resolves rather than rejects, so a promise that is never
+    // awaited (because the client cancelled mid-batch) cannot surface as
+    // an unhandled rejection.
+    const fetchOne = (file) =>
+      callAppsScript('get_drive_file_bytes', { file_id: file.file_id })
+        .then(result => ({ ok: true,  result }),
+              error  => ({ ok: false, error }))
+
+    const inFlight = new Map()   // file index → settled-shaped promise
+    const startFetch = (i) => {
+      if (i < files.length && !cancelled && !inFlight.has(i)) {
+        inFlight.set(i, fetchOne(files[i]))
+      }
+    }
+    for (let i = 0; i < Math.min(BATCH_FETCH_WINDOW, files.length); i++) startFetch(i)
+
     let appended = 0
     let failed   = 0
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+      if (cancelled) break
+      const file = files[i]
+      const settled = await inFlight.get(i)
+      inFlight.delete(i)
+      // Refill the window as soon as this slot frees.
+      startFetch(i + BATCH_FETCH_WINDOW)
       if (cancelled) break
       try {
-        const fetched = await callAppsScript('get_drive_file_bytes', { file_id: file.file_id })
+        if (!settled.ok) throw settled.error
+        const fetched = settled.result
         if (!fetched || !fetched.data) {
           console.warn(`batch-download: get_drive_file_bytes returned no bytes for ${file.filename}`)
           failed++
@@ -2106,6 +2150,10 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
         // Continue with the other files rather than aborting the whole zip.
       }
     }
+    // On cancel, whatever is still in flight is left to settle on its own.
+    // fetchOne never rejects, so those are harmless; awaiting them here
+    // would only delay archive.abort() by a round trip.
+    inFlight.clear()
     console.log(`batch-download: appended=${appended} failed=${failed} cancelled=${cancelled}`)
 
     if (cancelled) {
