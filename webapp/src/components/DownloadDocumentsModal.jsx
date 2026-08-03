@@ -105,6 +105,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError,   setPreviewError]   = useState(null)
   const [preview,        setPreview]        = useState(null)
+  const [previewElapsed, setPreviewElapsed] = useState(0)
+  // The preview walk runs 30s+, so the user can hit Back, change filters
+  // and re-Preview while an older request is still in flight. The seq ref
+  // decides which response is allowed to write state; the abort ref stops
+  // the abandoned one from burning another archive walk server-side.
+  const previewSeqRef   = useRef(0)
+  const previewAbortRef = useRef(null)
   // Submission
   const [markSent, setMarkSent] = useState(true)
   const [submitState, setSubmitState] = useState('idle')   // idle | working | cancelled | done | error
@@ -140,6 +147,22 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     }
   }, [mode])
 
+  // Elapsed-seconds readout while the preview loads. Apps Script returns
+  // the whole listing in one response, so there is no real progress to
+  // report — a running clock is the honest signal that work is happening.
+  useEffect(() => {
+    if (!previewLoading) return
+    setPreviewElapsed(0)
+    const started = Date.now()
+    const id = setInterval(() => {
+      setPreviewElapsed(Math.floor((Date.now() - started) / 1000))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [previewLoading])
+
+  // Abandoning the modal mid-preview shouldn't leave the request running.
+  useEffect(() => () => { previewAbortRef.current?.abort() }, [])
+
   // ── Filter payload built from current state ───────────────────
   const filters = useMemo(() => {
     const f = {
@@ -171,28 +194,53 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos, granularity, periodWeek, periodMonth])
 
   // ── Step transitions ──────────────────────────────────────────
+  // Step 3 is shown IMMEDIATELY and renders its own loading state. The
+  // preview walks the Drive archive server-side and legitimately takes
+  // tens of seconds; awaiting it before setStep left the modal sitting on
+  // step 2 the whole time, so the Preview button looked dead.
   const goToStep = async (next) => {
-    if (next === 3) {
-      // Fetch preview before showing step 3
-      setPreviewLoading(true)
-      setPreviewError(null)
-      setPreview(null)
-      try {
-        const res = await fetch('/api/documents/list-batch', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify(filters),
-        })
-        const data = await res.json()
-        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-        setPreview(data)
-      } catch (e) {
-        setPreviewError(e.message)
-      } finally {
-        setPreviewLoading(false)
-      }
+    if (next !== 3) { setStep(next); return }
+
+    previewAbortRef.current?.abort()
+    const controller = new AbortController()
+    previewAbortRef.current = controller
+    const seq = ++previewSeqRef.current
+
+    setStep(3)
+    setPreviewLoading(true)
+    setPreviewError(null)
+    setPreview(null)
+    try {
+      const res = await fetch('/api/documents/list-batch', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(filters),
+        signal:  controller.signal,
+      })
+      const data = await res.json()
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
+      if (seq !== previewSeqRef.current) return
+      setPreview(data)
+    } catch (e) {
+      // A superseded or unmounted request must not surface as an error.
+      if (seq !== previewSeqRef.current || e.name === 'AbortError') return
+      setPreviewError(e.message)
+    } finally {
+      // Only the newest request owns the spinner — an older one finishing
+      // late must not clear it out from under the request still running.
+      if (seq === previewSeqRef.current) setPreviewLoading(false)
     }
-    setStep(next)
+  }
+
+  // Back out of the preview: drop the in-flight walk rather than letting
+  // it finish into a screen the user has already left.
+  const goBack = () => {
+    if (step === 3 && previewLoading) {
+      previewSeqRef.current++
+      previewAbortRef.current?.abort()
+      setPreviewLoading(false)
+    }
+    setStep(step - 1)
   }
 
   // ── Step 2 validity ───────────────────────────────────────────
@@ -541,9 +589,17 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
           {step === 3 && (
             <div className="space-y-4">
               {previewLoading && (
-                <div className="flex items-center gap-3 text-slate-500 text-sm">
-                  <div className="w-5 h-5 border-[2px] border-slate-200 border-t-navy rounded-full animate-spin" />
-                  Loading preview…
+                <div className="card p-4 flex items-center gap-3 text-sm">
+                  <div className="w-5 h-5 shrink-0 border-[2px] border-slate-200 border-t-navy rounded-full animate-spin" />
+                  <span className="text-slate-600">
+                    Scanning the archive for matching documents…
+                    {previewElapsed > 0 && (
+                      <span className="text-slate-400 tabular-nums"> {previewElapsed}s</span>
+                    )}
+                    <span className="block text-[11px] text-slate-400 mt-0.5">
+                      Large batches can take a minute or more.
+                    </span>
+                  </span>
                 </div>
               )}
               {previewError && (
@@ -681,7 +737,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
           <div className="flex gap-2">
             {step > 1 && submitState !== 'working' && submitState !== 'done' && (
               <button
-                onClick={() => setStep(step - 1)}
+                onClick={goBack}
                 className="btn-outline text-sm px-4 py-2"
               >
                 Back
