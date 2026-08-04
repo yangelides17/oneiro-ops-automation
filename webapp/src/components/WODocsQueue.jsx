@@ -7,23 +7,30 @@ import FilterBar from './FilterBar'
 /**
  * WODocsQueue — a condensed "what still needs doc work" list for the top
  * of the Doc Status tab. Shows every COMPLETED work order whose CFR or
- * Invoice isn't yet both Done AND Sent, so the admin sees outstanding
- * doc work in one place.
+ * Invoice isn't yet both Done AND Sent — and, for PT (paint/MMA) WOs,
+ * whose DOT-required proof-of-work photos (PICS) aren't either — so the
+ * admin sees outstanding doc work in one place.
  *
  * Reuses the WO Tracker's exact pieces (DocStatusChips pills → same
  * /api/documents/flags, InvoiceCell → same /api/qb/invoice/:id) and is
  * fed the SAME `wos` array the WO Tracker renders (lifted from the parent
  * Dashboard). So the two lists are one source of truth: a toggle or an
  * invoice here optimistically updates the shared state and the row drops
- * out the moment its CFR + Invoice are both done + sent.
+ * out the moment its required docs are all done + sent.
  */
 const isCompleted = (wo) => String(wo?.status || '').toLowerCase() === 'completed'
 const docFull = (d) => !!(d && d.done && d.sent)
+// PT-XXXXX = Paint/MMA WO — the only type the DOT proof-of-work photo
+// requirement applies to. Mirrors the isPaintWO check in Code.js.
+const isPTWo = (id) => String(id || '').toUpperCase().startsWith('PT-')
 
-// Completed WO whose CFR or Invoice isn't fully done+sent.
+// Completed WO whose CFR or Invoice isn't fully done+sent — or, for PT
+// (paint/MMA) WOs, whose PICS proof-of-work photos aren't done+sent.
 function isDocsPending(wo) {
   if (!isCompleted(wo)) return false
-  return !docFull(wo.docs?.cfr) || !docFull(wo.docs?.invoice)
+  if (!docFull(wo.docs?.cfr) || !docFull(wo.docs?.invoice)) return true
+  if (isPTWo(wo.id) && !docFull(wo.docs?.pics)) return true
+  return false
 }
 
 export default function WODocsQueue({ wos, qbConnected, onDocsChange, onInvoiced }) {
@@ -68,7 +75,7 @@ export default function WODocsQueue({ wos, qbConnected, onDocsChange, onInvoiced
       {rows.length === 0 ? (
         <p className="text-xs text-slate-400 italic py-2">
           {pending.length === 0
-            ? 'All caught up — every completed WO has its CFR and invoice done + sent. ✓'
+            ? 'All caught up — every completed WO has its CFR and invoice (and PICS, for PT WOs) done + sent. ✓'
             : 'No pending WOs for this contractor. ✓'}
         </p>
       ) : (

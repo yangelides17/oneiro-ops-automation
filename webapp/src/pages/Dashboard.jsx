@@ -326,9 +326,6 @@ function StatCard({ label, value, sub, color }) {
 
 // ── WO Table row ──────────────────────────────────────────────
 function WORow({ wo, flagged, qbConnected, onDocsChange, onChangeStatus, onDeleteWO, onInvoiced }) {
-  const isOverdue = wo.due_date && new Date(wo.due_date) < new Date()
-    && wo.status.toLowerCase() !== 'completed'
-
   // Quantity cell: e.g. "1500 SF" or "240 LF". Empty / zero → em-dash.
   const qtyNum = parseFloat(wo.quantity)
   const qtyText = (!wo.quantity || isNaN(qtyNum) || qtyNum === 0)
@@ -364,11 +361,6 @@ function WORow({ wo, flagged, qbConnected, onDocsChange, onChangeStatus, onDelet
       </td>
       <td className="py-2.5 px-3 text-slate-600 max-w-[180px] truncate">
         {wo.location || '—'}
-      </td>
-      <td className={`py-2.5 px-3 whitespace-nowrap text-xs font-medium
-                      ${isOverdue ? 'text-red-600 font-bold' : 'text-slate-500'}`}>
-        {prettyDate(wo.due_date) || '—'}
-        {isOverdue && ' ⚡'}
       </td>
       <td className="py-2.5 px-3"><StatusBadge status={wo.status} /></td>
       <td className="py-2.5 px-3 text-slate-600 text-xs whitespace-nowrap">
@@ -590,6 +582,7 @@ export default function Dashboard() {
       'Sign-In':           'signin',
       'Certified Payroll': 'certified_payroll',
       'Invoice':           'invoice',
+      'PICS':              'pics',
     })[friendlyDocType]
 
     if (docKey) {
@@ -1083,7 +1076,7 @@ function OperationsTabContent({
           <table className="w-full min-w-[820px]">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50">
-                {['WO #', 'Contractor', 'Boro', 'Location', 'Due Date', 'Status', 'Quantity', 'Progress', 'Docs', 'Invoice', 'Drive', ''].map((h, i) => (
+                {['WO #', 'Contractor', 'Boro', 'Location', 'Status', 'Quantity', 'Progress', 'Docs', 'Invoice', 'Drive', ''].map((h, i) => (
                   <th
                     key={h || `col-${i}`}
                     className={`py-2.5 px-3 text-left text-[10px] font-extrabold
@@ -1098,7 +1091,7 @@ function OperationsTabContent({
             <tbody>
               {filteredWOs.length === 0 ? (
                 <tr>
-                  <td colSpan={12} className="py-12 text-center text-slate-400 text-sm">
+                  <td colSpan={11} className="py-12 text-center text-slate-400 text-sm">
                     No work orders match your filters.
                   </td>
                 </tr>

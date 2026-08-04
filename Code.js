@@ -1700,10 +1700,12 @@ function getRecipientsForDoc_(docType, woId, ss) {
 const DOC_TYPE_DONE_COL_ = Object.freeze({
   'Field Report': 25,   // legacy — Field Report Done?
   'Invoice':      44,   // Invoice Done? — shifted left after the obsolete-col trim
+  'PICS':         50,   // PICS Done? — col 51/0-idx 50, added by setupPicsColumns()
 });
 const DOC_TYPE_SENT_COL_ = Object.freeze({
   'Field Report': 43,   // CFR Sent?
   'Invoice':      29,   // legacy — Invoice Sent?
+  'PICS':         51,   // PICS Sent? — col 52/0-idx 51, added by setupPicsColumns()
 });
 
 /**
@@ -1788,6 +1790,7 @@ function handleSetDocsSent_(body) {
     'Sign-In':           'Sign-In',
     'Certified Payroll': 'Certified Payroll',
     'Invoice':           'Invoice',
+    'PICS':              'PICS',
   };
 
   // PL / SI / CP storage moved to the Doc Lifecycle Log (per-doc rows
@@ -7050,7 +7053,9 @@ function retryArchiveStuckWO(woId) {
  * Column layout (1-indexed): 36 = Date Entered, 37 = School,
  *   38 = Prep By, 39 = Scan File ID, 40 = Combined Scan File ID,
  *   41 = Scan Upload Timestamp, 42 = Original Filename,
- *   43 = Archive Folder URL.
+ *   43 = Archive Folder URL. (50 = QB Invoice ID, 51/52 = PICS Done?/Sent?
+ *   are added separately by setupQBInvoiceCol() / setupPicsColumns() — not
+ *   part of this function's EXTRA_HEADERS block.)
  */
 function ensureWoTrackerExtraCols_(woSheet) {
   const EXTRA_HEADERS = [
@@ -12593,6 +12598,10 @@ function _buildDashboardPayload_() {
         signin:            { done: false, sent: false },
         certified_payroll: { done: false, sent: false },
         invoice:           { done: yes(DOC_TYPE_DONE_COL_['Invoice']),      sent: yes(DOC_TYPE_SENT_COL_['Invoice']) },
+        // DOT-required proof-of-work photos (street sign, before, after) that must
+        // accompany the CFR on PT (paint/MMA) orders. Populated for every WO for
+        // payload-shape consistency; the webapp only surfaces this chip on PT WOs.
+        pics:              { done: yes(DOC_TYPE_DONE_COL_['PICS']),         sent: yes(DOC_TYPE_SENT_COL_['PICS']) },
       };
       return {
         id:                  woId,
@@ -14861,6 +14870,8 @@ function resolveWOSubfolder_(wo_id, subfolderName, maxAttempts) {
 //   29 = Invoice Amount
 //   30 = Invoice Sent?      (legacy; kept at "No" — QB now tracks)
 //   50 = QB Invoice ID      (Intuit's internal Id; for building view URL)
+//   51 = PICS Done?         (DOT proof-of-work photos verified — PT WOs only)
+//   52 = PICS Sent?         (see setupPicsColumns())
 
 const _QB_GROUP_ORDER = ['line4', 'line12', 'preformed', 'extruded', 'color_surface'];
 const _QB_GROUP_LABEL = Object.freeze({
@@ -15171,6 +15182,67 @@ function setupQBInvoiceCol() {
   }
   woSheet.getRange(1, COL).setValue(HEADER).setFontWeight('bold');
   Logger.log('✅ Added "QB Invoice ID" header at WO Tracker col 50');
+}
+
+
+/**
+ * One-shot bootstrap: add "PICS Done?" (col 51) and "PICS Sent?" (col 52) to the
+ * WO Tracker. Tracks whether the DOT-required proof-of-work photos (street sign,
+ * before-work, after-work-complete) were verified and sent alongside the CFR —
+ * required on PT (paint/MMA) orders only. Idempotent. Run from the Apps Script
+ * editor once after deploying. Avoids re-running setupAutomation (which has many
+ * side effects).
+ *
+ * Also backfills existing data: any row with Status = "Completed" AND a WO ID
+ * starting with "PT-" gets both columns defaulted to "Yes" — this assumes
+ * historical completed PT jobs already shipped their photos, so the admin only
+ * has to hand-flip the small number of exceptions back to pending via the
+ * DocStatusChips popover instead of marking every historical PT WO from scratch.
+ * RM/PM rows and non-Completed PT rows are left blank, same as any newly added
+ * column. The backfill only touches rows where BOTH cells are still blank, so
+ * re-running this function is safe and won't stomp on flags an admin has since
+ * edited by hand.
+ */
+function setupPicsColumns() {
+  const ss      = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const woSheet = ss.getSheetByName('Work Order Tracker');
+  if (!woSheet) throw new Error('Work Order Tracker not found');
+
+  const DONE_COL    = 51;
+  const SENT_COL    = 52;
+  const DONE_HEADER = 'PICS Done?';
+  const SENT_HEADER = 'PICS Sent?';
+
+  const currentDone = String(woSheet.getRange(1, DONE_COL).getValue() || '').trim();
+  const currentSent = String(woSheet.getRange(1, SENT_COL).getValue() || '').trim();
+  if (currentDone && currentDone !== DONE_HEADER) {
+    throw new Error(`Col ${DONE_COL} already has header "${currentDone}" — refusing to overwrite. Migrate manually first.`);
+  }
+  if (currentSent && currentSent !== SENT_HEADER) {
+    throw new Error(`Col ${SENT_COL} already has header "${currentSent}" — refusing to overwrite. Migrate manually first.`);
+  }
+  if (currentDone !== DONE_HEADER) woSheet.getRange(1, DONE_COL).setValue(DONE_HEADER).setFontWeight('bold');
+  if (currentSent !== SENT_HEADER) woSheet.getRange(1, SENT_COL).setValue(SENT_HEADER).setFontWeight('bold');
+
+  // Backfill Completed + PT- WOs → Yes/Yes (see doc comment above for rationale).
+  const data = woSheet.getDataRange().getValues();
+  let backfilled = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row  = data[i];
+    const woId = String(row[0] || '').trim();
+    if (!woId.toUpperCase().startsWith('PT-')) continue;
+    const status = String(row[15] || '').trim().toLowerCase();  // col 16/0-idx 15 = Status
+    if (status !== 'completed') continue;
+    const doneVal = String(row[DONE_COL - 1] || '').trim();
+    const sentVal = String(row[SENT_COL - 1] || '').trim();
+    if (doneVal || sentVal) continue;  // already touched (manually or a prior run) — don't stomp
+    woSheet.getRange(i + 1, DONE_COL).setValue('Yes');
+    woSheet.getRange(i + 1, SENT_COL).setValue('Yes');
+    backfilled++;
+  }
+
+  Logger.log(`✅ setupPicsColumns: headers set at cols ${DONE_COL}/${SENT_COL}; ` +
+             `backfilled ${backfilled} completed PT WO(s) to Yes/Yes`);
 }
 
 

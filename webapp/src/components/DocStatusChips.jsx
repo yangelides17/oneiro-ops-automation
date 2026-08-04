@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 
 /**
- * DocStatusChips — compact 5-chip cluster showing per-doc-type
+ * DocStatusChips — compact chip cluster showing per-doc-type
  * lifecycle state on a WO row. Click anywhere on the cluster to
  * open an inline editor popover with toggle buttons for Done/Sent
- * across all 5 doc types.
+ * across each doc type.
  *
  * Props:
  *   woId     — WO id (string), passed back through onChange
- *   docs     — { cfr, production_log, signin, certified_payroll, invoice },
+ *   docs     — { cfr, production_log, signin, certified_payroll, invoice, pics },
  *              each { done: bool, sent: bool }
  *   onChange — (woId, friendlyDocType, partial) => Promise<bool>
  *              partial: { done?: bool } | { sent?: bool }
@@ -27,6 +27,22 @@ const DOC_TYPES = [
   { key: 'invoice', friendly: 'Invoice', label: 'Invoice',                 short: 'INV' },
 ]
 
+// PICS — DOT-required proof-of-work photos (street sign, before-work,
+// after-work-complete) that must accompany the CFR. Required on PT
+// (paint/MMA) orders only, so it's appended to DOC_TYPES conditionally
+// per-WO rather than living in the base list above.
+const PICS_DOC_TYPE = {
+  key: 'pics', friendly: 'PICS', short: 'PICS', label: 'Proof-of-Work Photos',
+  description: 'Proof-of-Work Photos — confirm all 3 shots (street sign, before-work, '
+    + 'after-work-complete) are uploaded before marking Done',
+}
+
+// PT-XXXXX = Paint/MMA work order — the only WO type the DOT photo
+// requirement applies to. Mirrors the isPaintWO check in Code.js.
+function isPTWo(woId) {
+  return String(woId || '').toUpperCase().startsWith('PT-')
+}
+
 // Lifecycle state → visual style. Three states only: not done, done
 // (not sent), sent. Sent implies done so we don't surface a separate
 // "sent but not done" state — that's invariant-violating data.
@@ -40,6 +56,10 @@ function chipTooltip(label, done, sent) {
 }
 
 export default function DocStatusChips({ woId, docs, onChange }) {
+  // PICS only applies to PT (paint/MMA) orders — RM/PM WOs keep the
+  // 2-chip CFR/INV cluster unchanged.
+  const docTypes = isPTWo(woId) ? [...DOC_TYPES, PICS_DOC_TYPE] : DOC_TYPES
+
   const [open, setOpen] = useState(false)
   // Local optimistic copy of the docs object — updated immediately on
   // toggle, revert if onChange returns false.
@@ -70,7 +90,7 @@ export default function DocStatusChips({ woId, docs, onChange }) {
   // Toggle one flag for one doc type. Optimistic — flips local state
   // immediately, fires the network call, reverts on failure.
   async function toggle(docKey, flag) {
-    const docMeta = DOC_TYPES.find(d => d.key === docKey)
+    const docMeta = docTypes.find(d => d.key === docKey)
     if (!docMeta) return
     const cur = local[docKey] || { done: false, sent: false }
     // Sent requires Done. The button is disabled in that case but
@@ -111,12 +131,12 @@ export default function DocStatusChips({ woId, docs, onChange }) {
                    hover:bg-slate-50 transition-colors"
         aria-label="Edit document statuses"
       >
-        {DOC_TYPES.map(d => {
+        {docTypes.map(d => {
           const s = local[d.key] || { done: false, sent: false }
           return (
             <span
               key={d.key}
-              title={chipTooltip(d.label, s.done, s.sent)}
+              title={chipTooltip(d.description || d.label, s.done, s.sent)}
               className={`inline-flex items-center justify-center
                           text-[9px] font-extrabold tracking-wider
                           px-1.5 h-[18px] min-w-[24px] rounded
@@ -147,7 +167,7 @@ export default function DocStatusChips({ woId, docs, onChange }) {
             >×</button>
           </div>
           <div className="px-2 py-1 space-y-1.5">
-            {DOC_TYPES.map(d => {
+            {docTypes.map(d => {
               const s = local[d.key] || { done: false, sent: false }
               const sentDisabled = !s.done
               const donePending = pending[`${d.key}|done`]
@@ -158,7 +178,10 @@ export default function DocStatusChips({ woId, docs, onChange }) {
               return (
                 <div key={d.key}
                   className={`flex items-center justify-between gap-3 border rounded-md px-2 py-1.5 ${rowBg}`}>
-                  <span className="text-xs text-slate-700 font-medium truncate">
+                  <span
+                    className="text-xs text-slate-700 font-medium truncate"
+                    title={d.description || ''}
+                  >
                     {d.label}
                   </span>
                   <div className="flex gap-1.5 flex-shrink-0">
