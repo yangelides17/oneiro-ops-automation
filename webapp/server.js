@@ -142,19 +142,26 @@ async function callAppsScript(action, data = null) {
   // back, the human-readable Google error text. All lines are prefixed
   // [AS] for easy grep in the Railway logs.
   //
-  // NOTE: no timeout and no retry here, deliberately. A blanket 28s
-  // AbortSignal was tried and reverted (644d17a) — list_documents_for_batch
-  // legitimately runs longer, so the timeout turned a slow-but-working
-  // call into a guaranteed failure.
+  // NOTE: still no timeout/retry on the ACTION itself, deliberately. A
+  // blanket 28s AbortSignal was tried and reverted (644d17a) —
+  // list_documents_for_batch legitimately runs longer, so the timeout
+  // turned a slow-but-working call into a guaranteed failure. The one
+  // retry that does exist (below) is scoped to re-fetching an
+  // already-computed result, never to re-invoking doPost.
   //
-  // 2026-08-06: added explicit per-hop redirect logging ([AS] REDIRECT).
-  // Real field incidents showed calls coming back as Google's own "Script
-  // function not found: doGet" error page — the fingerprint of a POST
-  // silently downgraded to a bodyless GET when Apps Script answers with a
-  // 3xx (standard HTTP redirect semantics for non-GET methods on
-  // 301/302/303). This block does NOT change that behavior yet — it only
-  // makes the real status + Location on each hop visible, since before
-  // this the code could only ever see the post-redirect end state.
+  // 2026-08-06: real field incidents showed calls coming back as Google's
+  // own "Script function not found: doGet" error page — the fingerprint
+  // of a POST silently downgraded to a bodyless GET when Apps Script
+  // answers with a 3xx (standard HTTP redirect semantics for non-GET
+  // methods on 301/302/303). Added per-hop redirect logging ([AS]
+  // REDIRECT) plus a targeted retry: when the chain passes through a
+  // googleusercontent.com content-delivery URL (proof doPost already ran)
+  // and the eventual result still isn't clean, re-fetch that same URL a
+  // few times before giving up. Also fixed a real bug this rewrite
+  // introduced: an unresolved redirect chain (hop cap or missing
+  // Location) was being folded into the generic HTML-error path and
+  // misreported as "needs re-authorization" — it now gets its own
+  // REDIRECT-EXHAUSTED path with an honest message.
   const started = Date.now()
   loopLag.reset()
   asInFlight++
@@ -175,14 +182,27 @@ async function callAppsScript(action, data = null) {
     return r.status < 200 || r.status >= 300 || t.startsWith('<')
   }
 
+  // Only these statuses are redirects fetch (and browsers) auto-follow;
+  // 300/304-306/309+ are NOT — treating any 3xx as followable was a spec
+  // deviation in the first version of this rewrite.
+  const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+  // fetch follows up to 20 redirects before giving up (WHATWG spec
+  // default) and, critically, treats exceeding that as a hard network
+  // error rather than silently handing back a still-3xx response. The
+  // first version of this rewrite capped at 5 with no distinct signal for
+  // "gave up mid-chain" — that's a real regression (not just parity with
+  // the old fetch-based code) that can misclassify an unresolved redirect
+  // chain as "needs re-authorization" below. Match fetch's cap exactly.
+  const MAX_HOPS = 20
+
   try {
-    for (let hop = 0; hop < 5; hop++) {
+    for (let hop = 0; hop < MAX_HOPS; hop++) {
       result = await httpRequestOnce(currentUrl, {
         method:  currentMethod,
         headers: currentHeaders,
         body:    currentMethod === 'GET' ? null : currentBody,
       })
-      if (result.status >= 300 && result.status < 400) {
+      if (REDIRECT_STATUSES.has(result.status)) {
         anyRedirect = true
         const location = result.headers.location || ''
         console.warn(
@@ -261,6 +281,15 @@ async function callAppsScript(action, data = null) {
   const clen     = result.headers['content-length'] || ''
   const trimmed  = text.trim()
   const looksHtml = trimmed.startsWith('<')
+  // The chain gave up (hop cap hit, or a redirect with no Location) while
+  // still sitting on an unresolved 3xx — distinct from actually landing on
+  // a terminal HTML error page. Folding this into the generic HTML-error
+  // path below produced a real, misleading bug: a raw redirect response
+  // (which can carry an HTML boilerplate body) got reported as "needs
+  // re-authorization" when it's really "the redirect chain never
+  // resolved," which is a different failure with a different likely cause
+  // (platform load/instability, not auth/deployment).
+  const redirectExhausted = REDIRECT_STATUSES.has(result.status)
 
   console.log(
     `[AS] action=${action} status=${result.status} redirected=${anyRedirect} ` +
@@ -272,12 +301,26 @@ async function callAppsScript(action, data = null) {
     `finalUrl=${currentUrl} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
   )
 
-  // Apps Script normally returns 200 + JSON. If the deployment is in a
-  // bad state (fresh deploy that needs re-auth, URL pointing at a stale
-  // version, Google outage), it returns an HTML login/error page and
-  // res.json() throws a cryptic "Unexpected token '<'" that bubbles to
-  // the browser as a confusing JSON-parse error. Catch that shape and
-  // raise something the user can actually act on.
+  if (redirectExhausted) {
+    console.error(
+      `[AS] REDIRECT-EXHAUSTED action=${action} status=${result.status} ` +
+      `elapsed=${elapsed}ms finalUrl=${currentUrl} respBytes=${text.length}`
+    )
+    throw new Error(
+      `Apps Script's redirect chain for "${action}" never resolved (still ${result.status} after ` +
+      `following every hop, or a hop had no Location header) — this looks like Google-side ` +
+      `platform load/instability, not an auth or deployment problem. Retrying in a moment is the ` +
+      `right response, not re-authorizing the deployment.`
+    )
+  }
+
+  // Apps Script normally returns 200 + JSON. Known causes of an HTML body
+  // instead: the content-delivery echo URL failing to serve an
+  // already-computed result (see the echo-retry block above), a genuine
+  // Google-side error page, or — less commonly than originally assumed —
+  // an actual re-auth/stale-deployment page. Don't default-blame
+  // re-authorization; check the [AS] REDIRECT / HTML-RESPONSE lines above
+  // for what actually happened.
   if (looksHtml) {
     // Strip tags/scripts/styles so the actual Google error message is
     // legible in the logs — this is the piece that tells us WHY the
@@ -301,12 +344,12 @@ async function callAppsScript(action, data = null) {
       `[AS]   readable="${readable.slice(0, 600)}"`
     )
     const status = result.status
-    const redirected = anyRedirect ? ' (redirected — Apps Script may need re-authorization)' : ''
+    const redirected = anyRedirect
+      ? ' (redirect chain didn\'t deliver a clean response — check [AS] REDIRECT lines above for the actual cause)'
+      : ''
     throw new Error(
       `Apps Script returned HTML instead of JSON${redirected} — ` +
-      `action="${action}", status=${status}. ` +
-      `This usually means the Web App deployment needs to be re-authorized ` +
-      `or APPS_SCRIPT_URL is pointing at a stale deployment.`
+      `action="${action}", status=${status}.`
     )
   }
   let json
