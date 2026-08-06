@@ -13279,6 +13279,7 @@ function handleListDocumentsForBatch_(body) {
         'Sign-In':           false,
         'Certified Payroll': false,
         'Invoice':           String(row[DOC_TYPE_DONE_COL_['Invoice']]      || '').toLowerCase() === 'yes',
+        'PICS':              String(row[DOC_TYPE_DONE_COL_['PICS']]        || '').toLowerCase() === 'yes',
       },
       sent: {
         'Field Report':      String(row[DOC_TYPE_SENT_COL_['Field Report']] || '').toLowerCase() === 'yes',
@@ -13286,6 +13287,7 @@ function handleListDocumentsForBatch_(body) {
         'Sign-In':           false,
         'Certified Payroll': false,
         'Invoice':           String(row[DOC_TYPE_SENT_COL_['Invoice']]      || '').toLowerCase() === 'yes',
+        'PICS':              String(row[DOC_TYPE_SENT_COL_['PICS']]        || '').toLowerCase() === 'yes',
       },
     });
   }
@@ -13419,6 +13421,17 @@ function handleListDocumentsForBatch_(body) {
         }
         return;
       }
+      // DOT rule: an unsent PT (paint/MMA) CFR can't go out to the prime
+      // without its proof-of-work photos already verified (PICS chip Done).
+      // Only enforced in unsent mode — that's the flow that actually sends
+      // docs out; wo_numbers/date_range pulls are ad hoc/internal and stay
+      // unaffected. See isPaintWO precedent at Code.js:10260.
+      const isPTWo = /^PT-/i.test(w.wo_id);
+      if (mode === 'unsent' && isPTWo && !w.done['PICS']) {
+        missing.push({ wo_id: w.wo_id, doc_type: 'CFR',
+          reason: 'PICS not verified yet — mark the PICS chip Done before this CFR can be sent' });
+        return;
+      }
       const folder = getWoFolder(w);
       if (!folder) {
         missing.push({ wo_id: w.wo_id, doc_type: 'CFR', reason: 'archive folder not found' });
@@ -13455,6 +13468,46 @@ function handleListDocumentsForBatch_(body) {
         done:         true,
         sent:         w.sent['Field Report'],
       });
+
+      // Bundle PICS photos alongside the CFR — same zip folder (no separate
+      // PICS/ subfolder) so the whole batch can be selected/emailed together.
+      // Filenames are used as-is: buildFilename()/renameFile() in
+      // FieldReport.jsx already renames every capture + library import to
+      // {WO}_{LOCATION}_{YYYY-MM-DD}_{HH-MM-SS}[_N].jpg before upload, so
+      // they're already self-describing — no need to re-prefix here (that
+      // would just double the WO id).
+      if (mode === 'unsent' && isPTWo) {
+        let photosFolder = null;
+        try {
+          photosFolder = folderIdx.folderByName(folder, 'Photos');
+        } catch (e) { /* ignore */ }
+        const photoFiles = photosFolder
+          ? folderIdx.files(photosFolder).filter(f => f.mimeType.indexOf('image/') === 0)
+          : [];
+        if (photoFiles.length === 0) {
+          missing.push({ wo_id: w.wo_id, doc_type: 'PICS',
+            reason: 'PICS Done? = Yes but no photos found in Photos/ folder' });
+        } else {
+          photoFiles.forEach(f => {
+            if (files.length >= MAX_BATCH_FILES_) return;
+            pushFile({
+              file_id:      f.id,
+              filename:     f.name,
+              mime_type:    f.mimeType,
+              size:         f.size,
+              contractor:   w.contractor,
+              contract_num: w.contract_num,
+              borough:      w.borough,
+              location:     w.location,
+              doc_type:     'PICS',
+              wo_ids:       [w.wo_id],
+              work_date:    w.work_end,
+              done:         true,
+              sent:         w.sent['PICS'],
+            });
+          });
+        }
+      }
     });
   }
 

@@ -2064,6 +2064,11 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
       'Sign-In':           'Sign-In Sheets',
       'Certified Payroll': 'Certified Payroll',
       'Invoice':           'Invoices',
+      // PICS photos ride alongside their CFR — same folder, not a separate
+      // one — so the whole batch can be selected/emailed together. doc_type
+      // stays 'PICS' (only the zip folder is shared) so mark-sent tracking
+      // below stays distinct from CFR's.
+      'PICS':              'Contractor Field Reports',
     })[dt] || dt
     const usedPaths = new Set()
     const zipPathFor = (file) => {
@@ -2179,8 +2184,8 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     // last byte was written to the socket.
     //
     // Two storage shapes to handle:
-    //   - CFR + Invoice  → per-WO via /api/documents/flags-style updates
-    //                      (wo_id + doc_type + sent).
+    //   - CFR + Invoice + PICS → per-WO via /api/documents/flags-style
+    //                      updates (wo_id + doc_type + sent).
     //   - PL / SI / CP   → per-doc via Doc Lifecycle Log keyed by Doc ID.
     //                      Doc ID = <PREFIX>_<ANCHOR>_<CONTRACTNUM>_<BOROUGH>
     //                      where ANCHOR is the work_date (already in
@@ -2188,7 +2193,7 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     res.on('finish', () => {
       if (cancelled || !markSent) return
 
-      const PER_WO = { CFR: 1, Invoice: 1 }
+      const PER_WO = { CFR: 1, Invoice: 1, PICS: 1 }
       // SI Sent isn't tracked (Sign-Ins ride out with the CP, CP Sent
       // implies SI Sent) so it's omitted here.
       // PL is keyed per-(date, contractor, crew_chief) — multi-crew shifts
