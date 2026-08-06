@@ -167,7 +167,13 @@ async function callAppsScript(action, data = null) {
     'Content-Length': Buffer.byteLength(reqJson),
   }
   let anyRedirect = false
+  let echoUrl     = null   // googleusercontent.com content-retrieval URL, once seen
   let result, tHeaders
+
+  const isBad = (r) => {
+    const t = (r.bodyText || '').trim()
+    return r.status < 200 || r.status >= 300 || t.startsWith('<')
+  }
 
   try {
     for (let hop = 0; hop < 5; hop++) {
@@ -184,12 +190,21 @@ async function callAppsScript(action, data = null) {
           `fromMethod=${currentMethod} location="${location}"`
         )
         if (!location) break
-        currentUrl = new URL(location, currentUrl).toString()
+        const resolved = new URL(location, currentUrl).toString()
+        // Once Apps Script redirects a POST to a googleusercontent.com
+        // content-retrieval URL, doPost has already run server-side —
+        // everything from here on is Google trying to hand us back the
+        // already-computed result. Remember that URL specifically: if
+        // fetching it (or wherever it further redirects) doesn't pan out,
+        // the safe recovery is to re-fetch THAT SAME URL, not to give up
+        // or re-POST — retrying it can never re-execute anything.
+        if (/^https:\/\/script\.googleusercontent\.com\/macros\/echo/.test(resolved)) {
+          echoUrl = resolved
+        }
+        currentUrl = resolved
         // Mirrors what fetch's automatic 'follow' mode does: 303 always
         // downgrades to GET; 301/302 downgrade a non-GET/HEAD method to
-        // GET and drop the body; 307/308 preserve method + body. We are
-        // NOT changing this behavior — only observing it — until the
-        // logged data confirms what's actually happening.
+        // GET and drop the body; 307/308 preserve method + body.
         const downgrade = result.status === 303 ||
           ((result.status === 301 || result.status === 302) &&
             currentMethod !== 'GET' && currentMethod !== 'HEAD')
@@ -202,6 +217,34 @@ async function callAppsScript(action, data = null) {
       }
       break
     }
+
+    // Confirmed via real field incidents (2026-08-06): a slow/large
+    // response (e.g. get_drive_file_bytes on a big PDF) sends the client
+    // through this echo URL, which can itself take 30+ seconds and then
+    // fail — either bouncing back to /exec (where the now-GET request
+    // 404s on the nonexistent doGet) or 404ing directly. Since doPost
+    // already ran (proven by having reached echoUrl at all), retrying the
+    // ACTION would risk double-executing a mutation — but retrying the
+    // content fetch itself carries no such risk. Short backoff, a few
+    // attempts, never touches /exec again.
+    if (echoUrl && isBad(result)) {
+      const delays = [2000, 3000, 5000]
+      for (let i = 0; i < delays.length && isBad(result); i++) {
+        await new Promise(r => setTimeout(r, delays[i]))
+        console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} url=${echoUrl}`)
+        try {
+          const retry = await httpRequestOnce(echoUrl, { method: 'GET', headers: {} })
+          result = retry
+          currentUrl = echoUrl
+          if (!isBad(retry)) {
+            console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} recovered`)
+          }
+        } catch (e) {
+          console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} threw: ${e.message}`)
+        }
+      }
+    }
+
     tHeaders = result.tHeaders
   } finally {
     asInFlight--
