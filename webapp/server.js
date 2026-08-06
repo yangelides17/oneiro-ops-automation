@@ -20,6 +20,7 @@ import path     from 'path'
 import multer   from 'multer'
 import archiver from 'archiver'
 import crypto   from 'crypto'
+import https    from 'https'
 import { fileURLToPath } from 'url'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 import 'dotenv/config'
@@ -92,6 +93,35 @@ const ms = (ns) => Math.round(ns / 1e6)
 
 
 // ── Apps Script proxy helper ──────────────────────────────────
+
+// Single-hop HTTPS request, no auto-redirect-following. Deliberately NOT
+// the global `fetch` here: fetch's `redirect: 'manual'` mode returns an
+// "opaqueredirect" response per the WHATWG spec — status reads as 0 and
+// headers (including Location) are unreadable, even for a same-origin
+// server-to-server call. That makes it useless for actually seeing what
+// Apps Script's redirect looks like. Node's raw https.request has no such
+// restriction, so we get a real status + Location on every hop.
+function httpRequestOnce(urlStr, { method, headers, body }) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr)
+    const req = https.request(u, { method, headers }, (res) => {
+      const tHeaders = Date.now()
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({
+        status:   res.statusCode,
+        headers:  res.headers,
+        bodyText: Buffer.concat(chunks).toString('utf8'),
+        tHeaders,
+      }))
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+    if (body) req.write(body)
+    req.end()
+  })
+}
+
 async function callAppsScript(action, data = null) {
   const url = process.env.APPS_SCRIPT_URL
   const key = process.env.APPS_SCRIPT_KEY
@@ -116,41 +146,87 @@ async function callAppsScript(action, data = null) {
   // AbortSignal was tried and reverted (644d17a) — list_documents_for_batch
   // legitimately runs longer, so the timeout turned a slow-but-working
   // call into a guaranteed failure.
+  //
+  // 2026-08-06: added explicit per-hop redirect logging ([AS] REDIRECT).
+  // Real field incidents showed calls coming back as Google's own "Script
+  // function not found: doGet" error page — the fingerprint of a POST
+  // silently downgraded to a bodyless GET when Apps Script answers with a
+  // 3xx (standard HTTP redirect semantics for non-GET methods on
+  // 301/302/303). This block does NOT change that behavior yet — it only
+  // makes the real status + Location on each hop visible, since before
+  // this the code could only ever see the post-redirect end state.
   const started = Date.now()
   loopLag.reset()
   asInFlight++
-  let res, text, tHeaders
+
+  let currentUrl     = url
+  let currentMethod  = 'POST'
+  let currentBody    = reqJson
+  let currentHeaders = {
+    'Content-Type':   'application/json',
+    'Content-Length': Buffer.byteLength(reqJson),
+  }
+  let anyRedirect = false
+  let result, tHeaders
+
   try {
-    res = await fetch(url, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    reqJson
-    })
-    tHeaders = Date.now()
-    text = await res.text()
+    for (let hop = 0; hop < 5; hop++) {
+      result = await httpRequestOnce(currentUrl, {
+        method:  currentMethod,
+        headers: currentHeaders,
+        body:    currentMethod === 'GET' ? null : currentBody,
+      })
+      if (result.status >= 300 && result.status < 400) {
+        anyRedirect = true
+        const location = result.headers.location || ''
+        console.warn(
+          `[AS] REDIRECT action=${action} hop=${hop} status=${result.status} ` +
+          `fromMethod=${currentMethod} location="${location}"`
+        )
+        if (!location) break
+        currentUrl = new URL(location, currentUrl).toString()
+        // Mirrors what fetch's automatic 'follow' mode does: 303 always
+        // downgrades to GET; 301/302 downgrade a non-GET/HEAD method to
+        // GET and drop the body; 307/308 preserve method + body. We are
+        // NOT changing this behavior — only observing it — until the
+        // logged data confirms what's actually happening.
+        const downgrade = result.status === 303 ||
+          ((result.status === 301 || result.status === 302) &&
+            currentMethod !== 'GET' && currentMethod !== 'HEAD')
+        if (downgrade) {
+          currentMethod  = 'GET'
+          currentBody    = null
+          currentHeaders = {}
+        }
+        continue
+      }
+      break
+    }
+    tHeaders = result.tHeaders
   } finally {
     asInFlight--
   }
 
+  const text     = result.bodyText
   const finished = Date.now()
   const elapsed  = finished - started
   const ttfbMs   = tHeaders - started
   const bodyMs   = finished - tHeaders
   const elMaxMs  = ms(loopLag.max)
   const elMeanMs = Number.isFinite(loopLag.mean) ? ms(loopLag.mean) : 0
-  const ctype    = res.headers.get('content-type') || ''
-  const clen     = res.headers.get('content-length') || ''
+  const ctype    = result.headers['content-type'] || ''
+  const clen     = result.headers['content-length'] || ''
   const trimmed  = text.trim()
   const looksHtml = trimmed.startsWith('<')
 
   console.log(
-    `[AS] action=${action} status=${res.status} redirected=${res.redirected} ` +
+    `[AS] action=${action} status=${result.status} redirected=${anyRedirect} ` +
     `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
     `elMax=${elMaxMs}ms elMean=${elMeanMs}ms ` +
     `asInFlight=${asInFlight} zips=${batchDownloadsActive} ` +
     `reqBytes=${reqJson.length} respBytes=${text.length} ` +
     `contentLength=${clen || 'n/a'} contentType="${ctype}" ` +
-    `finalUrl=${res.url} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
+    `finalUrl=${currentUrl} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
   )
 
   // Apps Script normally returns 200 + JSON. If the deployment is in a
@@ -173,16 +249,16 @@ async function callAppsScript(action, data = null) {
       .trim()
     const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
     console.error(
-      `[AS] HTML-RESPONSE action=${action} status=${res.status} ` +
+      `[AS] HTML-RESPONSE action=${action} status=${result.status} ` +
       `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
       `elMax=${elMaxMs}ms zips=${batchDownloadsActive} ` +
-      `respBytes=${text.length} finalUrl=${res.url}\n` +
+      `respBytes=${text.length} finalUrl=${currentUrl}\n` +
       `[AS]   verdict=${elMaxMs > 1000 ? 'node-blocked (event loop stalled)' : 'apps-script-slow'}\n` +
       `[AS]   title="${titleMatch ? titleMatch[1].trim() : '(none)'}"\n` +
       `[AS]   readable="${readable.slice(0, 600)}"`
     )
-    const status = res.status
-    const redirected = res.redirected ? ' (redirected — Apps Script may need re-authorization)' : ''
+    const status = result.status
+    const redirected = anyRedirect ? ' (redirected — Apps Script may need re-authorization)' : ''
     throw new Error(
       `Apps Script returned HTML instead of JSON${redirected} — ` +
       `action="${action}", status=${status}. ` +
@@ -195,16 +271,16 @@ async function callAppsScript(action, data = null) {
     json = JSON.parse(text)
   } catch (e) {
     console.error(
-      `[AS] NON-JSON action=${action} status=${res.status} respBytes=${text.length} ` +
+      `[AS] NON-JSON action=${action} status=${result.status} respBytes=${text.length} ` +
       `head="${text.slice(0, 200).replace(/\n/g, ' ')}"`
     )
     throw new Error(
-      `Apps Script response wasn't JSON (action="${action}", status=${res.status}): ` +
+      `Apps Script response wasn't JSON (action="${action}", status=${result.status}): ` +
       `${text.slice(0, 200)}`
     )
   }
   if (json.error) {
-    console.error(`[AS] JSON-ERROR action=${action} status=${res.status} error="${json.error}"`)
+    console.error(`[AS] JSON-ERROR action=${action} status=${result.status} error="${json.error}"`)
     throw new Error(json.error)
   }
   return json
