@@ -28,6 +28,7 @@
  */
 
 import crypto from 'crypto'
+import { callAppsScript } from './appsScript.js'
 import { QB_ITEMS } from './qbItems.js'
 
 // ── Config from env ───────────────────────────────────────────────
@@ -152,23 +153,12 @@ function decryptToken(stored) {
 }
 
 // ── Apps Script proxy (token + customer cache live there) ─────────
-async function callAppsScript(action, data = null) {
-  const url = process.env.APPS_SCRIPT_URL
-  const key = process.env.APPS_SCRIPT_KEY
-  if (!url || !key) throw new Error('APPS_SCRIPT_URL or APPS_SCRIPT_KEY env var not set')
-  const body = { action, key, ...(data ? { data } : {}) }
-  const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
-  })
-  const text = await res.text()
-  let json
-  try { json = JSON.parse(text) }
-  catch (_) { throw new Error(`Apps Script returned non-JSON for ${action}: ${text.slice(0, 200)}`) }
-  if (json.error) throw new Error(json.error)
-  return json
-}
+// This file used to carry its OWN bare-fetch copy of callAppsScript.
+// That copy predated — and was missed by — the redirect hardening in
+// server/appsScript.js, so every QB call (including the connection poll
+// that fires every 120s from every open admin tab) was still exposed to
+// the POST→GET-on-redirect failure that hardening exists to fix, and
+// produced none of the [AS] diagnostics. Use the shared one.
 
 // ── In-memory access token state ──────────────────────────────────
 let _accessToken    = ''
