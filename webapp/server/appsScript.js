@@ -15,6 +15,7 @@
  */
 
 import https from 'https'
+import zlib from 'zlib'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 
 // ── Event-loop lag monitor ────────────────────────────────────
@@ -48,19 +49,46 @@ const ms = (ns) => Math.round(ns / 1e6)
 // server-to-server call. That makes it useless for actually seeing what
 // Apps Script's redirect looks like. Node's raw https.request has no such
 // restriction, so we get a real status + Location on every hop.
+// COMPRESSION: `fetch` sends Accept-Encoding and transparently inflates
+// the response; raw https.request does NEITHER. Swapping to https.request
+// for the redirect diagnostics silently turned compression off for every
+// Apps Script call in the app — verified 2026-08-07 that Apps Script does
+// serve `content-encoding: gzip` when asked. That matters most on the
+// payloads that hurt most: a PDF arrives base64'd (+33% over the raw
+// file) and gzip recovers most of that expansion, and the JSON payloads
+// are highly repetitive. So we ask for gzip and inflate it here.
+//
+// Decompression is streamed rather than done in one sync call, because
+// this process already blocks its own event loop hard enough elsewhere
+// (see the loop-lag monitor above) that adding a multi-MB synchronous
+// inflate would be self-defeating.
 function httpRequestOnce(urlStr, { method, headers, body }) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr)
-    const req = https.request(u, { method, headers }, (res) => {
+    const reqHeaders = { 'Accept-Encoding': 'gzip, deflate', ...headers }
+    const req = https.request(u, { method, headers: reqHeaders }, (res) => {
       const tHeaders = Date.now()
+      const enc = String(res.headers['content-encoding'] || '').toLowerCase()
+
+      let stream = res
+      if (enc === 'gzip')         stream = res.pipe(zlib.createGunzip())
+      else if (enc === 'deflate') stream = res.pipe(zlib.createInflate())
+      else if (enc === 'br')      stream = res.pipe(zlib.createBrotliDecompress())
+
       const chunks = []
-      res.on('data', (c) => chunks.push(c))
-      res.on('end', () => resolve({
+      stream.on('data', (c) => chunks.push(c))
+      stream.on('end', () => resolve({
         status:   res.statusCode,
         headers:  res.headers,
+        // Decompressed. Note `content-length` in headers is the COMPRESSED
+        // size, so it will no longer match respBytes in the logs below.
         bodyText: Buffer.concat(chunks).toString('utf8'),
+        encoding: enc || 'identity',
         tHeaders,
       }))
+      // A corrupt/truncated compressed body errors on the inflate stream,
+      // not on `res` — listen on both or it surfaces as an unhandled error.
+      stream.on('error', reject)
       res.on('error', reject)
     })
     req.on('error', reject)
@@ -283,7 +311,10 @@ export async function callAppsScript(action, data = null) {
     `elMax=${elMaxMs}ms elMean=${elMeanMs}ms ` +
     `asInFlight=${asInFlight} zips=${batchDownloadsActive} ` +
     `reqBytes=${reqJson.length} respBytes=${text.length} ` +
-    `contentLength=${clen || 'n/a'} contentType="${ctype}" ` +
+    // wireBytes is the COMPRESSED size actually transferred; respBytes is
+    // after inflation. The gap between them is what gzip is saving us.
+    `enc=${result.encoding || 'identity'} wireBytes=${clen || 'chunked'} ` +
+    `contentType="${ctype}" ` +
     `finalUrl=${currentUrl} kind=${looksHtml ? 'HTML' : 'JSON/other'}`
   )
 
