@@ -950,7 +950,16 @@ function PhotoThumb({ item, onDelete, onRetry, onOpen }) {
           ${canOpen ? 'cursor-zoom-in hover:ring-2 hover:ring-navy/40' : 'cursor-default'}
           ${inFlight ? 'opacity-60' : ''}`}>
         {src ? (
+          // loading="lazy" matters here now that the 25-photo server cap is
+          // gone: without it a WO with 100+ historic photos fires that many
+          // concurrent /thumb requests the moment the gallery mounts, each
+          // costing upstream Google calls on a single Node process. Lazy
+          // loading lets the browser fetch only what's near the viewport and
+          // pull the rest in as the crew scrolls.
+          // decoding="async" keeps image decode off the main thread, which
+          // matters on the mid-range phones this runs on in the field.
           <img src={src} alt={item.filename || 'photo'}
+            loading="lazy" decoding="async"
             className="w-full h-full object-cover" />
         ) : (
           <div className="w-full h-full bg-slate-50" />

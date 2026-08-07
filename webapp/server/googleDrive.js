@@ -195,7 +195,26 @@ export async function fetchThumbnail(fileId, { timeoutMs = 10000 } = {}) {
   const token = await getAccessToken()
   const metaUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
                   `?fields=thumbnailLink,mimeType&supportsAllDrives=true`
-  const metaRes = await fetch(metaUrl, { headers: { Authorization: `Bearer ${token}` } })
+
+  // BOTH calls need a bound, not just the thumbnail fetch. Google's random
+  // 10-55s service hangs apply to files.get exactly as much as to anything
+  // else, and an unbounded hang here would leave the request running until
+  // Railway's gateway 502s it — with no recovery, because these are <img>
+  // tags with no retry, so the tile would simply stay blank.
+  const metaCtrl = new AbortController()
+  const metaTimer = setTimeout(() => metaCtrl.abort(), timeoutMs)
+  let metaRes
+  try {
+    metaRes = await fetch(metaUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: metaCtrl.signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') return null   // caller falls back to full image
+    throw err
+  } finally {
+    clearTimeout(metaTimer)
+  }
   if (!metaRes.ok) {
     const t = await metaRes.text()
     throw new Error(`thumbnail meta failed (${metaRes.status}): ${t.slice(0, 200)}`)

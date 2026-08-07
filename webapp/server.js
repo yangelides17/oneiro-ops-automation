@@ -1883,28 +1883,38 @@ app.get('/api/wo-photos/:fileId/content', async (req, res) => {
  */
 app.get('/api/wo-photos/:fileId/thumb', async (req, res) => {
   const { fileId } = req.params
+  const send = (buf, mime) => {
+    res.set('Content-Type', mime || 'image/jpeg')
+    res.set('Cache-Control', 'private, max-age=3600')
+    res.send(buf)
+  }
   try {
     const hit = getCachedPreview(fileId, 'thumb')
-    if (hit) {
-      res.set('Content-Type', hit.mime || 'image/jpeg')
-      res.set('Cache-Control', 'private, max-age=3600')
-      return res.send(hit.buf)
-    }
+    if (hit) return send(hit.buf, hit.mime)
+    // A photo with no Drive thumbnail falls back to the full image below.
+    // If the lightbox already pulled that same full image, reuse it rather
+    // than downloading and caching identical bytes a second time under a
+    // different key — that would halve effective cache capacity for exactly
+    // the photos most likely to be viewed twice in one session.
+    const full = getCachedPreview(fileId, 'photo')
+    if (full) return send(full.buf, full.mime)
+
     if (!isDriveConfigured()) return res.status(503).json({ error: 'Drive not configured' })
 
-    let out = await fetchThumbnail(fileId)
-    if (!out) {
-      // No Drive thumbnail — serve the full image rather than a blank tile.
-      const resp = await fetchFileResponse(fileId)
-      out = {
-        buf:  Buffer.from(await resp.arrayBuffer()),
-        mime: resp.headers.get('content-type') || 'image/jpeg',
-      }
+    const out = await fetchThumbnail(fileId)
+    if (out) {
+      putCachedPreview(fileId, 'thumb', out.buf, out.mime, null)
+      return send(out.buf, out.mime)
     }
-    putCachedPreview(fileId, 'thumb', out.buf, out.mime, null)
-    res.set('Content-Type', out.mime)
-    res.set('Cache-Control', 'private, max-age=3600')
-    res.send(out.buf)
+
+    // No Drive thumbnail yet — routine right after a bulk upload. Serve the
+    // full image rather than a blank tile, and cache it under 'photo' so
+    // the lightbox reuses it instead of fetching again.
+    const resp = await fetchFileResponse(fileId)
+    const buf  = Buffer.from(await resp.arrayBuffer())
+    const mime = resp.headers.get('content-type') || 'image/jpeg'
+    putCachedPreview(fileId, 'photo', buf, mime, null)
+    send(buf, mime)
   } catch (err) {
     console.error(`GET /api/wo-photos/${fileId}/thumb error:`, err.message)
     if (!res.headersSent) res.status(500).json({ error: err.message })

@@ -14795,19 +14795,25 @@ function handleUploadPhoto_(body) {
 /**
  * Returns every photo currently in the WO's Photos/ Drive folder so the
  * Field Report page can render a "previously taken" gallery alongside
- * the live picker. Thumbnail bytes are inlined as base64 so the client
- * doesn't have to chase per-file URLs (Drive thumbnails behind auth are
- * a pain for an unauthenticated webapp tab).
+ * the live picker.
+ *
+ * Thumbnails are NOT inlined. The response carries Drive's own
+ * `thumbnail_link` and the webapp proxies it per tile — see
+ * /api/wo-photos/:fileId/thumb. Inlining base64 used to cost a serial
+ * ~250-400ms Drive round trip per file inside this one execution, which
+ * is what forced a 25-photo cap and made this the most failure-prone
+ * handler in the app.
  *
  * body.data: { wo_id }
- * response: { photos: [{ file_id, name, url, thumbnail_b64, mime, created_at }] }
+ * response: { photos: [{ file_id, name, url, thumbnail_link, mime, created_at }],
+ *             truncated?: true }
  */
 function handleListWOPhotos_(body) {
   const d = body.data || {};
   const woId = String(d.wo_id || '').trim();
   if (!woId) return jsonResponse_({ error: 'Missing wo_id' }, 400);
 
-  const { folder, error } = resolveWOSubfolder_(woId, 'Photos');
+  const { folder, error } = _resolveWOPhotosFolderCached_(woId);
   if (!folder) {
     // Soft-fail: a WO that has never had a photo uploaded simply has no
     // folder. Return an empty list so the UI renders a clean empty state.
@@ -14832,26 +14838,92 @@ function handleListWOPhotos_(body) {
   // Thumbnails are no longer base64'd into this payload either — the
   // response returns Drive's own thumbnailLink and the webapp proxies it,
   // which also takes the image bytes out of this JSON entirely.
-  const files = _withDriveRetry_('list WO photos', () =>
-    Drive.Files.list({
+  // Paginated. A single 200-item page would SILENTLY drop the oldest
+  // photos on a long-running WO — and because the order is newest-first,
+  // what disappears is exactly the early DOT proof-of-work shots. The old
+  // code capped at 25 but at least logged that it had; dropping data with
+  // no signal at all would be a worse failure than the cap ever was.
+  //
+  // MAX_PHOTOS is a real ceiling rather than a workaround: it bounds the
+  // response size, and if it is ever hit the client is told so explicitly.
+  // (The old MAX_THUMBS = 25 existed only to keep a serial per-file
+  // thumbnail loop under the ~30-35s response ceiling. That loop is gone —
+  // there is one list call now — so the limit here can be about payload
+  // size instead of survival.)
+  const MAX_PHOTOS = 500;
+  const out = [];
+  let pageToken = null;
+  let truncated = false;
+  do {
+    const params = {
       q: "'" + folder.getId() + "' in parents and trashed = false " +
          "and mimeType contains 'image/'",
-      fields: 'files(id,name,mimeType,createdTime,thumbnailLink,webViewLink)',
+      fields: 'nextPageToken,files(id,name,mimeType,createdTime,thumbnailLink,webViewLink)',
       orderBy: 'createdTime desc',
       pageSize: 200,
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
-    }));
+    };
+    if (pageToken) params.pageToken = pageToken;
+    const page = _withDriveRetry_('list WO photos', () => Drive.Files.list(params));
 
-  const out = (files.files || []).map(f => ({
-    file_id:        f.id,
-    name:           f.name,
-    url:            f.webViewLink || '',
-    thumbnail_link: f.thumbnailLink || '',
-    mime:           f.mimeType || 'image/jpeg',
-    created_at:     f.createdTime || '',
-  }));
-  return jsonResponse_({ photos: out });
+    (page.files || []).forEach(f => {
+      if (out.length >= MAX_PHOTOS) { truncated = true; return; }
+      out.push({
+        file_id:        f.id,
+        name:           f.name,
+        url:            f.webViewLink || '',
+        thumbnail_link: f.thumbnailLink || '',
+        mime:           f.mimeType || 'image/jpeg',
+        created_at:     f.createdTime || '',
+      });
+    });
+    pageToken = page.nextPageToken || null;
+  } while (pageToken && out.length < MAX_PHOTOS);
+
+  if (truncated || pageToken) {
+    truncated = true;
+    Logger.log('list_wo_photos: ' + woId + ' exceeded ' + MAX_PHOTOS +
+               ' photos; returning newest ' + out.length);
+  }
+  return jsonResponse_(truncated ? { photos: out, truncated: true } : { photos: out });
+}
+
+
+// ── Photos-folder resolution, cached ──────────────────────────
+//
+// resolveWOSubfolder_ is expensive and was the dominant remaining cost of
+// list_wo_photos once the per-file thumbnail loop was removed: a FULL
+// Work Order Tracker sheet read plus up to four sequential
+// getFoldersByName round trips (Archive → Contractor → Contract → WO →
+// subfolder), before the actual listing call even starts.
+//
+// A WO's folder structure never changes once created, so the resolved id
+// is cached for six hours. Cache stores the ID, not the Folder object —
+// Folder handles don't survive a cache round trip.
+function _resolveWOPhotosFolderCached_(woId) {
+  const cacheKey = 'wo_photos_folder_' + woId;
+  let cache = null;
+  try { cache = CacheService.getScriptCache(); } catch (e) { /* cache optional */ }
+
+  if (cache) {
+    const hit = cache.get(cacheKey);
+    if (hit) {
+      try {
+        return { folder: DriveApp.getFolderById(hit), error: null };
+      } catch (e) {
+        // Folder was moved, trashed, or the id went stale — fall through
+        // and re-resolve rather than failing the request.
+        try { cache.remove(cacheKey); } catch (_) {}
+      }
+    }
+  }
+
+  const resolved = resolveWOSubfolder_(woId, 'Photos');
+  if (resolved.folder && cache) {
+    try { cache.put(cacheKey, resolved.folder.getId(), 21600); } catch (e) {}
+  }
+  return resolved;
 }
 
 
