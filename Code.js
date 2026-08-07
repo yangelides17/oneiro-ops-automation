@@ -4818,6 +4818,28 @@ function handleGetDriveFileBytes_(body) {
   // throws "Service error: Drive" repeatedly even on files that are
   // visibly in the right folder. Drop the redundant check.
 
+  // Retry policy here is deliberately NOT the usual _withDriveRetry_
+  // 3-attempt wrapper, and that difference is the whole point.
+  //
+  // Measured 2026-08-07: this action had a 21% failure rate, the worst
+  // in the app. The cause was that getBlob/getBytes/base64Encode used to
+  // sit INSIDE the retry closure, so one hung Drive call turned into
+  // three full multi-MB re-downloads plus 1.5s of backoff sleeps. Apps
+  // Script discards a web-app response past a ~30-35s ceiling, so that
+  // retry budget didn't protect the call — it guaranteed the call would
+  // blow the ceiling and come back as an HTML error page.
+  //
+  // A multi-MB fetch that just hung for 10s+ is unlikely to succeed on an
+  // immediate second try, and a third attempt cannot finish inside the
+  // ceiling regardless. Failing fast is strictly better: the client gets
+  // a clean error it can retry against a FRESH execution with a FRESH
+  // 30s budget, instead of a guaranteed ceiling breach.
+  //
+  // So: retry the cheap metadata lookup (a real eventual-consistency
+  // race, which is what the wrapper was built for), but attempt the
+  // expensive blob at most twice and only if there is budget left.
+  const BLOB_RETRY_BUDGET_MS = 12000;
+
   let step = 'init';
   try {
     step = 'getFileById';
@@ -4826,17 +4848,45 @@ function handleGetDriveFileBytes_(body) {
     step = 'isTrashed';
     if (file.isTrashed()) return jsonResponse_({ error: 'File is trashed' }, 404);
 
+    // Read metadata OUTSIDE the blob attempt so a retry never re-fetches
+    // it — these are cheap, and they were previously being redone on
+    // every attempt alongside the multi-MB download.
+    step = 'metadata';
+    const filename = file.getName();
+    const size     = file.getSize();
+
     step = 'getBlob/getBytes';
-    const result = _withDriveRetry_('getBlob preview', () => {
-      const blob = file.getBlob();
-      return {
-        filename:  file.getName(),
-        mime_type: blob.getContentType(),
-        size:      file.getSize(),
-        data:      Utilities.base64Encode(blob.getBytes()),
-      };
+    const tBlobStart = Date.now();
+    let blob = null;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const tAttempt = Date.now();
+      try {
+        blob = file.getBlob();
+        _noteDriveOp_('getBlob preview', attempt, Date.now() - tAttempt, true);
+        break;
+      } catch (err) {
+        lastErr = err;
+        _noteDriveOp_('getBlob preview', attempt, Date.now() - tAttempt, false);
+        Logger.log(`⚠️ getBlob preview attempt ${attempt} failed: ${err && err.message || err}`);
+        // Only try again if a second attempt could plausibly finish
+        // before the response ceiling. No sleep — the hang already was
+        // the backoff.
+        if (Date.now() - tBlobStart > BLOB_RETRY_BUDGET_MS) {
+          Logger.log(`⚠️ getBlob preview: ${Date.now() - tBlobStart}ms spent, over budget — not retrying`);
+          break;
+        }
+      }
+    }
+    if (!blob) throw lastErr || new Error('getBlob returned nothing');
+
+    step = 'encode';
+    return jsonResponse_({
+      filename:  filename,
+      mime_type: blob.getContentType(),
+      size:      size,
+      data:      Utilities.base64Encode(blob.getBytes()),
     });
-    return jsonResponse_(result);
   } catch (err) {
     Logger.log(`❌ handleGetDriveFileBytes_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);

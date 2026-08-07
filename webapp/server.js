@@ -33,6 +33,12 @@ import { putListing, resolveListing } from './server/batchListingCache.js'
 import {
   callAppsScript, noteBatchDownloadStart, noteBatchDownloadEnd,
 } from './server/appsScript.js'
+import {
+  getBytes as getCachedPreview,
+  putBytes as putCachedPreview,
+  invalidate as invalidatePreview,
+  stats as previewCacheStats,
+} from './server/previewBytesCache.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
@@ -720,19 +726,43 @@ app.get('/api/pending-counts/doc-status', async (_req, res) => {
  * can consume the URL directly.
  */
 app.get('/api/approvals/:fileId/pdf', async (req, res) => {
+  const { fileId } = req.params
+  // The client already appends ?v=<n>, bumped after a regenerate
+  // (Approvals.jsx), so it participates in the cache key and a regenerated
+  // document can never be served from a stale entry.
+  const version = String(req.query.v || '')
+  const t0 = Date.now()
   try {
-    const data = await callAppsScript('get_drive_file_bytes',
-                                      { file_id: req.params.fileId })
+    // Server-side cache only. The browser is still sent `no-store` below —
+    // the Intuit requirement is untouched. This just stops us re-asking
+    // Google for bytes we already hold, which is the single most
+    // failure-prone call in the app (21% measured).
+    const hit = getCachedPreview(fileId, version)
+    if (hit) {
+      console.log(`[PREVIEW] HIT file=${fileId} v=${version || '-'} ` +
+                  `${hit.buf.length}B age=${Math.round(hit.ageMs / 1000)}s ` +
+                  `cache=${JSON.stringify(previewCacheStats())}`)
+      res.setHeader('Content-Type', hit.mime || 'application/pdf')
+      res.setHeader('Content-Length', hit.buf.length)
+      res.setHeader('Cache-Control', 'no-store')
+      return res.send(hit.buf)
+    }
+
+    const data = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
     if (!data || !data.data) {
       return res.status(500).json({ error: 'Apps Script returned no bytes' })
     }
     const buf = Buffer.from(data.data, 'base64')
+    putCachedPreview(fileId, version, buf, data.mime_type, data.filename)
+    console.log(`[PREVIEW] MISS file=${fileId} v=${version || '-'} ` +
+                `${buf.length}B fetch=${Date.now() - t0}ms ` +
+                `cache=${JSON.stringify(previewCacheStats())}`)
     res.setHeader('Content-Type', data.mime_type || 'application/pdf')
     res.setHeader('Content-Length', buf.length)
     res.setHeader('Cache-Control', 'no-store')
     res.send(buf)
   } catch (err) {
-    console.error(`GET /api/approvals/${req.params.fileId}/pdf error:`, err.message)
+    console.error(`GET /api/approvals/${fileId}/pdf error (${Date.now() - t0}ms):`, err.message)
     res.status(500).json({ error: err.message })
   }
 })
@@ -748,6 +778,7 @@ app.post('/api/approvals/:fileId/approve', async (req, res) => {
   try {
     const data = await callAppsScript('approve_doc',
                                       { file_id: req.params.fileId })
+    invalidatePreview(req.params.fileId)   // file moves out of review
     res.json(data)
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/approve error:`, err.message)
@@ -766,6 +797,7 @@ app.post('/api/approvals/:fileId/skip-signoff', async (req, res) => {
   try {
     const data = await callAppsScript('approve_doc_skip_signoff',
                                       { file_id: req.params.fileId })
+    invalidatePreview(req.params.fileId)   // file moves out of review
     res.json(data)
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/skip-signoff error:`, err.message)
@@ -790,6 +822,9 @@ app.post('/api/approvals/:fileId/reupload', upload.single('file'), async (req, r
       bytes_b64: base64,
     })
     if (data && data.error) return res.status(500).json(data)
+    // Content replaced in place under the SAME file_id — a cached copy
+    // here would show the admin the pre-upload version.
+    invalidatePreview(req.params.fileId)
     res.json(data)   // { success, file_id, filename }
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/reupload error:`, err.message)
@@ -811,6 +846,11 @@ app.post('/api/approvals/:fileId/regenerate', async (req, res) => {
       file_id: req.params.fileId,
     })
     if (data && data.error) return res.status(400).json(data)
+    // The worker overwrites this file in place shortly. Drop any cached
+    // copy now so nothing can serve the pre-regenerate bytes in the
+    // window before the client bumps its ?v= and re-requests. Belt and
+    // braces — the version bump alone would also miss the cache.
+    invalidatePreview(req.params.fileId)
     res.json(data)   // { success, doc_type, message }
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/regenerate error:`, err.message)
@@ -1029,6 +1069,7 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
       bytes_b64: Buffer.from(signedBytes).toString('base64'),
     })
     if (result.error) throw new Error(result.error)
+    invalidatePreview(fileId)   // signed bytes replace the reviewed file
     res.json(result)
   } catch (err) {
     console.error(`POST /api/approvals/${fileId}/approve-signin error:`, err.message)
@@ -1167,6 +1208,7 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
       bytes_b64: Buffer.from(signedBytes).toString('base64'),
     })
     if (result.error) throw new Error(result.error)
+    invalidatePreview(fileId)   // signed bytes replace the reviewed file
     res.json(result)
   } catch (err) {
     console.error(`POST /api/approvals/${fileId}/approve-cert-payroll error:`, err.message)
