@@ -17,6 +17,29 @@
  *  v1.2 — 2026-04-10 — Removed daily summary email trigger (sendDailySummary)
  */
 
+// ── TIMING INSTRUMENTATION (diagnostic, 2026-08-06) ────────────
+//
+// Measurement only — no behavior depends on these. Purpose: split the
+// ~1.9s floor observed on EVERY call (measured at zero concurrency, so
+// it is not contention) into its parts. Apps Script's own Executions log
+// reports doPost durations of 1.0-1.5s for actions that do ~50ms of real
+// work, so the cost is inside the execution, but "inside" still covers
+// three very different things:
+//
+//   request arrives -> [queue] -> [fetch+parse+compile this 668KB file]
+//     -> module eval (_T_SCRIPT_LOADED_) -> doPost (_T_DOPOST_ENTRY_)
+//     -> handler -> jsonResponse_ (exit) -> output stored -> 302
+//
+// Both deltas below use the SAME clock, so no client/server skew is
+// involved:
+//   entry - loaded  = rest of module eval + dispatch
+//   exit  - entry   = actual handler work
+// The client then derives the remainder:
+//   hop0 - (exit - loaded) = network + queue + parse/compile
+// which is the piece nothing has been able to see until now.
+const _T_SCRIPT_LOADED_ = Date.now();
+let   _T_DOPOST_ENTRY_  = 0;
+
 // ── CONFIGURATION ──────────────────────────────────────────────
 const CONFIG = {
   // After uploading the spreadsheet to Google Drive and converting to Sheets,
@@ -4089,6 +4112,7 @@ function appendRowsWithProbing_(sheet, rows, labels, sheetLabel) {
  * All requests must include body.key matching the UPLOAD_SECRET Script Property.
  */
 function doPost(e) {
+  _T_DOPOST_ENTRY_ = Date.now();   // diagnostic — see _T_SCRIPT_LOADED_ at top
   try {
     const body   = JSON.parse(e.postData.contents);
     const secret = PropertiesService.getScriptProperties().getProperty('UPLOAD_SECRET');
@@ -4098,6 +4122,14 @@ function doPost(e) {
     }
 
     const action = body.action || 'upload_pdf';
+
+    // Diagnostic no-op. Deliberately FIRST and before any service call so
+    // its latency is the pure floor: queue + parse/compile + dispatch,
+    // with zero handler work. Comparing ping against a real action
+    // separates "the platform floor is slow" from "our handlers are slow".
+    if (action === 'ping') {
+      return jsonResponse_({ pong: true });
+    }
 
     if (action === 'upload_pdf') {
       return handleUploadPdf_(body);
@@ -9543,6 +9575,18 @@ function handleTrashFile_(body) {
 /** Wraps an object as a JSON ContentService response. */
 function jsonResponse_(obj, statusCode) {
   if (statusCode && statusCode !== 200) obj._status = statusCode;
+  // Diagnostic timing rider (2026-08-06). This is the single choke point
+  // every one of the ~68 handlers returns through, so attaching it here
+  // instruments the whole API without touching a single handler. Same
+  // in-place-mutation precedent as _status above. Namespaced `_t` so it
+  // cannot collide with handler payload keys.
+  try {
+    obj._t = {
+      loaded: _T_SCRIPT_LOADED_,      // module eval reached (post parse/compile)
+      entry:  _T_DOPOST_ENTRY_,       // doPost invoked
+      exit:   Date.now(),             // response being built
+    };
+  } catch (_) { /* never let instrumentation break a response */ }
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);

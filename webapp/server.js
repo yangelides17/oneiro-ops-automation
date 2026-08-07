@@ -82,6 +82,25 @@ app.get('/api/health', (_req, res) => {
 })
 
 /**
+ * GET /api/diag/ping
+ * Diagnostic only. Round-trips the Apps Script `ping` action, which does
+ * NO work — no spreadsheet, no Drive, no properties beyond the auth check.
+ * Its latency is therefore the pure platform floor (queue + fetch/parse/
+ * compile of Code.js + dispatch). Comparing it against a real action is
+ * what separates "the floor is slow" from "our handlers are slow".
+ * See the [AS] SPLIT log line for the decomposition.
+ */
+app.get('/api/diag/ping', async (_req, res) => {
+  const t0 = Date.now()
+  try {
+    const data = await callAppsScript('ping')
+    res.json({ ...data, round_trip_ms: Date.now() - t0 })
+  } catch (err) {
+    res.status(500).json({ error: err.message, round_trip_ms: Date.now() - t0 })
+  }
+})
+
+/**
  * GET /api/wos
  * Returns all active (non-complete) Work Orders for the field report dropdown.
  */

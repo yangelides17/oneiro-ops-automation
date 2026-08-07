@@ -125,6 +125,7 @@ export async function callAppsScript(action, data = null) {
   }
   let anyRedirect = false
   let result, tHeaders
+  let hop0Ms = 0   // POST /exec — the hop that carries the whole execution
 
   // Only these statuses are redirects fetch (and browsers) auto-follow;
   // 300/304-306/309+ are NOT.
@@ -150,6 +151,7 @@ export async function callAppsScript(action, data = null) {
         body:    currentMethod === 'GET' ? null : currentBody,
       })
       const hopMs = Date.now() - hopStarted
+      if (hop === 0) hop0Ms = hopMs
       if (REDIRECT_STATUSES.has(result.status)) {
         anyRedirect = true
         const location = result.headers.location || ''
@@ -296,6 +298,25 @@ export async function callAppsScript(action, data = null) {
     throw new Error(
       `Apps Script response wasn't JSON (action="${action}", status=${result.status}): ` +
       `${text.slice(0, 200)}`
+    )
+  }
+  // Server-side timing rider from jsonResponse_. Read BEFORE the
+  // json.error throw below so failures are measured too.
+  //
+  // `loaded`/`entry`/`exit` all come from Apps Script's clock, so only
+  // same-clock deltas are used — no client/server skew enters the math.
+  // The remainder is what nothing could see before: how much of the call
+  // is spent before our code even starts running.
+  if (json && json._t && typeof json._t.exit === 'number') {
+    const { loaded, entry, exit } = json._t
+    const dispatchMs = entry - loaded      // rest of module eval + dispatch
+    const handlerMs  = exit  - entry       // actual handler work
+    const inScriptMs = exit  - loaded      // everything we can attribute
+    const preScriptMs = hop0Ms - inScriptMs // network + queue + parse/compile
+    console.log(
+      `[AS] SPLIT action=${action} hop0=${hop0Ms}ms ` +
+      `preScript=${preScriptMs}ms dispatch=${dispatchMs}ms handler=${handlerMs}ms ` +
+      `(preScript = network + queue + fetch/parse/compile of Code.js)`
     )
   }
   if (json.error) {
