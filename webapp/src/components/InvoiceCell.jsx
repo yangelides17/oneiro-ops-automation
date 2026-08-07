@@ -1,8 +1,8 @@
 import { useState } from 'react'
 
 // Invoice column cell. One of: already-invoiced link · em-dash (WO not
-// completed) · spinner (in-flight) · error/Retry · "Generate" (disabled
-// when QB not connected). The button POSTs /api/qb/invoice/:wo_id and
+// completed, or CFR not yet done) · spinner (in-flight) · error/Retry ·
+// "Generate" (disabled when QB not connected). The button POSTs /api/qb/invoice/:wo_id and
 // propagates the result via onInvoiced so the parent can patch local
 // state. Extracted from Dashboard so the WO Tracker and the Doc Status
 // docs-queue share the exact same invoice control + endpoint.
@@ -30,7 +30,13 @@ export default function InvoiceCell({ wo, qbConnected, onInvoiced }) {
     return <span className="text-slate-300 text-xs px-2 py-1" title="Available once WO is Completed">—</span>
   }
 
-  // 3) In flight
+  // 3) CFR not yet done/approved — not eligible. Production numbers
+  // aren't confirmed until then, so invoicing earlier risks a stale amount.
+  if (!wo.docs?.cfr?.done) {
+    return <span className="text-slate-300 text-xs px-2 py-1" title="Available once CFR is approved">—</span>
+  }
+
+  // 4) In flight
   if (loading) {
     return (
       <span className="inline-flex items-center gap-1 text-xs text-slate-500">
@@ -61,7 +67,7 @@ export default function InvoiceCell({ wo, qbConnected, onInvoiced }) {
     }
   }
 
-  // 4) Error — show Retry with the message in a tooltip
+  // 5) Error — show Retry with the message in a tooltip
   if (error) {
     return (
       <button
@@ -74,7 +80,7 @@ export default function InvoiceCell({ wo, qbConnected, onInvoiced }) {
     )
   }
 
-  // 5) Idle — Generate (disabled when QB disconnected)
+  // 6) Idle — Generate (disabled when QB disconnected)
   return (
     <button
       onClick={doGenerate}

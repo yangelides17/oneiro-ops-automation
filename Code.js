@@ -15604,6 +15604,13 @@ function handleGetQbInvoicePayload_(body) {
     });
   }
 
+  // Pre-flight: CFR done? Production numbers aren't confirmed until the
+  // CFR is approved, so refuse to invoice off numbers that could still change.
+  const cfrDone = String(woRow[DOC_TYPE_DONE_COL_['Field Report']] || '').trim().toLowerCase() === 'yes';
+  if (!cfrDone) {
+    return jsonResponse_({ cfr_not_done: true });
+  }
+
   const payload = aggregateRevenueByWoForQB_(ss, woId);
   return jsonResponse_(payload);
 }

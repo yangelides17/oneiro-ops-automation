@@ -2852,6 +2852,13 @@ app.post('/api/qb/invoice/:woId', async (req, res) => {
       }
     }
 
+    if (payload.cfr_not_done) {
+      return res.status(400).json({
+        ok:    false,
+        error: 'CFR must be approved before generating an invoice.',
+      })
+    }
+
     if (Array.isArray(payload.needs_pricing) && payload.needs_pricing.length > 0) {
       return res.status(400).json({
         ok:    false,
