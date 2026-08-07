@@ -126,6 +126,10 @@ export async function callAppsScript(action, data = null) {
   let anyRedirect = false
   let result, tHeaders
   let hop0Ms = 0   // POST /exec — the hop that carries the whole execution
+  // Compact per-hop trace. A failure otherwise scatters across 5-6 log
+  // lines that have to be hand-assembled; building a dataset of many
+  // failures needs ONE greppable line each. See emitFailureSummary_.
+  const hops = []
 
   // Only these statuses are redirects fetch (and browsers) auto-follow;
   // 300/304-306/309+ are NOT.
@@ -152,6 +156,7 @@ export async function callAppsScript(action, data = null) {
       })
       const hopMs = Date.now() - hopStarted
       if (hop === 0) hop0Ms = hopMs
+      hops.push(`h${hop}:${result.status}:${hopMs}ms:${new URL(currentUrl).host.replace('script.googleusercontent.com', 'ECHO').replace('script.google.com', 'EXEC')}`)
       if (REDIRECT_STATUSES.has(result.status)) {
         anyRedirect = true
         const location = result.headers.location || ''
@@ -254,6 +259,24 @@ export async function callAppsScript(action, data = null) {
   // likely cause (platform load/instability, not auth/deployment).
   const redirectExhausted = REDIRECT_STATUSES.has(result.status)
 
+  // ONE self-contained line per failure. Everything needed to classify a
+  // failure without cross-referencing five other log lines: which action,
+  // total time, and every hop's status/duration/host. Grep `FAIL#` to
+  // pull a whole dataset out of the logs at once.
+  //
+  // Classification is then direct from the hop trace:
+  //   h0 huge, h1 small   -> execution hung; blew the ~30-35s response
+  //                          ceiling, so the echo URL was dead on arrival
+  //   h0 small, h1 huge   -> execution fine, delivery hung
+  //   h0 small, h1 small  -> neither; something else entirely
+  const emitFailureSummary = (verdict) => {
+    console.error(
+      `[AS] FAIL# action=${action} verdict=${verdict} elapsed=${elapsed}ms ` +
+      `hops=[${hops.join(' ')}] respBytes=${text.length} ` +
+      `elMax=${elMaxMs}ms asInFlight=${asInFlight} zips=${batchDownloadsActive}`
+    )
+  }
+
   console.log(
     `[AS] action=${action} status=${result.status} redirected=${anyRedirect} ` +
     `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
@@ -265,6 +288,7 @@ export async function callAppsScript(action, data = null) {
   )
 
   if (redirectExhausted) {
+    emitFailureSummary('redirect-never-resolved')
     console.error(
       `[AS] REDIRECT-EXHAUSTED action=${action} status=${result.status} ` +
       `elapsed=${elapsed}ms finalUrl=${currentUrl} respBytes=${text.length}`
@@ -295,6 +319,7 @@ export async function callAppsScript(action, data = null) {
       .replace(/\s+/g, ' ')
       .trim()
     const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+    emitFailureSummary(`html:${titleMatch ? titleMatch[1].trim().slice(0, 40) : 'untitled'}`)
     console.error(
       `[AS] HTML-RESPONSE action=${action} status=${result.status} ` +
       `elapsed=${elapsed}ms ttfb=${ttfbMs}ms body=${bodyMs}ms ` +
@@ -317,6 +342,7 @@ export async function callAppsScript(action, data = null) {
   try {
     json = JSON.parse(text)
   } catch (e) {
+    emitFailureSummary('non-json')
     console.error(
       `[AS] NON-JSON action=${action} status=${result.status} respBytes=${text.length} ` +
       `head="${text.slice(0, 200).replace(/\n/g, ' ')}"`
