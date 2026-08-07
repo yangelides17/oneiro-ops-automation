@@ -124,13 +124,7 @@ export async function callAppsScript(action, data = null) {
     'Content-Length': Buffer.byteLength(reqJson),
   }
   let anyRedirect = false
-  let echoUrl     = null   // googleusercontent.com content-retrieval URL, once seen
   let result, tHeaders
-
-  const isBad = (r) => {
-    const t = (r.bodyText || '').trim()
-    return r.status < 200 || r.status >= 300 || t.startsWith('<')
-  }
 
   // Only these statuses are redirects fetch (and browsers) auto-follow;
   // 300/304-306/309+ are NOT.
@@ -165,17 +159,13 @@ export async function callAppsScript(action, data = null) {
           `host=${new URL(currentUrl).host} location="${location}"`
         )
         if (!location) break
+        // Reaching a googleusercontent.com/macros/echo URL means doPost
+        // has already finished server-side — Apps Script only redirects
+        // there once it has output to hand back. The per-hop host/location
+        // logged above records that, so a failing chain can be read as
+        // "execution finished, delivery failed" vs "execution never
+        // produced output" without any extra bookkeeping here.
         const resolved = new URL(location, currentUrl).toString()
-        // Once Apps Script redirects a POST to a googleusercontent.com
-        // content-retrieval URL, doPost has already run server-side —
-        // everything from here on is Google trying to hand us back the
-        // already-computed result. Remember that URL specifically: if
-        // fetching it (or wherever it further redirects) doesn't pan out,
-        // the safe recovery is to re-fetch THAT SAME URL, not to give up
-        // or re-POST — retrying it can never re-execute anything.
-        if (/^https:\/\/script\.googleusercontent\.com\/macros\/echo/.test(resolved)) {
-          echoUrl = resolved
-        }
         currentUrl = resolved
         // Mirrors what fetch's automatic 'follow' mode does: 303 always
         // downgrades to GET; 301/302 downgrade a non-GET/HEAD method to
@@ -197,41 +187,23 @@ export async function callAppsScript(action, data = null) {
       break
     }
 
-    // Echo-URL retry — deliberately ONE quick attempt, not the 3-attempt
-    // 2s/3s/5s ladder this started as.
+    // NO RETRY HERE, deliberately.
     //
-    // Measured (2026-08-06, prod): zero recoveries across ~9 attempts on
-    // real incidents, while adding a flat 10s to failures users were
-    // already waiting on. The mechanism explains why. Apps Script only
-    // redirects to the echo URL once doPost has finished, and the echo
-    // URL serves that execution's stored output; on the failing calls it
-    // answers 302-back-to-/exec instead, i.e. there is no stored output
-    // to serve. If the execution never produced output, re-fetching the
-    // place that output would live cannot succeed no matter how many
-    // times we ask.
+    // An echo-URL retry lived here and was removed 2026-08-06: measured
+    // zero recoveries across ~9 attempts on real incidents while adding
+    // latency to failures users were already waiting through. The
+    // mechanism explains why it could never have worked. Apps Script only
+    // redirects to the echo URL once doPost has finished, and that URL
+    // serves the execution's stored output; on the failing calls it
+    // answers 302-back-to-/exec instead — i.e. there is no stored output
+    // to serve. Re-fetching where absent output would live cannot succeed
+    // no matter how many times we ask.
     //
-    // One short attempt is kept as a cheap hedge for a genuinely
-    // transient delivery hiccup (execution DID finish, handoff glitched)
-    // — that case would still recover, and would log `recovered`, which
-    // is the evidence needed to justify ever widening this again.
-    if (echoUrl && isBad(result)) {
-      await new Promise(r => setTimeout(r, 1000))
-      console.warn(`[AS] ECHO-RETRY action=${action} attempt=1 url=${echoUrl}`)
-      try {
-        const rStarted = Date.now()
-        const retry = await httpRequestOnce(echoUrl, { method: 'GET', headers: {} })
-        result = retry
-        currentUrl = echoUrl
-        console.warn(
-          `[AS] ECHO-RETRY action=${action} attempt=1 status=${retry.status} ` +
-          `hopMs=${Date.now() - rStarted} ` +
-          `outcome=${isBad(retry) ? 'still-bad' : 'recovered'}`
-        )
-      } catch (e) {
-        console.warn(`[AS] ECHO-RETRY action=${action} attempt=1 threw: ${e.message}`)
-      }
-    }
-
+    // This module is now a pure OBSERVER. It must not alter behavior
+    // relative to a plain redirect-following fetch. Do not add retries,
+    // timeouts, or concurrency limits here until the failure mode is
+    // actually confirmed — four such fixes shipped against four unproven
+    // theories and none of them stopped the recurrence.
     tHeaders = result.tHeaders
   } finally {
     asInFlight--
