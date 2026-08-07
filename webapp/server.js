@@ -2787,4 +2787,53 @@ app.listen(PORT, () => {
     console.log(`   API:  http://localhost:${PORT}/api/health`)
     console.log(`   App:  http://localhost:5173  (Vite dev server)`)
   }
+  startDiagnosticProbe()
 })
+
+
+// ── TEMPORARY diagnostic probe (2026-08-07) ───────────────────────
+//
+// Collects a dataset of the intermittent Apps Script failures while
+// nobody is using the app. Lives here rather than on a laptop because
+// the failures are rare and unpredictable: a local probe dies the
+// moment the machine sleeps, and the whole problem is that you cannot
+// summon these on demand.
+//
+// Alternates two actions so the sample covers both shapes:
+//   ping           — zero handler work; isolates the platform floor
+//   get_active_wos — a full-sheet read; where the latency variance and
+//                    the long hangs have actually shown up
+//
+// Cost is deliberately trivial: one execution per interval (default
+// 3 min = 0.33/min) against a ~3.7/min steady-state baseline. Failures
+// surface through the normal [AS] FAIL# path, so nothing extra is
+// needed to read them.
+//
+// REMOVE THIS once the failure mode is characterised. Set
+// DIAG_PROBE_MS=0 in Railway to switch it off without a deploy.
+const DIAG_PROBE_MS = process.env.DIAG_PROBE_MS === undefined
+  ? 180000
+  : Number(process.env.DIAG_PROBE_MS)
+
+function startDiagnosticProbe() {
+  if (!DIAG_PROBE_MS || DIAG_PROBE_MS < 30000) {
+    console.log('[DIAG] probe disabled')
+    return
+  }
+  const actions = ['ping', 'get_active_wos']
+  let i = 0
+  console.log(`[DIAG] probe every ${Math.round(DIAG_PROBE_MS / 1000)}s (DIAG_PROBE_MS=0 to disable)`)
+  setInterval(async () => {
+    const action = actions[i++ % actions.length]
+    const t0 = Date.now()
+    try {
+      await callAppsScript(action)
+      const ms = Date.now() - t0
+      // Quiet on healthy calls — only surface the interesting tail, so
+      // an overnight run leaves a short readable log rather than a wall.
+      if (ms > 5000) console.warn(`[DIAG] SLOW action=${action} ${ms}ms`)
+    } catch (err) {
+      console.error(`[DIAG] FAILED action=${action} ${Date.now() - t0}ms — ${err.message}`)
+    }
+  }, DIAG_PROBE_MS).unref?.()
+}
