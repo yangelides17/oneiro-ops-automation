@@ -12,6 +12,7 @@ import ReuploadModal from '../components/ReuploadModal'
 import ConfirmModal from '../components/ConfirmModal'
 import MonthEndUploadModal from '../components/MonthEndUploadModal'
 import { usePendingCounts } from '../lib/PendingCountsContext'
+import { docLabel, fmtMonthLong } from '../lib/monthEndDocs'
 
 // Doc types whose data-driven PDF can be rebuilt from current system data
 // and overwritten in place. CP + SI are not yet supported.
@@ -60,7 +61,10 @@ const awaitingToItem = (a) => ({
   doc_type:        'month_end',
   awaiting_upload: true,
   filename:        '',
-  subtitle:        `${a.label} · ${a.contract_num}-${a.borough}`,
+  // Contractor is dropped here but the month is not: the same contract
+  // produces one of these every month, so a label without it is genuinely
+  // ambiguous in a queue that can hold several at once.
+  subtitle:        docLabel(a, { withContractor: false }),
   created_at:      a.downloaded_at,
 })
 
@@ -73,14 +77,6 @@ const fmtTime = (iso) => {
       hour: 'numeric',  minute: '2-digit',
     })
   } catch { return '' }
-}
-
-// "2026-07" → "July 2026". Month-end docs are anchored to a payroll month
-// rather than a date, so they can't share fmtTime.
-const fmtMonth = (monthIso) => {
-  const [y, m] = String(monthIso || '').split('-').map(Number)
-  if (!y || !m) return monthIso || ''
-  return new Date(y, m - 1, 1).toLocaleString(undefined, { month: 'long', year: 'numeric' })
 }
 
 export default function Approvals() {
@@ -469,6 +465,30 @@ export default function Approvals() {
     }
   }
 
+  // Dismissing an awaiting card. Confirmed first: the rows sit flush
+  // against each other and the × is small, so a misclick is easy — and
+  // while the action is reversible, the admin has to know to go back to
+  // Doc Status to reverse it.
+  const [dismissItem, setDismissItem] = useState(null)
+  const doDismiss = async () => {
+    const item = dismissItem
+    setDismissItem(null)
+    if (!item) return
+    setActionError('')
+    try {
+      const res = await fetch('/api/approvals/month-end/dismiss', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ doc_id: item.doc_id }),
+      })
+      const json = await res.json()
+      if (!res.ok || json.error) throw new Error(json.error || `HTTP ${res.status}`)
+      removeApprovedAndAdvance(item.file_id)   // same drop-and-advance as an approve
+    } catch (err) {
+      setActionError(err.message || 'Could not remove that item')
+    }
+  }
+
   // After a commit the placeholders become real queue items. Refresh, then
   // land on the first uploaded doc so it's ready to review immediately.
   const handleMonthEndUploaded = async (uploaded) => {
@@ -590,6 +610,7 @@ export default function Approvals() {
               item={item}
               active={item.file_id === selectedId}
               onClick={() => setSelectedId(item.file_id)}
+              onDismiss={setDismissItem}
             />
           ))}
         </section>
@@ -619,7 +640,7 @@ export default function Approvals() {
                   <span className="font-mono">{selected.contract_num}</span>-{selected.borough}
                   {selected.contractor && <> · {selected.contractor}</>}
                 </p>
-                <p className="text-xs text-slate-500">Month of {fmtMonth(selected.month)}</p>
+                <p className="text-xs text-slate-500">Month of {fmtMonthLong(selected.month)}</p>
               </div>
               <p className="text-sm text-slate-500 max-w-md">
                 Downloaded {fmtTime(selected.downloaded_at)}. This form has to be signed by hand —
@@ -823,6 +844,22 @@ export default function Approvals() {
         />
       )}
 
+      {/* Dismiss an awaiting-upload card (accidental download, etc). */}
+      {dismissItem && (
+        <ConfirmModal
+          title="Remove this from the queue?"
+          message={
+            `${docLabel(dismissItem)} will stop showing here as awaiting a signed copy. ` +
+            `Nothing is deleted — it goes back to being listed on Doc Status, and ` +
+            `downloading the blank form again brings this card back.`
+          }
+          confirmLabel="Remove"
+          cancelLabel="Keep it"
+          onConfirm={doDismiss}
+          onCancel={() => setDismissItem(null)}
+        />
+      )}
+
       {/* Month-end signed-scan upload. Proposes a page→document split and
           files nothing until the admin confirms it. */}
       {monthEndUploadOpen && (
@@ -885,36 +922,58 @@ export default function Approvals() {
 }
 
 // ── List row ──────────────────────────────────────────────────
-function ApprovalRow({ item, active, onClick }) {
+function ApprovalRow({ item, active, onClick, onDismiss }) {
   const meta = docTypeMeta(item.doc_type)
   const awaiting = !!item.awaiting_upload
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`w-full text-left border-b px-3 py-3 transition-colors
-                  ${awaiting ? 'border-b-slate-100 border-l-4 border-l-teal-400' : 'border-slate-100'}
-                  ${active ? 'bg-navy/5' : 'hover:bg-slate-50'}`}
-    >
-      <div className="flex items-start justify-between gap-2 mb-1">
-        <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${meta.chip}`}>
-          {awaiting ? '⬆ Needs upload' : meta.badge}
-        </span>
-        <span className="text-[10px] text-slate-400 flex-shrink-0">{fmtTime(item.created_at)}</span>
-      </div>
-      <p className="text-sm font-semibold text-slate-800 truncate">
-        {item.subtitle || item.filename}
-      </p>
-      {awaiting ? (
-        <p className="text-[11px] text-teal-700 truncate">
-          Downloaded {fmtTime(item.downloaded_at)} · needs a signed copy
+    // Relative wrapper so the dismiss control can sit over the row: a
+    // <button> nested inside another <button> is invalid HTML and browsers
+    // resolve the click ambiguously.
+    <div className="relative">
+      <button
+        type="button"
+        onClick={onClick}
+        className={`w-full text-left border-b px-3 py-3 transition-colors
+                    ${awaiting ? 'border-b-slate-100 border-l-4 border-l-teal-400' : 'border-slate-100'}
+                    ${active ? 'bg-navy/5' : 'hover:bg-slate-50'}`}
+      >
+        <div className="flex items-start justify-between gap-2 mb-1">
+          <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${meta.chip}`}>
+            {awaiting ? '⬆ Needs upload' : meta.badge}
+          </span>
+          {/* Extra right margin on dismissible rows keeps the timestamp
+              clear of the × sitting above it. */}
+          <span className={`text-[10px] text-slate-400 flex-shrink-0 ${awaiting ? 'mr-5' : ''}`}>
+            {fmtTime(item.created_at)}
+          </span>
+        </div>
+        <p className="text-sm font-semibold text-slate-800 truncate">
+          {item.subtitle || item.filename}
         </p>
-      ) : (
-        item.subtitle && item.filename && item.subtitle !== item.filename.replace(/\.pdf$/i, '') && (
-          <p className="text-[11px] text-slate-400 truncate">{item.filename}</p>
-        )
+        {awaiting ? (
+          <p className="text-[11px] text-teal-700 truncate">
+            Downloaded {fmtTime(item.downloaded_at)} · needs a signed copy
+          </p>
+        ) : (
+          item.subtitle && item.filename && item.subtitle !== item.filename.replace(/\.pdf$/i, '') && (
+            <p className="text-[11px] text-slate-400 truncate">{item.filename}</p>
+          )
+        )}
+      </button>
+      {awaiting && onDismiss && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onDismiss(item) }}
+          title="Remove from the queue — downloading the form again brings it back"
+          aria-label="Remove from the queue"
+          className="absolute top-2 right-1.5 w-5 h-5 flex items-center justify-center
+                     rounded text-slate-300 hover:text-red-600 hover:bg-red-50
+                     text-base leading-none transition-colors"
+        >
+          ×
+        </button>
       )}
-    </button>
+    </div>
   )
 }
 

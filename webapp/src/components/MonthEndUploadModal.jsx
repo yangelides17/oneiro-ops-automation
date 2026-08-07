@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Document, Page } from 'react-pdf'
+import { docLabel } from '../lib/monthEndDocs'
 
 // Upload signed month-end paperwork (Employee Utilization / Certificates).
 //
@@ -22,9 +23,6 @@ import { Document, Page } from 'react-pdf'
 const MAX_BYTES = 20 * 1024 * 1024   // matches the server multer limit
 
 const UNASSIGNED = ''
-
-const docLabel = (c) =>
-  `${c.label} · ${c.contract_num}-${c.borough}${c.contractor ? ` · ${c.contractor}` : ''}`
 
 export default function MonthEndUploadModal({ candidates = [], onClose, onUploaded }) {
   const [step, setStep]     = useState('choose')  // choose | analyzing | review | committing

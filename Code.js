@@ -4301,6 +4301,8 @@ function doPost(e) {
       return handleBuildMonthEndFillAll_(body);
     } else if (action === 'upload_month_end_signed') {
       return handleUploadMonthEndSigned_(body);
+    } else if (action === 'clear_month_end_downloaded') {
+      return handleClearMonthEndDownloaded_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
     } else if (action === 'list_employees') {
@@ -5528,6 +5530,58 @@ function handleUploadMonthEndSigned_(body) {
     Logger.log(`❌ handleUploadMonthEndSigned_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
+}
+
+
+// ── action: clear_month_end_downloaded ────────────────────────
+//
+// Removes a month-end doc's awaiting-upload card from the Approvals page
+// by clearing its Downloaded At stamp.
+//
+// Deliberately NOT a delete. It reverts the doc to "not yet downloaded",
+// which is exactly what an accidental download should look like — the
+// doc goes back to being prompted on Doc Status, and downloading it again
+// re-queues the card. Done/Sent and any archived file are untouched, so
+// this can't be used to lose a real record.
+//
+// body.data = { doc_id }
+function handleClearMonthEndDownloaded_(body) {
+  const d = body.data || {};
+  const docId = String(d.doc_id || '').trim();
+  if (!docId) return jsonResponse_({ error: 'Missing doc_id' }, 400);
+  if (!_parseMonthEndDocId_(docId)) {
+    return jsonResponse_({ error: 'Not a month-end doc_id: ' + docId }, 400);
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!sheet) return jsonResponse_({ error: 'Doc Lifecycle Log not found' }, 500);
+
+  const col  = DOC_LIFECYCLE_HEADERS_.indexOf('Downloaded At') + 1;
+  const data = sheet.getDataRange().getValues();
+  let cleared = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() !== docId) continue;
+    if (data[i][col - 1]) { sheet.getRange(i + 1, col).setValue(''); cleared++; }
+    break;   // Doc ID is the primary key; first match is the row.
+  }
+
+  if (cleared) {
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Month-End Dismissed', docId,
+          'Awaiting-upload card removed via webapp', 'Reverted to not-downloaded', '',
+          'Re-download from Doc Status to queue it again'
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on month-end dismiss: ' + logErr);
+    }
+    _invalidateCacheKeys_([]);
+  }
+
+  return jsonResponse_({ success: true, doc_id: docId, cleared: cleared });
 }
 
 

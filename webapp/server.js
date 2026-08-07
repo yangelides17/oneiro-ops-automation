@@ -748,6 +748,26 @@ app.post('/api/approvals/month-end/commit', upload.single('file'), async (req, r
 })
 
 /**
+ * POST /api/approvals/month-end/dismiss  { doc_id }
+ * Removes an awaiting-upload card by clearing the doc's Downloaded At
+ * stamp — for an accidental download. Reversible: downloading the blank
+ * again re-queues it. doc_id travels in the body rather than the path so
+ * nothing has to survive URL encoding.
+ */
+app.post('/api/approvals/month-end/dismiss', async (req, res) => {
+  try {
+    const doc_id = String(req.body?.doc_id || '').trim()
+    if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
+    const data = await callAppsScript('clear_month_end_downloaded', { doc_id })
+    if (data && data.error) return res.status(400).json(data)
+    res.json(data)
+  } catch (err) {
+    console.error('POST /api/approvals/month-end/dismiss error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker
  * (col N). MMA jobs can't have a Field Report submitted until this is
