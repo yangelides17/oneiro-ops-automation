@@ -154,6 +154,45 @@ export default function Approvals() {
 
   const selected = approvals?.find(a => a.file_id === selectedId) || null
 
+  // ── Prefetch the NEXT document in the queue ──────────────────
+  //
+  // Admins work this queue top-to-bottom (it's FIFO, oldest first), so
+  // the next document is highly predictable. Warming it while they read
+  // the current one turns the next click into a server cache hit —
+  // fetching the bytes is the slowest and most failure-prone call in the
+  // app (measured 21% failure, 7-45s), so paying it in the background
+  // instead of in front of the user is most of the perceived win.
+  //
+  // Deliberately conservative:
+  //  - ONE document ahead, never a batch. Concurrency against Apps
+  //    Script is what makes tails worse, and we are trying to remove
+  //    waiting, not add load.
+  //  - Starts 1.5s after selection so it never competes with the fetch
+  //    the user is actually waiting on.
+  //  - Aborted if the user moves on first; a half-finished prefetch is
+  //    wasted work, not a cached document.
+  //  - Failures are ignored on purpose. This is an optimisation; if it
+  //    fails the normal path just runs when the user clicks.
+  const prefetchedRef = useRef(new Set())
+  useEffect(() => {
+    if (!selectedId || filtered.length < 2) return
+    const idx = filtered.findIndex(a => a.file_id === selectedId)
+    const next = idx >= 0 ? filtered[idx + 1] : null
+    if (!next || prefetchedRef.current.has(next.file_id)) return
+
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => {
+      prefetchedRef.current.add(next.file_id)
+      fetch(`/api/approvals/${encodeURIComponent(next.file_id)}/pdf`, { signal: ctrl.signal })
+        // Drain the body so the response completes and the server caches it;
+        // we intentionally do nothing with the bytes here.
+        .then(r => (r.ok ? r.arrayBuffer() : null))
+        .catch(() => {})
+    }, 1500)
+
+    return () => { clearTimeout(timer); ctrl.abort() }
+  }, [selectedId, filtered])
+
   // Sign-In docs route through PrincipalSignModal; everything else fires
   // the lightweight direct approve.
   const [signingItem, setSigningItem] = useState(null)
@@ -710,20 +749,55 @@ function ApprovalRow({ item, active, onClick }) {
 function PDFViewer({ fileId, width, version = 0 }) {
   const [numPages, setNumPages] = useState(null)
   const [loadErr, setLoadErr]   = useState(null)
+  // Bumped to force react-pdf to re-issue the request after a transient
+  // failure. Separate from `version`, which means "the bytes changed".
+  const [attempt, setAttempt]   = useState(0)
 
   // react-pdf's `file` prop. Using the URL directly lets pdf.js stream
   // the document — faster than fetching the whole blob first. `version`
   // is a cache-buster bumped after a reupload (content replaced in place
   // under the same file_id) so react-pdf re-fetches the new bytes.
-  const file = useMemo(() => ({
-    url: `/api/approvals/${encodeURIComponent(fileId)}/pdf${version ? `?v=${version}` : ''}`,
-  }), [fileId, version])
+  // `r` is the retry counter. It is deliberately a SEPARATE param from
+  // `v`: the server keys its byte cache on `v` only, so a retry does not
+  // bypass a warm cache — it just guarantees a fresh request rather than
+  // reusing a memoized file object.
+  const file = useMemo(() => {
+    const qs = []
+    if (version) qs.push(`v=${version}`)
+    if (attempt) qs.push(`r=${attempt}`)
+    return {
+      url: `/api/approvals/${encodeURIComponent(fileId)}/pdf${qs.length ? `?${qs.join('&')}` : ''}`,
+    }
+  }, [fileId, version, attempt])
 
   // Reset error / page count whenever the document changes
   useEffect(() => {
     setLoadErr(null)
     setNumPages(null)
+    setAttempt(0)
   }, [fileId, version])
+
+  // Retry once, automatically, on a failed load.
+  //
+  // These failures are transient by nature: a Google service call inside
+  // the Apps Script execution hung long enough to blow the ~30-35s
+  // response ceiling, so the result was discarded. A retry runs as a
+  // BRAND NEW execution with a fresh budget and usually succeeds — and
+  // now that the server caches bytes, a success also warms the cache.
+  //
+  // This is safe where an earlier retry attempt (since removed) was not:
+  // that one re-fetched Google's content-delivery URL, which is
+  // single-use and expires in 15-60s (both proven by experiment), so it
+  // could never have worked. This re-issues the whole request instead.
+  useEffect(() => {
+    if (!loadErr || attempt >= 1) return
+    const t = setTimeout(() => {
+      setLoadErr(null)
+      setNumPages(null)
+      setAttempt(a => a + 1)
+    }, 800)
+    return () => clearTimeout(t)
+  }, [loadErr, attempt])
 
   return (
     <div className="flex-1 min-h-0 overflow-auto bg-slate-50 rounded-lg border border-slate-200">
@@ -734,7 +808,7 @@ function PDFViewer({ fileId, width, version = 0 }) {
       )}
       {!loadErr && (
         <Document
-          key={`${fileId}:${version}`}
+          key={`${fileId}:${version}:${attempt}`}
           file={file}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
           onLoadError={(e) => setLoadErr(e)}
