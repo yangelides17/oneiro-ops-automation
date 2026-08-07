@@ -33,14 +33,17 @@ export default function InvoiceCell({ wo, qbConnected, onInvoiced }) {
   // 3) CFR not yet done/approved — not eligible. Production numbers
   // aren't confirmed until then, so invoicing earlier risks a stale amount.
   if (!wo.docs?.cfr?.done) {
+    // title lives on the wrapping span, not the disabled button — disabled
+    // elements don't reliably fire the hover events tooltips need.
     return (
-      <button
-        disabled
-        title="Available once CFR is approved"
-        className="text-xs font-bold px-2 py-1 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"
-      >
-        Generate
-      </button>
+      <span title="Available once CFR is approved">
+        <button
+          disabled
+          className="text-xs font-bold px-2 py-1 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"
+        >
+          Generate
+        </button>
+      </span>
     )
   }
 
@@ -88,17 +91,19 @@ export default function InvoiceCell({ wo, qbConnected, onInvoiced }) {
     )
   }
 
-  // 6) Idle — Generate (disabled when QB disconnected)
+  // 6) Idle — Generate (disabled when QB disconnected). Same reasoning as
+  // above: title on the wrapping span so it still shows when disabled.
   return (
-    <button
-      onClick={doGenerate}
-      disabled={!qbConnected}
-      title={qbConnected ? 'Generate QuickBooks invoice' : 'QuickBooks not connected'}
-      className={`text-xs font-bold px-2 py-1 rounded-lg ${qbConnected
-        ? 'bg-navy text-white hover:bg-navy/80'
-        : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}
-    >
-      Generate
-    </button>
+    <span title={qbConnected ? 'Generate QuickBooks invoice' : 'QuickBooks not connected'}>
+      <button
+        onClick={doGenerate}
+        disabled={!qbConnected}
+        className={`text-xs font-bold px-2 py-1 rounded-lg ${qbConnected
+          ? 'bg-navy text-white hover:bg-navy/80'
+          : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}
+      >
+        Generate
+      </button>
+    </span>
   )
 }
