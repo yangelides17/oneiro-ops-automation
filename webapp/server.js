@@ -35,6 +35,7 @@ import {
 } from './server/appsScript.js'
 import {
   loadServiceAccount, getAccessToken, getFileMeta, fetchFileResponse,
+  isConfigured as isDriveConfigured,
 } from './server/googleDrive.js'
 import {
   getBytes as getCachedPreview,
@@ -800,13 +801,63 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
       return res.send(hit.buf)
     }
 
+    // ── Preferred: read Drive directly ──────────────────────────
+    //
+    // Measured 2026-08-07 on the same 3.9MB file: 1,996ms direct vs
+    // 4,500-11,000ms through Apps Script. The Apps Script path base64s the
+    // file (+33%), pays a ~1.2-2.4s script-load tax, cannot emit a byte
+    // until the whole file is encoded, and dies past the ~30-35s response
+    // ceiling — which is where its 21% failure rate comes from. None of
+    // that applies here.
+    //
+    // Streamed, not buffered, so pdf.js can start rendering while bytes are
+    // still arriving. Chunks are collected as they pass through so the
+    // result still populates the cache — the two are not in tension.
+    if (isDriveConfigured()) {
+      try {
+        const resp = await fetchFileResponse(fileId)   // throws before headers are sent
+        const mime = resp.headers.get('content-type') || 'application/pdf'
+        const len  = resp.headers.get('content-length')
+        res.setHeader('Content-Type', mime)
+        if (len) res.setHeader('Content-Length', len)
+        res.setHeader('Cache-Control', 'no-store')
+
+        const reader = resp.body.getReader()
+        const chunks = []
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(Buffer.from(value))
+          res.write(Buffer.from(value))
+        }
+        res.end()
+        const buf = Buffer.concat(chunks)
+        putCachedPreview(fileId, version, buf, mime, null)
+        console.log(`[PREVIEW] MISS-DRIVE file=${fileId} v=${version || '-'} ` +
+                    `${buf.length}B fetch=${Date.now() - t0}ms ` +
+                    `cache=${JSON.stringify(previewCacheStats())}`)
+        return
+      } catch (driveErr) {
+        // Only safe to fall back if nothing has been written yet. Once
+        // headers are out we cannot switch strategies, so bail cleanly
+        // rather than emit a corrupt response.
+        if (res.headersSent) {
+          console.error(`[PREVIEW] drive stream failed mid-flight file=${fileId}:`, driveErr.message)
+          return res.destroy()
+        }
+        console.warn(`[PREVIEW] drive failed, falling back to Apps Script file=${fileId}:`,
+                     driveErr.message)
+      }
+    }
+
+    // ── Fallback: the original Apps Script path ─────────────────
     const data = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
     if (!data || !data.data) {
       return res.status(500).json({ error: 'Apps Script returned no bytes' })
     }
     const buf = Buffer.from(data.data, 'base64')
     putCachedPreview(fileId, version, buf, data.mime_type, data.filename)
-    console.log(`[PREVIEW] MISS file=${fileId} v=${version || '-'} ` +
+    console.log(`[PREVIEW] MISS-APPSSCRIPT file=${fileId} v=${version || '-'} ` +
                 `${buf.length}B fetch=${Date.now() - t0}ms ` +
                 `cache=${JSON.stringify(previewCacheStats())}`)
     res.setHeader('Content-Type', data.mime_type || 'application/pdf')
@@ -815,7 +866,7 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
     res.send(buf)
   } catch (err) {
     console.error(`GET /api/approvals/${fileId}/pdf error (${Date.now() - t0}ms):`, err.message)
-    res.status(500).json({ error: err.message })
+    if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 })
 
