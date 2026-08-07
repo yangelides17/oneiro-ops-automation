@@ -8477,11 +8477,24 @@ function _buildMonthEndFillSpec_(docId) {
     filename = 'Certs_' + monthName + '_' + yy + '_Contract_' + shortNum + '_' + p.borough + '_' + contractorSlug + '.pdf';
   }
 
+  // Identity caption the worker draws in the top-right of every page after
+  // the first. The Employee Utilization form's page 2 is the back half of
+  // one long trade table and carries no contract, borough, or month of its
+  // own — so a page separated from its front page can't be matched back,
+  // on paper or by the upload classifier.
+  //
+  // EU only. The certificate pages each already print their own
+  // identifiers, and an empty stamp is a no-op in the filler.
+  const stamp = (p.key === 'EU')
+    ? (pinBorough + ', ' + monthName + ' ' + yy)     // "84123MBTP564-BK, June 2026"
+    : '';
+
   return {
     doc_kind:         p.key,
     template_file_id: templateFileId,
     filename:         filename,
     fields:           fields,
+    stamp:            stamp,
     warnings:         warnings,
     // Carried out for the download stamp (see _stampMonthEndDownloaded_).
     // `meta` was already resolved above, so handing it back costs nothing
@@ -8650,7 +8663,8 @@ function handleBuildMonthEndFillAll_(body) {
     docIds.forEach(docId => {
       const spec = _buildMonthEndFillSpec_(docId);
       if (spec.error || !spec.doc_kind) return;
-      (byKind[spec.doc_kind] = byKind[spec.doc_kind] || []).push({ fields: spec.fields });
+      (byKind[spec.doc_kind] = byKind[spec.doc_kind] || [])
+        .push({ fields: spec.fields, stamp: spec.stamp || '' });
       stamps.push({ doc_id: docId, meta: spec.lifecycle_meta });
     });
 

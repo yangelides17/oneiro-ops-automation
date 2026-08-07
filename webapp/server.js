@@ -422,7 +422,10 @@ app.post('/api/tools/generate-month-end-doc', async (req, res) => {
     const wr = await fetch(fillBase.replace(/\/$/, '') + '/fill', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'X-Fill-Key': process.env.FILL_SERVER_KEY || '' },
-      body:    JSON.stringify({ doc_kind: spec.doc_kind, fields: spec.fields, filename: spec.filename }),
+      body:    JSON.stringify({
+        doc_kind: spec.doc_kind, fields: spec.fields, filename: spec.filename,
+        stamp: spec.stamp || '',   // per-page identity caption (EU only)
+      }),
     })
     if (!wr.ok) {
       const t = await wr.text().catch(() => '')
@@ -559,6 +562,7 @@ How to tell them apart:
 - "Employee Utilization" is a demographic headcount grid (columns for total, Black, Hispanic, Asian, Native American, Female).
 - "Certificates" is a packet of three separate certificates — Contractor's Certificate, Compliance Certificate, and the 220 Labor Law Certificate. All three belong to the SAME doc_id; do not split them apart.
 - Within a form type, the contract number and borough printed on the page are what distinguish one document from another. Match them exactly against the list above.
+- Continuation pages (an Employee Utilization page 2, which is the back half of the trade table and has no header) carry a small bold caption in the TOP-RIGHT corner reading "<contract>-<borough>, <Month> <Year>". That caption identifies the page outright — read it and match on it. Older forms printed before this was added won't have it; fall back to page order there.
 
 Rules:
 - Return one entry per page, for every page from 1 to ${pageCount}.

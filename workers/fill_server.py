@@ -75,10 +75,13 @@ def _make_handler(service, get_template, key):
                         # Combine every item's filled doc into one PDF.
                         items    = data.get('items') or []
                         filename = str(data.get('combined_filename') or 'combined.pdf')
-                        merge_filled(str(template), [it.get('fields') or {} for it in items], str(out))
+                        # Items carry their own per-document stamp — each is a
+                        # different contract/month, so it can't be batch-level.
+                        merge_filled(str(template), items, str(out))
                     else:
                         filename = str(data.get('filename') or 'month-end.pdf')
-                        fill_acroform(str(template), data.get('fields') or {}, str(out))
+                        fill_acroform(str(template), data.get('fields') or {}, str(out),
+                                      stamp=str(data.get('stamp') or ''))
                     pdf = out.read_bytes()
 
                 safe = filename.replace('"', '').replace('\r', '').replace('\n', '')
