@@ -284,49 +284,74 @@ function Header({ role = 'admin' }) {
   )
 }
 
-// Cold-start fetches: populate all four nav-badge counts so a fresh
-// visitor on any page sees pending work in the nav. Two requests fire
-// in parallel:
-//   1. /api/pending-counts (fast, ~300 ms) — Approvals + Sign-In +
-//      Approved Docs counts. Drives the always-visible nav badges.
-//   2. /api/pending-counts/doc-status (slower, ~500 ms-1.5 s) — Doc
-//      Status pending count. Drives the Doc Status tab badge. Slow
-//      because it runs the same _buildDocStatusPayload_ the calendar
-//      uses; split out so the fast badges don't wait on it.
-// Pages with their own queue fetches will still overwrite their
-// matching slot afterwards — no polling.
+// Cold-start fetches: populate the nav-badge counts so a fresh visitor
+// on any page sees pending work in the nav.
+//
+// These are DEFERRED and SEQUENTIAL, deliberately. They used to fire
+// both-at-once the instant the app mounted, which put two Apps Script
+// executions in flight alongside whatever the landed-on page was
+// actually fetching — four concurrent calls for one page load.
+//
+// Measured in prod 2026-08-06 (the old comment here claimed ~300ms and
+// ~500ms-1.5s; both were wildly optimistic):
+//   - every Apps Script call pays ~1,200ms before any handler runs
+//     (fetch/parse/compile of the 668KB Code.js), sometimes 4,800ms
+//   - a single full-sheet read is 775ms p50 but swings to 6,100ms
+//   - /api/pending-counts/doc-status runs _buildDocStatusPayload_,
+//     which reads FOUR entire sheets — ~3s p50, far worse on a bad draw
+//   - each call is an independent draw from that heavy tail, so a page
+//     load's latency is the MAX of four draws
+//
+// Badge counts are strictly secondary to the content the user actually
+// navigated to, so they yield: wait for the page to get its own request
+// out and largely finished, then fetch them one at a time rather than
+// racing each other. Peak concurrency on a page load drops from 4 to 2,
+// and the two slowest calls in the app leave the critical path entirely.
+const COLD_START_DELAY_MS = 1500
+
 function ColdStartCounts() {
   const { setCount } = usePendingCounts()
   useEffect(() => {
     let cancelled = false
 
-    fetch('/api/pending-counts')
-      .then(r => r.ok ? r.json() : Promise.reject(r))
-      .then(d => {
+    const loadFastCounts = async () => {
+      try {
+        const r = await fetch('/api/pending-counts')
+        if (!r.ok) throw r
+        const d = await r.json()
         if (cancelled) return
         if (d?.approvals_review      !== undefined) setCount('approvals_review',      d.approvals_review)
         if (d?.approved_docs_pending !== undefined) setCount('approved_docs_pending', d.approved_docs_pending)
         if (d?.signins_pending       !== undefined) setCount('signins_pending',       d.signins_pending)
-      })
-      .catch(err => {
+      } catch (err) {
         console.warn('cold-start /api/pending-counts failed:', err)
-      })
+      }
+    }
 
-    fetch('/api/pending-counts/doc-status')
-      .then(r => r.ok ? r.json() : Promise.reject(r))
-      .then(d => {
+    const loadDocStatusCount = async () => {
+      try {
+        const r = await fetch('/api/pending-counts/doc-status')
+        if (!r.ok) throw r
+        const d = await r.json()
         if (cancelled) return
         if (d?.doc_status_pending !== undefined) {
           setCount('doc_status_pending', d.doc_status_pending)
         }
-      })
-      .catch(err => {
+      } catch (err) {
         // Non-fatal — the DocStatusTab will populate this slot when
         // the user visits Dashboard, same as before.
         console.warn('cold-start /api/pending-counts/doc-status failed:', err)
-      })
+      }
+    }
 
-    return () => { cancelled = true }
+    const timer = setTimeout(async () => {
+      if (cancelled) return
+      await loadFastCounts()
+      if (cancelled) return
+      await loadDocStatusCount()
+    }, COLD_START_DELAY_MS)
+
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [setCount])
   return null
 }
