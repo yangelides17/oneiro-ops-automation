@@ -142,17 +142,27 @@ export async function callAppsScript(action, data = null) {
 
   try {
     for (let hop = 0; hop < MAX_HOPS; hop++) {
+      // Per-hop timing. This is the measurement that separates the two
+      // candidate causes, which the aggregate `elapsed` cannot:
+      //   slow hop 0 (POST /exec)  → the EXECUTION is slow/starved;
+      //                              Apps Script only redirects once
+      //                              doPost has finished.
+      //   slow hop 1 (GET echo)    → the execution finished but Google
+      //                              can't hand back the result.
+      const hopStarted = Date.now()
       result = await httpRequestOnce(currentUrl, {
         method:  currentMethod,
         headers: currentHeaders,
         body:    currentMethod === 'GET' ? null : currentBody,
       })
+      const hopMs = Date.now() - hopStarted
       if (REDIRECT_STATUSES.has(result.status)) {
         anyRedirect = true
         const location = result.headers.location || ''
         console.warn(
           `[AS] REDIRECT action=${action} hop=${hop} status=${result.status} ` +
-          `fromMethod=${currentMethod} location="${location}"`
+          `hopMs=${hopMs} fromMethod=${currentMethod} ` +
+          `host=${new URL(currentUrl).host} location="${location}"`
         )
         if (!location) break
         const resolved = new URL(location, currentUrl).toString()
@@ -180,29 +190,45 @@ export async function callAppsScript(action, data = null) {
         }
         continue
       }
+      console.log(
+        `[AS] FINAL-HOP action=${action} hop=${hop} status=${result.status} ` +
+        `hopMs=${hopMs} host=${new URL(currentUrl).host}`
+      )
       break
     }
 
-    // The echo URL can take 30+ seconds and then fail — bouncing back to
-    // /exec (where the now-GET request hits the nonexistent doGet) or
-    // 404ing directly. Since doPost already ran, retrying the ACTION
-    // would risk double-executing a mutation, but retrying the content
-    // fetch carries no such risk. Never touches /exec again.
+    // Echo-URL retry — deliberately ONE quick attempt, not the 3-attempt
+    // 2s/3s/5s ladder this started as.
+    //
+    // Measured (2026-08-06, prod): zero recoveries across ~9 attempts on
+    // real incidents, while adding a flat 10s to failures users were
+    // already waiting on. The mechanism explains why. Apps Script only
+    // redirects to the echo URL once doPost has finished, and the echo
+    // URL serves that execution's stored output; on the failing calls it
+    // answers 302-back-to-/exec instead, i.e. there is no stored output
+    // to serve. If the execution never produced output, re-fetching the
+    // place that output would live cannot succeed no matter how many
+    // times we ask.
+    //
+    // One short attempt is kept as a cheap hedge for a genuinely
+    // transient delivery hiccup (execution DID finish, handoff glitched)
+    // — that case would still recover, and would log `recovered`, which
+    // is the evidence needed to justify ever widening this again.
     if (echoUrl && isBad(result)) {
-      const delays = [2000, 3000, 5000]
-      for (let i = 0; i < delays.length && isBad(result); i++) {
-        await new Promise(r => setTimeout(r, delays[i]))
-        console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} url=${echoUrl}`)
-        try {
-          const retry = await httpRequestOnce(echoUrl, { method: 'GET', headers: {} })
-          result = retry
-          currentUrl = echoUrl
-          if (!isBad(retry)) {
-            console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} recovered`)
-          }
-        } catch (e) {
-          console.warn(`[AS] ECHO-RETRY action=${action} attempt=${i + 1} threw: ${e.message}`)
-        }
+      await new Promise(r => setTimeout(r, 1000))
+      console.warn(`[AS] ECHO-RETRY action=${action} attempt=1 url=${echoUrl}`)
+      try {
+        const rStarted = Date.now()
+        const retry = await httpRequestOnce(echoUrl, { method: 'GET', headers: {} })
+        result = retry
+        currentUrl = echoUrl
+        console.warn(
+          `[AS] ECHO-RETRY action=${action} attempt=1 status=${retry.status} ` +
+          `hopMs=${Date.now() - rStarted} ` +
+          `outcome=${isBad(retry) ? 'still-bad' : 'recovered'}`
+        )
+      } catch (e) {
+        console.warn(`[AS] ECHO-RETRY action=${action} attempt=1 threw: ${e.message}`)
       }
     }
 
