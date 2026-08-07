@@ -489,6 +489,264 @@ app.post('/api/tools/generate-month-end-all', async (req, res) => {
   }
 })
 
+// ── Month-end signed uploads: split-preview → commit ───────────
+//
+// Month-end forms (Employee Utilization, Certificates) must be printed
+// and wet-signed, so they come back as a scan — often one stack covering
+// several contracts at once. These two routes turn that stack into one
+// PDF per document in the approvals queue.
+//
+// The split is proposed, never applied silently. A month-end form filed
+// under the wrong contract is worse than one left unfiled, so the model
+// only ever produces a proposal the admin confirms; a wrong guess costs
+// one dropdown click and can't misfile anything on its own.
+
+/** Awaiting-upload docs are the closed candidate set the classifier picks from. */
+async function fetchMonthEndCandidates() {
+  const data = await callAppsScript('list_pending_approvals')
+  if (data && data.error) throw new Error(data.error)
+  return Array.isArray(data?.month_end_awaiting) ? data.month_end_awaiting : []
+}
+
+const monthEndCandidateLine = (c) =>
+  `- doc_id "${c.doc_id}": ${c.label} for contract ${c.contract_num}, ` +
+  `borough ${c.borough}, prime contractor ${c.contractor || 'unknown'}, month ${c.month}`
+
+/**
+ * POST /api/approvals/month-end/split-preview
+ * Multipart: file — one PDF, either a single signed form or a combined stack.
+ *
+ * Returns a PROPOSED page→document assignment plus any warnings. Writes
+ * nothing; the client reviews and confirms, then calls /commit.
+ */
+app.post('/api/approvals/month-end/split-preview', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' })
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on this server' })
+    }
+    if ((req.file.mimetype || '') !== 'application/pdf') {
+      return res.status(400).json({ error: `Expected a PDF (got ${req.file.mimetype || 'unknown'}).` })
+    }
+
+    const candidates = await fetchMonthEndCandidates()
+    if (candidates.length === 0) {
+      return res.status(400).json({
+        error: 'No month-end documents are awaiting upload. Download the blank forms from ' +
+               'Doc Status first — that is what queues them here.',
+      })
+    }
+
+    const { PDFDocument } = await import('pdf-lib')
+    const srcDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true })
+    const pageCount = srcDoc.getPageCount()
+
+    const base64 = req.file.buffer.toString('base64')
+
+    // The classifier's job is deliberately narrow: pick one of a handful
+    // of known documents per page, or abstain. That's a far easier — and
+    // far more reliable — problem than reading a field cold, and the
+    // discriminating value (the contract number) is a long machine-printed
+    // string this system put on the page itself.
+    const prompt = `You are sorting the pages of a scanned stack of signed month-end construction compliance forms back into the individual documents they belong to.
+
+There are exactly ${pageCount} pages, numbered 1 to ${pageCount}.
+
+Every page belongs to exactly one of these documents, identified by doc_id:
+${candidates.map(monthEndCandidateLine).join('\n')}
+
+How to tell them apart:
+- "Employee Utilization" is a demographic headcount grid (columns for total, Black, Hispanic, Asian, Native American, Female).
+- "Certificates" is a packet of three separate certificates — Contractor's Certificate, Compliance Certificate, and the 220 Labor Law Certificate. All three belong to the SAME doc_id; do not split them apart.
+- Within a form type, the contract number and borough printed on the page are what distinguish one document from another. Match them exactly against the list above.
+
+Rules:
+- Return one entry per page, for every page from 1 to ${pageCount}.
+- doc_id must be copied EXACTLY from the list above, or be null.
+- If a page is illegible, blank, upside down, or you cannot match it to a specific doc_id with confidence, return null rather than guessing. A null is easy for a human to fix; a wrong contract silently misfiles a legal document.
+- Set confidence to "low" whenever you had to infer rather than read the identifying values directly.`
+
+    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'x-api-key':         process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type':      'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 8192,
+        // Structured outputs: the schema is enforced at the API, so there
+        // is no fence-stripping or JSON.parse guesswork on this path.
+        output_config: {
+          format: {
+            type: 'json_schema',
+            schema: {
+              type: 'object',
+              properties: {
+                assignments: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      page:       { type: 'integer' },
+                      doc_id:     { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                      confidence: { type: 'string', enum: ['high', 'low'] },
+                    },
+                    required: ['page', 'doc_id', 'confidence'],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ['assignments'],
+              additionalProperties: false,
+            },
+          },
+        },
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      }),
+    })
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text()
+      throw new Error(`Anthropic API error ${apiRes.status}: ${errText.slice(0, 300)}`)
+    }
+    const apiJson = await apiRes.json()
+    if (apiJson.stop_reason === 'refusal') {
+      throw new Error('The document classifier declined this file. Assign the pages manually.')
+    }
+    const textBlock = (apiJson.content || []).find(b => b.type === 'text')
+    if (!textBlock) throw new Error('Anthropic response had no text block')
+    const parsed = JSON.parse(String(textBlock.text || ''))
+
+    // ── Deterministic checks ──
+    // These need no model at all: we know the candidate set and the page
+    // count, so anything that doesn't line up is caught before the admin
+    // sees it. Everything here is a warning, not an error — the admin can
+    // always fix an assignment by hand.
+    const byId = new Map(candidates.map(c => [c.doc_id, c]))
+    const warnings = []
+    const pageToDoc = new Map()
+
+    for (const a of (parsed.assignments || [])) {
+      const page = Number(a.page)
+      if (!Number.isInteger(page) || page < 1 || page > pageCount) continue
+      if (a.doc_id && !byId.has(a.doc_id)) {
+        // A doc_id outside the candidate set is not a document we can file.
+        warnings.push(`Page ${page} was matched to an unrecognised document and left unassigned.`)
+        continue
+      }
+      if (a.doc_id) pageToDoc.set(page, a.doc_id)
+      if (a.doc_id && a.confidence === 'low') {
+        warnings.push(`Page ${page} was a low-confidence match — worth checking.`)
+      }
+    }
+
+    const groups = []
+    for (const c of candidates) {
+      const pages = []
+      for (let p = 1; p <= pageCount; p++) if (pageToDoc.get(p) === c.doc_id) pages.push(p)
+      if (pages.length > 0) groups.push({ ...c, pages })
+    }
+
+    const unassigned = []
+    for (let p = 1; p <= pageCount; p++) if (!pageToDoc.has(p)) unassigned.push(p)
+    if (unassigned.length > 0) {
+      warnings.push(`${unassigned.length} page(s) could not be matched to a document: ` +
+                    `${unassigned.join(', ')}. Assign or drop them before continuing.`)
+    }
+
+    const missing = candidates.filter(c => !groups.some(g => g.doc_id === c.doc_id))
+    if (missing.length > 0 && groups.length > 0) {
+      warnings.push(`No pages were found for: ${missing.map(m => `${m.label} ${m.contract_num}-${m.borough}`).join('; ')}. ` +
+                    `That is expected if this stack only covers some of the outstanding forms.`)
+    }
+
+    res.json({ page_count: pageCount, candidates, groups, unassigned_pages: unassigned, warnings })
+  } catch (err) {
+    console.error('POST /api/approvals/month-end/split-preview error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/approvals/month-end/commit
+ * Multipart: file — the same PDF; assignments — JSON [{ doc_id, pages: [1,2] }].
+ *
+ * Splits the stack into one PDF per document and files each into the
+ * approvals queue. The client re-sends the file it already holds rather
+ * than the server caching bytes between the two calls — no server-side
+ * state to expire, leak, or get out of sync with what the admin reviewed.
+ */
+app.post('/api/approvals/month-end/commit', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' })
+
+    let assignments
+    try {
+      assignments = JSON.parse(req.body?.assignments || '[]')
+    } catch {
+      return res.status(400).json({ error: 'assignments was not valid JSON' })
+    }
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      return res.status(400).json({ error: 'No page assignments supplied' })
+    }
+
+    const { PDFDocument } = await import('pdf-lib')
+    const srcDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true })
+    const pageCount = srcDoc.getPageCount()
+
+    const uploaded = []
+    const errors   = []
+
+    for (const group of assignments) {
+      const docId = String(group?.doc_id || '').trim()
+      // Sort and de-duplicate: page order in the split PDF should follow
+      // the document, not the order the admin happened to click them in.
+      const pages = [...new Set((group?.pages || []).map(Number))]
+        .filter(p => Number.isInteger(p) && p >= 1 && p <= pageCount)
+        .sort((a, b) => a - b)
+      if (!docId || pages.length === 0) continue
+
+      try {
+        const out = await PDFDocument.create()
+        const copied = await out.copyPages(srcDoc, pages.map(p => p - 1))   // pdf-lib is 0-based
+        copied.forEach(pg => out.addPage(pg))
+        const bytes = Buffer.from(await out.save())
+
+        const result = await callAppsScript('upload_month_end_signed', {
+          doc_id:    docId,
+          bytes_b64: bytes.toString('base64'),
+        })
+        if (result && result.error) throw new Error(result.error)
+        uploaded.push({ doc_id: docId, pages, file_id: result.file_id, filename: result.filename })
+      } catch (e) {
+        // One bad document must not lose the others — the admin would
+        // have to re-scan the whole stack to retry.
+        console.error(`month-end commit failed for ${docId}:`, e.message)
+        errors.push({ doc_id: docId, error: e.message })
+      }
+    }
+
+    if (uploaded.length === 0) {
+      return res.status(500).json({
+        error: errors[0]?.error || 'Nothing was uploaded.',
+        errors,
+      })
+    }
+    res.json({ uploaded, errors })
+  } catch (err) {
+    console.error('POST /api/approvals/month-end/commit error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 /**
  * POST /api/waterblasting/:woId/confirm
  * Flips the "Water Blast Confirmed?" flag on the Work Order Tracker

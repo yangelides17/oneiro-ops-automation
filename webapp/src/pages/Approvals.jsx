@@ -10,6 +10,7 @@ import SignInHoursEditor from '../components/SignInHoursEditor'
 import SignInHeaderCard from '../components/SignInHeaderCard'
 import ReuploadModal from '../components/ReuploadModal'
 import ConfirmModal from '../components/ConfirmModal'
+import MonthEndUploadModal from '../components/MonthEndUploadModal'
 import { usePendingCounts } from '../lib/PendingCountsContext'
 
 // Doc types whose data-driven PDF can be rebuilt from current system data
@@ -40,8 +41,28 @@ const DOC_TYPES = [
   { value: 'production_log',    label: 'Production Log',  badge: 'Prod Log',    chip: 'bg-amber-100 text-amber-800' },
   { value: 'field_report',      label: 'CFR',             badge: 'CFR',         chip: 'bg-violet-100 text-violet-800' },
   { value: 'certified_payroll', label: 'Cert Payroll',    badge: 'Cert Payroll',chip: 'bg-emerald-100 text-emerald-800' },
+  { value: 'month_end',         label: 'Month-End',       badge: 'Month-End',   chip: 'bg-teal-100 text-teal-800' },
 ]
 const docTypeMeta = (t) => DOC_TYPES.find(x => x.value === t) || DOC_TYPES[0]
+
+// Month-end docs (Employee Utilization / Certificates) run backwards
+// through this page: they're printed, wet-signed by hand, and only then
+// scanned back in. Until that scan arrives there's no Drive file to
+// review, so the queue carries a placeholder instead — same list, same
+// selection, but an upload prompt in place of the PDF viewer.
+//
+// The synthetic file_id is namespaced so it can never collide with a real
+// Drive ID, and every code path that would hit the Drive API for a
+// selected row checks `awaiting_upload` first.
+const awaitingToItem = (a) => ({
+  ...a,
+  file_id:         `awaiting:${a.doc_id}`,
+  doc_type:        'month_end',
+  awaiting_upload: true,
+  filename:        '',
+  subtitle:        `${a.label} · ${a.contract_num}-${a.borough}`,
+  created_at:      a.downloaded_at,
+})
 
 const fmtTime = (iso) => {
   if (!iso) return ''
@@ -52,6 +73,14 @@ const fmtTime = (iso) => {
       hour: 'numeric',  minute: '2-digit',
     })
   } catch { return '' }
+}
+
+// "2026-07" → "July 2026". Month-end docs are anchored to a payroll month
+// rather than a date, so they can't share fmtTime.
+const fmtMonth = (monthIso) => {
+  const [y, m] = String(monthIso || '').split('-').map(Number)
+  if (!y || !m) return monthIso || ''
+  return new Date(y, m - 1, 1).toLocaleString(undefined, { month: 'long', year: 'numeric' })
 }
 
 export default function Approvals() {
@@ -75,7 +104,15 @@ export default function Approvals() {
       const res  = await fetch('/api/approvals')
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      const approvalsList = Array.isArray(data.approvals) ? data.approvals : []
+      // Real pending files and awaiting-upload placeholders share one
+      // list so filtering, selection, and the badge counts don't have to
+      // know the difference. Sorted FIFO on the same key the server sorts
+      // real files by — for a placeholder that's when it was downloaded.
+      const awaiting = Array.isArray(data.month_end_awaiting)
+        ? data.month_end_awaiting.map(awaitingToItem)
+        : []
+      const approvalsList = [...(Array.isArray(data.approvals) ? data.approvals : []), ...awaiting]
+        .sort((a, b) => (a.created_at || '') < (b.created_at || '') ? -1 : 1)
       setApprovals(approvalsList)
       setLoadError('')
       // Push the freshest counts into the shared context. approvals_review
@@ -178,7 +215,8 @@ export default function Approvals() {
     if (!selectedId || filtered.length < 2) return
     const idx = filtered.findIndex(a => a.file_id === selectedId)
     const next = idx >= 0 ? filtered[idx + 1] : null
-    if (!next || prefetchedRef.current.has(next.file_id)) return
+    // Placeholders have no Drive file to warm.
+    if (!next || next.awaiting_upload || prefetchedRef.current.has(next.file_id)) return
 
     const ctrl = new AbortController()
     const timer = setTimeout(() => {
@@ -202,6 +240,8 @@ export default function Approvals() {
   // Controls the Reupload modal (replace the pending PDF with a signed/
   // rescanned version).
   const [reuploadOpen, setReuploadOpen] = useState(false)
+  // Controls the month-end signed-scan upload + page-assignment modal.
+  const [monthEndUploadOpen, setMonthEndUploadOpen] = useState(false)
   // Certified Payroll: confirm before approving without an electronic
   // signature (guards against pushing a still-unsigned CP through).
   const [cpSkipConfirmOpen, setCpSkipConfirmOpen] = useState(false)
@@ -392,6 +432,52 @@ export default function Approvals() {
 
   const pendingCount = approvals?.length ?? 0
 
+  // ── Month-end: awaiting-upload placeholders ─────────────────
+  const awaitingItems = useMemo(
+    () => (approvals || []).filter(a => a.awaiting_upload),
+    [approvals])
+
+  // Re-download the blank form from the awaiting card, so the admin
+  // doesn't have to go back to Doc Status to reprint one.
+  const [downloadingDocId, setDownloadingDocId] = useState(null)
+  const downloadBlankForm = async (item) => {
+    if (!item?.doc_id || downloadingDocId) return
+    setDownloadingDocId(item.doc_id)
+    setActionError('')
+    try {
+      const res = await fetch('/api/tools/generate-month-end-doc', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ doc_id: item.doc_id }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Request failed (HTTP ${res.status})`)
+      }
+      const blob = await res.blob()
+      const cd = res.headers.get('Content-Disposition') || ''
+      const m = cd.match(/filename="?([^"]+)"?/)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = m ? m[1] : 'month-end.pdf'
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setActionError(err.message || 'Could not generate the form')
+    } finally {
+      setDownloadingDocId(null)
+    }
+  }
+
+  // After a commit the placeholders become real queue items. Refresh, then
+  // land on the first uploaded doc so it's ready to review immediately.
+  const handleMonthEndUploaded = async (uploaded) => {
+    setMonthEndUploadOpen(false)
+    await refresh()
+    const firstId = uploaded?.[0]?.file_id
+    if (firstId) setSelectedId(firstId)
+  }
+
   return (
     <div className="max-w-6xl mx-auto px-4 py-6 space-y-4">
       {/* Header */}
@@ -455,6 +541,29 @@ export default function Approvals() {
         </div>
       )}
 
+      {/* One entry point for the whole month's signed paperwork, above the
+          list rather than buried in a row — the admin usually scans the
+          stack once and files everything in a single pass. */}
+      {awaitingItems.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setMonthEndUploadOpen(true)}
+          className="w-full border-2 border-dashed border-teal-300 bg-teal-50/50 rounded-xl
+                     px-4 py-3 text-left hover:border-teal-500 transition-colors"
+        >
+          <p className="text-sm font-bold text-teal-900">
+            ⬆ Upload signed month-end docs
+            <span className="font-normal text-teal-700">
+              {' '}— {awaitingItems.length} awaiting
+            </span>
+          </p>
+          <p className="text-[11px] text-teal-700 mt-0.5">
+            Drop the whole signed stack as one PDF, or one form at a time. You confirm the
+            split before anything is filed.
+          </p>
+        </button>
+      )}
+
       {/* Two-pane layout */}
       <div className="grid grid-cols-1 md:grid-cols-[320px_1fr] gap-4">
         {/* List */}
@@ -497,7 +606,52 @@ export default function Approvals() {
             </div>
           )}
 
-          {selected && (
+          {/* Awaiting-upload placeholder — no Drive file exists yet, so
+              there is nothing to preview or approve. The whole pane is the
+              instruction for what to do next. */}
+          {selected && selected.awaiting_upload && (
+            <div className="flex-1 flex flex-col items-center justify-center text-center px-6 py-10 space-y-4">
+              <div className="text-4xl">✍️</div>
+              <div className="space-y-1">
+                <p className="text-base font-bold text-slate-800">{selected.label}</p>
+                <p className="text-sm text-slate-600">
+                  <span className="font-mono">{selected.contract_num}</span>-{selected.borough}
+                  {selected.contractor && <> · {selected.contractor}</>}
+                </p>
+                <p className="text-xs text-slate-500">Month of {fmtMonth(selected.month)}</p>
+              </div>
+              <p className="text-sm text-slate-500 max-w-md">
+                Downloaded {fmtTime(selected.downloaded_at)}. This form has to be signed by hand —
+                print it, sign it, then upload the scan here to approve and archive it.
+              </p>
+              {actionError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 text-xs
+                                px-3 py-2 rounded-lg">
+                  {actionError}
+                </div>
+              )}
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => downloadBlankForm(selected)}
+                  disabled={downloadingDocId === selected.doc_id}
+                  className="text-xs font-bold px-3 py-2 rounded-lg bg-slate-100 text-slate-700
+                             hover:bg-slate-200 transition-colors disabled:opacity-50"
+                >
+                  {downloadingDocId === selected.doc_id ? 'Generating…' : 'Download blank form'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMonthEndUploadOpen(true)}
+                  className="text-xs font-bold px-4 py-2 rounded-lg bg-navy text-white hover:opacity-90"
+                >
+                  Upload signed copy
+                </button>
+              </div>
+            </div>
+          )}
+
+          {selected && !selected.awaiting_upload && (
             <>
               <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
                 <div className="min-w-0 flex-1">
@@ -668,6 +822,16 @@ export default function Approvals() {
         />
       )}
 
+      {/* Month-end signed-scan upload. Proposes a page→document split and
+          files nothing until the admin confirms it. */}
+      {monthEndUploadOpen && (
+        <MonthEndUploadModal
+          candidates={awaitingItems}
+          onClose={() => setMonthEndUploadOpen(false)}
+          onUploaded={handleMonthEndUploaded}
+        />
+      )}
+
       {/* Reupload modal — replace the pending PDF with a signed/rescanned
           version. Sign-ins get scan + PDF; other doc types get PDF only. */}
       {reuploadOpen && selected && (
@@ -722,24 +886,32 @@ export default function Approvals() {
 // ── List row ──────────────────────────────────────────────────
 function ApprovalRow({ item, active, onClick }) {
   const meta = docTypeMeta(item.doc_type)
+  const awaiting = !!item.awaiting_upload
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`w-full text-left border-b border-slate-100 px-3 py-3 transition-colors
+      className={`w-full text-left border-b px-3 py-3 transition-colors
+                  ${awaiting ? 'border-b-slate-100 border-l-4 border-l-teal-400' : 'border-slate-100'}
                   ${active ? 'bg-navy/5' : 'hover:bg-slate-50'}`}
     >
       <div className="flex items-start justify-between gap-2 mb-1">
         <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${meta.chip}`}>
-          {meta.badge}
+          {awaiting ? '⬆ Needs upload' : meta.badge}
         </span>
         <span className="text-[10px] text-slate-400 flex-shrink-0">{fmtTime(item.created_at)}</span>
       </div>
       <p className="text-sm font-semibold text-slate-800 truncate">
         {item.subtitle || item.filename}
       </p>
-      {item.subtitle && item.filename && item.subtitle !== item.filename.replace(/\.pdf$/i, '') && (
-        <p className="text-[11px] text-slate-400 truncate">{item.filename}</p>
+      {awaiting ? (
+        <p className="text-[11px] text-teal-700 truncate">
+          Downloaded {fmtTime(item.downloaded_at)} · needs a signed copy
+        </p>
+      ) : (
+        item.subtitle && item.filename && item.subtitle !== item.filename.replace(/\.pdf$/i, '') && (
+          <p className="text-[11px] text-slate-400 truncate">{item.filename}</p>
+        )
       )}
     </button>
   )

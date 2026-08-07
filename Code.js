@@ -1583,6 +1583,12 @@ function _processApprovedDocumentsImpl_() {
       if (match) woId = match[0];
     } else if (fileName.includes('Certified_Payroll')) {
       docType = 'Certified Payroll';
+    } else if (_parseMonthEndSignedFilename_(fileName)) {
+      // Wet-signed month-end scan: "<KEY>_<YYYY-MM>_<cn>_<bor>_<prime>_SIGNED.pdf".
+      // Matched by parsing rather than a substring test so a file that
+      // can't be resolved back to a doc_id falls through to Unknown and
+      // lands in Archive Errors instead of being filed on a guess.
+      docType = 'Month-End';
     } else if (fileName.includes('SignIn') || fileName.includes('Sign_In') || fileName.includes('Sign-In')) {
       docType = 'Sign-In';
       // New multi-WO pattern: SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
@@ -2285,6 +2291,80 @@ function archiveDocument_(file, docType, woId, ss) {
       }
 
       return { success: true, doc_type: 'Certified Payroll', wo_ids: wos.map(w => w.id) };
+
+    } else if (docType === 'Month-End') {
+      // Wet-signed Employee Utilization / Certificates scan. Filed at the
+      // CONTRACT level only — these cover a whole month for a (contract,
+      // borough, prime), not any individual work order, so unlike PL/SI/CP
+      // there is deliberately no per-WO fan-out.
+      //
+      //   <Contractor>/<cn> - <Borough>/Employee Utilization/
+      //   <Contractor>/<cn> - <Borough>/Certificates/
+      //
+      // No billing remap either: month-end forms are filed against the
+      // contract printed on the form, which is the doc_id's own tuple.
+      const p = _parseMonthEndSignedFilename_(cleanName);
+      if (!p) {
+        return { success: false, reason: `Could not parse month-end doc_id from filename '${cleanName}'` };
+      }
+      const meDoc = _MONTH_END_BY_KEY_[p.key];
+      if (!meDoc) {
+        return { success: false, reason: `Unknown month-end doc key '${p.key}'` };
+      }
+
+      // Contractor: the Doc Lifecycle Log row carries the display name,
+      // written when the blank was downloaded. The doc_id only carries a
+      // slug, and filing under "MetroExpress" would create a folder
+      // alongside the real "Metro Express" one.
+      const meLog = _readDocLifecycle_(ss);
+      const meRow = meLog.byId[p.doc_id];
+      let contractor = (meRow && meRow.contractor) || '';
+      if (!contractor) {
+        // Fallback: match the doc_id's slug against Contract Lookup's
+        // prime list. Two primes can share a (contract, borough), so
+        // match on the slug rather than taking the first entry.
+        const clSheet = ss.getSheetByName('Contract Lookup');
+        const clRow = clSheet
+          ? clSheet.getDataRange().getValues()
+              .find(r => String(r[0]).split('/')[0].trim() === p.contractNum && String(r[1]) === p.borough)
+          : null;
+        const primes = clRow ? String(clRow[5] || '').split(',').map(s => s.trim()).filter(Boolean) : [];
+        contractor = primes.find(c => _slugify_(c) === p.contractor) || primes[0] || '';
+      }
+      if (!contractor) {
+        return {
+          success: false,
+          reason: `No contractor found for ${p.contractNum}/${p.borough} — the Doc Lifecycle Log row has no prime and Contract Lookup has no matching entry.`
+        };
+      }
+
+      const meContractFolder = getOrCreateSubfolder_(
+        getOrCreateSubfolder_(archiveRoot, contractor),
+        `${p.contractNum} - ${getBoroughName_(p.borough)}`
+      );
+      const meCopy = file.makeCopy(cleanName,
+        getOrCreateSubfolder_(meContractFolder, meDoc.doc_type));
+      Logger.log(`📁 Archived ${meDoc.label} → ${contractor}/${p.contractNum} - ${getBoroughName_(p.borough)}/${meDoc.doc_type}`);
+
+      try {
+        _upsertDocLifecycleRow_(ss, {
+          doc_id:       p.doc_id,
+          doc_type:     meDoc.doc_type,
+          anchor:       p.monthIso + '-01',
+          contractor:   contractor,
+          contract_num: p.contractNum,
+          borough:      p.borough,
+          done:         true,
+          file_id:      meCopy.getId(),
+        });
+      } catch (e) {
+        Logger.log('⚠️ archiveDocument_ Month-End: Doc Lifecycle Log upsert failed: ' + e.message);
+      }
+
+      // Empty wo_ids on purpose — the caller's _setDocLifecycleFlags_ is a
+      // no-op for an empty list, which is right: these aren't WO docs and
+      // there is no WO Tracker column to flip.
+      return { success: true, doc_type: 'Month-End', wo_ids: [] };
 
     } else {
       return { success: false, reason: `Unknown docType '${docType}' — no archive path defined` };
@@ -4219,6 +4299,8 @@ function doPost(e) {
       return handleBuildMonthEndFill_(body);
     } else if (action === 'build_month_end_fill_all') {
       return handleBuildMonthEndFillAll_(body);
+    } else if (action === 'upload_month_end_signed') {
+      return handleUploadMonthEndSigned_(body);
     } else if (action === 'process_approved_documents') {
       return handleProcessApprovedDocuments_(body);
     } else if (action === 'list_employees') {
@@ -4554,6 +4636,12 @@ const APPROVAL_SUBFOLDERS_ = {
   production_log:    'Production Logs',
   field_report:      'Field Reports',
   certified_payroll: 'Certified Payroll',
+  // Signed month-end scans (Employee Utilization / Certificates). Unlike
+  // the others nothing generates into this folder — files arrive only by
+  // upload, after the admin has wet-signed a downloaded blank. Listing it
+  // here is what gets them into the normal approvals queue, viewer,
+  // Reupload action, and approve → archive path.
+  month_end:         'Month-End Docs',
 };
 
 // Inverse lookup helper — given a subfolder name, return the doc_type.
@@ -4590,6 +4678,18 @@ function _approvalSubtitleFromFilename_(docType, filename) {
     }
     return s.replace(/\.pdf$/i, '');
   }
+  if (docType === 'month_end') {
+    // e.g. "EU_2026-07_84125MBTP701_BK_MetroExpress_SIGNED.pdf"
+    //   → "Employee Utilization · 84125MBTP701-BK · Jul 2026"
+    const p = _parseMonthEndSignedFilename_(s);
+    if (p) {
+      const label = (_MONTH_END_BY_KEY_[p.key] || {}).label || p.key;
+      const [yy, mm] = p.monthIso.split('-').map(Number);
+      const month = Utilities.formatDate(new Date(yy, mm - 1, 1), CONFIG.TIMEZONE, 'MMM yyyy');
+      return `${label} · ${p.contractNum}-${p.borough} · ${month}`;
+    }
+    return s.replace(/\.pdf$/i, '');
+  }
   return s.replace(/\.pdf$/i, '');
 }
 
@@ -4619,6 +4719,10 @@ function handleListPendingApprovals_(body) {
 function _buildPendingApprovalsPayload_(needsReviewId) {
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
   const approvals    = [];
+  // doc_ids whose signed scan is already sitting in the queue. Collected
+  // during the walk we're doing anyway so the awaiting-upload list can
+  // suppress cards for docs that have already come back.
+  const uploadedMonthEndIds = {};
 
   Object.entries(APPROVAL_SUBFOLDERS_).forEach(([docType, subName]) => {
     const sub = reviewFolder.getFoldersByName(subName);
@@ -4641,6 +4745,10 @@ function _buildPendingApprovalsPayload_(needsReviewId) {
         created_at: f.getDateCreated().toISOString(),
         size:       f.getSize(),
       });
+      if (docType === 'month_end') {
+        const p = _parseMonthEndSignedFilename_(filename);
+        if (p) uploadedMonthEndIds[p.doc_id] = true;
+      }
     }
   });
 
@@ -4652,7 +4760,65 @@ function _buildPendingApprovalsPayload_(needsReviewId) {
   // next to the "Process Approved Docs Now" worker button.
   let approved_docs_pending = null;
   try { approved_docs_pending = _countApprovedDocsPending_(); } catch (e) {}
-  return { approvals, approved_docs_pending };
+  // Month-end docs that are out for wet signature. These have no Drive
+  // file yet — they render as placeholder cards prompting an upload.
+  // Wrapped like the count above so a Doc Lifecycle Log problem can't
+  // sink the whole approvals list.
+  let month_end_awaiting = [];
+  try { month_end_awaiting = _listMonthEndAwaitingUpload_(uploadedMonthEndIds); } catch (e) {
+    Logger.log('⚠️ _buildPendingApprovalsPayload_: awaiting-upload list failed: ' + e.message);
+  }
+  return { approvals, approved_docs_pending, month_end_awaiting };
+}
+
+
+// ── Month-end docs awaiting their signed upload ───────────────
+//
+// A month-end doc (Employee Utilization / Certificates) has to be
+// printed, wet-signed, and scanned back in, so there is no Drive file to
+// review until the admin uploads one. These rows drive the placeholder
+// cards on the Approvals page: "downloaded on X, still needs a signed
+// copy".
+//
+// A doc qualifies when it has been downloaded, isn't Done yet, and has
+// no signed scan already sitting in the review queue. Not-yet-downloaded
+// docs deliberately don't appear — Doc Status already prompts for those,
+// and keying off the download stamp keeps this to a single sheet read
+// instead of recomputing which contracts worked the month.
+//
+// `uploadedIds` is the doc_id set collected while walking the review
+// folders, so the dedupe costs no extra Drive calls.
+function _listMonthEndAwaitingUpload_(uploadedIds) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const log = _readDocLifecycle_(ss);
+  const out = [];
+
+  (log.rows || []).forEach(r => {
+    if (!r.downloaded_at) return;                       // not out for signature
+    if (r.done) return;                                 // archived or closed by hand
+    if (uploadedIds && uploadedIds[r.doc_id]) return;   // signed scan already queued
+    const p = _parseMonthEndDocId_(r.doc_id);
+    if (!p) return;                                     // defensive: not a month-end row
+
+    const downloadedAt = (r.downloaded_at instanceof Date && !isNaN(r.downloaded_at.getTime()))
+      ? r.downloaded_at.toISOString()
+      : String(r.downloaded_at);
+
+    out.push({
+      doc_id:        r.doc_id,
+      key:           p.key,                                          // EU | CERT
+      label:         (_MONTH_END_BY_KEY_[p.key] || {}).label || p.key,
+      month:         p.monthIso,                                     // YYYY-MM
+      contractor:    r.contractor   || '',
+      contract_num:  r.contract_num || p.contractNum,
+      borough:       r.borough      || p.borough,
+      downloaded_at: downloadedAt,
+    });
+  });
+
+  // FIFO, matching the approvals list: longest-waiting first.
+  out.sort((a, b) => a.downloaded_at < b.downloaded_at ? -1 : 1);
+  return out;
 }
 
 
@@ -4671,7 +4837,8 @@ function _countDocsNeedingReview_() {
   if (!needsReviewId) throw new Error('NEEDS_REVIEW_ID not set');
   const reviewFolder = DriveApp.getFolderById(needsReviewId);
   let n = 0;
-  Object.entries(APPROVAL_SUBFOLDERS_).forEach(([_docType, subName]) => {
+  const uploadedMonthEndIds = {};
+  Object.entries(APPROVAL_SUBFOLDERS_).forEach(([docType, subName]) => {
     const sub = reviewFolder.getFoldersByName(subName);
     if (!sub.hasNext()) return;
     const files = sub.next().getFiles();
@@ -4680,8 +4847,18 @@ function _countDocsNeedingReview_() {
       if (f.isTrashed()) continue;
       if (f.getMimeType() !== 'application/pdf') continue;
       n++;
+      if (docType === 'month_end') {
+        const p = _parseMonthEndSignedFilename_(f.getName());
+        if (p) uploadedMonthEndIds[p.doc_id] = true;
+      }
     }
   });
+  // Month-end docs out for signature are real outstanding work even
+  // though no file exists yet, so the nav badge counts them too. Failure
+  // only under-counts the badge — never breaks the other counts.
+  try { n += _listMonthEndAwaitingUpload_(uploadedMonthEndIds).length; } catch (e) {
+    Logger.log('⚠️ _countDocsNeedingReview_: awaiting-upload count failed: ' + e.message);
+  }
   return n;
 }
 
@@ -5272,6 +5449,83 @@ function handleReuploadPendingApproval_(body) {
     return jsonResponse_({ success: true, file_id: fileId, filename: filename });
   } catch (err) {
     Logger.log(`❌ handleReuploadPendingApproval_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
+    return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
+  }
+}
+
+
+// ── action: upload_month_end_signed ───────────────────────────
+//
+// Writes a wet-signed month-end scan into Docs Needing Review /
+// Month-End Docs, where it joins the normal approvals queue.
+//
+// This is the inverse of every other doc type: nothing generates a file
+// here, because the form has to leave the building to be signed. The
+// admin downloads a blank from Doc Status, signs it by hand, and uploads
+// the scan — only then is there something to review and approve.
+//
+// Named `<doc_id>_SIGNED.pdf` so the filename carries the doc's identity
+// (see _monthEndSignedFilename_); archiveDocument_ parses it back out to
+// resolve the contract folder, exactly as the CP and Sign-In branches do.
+//
+// body.data = { doc_id, bytes_b64 }
+function handleUploadMonthEndSigned_(body) {
+  const d      = body.data || {};
+  const docId  = String(d.doc_id || '').trim();
+  const b64    = String(d.bytes_b64 || '');
+  if (!docId || !b64) {
+    return jsonResponse_({ error: 'Missing required fields: doc_id, bytes_b64' }, 400);
+  }
+  // Reject anything that isn't a real month-end doc_id before it reaches
+  // Drive — a malformed name here would archive to the wrong contract.
+  if (!_parseMonthEndDocId_(docId)) {
+    return jsonResponse_({ error: 'Not a month-end doc_id: ' + docId }, 400);
+  }
+
+  const needsReviewId = PropertiesService.getScriptProperties().getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) return jsonResponse_({ error: 'NEEDS_REVIEW_ID not set' }, 500);
+
+  let step = 'init';
+  try {
+    step = 'resolve folder';
+    const folder = getOrCreateSubfolder_(
+      DriveApp.getFolderById(needsReviewId), APPROVAL_SUBFOLDERS_.month_end);
+
+    step = 'trash existing';
+    // Re-uploading a corrected scan replaces the previous one rather than
+    // leaving two same-named files for the admin to tell apart.
+    const filename = _monthEndSignedFilename_(docId);
+    const existing = folder.getFilesByName(filename);
+    while (existing.hasNext()) existing.next().setTrashed(true);
+
+    step = 'createFile';
+    const blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/pdf', filename);
+    const file = _withDriveRetry_('createFile month-end signed', () => folder.createFile(blob));
+
+    try {
+      SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
+        .getSheetByName('Automation Log')
+        .appendRow([
+          new Date(), 'Approvals', 'Month-End Uploaded', filename,
+          'Signed month-end scan uploaded via webapp', 'Pending review', '',
+          'Approve to archive into the contract folder'
+        ]);
+    } catch (logErr) {
+      Logger.log('⚠️ Automation Log write failed on month-end upload: ' + logErr);
+    }
+
+    // The doc moves from an awaiting-upload placeholder to a real queue
+    // item, so both halves of the approvals payload are now stale.
+    _invalidateCacheKeys_([]);
+
+    return jsonResponse_({
+      success:  true,
+      file_id:  file.getId(),
+      filename: filename,
+      doc_id:   docId,
+    });
+  } catch (err) {
+    Logger.log(`❌ handleUploadMonthEndSigned_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
   }
 }
@@ -7285,6 +7539,10 @@ const DOC_LIFECYCLE_HEADERS_ = [
   'Done At',          // 10 timestamp
   'Sent At',          // 11 timestamp
   'Notes',            // 12 free-form
+  'Downloaded At',    // 13 month-end docs only — stamped when the blank
+                      //    form is generated for download. Marks the doc as
+                      //    "out for wet signature", which is what puts an
+                      //    awaiting-upload card on the Approvals page.
 ];
 
 /**
@@ -7313,6 +7571,47 @@ function setupDocLifecycleLog() {
   Logger.log(createdNew
     ? '✅ setupDocLifecycleLog: created sheet "' + DOC_LIFECYCLE_LOG_SHEET_ + '"'
     : '↻ setupDocLifecycleLog: sheet already exists; headers reconciled');
+}
+
+/**
+ * Adds the 'Downloaded At' column (13) the month-end upload flow needs.
+ *
+ * Separate from setupDocLifecycleLog on purpose: that function rewrites
+ * the whole header row and reapplies data validations, which is more
+ * side effect than an existing deployment should take on just to gain
+ * one column. This only touches the one cell, and only when it's blank.
+ *
+ * Idempotent — safe to re-run.
+ */
+function setupMonthEndDocs() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!sheet) {
+    Logger.log('❌ setupMonthEndDocs: "' + DOC_LIFECYCLE_LOG_SHEET_ +
+               '" not found — run setupDocLifecycleLog first');
+    return;
+  }
+  const col = DOC_LIFECYCLE_HEADERS_.indexOf('Downloaded At') + 1;   // 1-indexed
+  const cell = sheet.getRange(1, col);
+  if (String(cell.getValue() || '').trim() === 'Downloaded At') {
+    Logger.log('↻ setupMonthEndDocs: "Downloaded At" column already present (col ' + col + ')');
+    return;
+  }
+  cell.setValue('Downloaded At').setFontWeight('bold');
+  Logger.log('✅ setupMonthEndDocs: added "Downloaded At" column at ' + col);
+
+  // Signed month-end scans land in a fifth Docs Needing Review subfolder so
+  // they flow through the existing approvals queue. getOrCreateSubfolder_
+  // would create it lazily on first upload, but creating it here means the
+  // folder is visible in Drive before anyone uploads anything.
+  const needsReviewId = PropertiesService.getScriptProperties().getProperty('NEEDS_REVIEW_ID');
+  if (!needsReviewId) {
+    Logger.log('⚠️ setupMonthEndDocs: NEEDS_REVIEW_ID not set — skipped creating the ' +
+               APPROVAL_SUBFOLDERS_.month_end + ' folder');
+    return;
+  }
+  getOrCreateSubfolder_(DriveApp.getFolderById(needsReviewId), APPROVAL_SUBFOLDERS_.month_end);
+  Logger.log('✅ setupMonthEndDocs: "' + APPROVAL_SUBFOLDERS_.month_end + '" review folder ready');
 }
 
 /**
@@ -7478,6 +7777,48 @@ function _parseMonthEndDocId_(docId) {
   return { key: m[1], monthIso: m[2], contractNum: m[3], borough: m[4], contractor: m[5] || '' };
 }
 
+// ── Signed month-end scans: filename ⇄ doc_id ─────────────────────
+//
+// A wet-signed month-end scan is stored as `<doc_id>_SIGNED.pdf`, so the
+// filename IS the identity — no separate lookup table, and the archive
+// step recovers the (key, month, contract, borough, prime) tuple straight
+// from the name the same way the CP and Sign-In branches do.
+const MONTH_END_SIGNED_SUFFIX_ = '_SIGNED';
+
+function _monthEndSignedFilename_(docId) {
+  return String(docId || '').trim() + MONTH_END_SIGNED_SUFFIX_ + '.pdf';
+}
+
+/**
+ * Inverse of _monthEndSignedFilename_. Returns the _parseMonthEndDocId_
+ * fields plus `doc_id`, or null if this isn't a signed month-end scan.
+ *
+ * The suffix MUST come off before parsing, and the failure mode depends
+ * on the prime's slug (verified against _parseMonthEndDocId_'s
+ * `(.+)_([A-Z]{1,2})(?:_([A-Za-z0-9]+))?`):
+ *
+ *   - Usual multi-character slug ("...BK_MetroExpress_SIGNED"): no match
+ *     at all, because "_SIGNED" can't fill the optional trailing group
+ *     AND leave a 1-2 letter borough. Nothing parses, nothing archives.
+ *   - NO slug ("...84125MBTP701_BK_SIGNED") — which is what
+ *     _monthEndDocId_ produces whenever the prime couldn't be resolved —
+ *     parses "SIGNED" as the contractor and "BK" as the borough while
+ *     folding the real borough into the contract number. That one is
+ *     silent and wrong, which is why this strips rather than trusting
+ *     the regex to reject.
+ */
+function _parseMonthEndSignedFilename_(filename) {
+  const stem = String(filename || '').replace(/\.pdf$/i, '');
+  if (stem.slice(-MONTH_END_SIGNED_SUFFIX_.length).toUpperCase() !== MONTH_END_SIGNED_SUFFIX_) {
+    return null;
+  }
+  const docId = stem.slice(0, -MONTH_END_SIGNED_SUFFIX_.length);
+  const p = _parseMonthEndDocId_(docId);
+  if (!p) return null;
+  p.doc_id = docId;
+  return p;
+}
+
 /**
  * Build a (contractNum|boroughCode → Contract ID / Reg #) map from the
  * Contract Lookup sheet. The Contract ID is a distinct identifier the
@@ -7583,6 +7924,9 @@ function _readDocLifecycle_(ss) {
       done_at:      r[10] || '',
       sent_at:      r[11] || '',
       notes:        String(r[12] || '').trim(),
+      // Month-end docs only. Blank on every other doc type, and blank on
+      // rows written before setupMonthEndDocs ran.
+      downloaded_at: r[13] || '',
     };
     rows.push(obj);
     byId[id] = obj;
@@ -7637,6 +7981,7 @@ function _upsertDocLifecycleRow_(ss, payload) {
       payload.done ? now : '',
       payload.sent ? now : '',
       payload.notes || '',
+      payload.downloaded_at || '',
     ];
     sheet.appendRow(row);
     return;
@@ -7690,6 +8035,7 @@ function _upsertDocLifecycleRow_(ss, payload) {
   }
   if (payload.file_id    !== undefined) updates.push({ col: 10, val: payload.file_id });
   if (payload.notes      !== undefined) updates.push({ col: 13, val: payload.notes });
+  if (payload.downloaded_at !== undefined) updates.push({ col: 14, val: payload.downloaded_at });
 
   updates.forEach(u => sheet.getRange(foundRow, u.col).setValue(u.val));
 }
@@ -8083,7 +8429,115 @@ function _buildMonthEndFillSpec_(docId) {
     filename:         filename,
     fields:           fields,
     warnings:         warnings,
+    // Carried out for the download stamp (see _stampMonthEndDownloaded_).
+    // `meta` was already resolved above, so handing it back costs nothing
+    // — re-deriving it in the caller would repeat a Work Day Log scan.
+    // Contractor is only trustworthy when the WDL actually matched; the
+    // slug fallback used for the filename would create a folder named
+    // "MetroExpress" instead of "Metro Express" at archive time.
+    lifecycle_meta: meta ? {
+      doc_type:     meta.doc_type,
+      anchor:       meta.anchor,
+      contractor:   meta.contractor || '',
+      contract_num: meta.contract_num,
+      borough:      meta.borough,
+      wo_ids:       meta.wo_ids || [],
+    } : null,
   };
+}
+
+/**
+ * Mark month-end docs as "downloaded" — i.e. out for wet signature.
+ *
+ * This is what puts an awaiting-upload card on the Approvals page
+ * (_listMonthEndAwaitingUpload_ keys off it), so it runs on the download
+ * path rather than after the worker renders: stamping at spec-build time
+ * costs one round trip instead of two, and a fill that fails afterwards
+ * only means the card shows up slightly early.
+ *
+ * Batched deliberately. "Generate All" builds a spec per (contract,
+ * borough, prime) pair, and stamping inside the spec builder would read
+ * the whole Doc Lifecycle Log once per doc. One read for the batch
+ * instead — the sheet reads are the expensive part here, not the writes.
+ *
+ * items: [{ doc_id, meta }]. Already-stamped docs are skipped so a
+ * re-download neither costs a write nor resets the original date.
+ */
+function _stampMonthEndDownloaded_(ss, items) {
+  const list = (items || []).filter(it => it && it.doc_id);
+  if (list.length === 0) return;
+  const sheet = ss.getSheetByName(DOC_LIFECYCLE_LOG_SHEET_);
+  if (!sheet) {
+    Logger.log('⚠️ _stampMonthEndDownloaded_: Doc Lifecycle Log not found — run setupDocLifecycleLog');
+    return;
+  }
+  const col = DOC_LIFECYCLE_HEADERS_.indexOf('Downloaded At') + 1;   // 1-indexed
+  const now = new Date();
+
+  const data = sheet.getDataRange().getValues();
+  const rowByDocId = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][0] || '').trim();
+    if (id && !rowByDocId[id]) rowByDocId[id] = i + 1;   // first match wins, as elsewhere
+  }
+
+  let changed = false;
+  const newRows = [];
+  const seenNew = {};   // guard against the same doc_id twice in one batch
+
+  list.forEach(it => {
+    const rowNum = rowByDocId[it.doc_id];
+    if (rowNum) {
+      // Column may be absent on a sheet where setupMonthEndDocs hasn't run;
+      // setValue extends the row rather than erroring, which is fine — the
+      // header just reads blank until the setup function is run.
+      if (!data[rowNum - 1][col - 1]) {
+        sheet.getRange(rowNum, col).setValue(now);
+        changed = true;
+      }
+      return;
+    }
+    if (seenNew[it.doc_id]) return;
+    seenNew[it.doc_id] = true;
+    changed = true;
+
+    // No row yet — the normal case. Month-end rows are otherwise only
+    // created by a manual Mark Done or by archiving, and this is usually
+    // the first thing that happens to the doc. Carry the metadata the
+    // archive step needs to resolve the contractor's Drive folder.
+    //
+    // Built inline rather than via _upsertDocLifecycleRow_ because that
+    // re-reads the whole sheet per call — which for a first-ever
+    // "Generate All" would mean one full read per document. Column order
+    // follows DOC_LIFECYCLE_HEADERS_.
+    const m = it.meta || {};
+    newRows.push([
+      it.doc_id,
+      m.doc_type || '',
+      m.anchor   || '',
+      m.contractor || '',
+      String(m.contract_num || '').split('/')[0].trim(),
+      m.borough || '',
+      Array.isArray(m.wo_ids) ? m.wo_ids.filter(Boolean).join(', ') : '',
+      '',    // Done
+      '',    // Sent
+      '',    // Drive File ID
+      '',    // Done At
+      '',    // Sent At
+      '',    // Notes
+      now,   // Downloaded At
+    ]);
+  });
+
+  if (newRows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, DOC_LIFECYCLE_HEADERS_.length)
+         .setValues(newRows);
+  }
+
+  // The Approvals payload derives its awaiting-upload cards from these
+  // rows, so its cached copy is now stale. Only on an actual change —
+  // re-downloading an already-stamped form shouldn't dump every cache.
+  if (changed) _invalidateCacheKeys_([]);
 }
 
 /**
@@ -8097,6 +8551,15 @@ function handleBuildMonthEndFill_(body) {
   try {
     const spec = _buildMonthEndFillSpec_(docId);
     if (spec.error) return jsonResponse_({ error: spec.error }, 400);
+    // Mark it out for signature so the Approvals page grows an
+    // awaiting-upload card. Never fatal — a failed stamp costs the admin
+    // a placeholder, not the document they asked to download.
+    try {
+      _stampMonthEndDownloaded_(SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID),
+                                [{ doc_id: docId, meta: spec.lifecycle_meta }]);
+    } catch (e) {
+      Logger.log('⚠️ build_month_end_fill: download stamp failed for ' + docId + ': ' + e.message);
+    }
     // Note: the worker resolves the actual template by doc_kind, so a blank
     // template_file_id here is not fatal (it's only a forward-compat hint).
     return jsonResponse_(spec);
@@ -8129,10 +8592,12 @@ function handleBuildMonthEndFillAll_(body) {
     }
 
     const byKind = {};   // doc_kind -> [ { fields } ]
+    const stamps = [];   // docs that built cleanly → mark out for signature
     docIds.forEach(docId => {
       const spec = _buildMonthEndFillSpec_(docId);
       if (spec.error || !spec.doc_kind) return;
       (byKind[spec.doc_kind] = byKind[spec.doc_kind] || []).push({ fields: spec.fields });
+      stamps.push({ doc_id: docId, meta: spec.lifecycle_meta });
     });
 
     const nameByKind = {
@@ -8145,6 +8610,14 @@ function handleBuildMonthEndFillAll_(body) {
       items:             byKind[kind],
     }));
     if (groups.length === 0) return jsonResponse_({ error: 'Nothing to generate' }, 400);
+
+    // One batched stamp for the whole month — see _stampMonthEndDownloaded_
+    // for why this isn't done per-doc inside the loop above.
+    try {
+      _stampMonthEndDownloaded_(SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID), stamps);
+    } catch (e) {
+      Logger.log('⚠️ build_month_end_fill_all: download stamp failed: ' + e.message);
+    }
 
     return jsonResponse_({ groups: groups, zip_name: 'Month_End_Docs_' + monthLabel + '_' + yearLabel + '.zip' });
   } catch (err) {

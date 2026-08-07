@@ -784,8 +784,13 @@ function PendingActionButton({ item, onMark }) {
 }
 
 // ── Generate button (PL/CP open a modal; EU/CERT fill + download) ─────
+// Month-end docs read "Download" rather than "Generate": the download is
+// the start of a wet-signature round trip, not the end of the task. It
+// also queues an upload placeholder on the Approvals page — see
+// _stampMonthEndDownloaded_ in Code.js.
 function PendingGenerateButton({ item, onGenerate }) {
   const [busy, setBusy] = useState(false)
+  const isMonthEnd = isMonthEndItem(item)
   const handle = async () => {
     if (busy) return
     setBusy(true)
@@ -796,9 +801,12 @@ function PendingGenerateButton({ item, onGenerate }) {
       type="button"
       onClick={handle}
       disabled={busy}
+      title={isMonthEnd
+        ? 'Download the blank form to print and sign. Upload the signed copy on the Approvals page.'
+        : undefined}
       className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded border transition-all flex-shrink-0 min-w-[80px] text-center bg-green-500 text-white border-green-500 hover:bg-green-600 ${busy ? 'opacity-60 cursor-wait' : ''}`}
     >
-      {busy ? '…' : 'Generate'}
+      {busy ? '…' : (isMonthEnd ? 'Download' : 'Generate')}
     </button>
   )
 }
@@ -858,6 +866,13 @@ function PendingList({ kind, pending, loading, onMark, onGenerate }) {
                   <> · <span className="font-semibold text-slate-600">{it.crew_chief}</span></>
                 )}
               </p>
+              {/* Month-end forms are signed by hand, so downloading is only
+                  half the job — say where the other half happens. */}
+              {isMonthEndItem(it) && (
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Download → sign → upload on the Approvals page
+                </p>
+              )}
             </div>
             <div className="flex gap-1.5 flex-shrink-0 items-center">
               {canGenerateForItem(it) && (
