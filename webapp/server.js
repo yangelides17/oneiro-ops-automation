@@ -2799,15 +2799,21 @@ app.listen(PORT, () => {
 // moment the machine sleeps, and the whole problem is that you cannot
 // summon these on demand.
 //
-// Alternates two actions so the sample covers both shapes:
-//   ping           — zero handler work; isolates the platform floor
-//   get_active_wos — a full-sheet read; where the latency variance and
-//                    the long hangs have actually shown up
+// Rotates three actions, chosen to span very different handler shapes so
+// that if failure modes differ BY HANDLER the sample will show it:
+//   ping                 — zero handler work, no service calls at all;
+//                          isolates the platform floor
+//   get_active_wos       — full-sheet SpreadsheetApp read; where the
+//                          latency variance lives (775ms p50, 6.1s max)
+//   get_drive_file_bytes — DriveApp blob + base64 of a ~3.9MB file; the
+//                          heaviest payload in the app and the action
+//                          that failed most in the original reports.
+//                          Also the only one of the three that goes
+//                          through _withDriveRetry_.
 //
-// Cost is deliberately trivial: one execution per interval (default
-// 3 min = 0.33/min) against a ~3.7/min steady-state baseline. Failures
-// surface through the normal [AS] FAIL# path, so nothing extra is
-// needed to read them.
+// Cost: one execution per interval (default 3 min), so each action fires
+// every ~9 min, against a ~3.7/min steady-state baseline. The bytes
+// probe pulls ~3.9MB per hit (~26MB/hr) — worth knowing, still small.
 //
 // REMOVE THIS once the failure mode is characterised. Set
 // DIAG_PROBE_MS=0 in Railway to switch it off without a deploy.
@@ -2815,25 +2821,78 @@ const DIAG_PROBE_MS = process.env.DIAG_PROBE_MS === undefined
   ? 180000
   : Number(process.env.DIAG_PROBE_MS)
 
+// The bytes probe needs a real file. This one is a ~3.9MB CFR PDF that
+// currently sits in the Approvals queue — which means it can legitimately
+// disappear (approved, archived, trashed) while the probe is running.
+// Overridable via env so it can be repointed without a deploy.
+const DIAG_PROBE_FILE_ID =
+  process.env.DIAG_PROBE_FILE_ID || '1sMURt0xIZdbrEzj2LURhOEx81W3hLqxg'
+
+// Only these mean "the transport/delivery broke" — the thing being
+// studied. Anything else coming back is a normal JSON business error
+// (e.g. "File is trashed") and must NOT be counted as a failure, or the
+// dataset gets poisoned the moment someone approves that document.
+const DIAG_TRANSPORT_SIGNATURES = [
+  'returned HTML instead of JSON',
+  'never resolved',
+  "wasn't JSON",
+  'fetch failed',
+  'socket hang up',
+  'ECONNRESET',
+  'ETIMEDOUT',
+]
+
 function startDiagnosticProbe() {
   if (!DIAG_PROBE_MS || DIAG_PROBE_MS < 30000) {
     console.log('[DIAG] probe disabled')
     return
   }
-  const actions = ['ping', 'get_active_wos']
+  const actions = [
+    { name: 'ping',                 data: null },
+    { name: 'get_active_wos',       data: null },
+    { name: 'get_drive_file_bytes', data: { file_id: DIAG_PROBE_FILE_ID } },
+  ]
+  const disabled = new Set()
   let i = 0
-  console.log(`[DIAG] probe every ${Math.round(DIAG_PROBE_MS / 1000)}s (DIAG_PROBE_MS=0 to disable)`)
+  console.log(
+    `[DIAG] probe every ${Math.round(DIAG_PROBE_MS / 1000)}s over ` +
+    `${actions.map(a => a.name).join(', ')} (DIAG_PROBE_MS=0 to disable)`
+  )
   setInterval(async () => {
-    const action = actions[i++ % actions.length]
+    // Skip actions that turned out to be misconfigured rather than broken.
+    let picked = null
+    for (let n = 0; n < actions.length; n++) {
+      const cand = actions[i++ % actions.length]
+      if (!disabled.has(cand.name)) { picked = cand; break }
+    }
+    if (!picked) return
+
     const t0 = Date.now()
     try {
-      await callAppsScript(action)
+      await callAppsScript(picked.name, picked.data)
       const ms = Date.now() - t0
       // Quiet on healthy calls — only surface the interesting tail, so
       // an overnight run leaves a short readable log rather than a wall.
-      if (ms > 5000) console.warn(`[DIAG] SLOW action=${action} ${ms}ms`)
+      if (ms > 5000) console.warn(`[DIAG] SLOW action=${picked.name} ${ms}ms`)
     } catch (err) {
-      console.error(`[DIAG] FAILED action=${action} ${Date.now() - t0}ms — ${err.message}`)
+      const msg = err.message || String(err)
+      const isTransport = DIAG_TRANSPORT_SIGNATURES.some(sig => msg.includes(sig))
+      if (isTransport) {
+        // A real instance of the bug. Full hop trace is in [AS] FAIL#.
+        console.error(`[DIAG] FAILED action=${picked.name} ${Date.now() - t0}ms — ${msg}`)
+      } else {
+        // Business error — the probe's own setup is stale, not Apps
+        // Script breaking. Stop probing it so it can't masquerade as a
+        // failure all night, and say exactly how to fix it.
+        disabled.add(picked.name)
+        console.warn(
+          `[DIAG] SKIP action=${picked.name} disabled for this process — ` +
+          `not a transport failure: ${msg}` +
+          (picked.name === 'get_drive_file_bytes'
+            ? ` (set DIAG_PROBE_FILE_ID to another Drive file id to re-enable)`
+            : '')
+        )
+      }
     }
   }, DIAG_PROBE_MS).unref?.()
 }
