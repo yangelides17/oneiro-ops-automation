@@ -27,10 +27,29 @@ export function useQbStatus() {
       }
     }
     load()
-    // Light polling — every 2 minutes catches expirations without
-    // hammering the QB CompanyInfo endpoint.
-    const id = setInterval(load, 120_000)
-    return () => { cancelled = true; clearInterval(id) }
+    // Poll every 15 minutes, and only while the tab is actually visible.
+    //
+    // This was every 2 minutes, ungated — 30 executions/hour from every
+    // open Dashboard tab, including ones left in the background all day.
+    // In the overnight failure dataset, get_qb_refresh_token accounted for
+    // 25 of 49 failures: not because it is fragile (it reads two Script
+    // Properties) but purely from exposure. Every Apps Script call is an
+    // independent roll against a service that intermittently hangs, and
+    // this one was rolling more than anything else in the app.
+    //
+    // What it buys is small: the badge renders NOTHING while QB is
+    // connected (see below), so this only needs to notice a disconnect
+    // eventually, not promptly. A visibility check also means a truck
+    // dashboard left open in a background tab stops polling entirely.
+    const tick = () => { if (!document.hidden) load() }
+    const id = setInterval(tick, 15 * 60_000)
+    const onVis = () => { if (!document.hidden) load() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [])
 
   return status
