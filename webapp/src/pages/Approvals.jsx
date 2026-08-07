@@ -543,8 +543,9 @@ export default function Approvals() {
 
       {/* One entry point for the whole month's signed paperwork, above the
           list rather than buried in a row — the admin usually scans the
-          stack once and files everything in a single pass. */}
-      {awaitingItems.length > 0 && (
+          stack once and files everything in a single pass. Hidden on the
+          other doc-type pills, where it isn't actionable. */}
+      {awaitingItems.length > 0 && (filter === 'all' || filter === 'month_end') && (
         <button
           type="button"
           onClick={() => setMonthEndUploadOpen(true)}
