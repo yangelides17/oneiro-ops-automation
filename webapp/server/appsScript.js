@@ -155,11 +155,37 @@ export async function callAppsScript(action, data = null) {
       if (REDIRECT_STATUSES.has(result.status)) {
         anyRedirect = true
         const location = result.headers.location || ''
+        // Session/cookie diagnostic. A browser following this 302 would
+        // carry any cookie set on the first response; this client has
+        // never sent one. If Google's content layer sometimes wants that
+        // session, "go back to /exec" is exactly the bounce we see on
+        // failures. Log what it hands us so we can stop guessing.
+        // OBSERVE ONLY — we do not send these back. Whether we should is
+        // the next question, but that would be a behavior change and the
+        // point right now is to find out whether a session cookie even
+        // exists to drop.
+        const sc = result.headers['set-cookie']
+        const cookieNames = sc
+          ? (Array.isArray(sc) ? sc : [sc]).map(c => String(c).split('=')[0]).join(',')
+          : 'none'
         console.warn(
           `[AS] REDIRECT action=${action} hop=${hop} status=${result.status} ` +
           `hopMs=${hopMs} fromMethod=${currentMethod} ` +
-          `host=${new URL(currentUrl).host} location="${location}"`
+          `host=${new URL(currentUrl).host} setCookie=${cookieNames} location="${location}"`
         )
+        // THE failure signature we're hunting: the content-delivery host
+        // itself redirecting instead of serving. hop0 healthy + this =
+        // "doPost finished and produced output, but Google won't hand it
+        // back." Dump every response header here — this is the one moment
+        // that might name the reason, and it is rare enough that the
+        // verbosity costs nothing.
+        if (new URL(currentUrl).host === 'script.googleusercontent.com') {
+          console.error(
+            `[AS] ECHO-BOUNCE action=${action} hop=${hop} status=${result.status} ` +
+            `hopMs=${hopMs} → ${location}\n` +
+            `[AS]   headers=${JSON.stringify(result.headers)}`
+          )
+        }
         if (!location) break
         // Reaching a googleusercontent.com/macros/echo URL means doPost
         // has already finished server-side — Apps Script only redirects
