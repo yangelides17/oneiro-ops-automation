@@ -32,14 +32,39 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
   const [file, setFile]     = useState(null)
   const [preview, setPreview] = useState(null)    // server split-preview payload
   const [assign, setAssign] = useState({})        // { [pageNumber]: doc_id | '' }
+  // Full-size page viewer. The row thumbnails are too small to read a
+  // contract number off, which is the one thing the admin needs to check.
+  const [zoomPage, setZoomPage] = useState(null)  // page number | null
+  const [zoomRotate, setZoomRotate] = useState(0) // degrees; scans come in sideways
+  const [viewportW, setViewportW] = useState(() =>
+    typeof window === 'undefined' ? 900 : window.innerWidth)
 
   const busy = step === 'analyzing' || step === 'committing'
 
   useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape' && !busy) onClose?.() }
+    const onResize = () => setViewportW(window.innerWidth)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  useEffect(() => {
+    const handler = (e) => {
+      // Escape closes the page viewer first — otherwise it would dismiss
+      // the whole modal and lose the assignments underneath it.
+      if (e.key === 'Escape') {
+        if (zoomPage !== null) { setZoomPage(null); return }
+        if (!busy) onClose?.()
+        return
+      }
+      if (zoomPage === null || !preview) return
+      if (e.key === 'ArrowRight') setZoomPage(p => Math.min(preview.page_count, p + 1))
+      if (e.key === 'ArrowLeft')  setZoomPage(p => Math.max(1, p - 1))
+    }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose, busy])
+  }, [onClose, busy, zoomPage, preview])
+
+  const openZoom = (pageNum) => { setZoomPage(pageNum); setZoomRotate(0) }
 
   // Candidate list for the dropdowns. Prefer the set the server echoed
   // back with the proposal — it's the same list the model chose from, so
@@ -129,6 +154,7 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
   }
 
   return (
+    <>
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
@@ -241,16 +267,40 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
                     className={`flex items-center gap-3 border rounded-lg p-2
                                 ${assign[pageNum] ? 'border-slate-200' : 'border-amber-300 bg-amber-50/40'}`}
                   >
-                    <div className="flex-shrink-0 w-[70px] overflow-hidden rounded border border-slate-200 bg-white">
+                    {/* Thumbnail doubles as the expand control — at this
+                        size it can only tell you the page exists, not what
+                        it says. */}
+                    <button
+                      type="button"
+                      onClick={() => openZoom(pageNum)}
+                      title={`Enlarge page ${pageNum}`}
+                      className="group relative flex-shrink-0 w-[70px] overflow-hidden rounded
+                                 border border-slate-200 bg-white hover:border-navy transition-colors"
+                    >
                       <Page
                         pageNumber={pageNum}
                         width={70}
                         renderTextLayer={false}
                         renderAnnotationLayer={false}
                       />
-                    </div>
+                      <span className="absolute inset-0 flex items-center justify-center
+                                       bg-navy/0 group-hover:bg-navy/50 transition-colors">
+                        <span className="text-white text-sm opacity-0 group-hover:opacity-100 transition-opacity">
+                          ⤢
+                        </span>
+                      </span>
+                    </button>
                     <div className="min-w-0 flex-1">
-                      <p className="text-[11px] font-bold text-slate-500 mb-1">Page {pageNum}</p>
+                      <p className="text-[11px] font-bold text-slate-500 mb-1">
+                        Page {pageNum}
+                        <button
+                          type="button"
+                          onClick={() => openZoom(pageNum)}
+                          className="ml-2 font-bold text-navy hover:underline"
+                        >
+                          Enlarge
+                        </button>
+                      </p>
                       <select
                         value={assign[pageNum] || UNASSIGNED}
                         onChange={e => setAssign(a => ({ ...a, [pageNum]: e.target.value }))}
@@ -289,5 +339,116 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
         )}
       </div>
     </div>
+
+    {/* Full-size page viewer. Sits above the modal rather than replacing
+        its content so the assignments underneath are never unmounted —
+        closing this returns to exactly the same review state.
+        Rotation is here because these come in as scans of a landscape
+        form: without it, enlarging still leaves the text sideways. */}
+    {zoomPage !== null && preview && (
+      <div
+        className="fixed inset-0 z-[60] flex flex-col"
+        style={{ backgroundColor: 'rgba(15,23,42,0.92)' }}
+        onClick={() => setZoomPage(null)}
+      >
+        <div
+          className="flex items-center justify-between gap-3 px-4 py-2.5 text-white flex-shrink-0"
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setZoomPage(p => Math.max(1, p - 1))}
+              disabled={zoomPage <= 1}
+              className="text-sm font-bold px-2.5 py-1 rounded bg-white/10 hover:bg-white/20
+                         disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              ‹
+            </button>
+            <span className="text-sm font-bold tabular-nums">
+              Page {zoomPage} of {preview.page_count}
+            </span>
+            <button
+              type="button"
+              onClick={() => setZoomPage(p => Math.min(preview.page_count, p + 1))}
+              disabled={zoomPage >= preview.page_count}
+              className="text-sm font-bold px-2.5 py-1 rounded bg-white/10 hover:bg-white/20
+                         disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              ›
+            </button>
+          </div>
+
+          {/* Assignable here too: you enlarge a page precisely because
+              you're checking whether its match is right, so make fixing it
+              possible without closing and hunting for the row again. */}
+          <select
+            value={assign[zoomPage] || UNASSIGNED}
+            onChange={e => setAssign(a => ({ ...a, [zoomPage]: e.target.value }))}
+            className="hidden sm:block max-w-[46%] text-xs rounded-lg px-2 py-1.5
+                       bg-white/10 text-white border border-white/20"
+          >
+            <option value={UNASSIGNED} className="text-slate-800">— skip this page —</option>
+            {options.map(c => (
+              <option key={c.doc_id} value={c.doc_id} className="text-slate-800">
+                {docLabel(c)}
+              </option>
+            ))}
+          </select>
+
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              type="button"
+              onClick={() => setZoomRotate(r => (r + 270) % 360)}
+              title="Rotate left"
+              className="text-sm px-2.5 py-1 rounded bg-white/10 hover:bg-white/20"
+            >
+              ↺
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoomRotate(r => (r + 90) % 360)}
+              title="Rotate right"
+              className="text-sm px-2.5 py-1 rounded bg-white/10 hover:bg-white/20"
+            >
+              ↻
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoomPage(null)}
+              className="text-xs font-bold px-3 py-1.5 rounded bg-white/15 hover:bg-white/25"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div
+          className="flex-1 min-h-0 overflow-auto px-4 pb-4 flex justify-center"
+          onClick={e => e.stopPropagation()}
+        >
+          <Document
+            file={file}
+            loading={<p className="text-sm text-white/70 py-8">Loading page…</p>}
+            error={<p className="text-sm text-red-300 py-8">Couldn&apos;t render this page.</p>}
+          >
+            <Page
+              // Re-render on rotate as well as page change so react-pdf
+              // doesn't reuse the previous orientation's canvas.
+              key={`${zoomPage}:${zoomRotate}`}
+              pageNumber={zoomPage}
+              rotate={zoomRotate}
+              // Sized to the viewport rather than a fixed width: these are
+              // dense grids, and the whole point is being able to read one.
+              width={Math.min(Math.max(viewportW - 64, 320), 1400)}
+              renderTextLayer={false}
+              renderAnnotationLayer={false}
+              className="shadow-2xl bg-white"
+            />
+          </Document>
+        </div>
+      </div>
+    )}
+    </>
   )
 }
