@@ -109,6 +109,44 @@ export function invalidate(fileId) {
   }
 }
 
+// ── Volatile files: a write is in flight somewhere we can't see ──
+//
+// Regenerate is ASYNCHRONOUS and crosses a service boundary. The route
+// only QUEUES the job; the actual overwrite is done later — seconds to
+// ~90s — by workers/watch_and_fill.py, a separate Railway service with no
+// knowledge of this cache. Invalidating once at queue time is therefore
+// not enough: any preview request landing in that gap re-fetches the OLD
+// bytes and caches them again, and nothing invalidates a second time when
+// the worker's write finally lands. That stale entry would then serve for
+// the full TTL — long enough for a second admin, or the same admin in
+// another tab, to approve a document while looking at pre-regenerate
+// content. The client's own 90s poll ceiling shows how wide the window is.
+//
+// So a file can be marked volatile for a window, during which it is
+// neither read from nor written to this cache. Only regenerating files pay
+// that cost; everything else keeps the full cache benefit.
+const volatileUntil = new Map()   // fileId → epoch ms
+
+export function markVolatile(fileId, windowMs = 5 * 60 * 1000) {
+  if (!fileId) return
+  invalidate(fileId)
+  volatileUntil.set(fileId, Date.now() + windowMs)
+}
+
+export function isVolatile(fileId) {
+  const until = volatileUntil.get(fileId)
+  if (!until) return false
+  if (Date.now() > until) { volatileUntil.delete(fileId); return false }
+  return true
+}
+
+/** Called once the new bytes are known to have landed. */
+export function clearVolatile(fileId) {
+  if (!fileId) return
+  volatileUntil.delete(fileId)
+  invalidate(fileId)
+}
+
 /** Snapshot for logging. */
 export function stats() {
   return {
@@ -119,5 +157,5 @@ export function stats() {
 }
 
 /** Test seam — not used in production paths. */
-export function _reset() { store.clear(); totalBytes = 0 }
+export function _reset() { store.clear(); totalBytes = 0; volatileUntil.clear() }
 export const _internals = { TTL_MS, MAX_BYTES, store }

@@ -34,17 +34,23 @@ import {
   callAppsScript, noteBatchDownloadStart, noteBatchDownloadEnd,
 } from './server/appsScript.js'
 import {
-  loadServiceAccount, getAccessToken, getFileMeta, fetchFileResponse,
-  isConfigured as isDriveConfigured,
+  fetchFileResponse, isConfigured as isDriveConfigured,
 } from './server/googleDrive.js'
 import {
   getBytes as getCachedPreview,
   putBytes as putCachedPreview,
   invalidate as invalidatePreview,
+  markVolatile as markPreviewVolatile,
+  isVolatile as isPreviewVolatile,
+  clearVolatile as clearPreviewVolatile,
   stats as previewCacheStats,
 } from './server/previewBytesCache.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Tracks the md5 seen for a file while a regenerate is in flight, so the
+// /meta poll can tell "the overwrite landed" from "still the old file".
+const regenSeenMd5 = new Map()
 const app  = express()
 const PORT = process.env.PORT || 3001
 
@@ -89,55 +95,6 @@ const upload = multer({
  */
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'oneiro-ops-webapp', ts: new Date().toISOString() })
-})
-
-/**
- * GET /api/diag/drive/:fileId
- * Diagnostic only — READ ONLY, no behavior change anywhere else.
- *
- * Answers, step by step, whether this service can read an approval document
- * from Drive directly instead of laundering it through Apps Script. Each
- * stage is reported separately so a failure names itself rather than
- * collapsing into "auth failed": env var present → parses → has the right
- * fields → token exchange works → file metadata readable → bytes readable.
- */
-app.get('/api/diag/drive/:fileId', async (req, res) => {
-  const { fileId } = req.params
-  const steps = []
-  const step = (name, ok, detail) => { steps.push({ name, ok, detail }) }
-  try {
-    const sa = loadServiceAccount()
-    step('service_account_json', sa.ok, sa.ok ? `client_email=${sa.client_email}` : sa.reason)
-    if (!sa.ok) return res.status(200).json({ ok: false, steps })
-
-    const t0 = Date.now()
-    await getAccessToken()
-    step('access_token', true, `${Date.now() - t0}ms`)
-
-    const t1 = Date.now()
-    const meta = await getFileMeta(fileId)
-    step('file_metadata', true,
-         `${meta.name} ${meta.size}B ${meta.mimeType} trashed=${meta.trashed} (${Date.now() - t1}ms)`)
-
-    const t2 = Date.now()
-    const resp = await fetchFileResponse(fileId)
-    const buf = Buffer.from(await resp.arrayBuffer())
-    const bytesMs = Date.now() - t2
-    step('file_bytes', true, `${buf.length}B in ${bytesMs}ms`)
-
-    // The comparison that decides whether this is worth building on.
-    res.json({
-      ok: true,
-      steps,
-      verdict: 'Drive is directly readable from this service',
-      bytes: buf.length,
-      direct_fetch_ms: bytesMs,
-      note: 'Compare against the Apps Script path, measured at ~4,500-11,000ms cold for this file.',
-    })
-  } catch (err) {
-    step('failed', false, err.message)
-    res.status(200).json({ ok: false, steps, error: err.message })
-  }
 })
 
 /**
@@ -790,7 +747,10 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
     // the Intuit requirement is untouched. This just stops us re-asking
     // Google for bytes we already hold, which is the single most
     // failure-prone call in the app (21% measured).
-    const hit = getCachedPreview(fileId, version)
+    // A regenerate in flight means the bytes are being rewritten by the
+    // worker right now — neither read nor write the cache until it lands.
+    const volatile_ = isPreviewVolatile(fileId)
+    const hit = volatile_ ? null : getCachedPreview(fileId, version)
     if (hit) {
       console.log(`[PREVIEW] HIT file=${fileId} v=${version || '-'} ` +
                   `${hit.buf.length}B age=${Math.round(hit.ageMs / 1000)}s ` +
@@ -810,9 +770,16 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
     // ceiling — which is where its 21% failure rate comes from. None of
     // that applies here.
     //
-    // Streamed, not buffered, so pdf.js can start rendering while bytes are
-    // still arriving. Chunks are collected as they pass through so the
-    // result still populates the cache — the two are not in tension.
+    // Chunks are collected as they pass through, so the result still fills
+    // the byte cache — streaming and caching are not in tension.
+    //
+    // Correcting an earlier version of this comment: this does NOT give
+    // progressive rendering. We neither advertise `Accept-Ranges` nor serve
+    // Range requests, and the generated PDFs here aren't linearised (xref
+    // near EOF), so pdf.js cannot render a partial document. The real win
+    // is lower total time from skipping base64 inflation and the
+    // script-load tax — which the measurements show plainly without
+    // needing an overstated mechanism.
     if (isDriveConfigured()) {
       try {
         const resp = await fetchFileResponse(fileId)   // throws before headers are sent
@@ -825,14 +792,29 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
         const reader = resp.body.getReader()
         const chunks = []
         for (;;) {
+          // Stop pulling from Drive the moment the client goes away. The
+          // app's own prefetch aborts routinely (AbortController on
+          // unmount / selection change), and without this we would keep
+          // downloading the whole file into a dead socket every time.
+          if (req.destroyed || res.destroyed) {
+            await reader.cancel().catch(() => {})
+            console.log(`[PREVIEW] client aborted, stopped Drive read file=${fileId}`)
+            return
+          }
           const { done, value } = await reader.read()
           if (done) break
-          chunks.push(Buffer.from(value))
-          res.write(Buffer.from(value))
+          const chunk = Buffer.from(value)
+          chunks.push(chunk)
+          // Respect backpressure: res.write returns false when the socket
+          // buffer is full. Without awaiting drain, a slow client makes
+          // this balloon in memory instead of pacing.
+          if (!res.write(chunk)) {
+            await new Promise(resolve => res.once('drain', resolve))
+          }
         }
         res.end()
         const buf = Buffer.concat(chunks)
-        putCachedPreview(fileId, version, buf, mime, null)
+        if (!volatile_) putCachedPreview(fileId, version, buf, mime, null)
         console.log(`[PREVIEW] MISS-DRIVE file=${fileId} v=${version || '-'} ` +
                     `${buf.length}B fetch=${Date.now() - t0}ms ` +
                     `cache=${JSON.stringify(previewCacheStats())}`)
@@ -856,7 +838,7 @@ app.get('/api/approvals/:fileId/pdf', async (req, res) => {
       return res.status(500).json({ error: 'Apps Script returned no bytes' })
     }
     const buf = Buffer.from(data.data, 'base64')
-    putCachedPreview(fileId, version, buf, data.mime_type, data.filename)
+    if (!volatile_) putCachedPreview(fileId, version, buf, data.mime_type, data.filename)
     console.log(`[PREVIEW] MISS-APPSSCRIPT file=${fileId} v=${version || '-'} ` +
                 `${buf.length}B fetch=${Date.now() - t0}ms ` +
                 `cache=${JSON.stringify(previewCacheStats())}`)
@@ -949,11 +931,17 @@ app.post('/api/approvals/:fileId/regenerate', async (req, res) => {
       file_id: req.params.fileId,
     })
     if (data && data.error) return res.status(400).json(data)
-    // The worker overwrites this file in place shortly. Drop any cached
-    // copy now so nothing can serve the pre-regenerate bytes in the
-    // window before the client bumps its ?v= and re-requests. Belt and
-    // braces — the version bump alone would also miss the cache.
-    invalidatePreview(req.params.fileId)
+    // Regenerate is ASYNCHRONOUS across a service boundary: this only
+    // QUEUES the job, and workers/watch_and_fill.py (a separate Railway
+    // service) overwrites the file seconds-to-90s later. A single
+    // invalidate here is NOT enough — any preview request landing in that
+    // gap would re-fetch the old bytes and cache them again, with nothing
+    // to invalidate a second time when the write actually lands. That
+    // stale entry could then serve for the full TTL, long enough for
+    // another tab or another admin to approve a document while looking at
+    // pre-regenerate content. Mark it volatile so it is neither read from
+    // nor written to the cache until the new bytes are confirmed.
+    markPreviewVolatile(req.params.fileId)
     res.json(data)   // { success, doc_type, message }
   } catch (err) {
     console.error(`POST /api/approvals/${req.params.fileId}/regenerate error:`, err.message)
@@ -973,6 +961,20 @@ app.get('/api/approvals/:fileId/meta', async (req, res) => {
       file_id: req.params.fileId,
     })
     if (data && data.error) return res.status(500).json(data)
+    // This route exists because the client polls it after a regenerate,
+    // watching for the md5 to change. That makes it the one place that
+    // observes the worker's overwrite actually landing — so use it to end
+    // the volatile window and drop anything cached from before the write.
+    if (isPreviewVolatile(req.params.fileId) && data && data.md5) {
+      const seen = regenSeenMd5.get(req.params.fileId)
+      if (seen === undefined) {
+        regenSeenMd5.set(req.params.fileId, data.md5)
+      } else if (seen !== data.md5) {
+        regenSeenMd5.delete(req.params.fileId)
+        clearPreviewVolatile(req.params.fileId)
+        console.log(`[PREVIEW] regenerate landed, cache re-armed file=${req.params.fileId}`)
+      }
+    }
     res.setHeader('Cache-Control', 'no-store')
     res.json(data)   // { md5, size, modified_time }
   } catch (err) {

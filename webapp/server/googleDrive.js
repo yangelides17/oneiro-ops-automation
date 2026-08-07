@@ -28,7 +28,8 @@ import crypto from 'crypto'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const SCOPE     = 'https://www.googleapis.com/auth/drive.readonly'
 
-let cachedToken = null   // { token, expiresAt }
+let cachedToken = null      // { token, expiresAt }
+let inFlightToken = null    // coalesces concurrent refreshes
 
 /** Parse and sanity-check the service account JSON from the environment. */
 export function loadServiceAccount() {
@@ -70,6 +71,17 @@ export async function getAccessToken() {
   if (cachedToken && Date.now() < cachedToken.expiresAt - 60_000) {
     return cachedToken.token
   }
+  // Coalesce concurrent refreshes. Without this, N requests arriving on a
+  // cold or expired cache each sign their own JWT and each hit the token
+  // endpoint — wasted latency on every one of them, and needless load on
+  // an endpoint that rate-limits. The first caller does the work; the rest
+  // await the same promise.
+  if (inFlightToken) return inFlightToken
+  inFlightToken = _refreshAccessToken().finally(() => { inFlightToken = null })
+  return inFlightToken
+}
+
+async function _refreshAccessToken() {
   const sa = loadServiceAccount()
   if (!sa.ok) throw new Error(`Drive auth unavailable — ${sa.reason}`)
 
@@ -129,11 +141,38 @@ export async function getFileMeta(fileId) {
  * the Apps Script path cannot deliver a single byte until it has base64'd
  * the entire file.
  */
-export async function fetchFileResponse(fileId) {
+export async function fetchFileResponse(fileId, { timeoutMs = 20000 } = {}) {
   const token = await getAccessToken()
   const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
               `?alt=media&supportsAllDrives=true`
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+
+  // Bounded on purpose. Removing Apps Script's ~30-35s response ceiling
+  // does NOT make Google's random 10-55s service hangs go away — it only
+  // changes which ceiling we hit, and the next one along is Railway's
+  // gateway timeout, which surfaces as an opaque 502 after ~30s. Failing
+  // at 20s instead gives a clean error the client's auto-retry can act on,
+  // and a retry is a fresh request rather than a continuation of a stall.
+  //
+  // This bounds time-to-first-byte, not the whole download; a large file
+  // that has started streaming is making progress and is not the failure
+  // mode being guarded against.
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  let res
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctrl.signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Drive did not respond within ${timeoutMs}ms`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`files.get media failed (${res.status}): ${text.slice(0, 300)}`)
