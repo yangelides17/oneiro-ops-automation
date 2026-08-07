@@ -35,17 +35,61 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
   // Full-size page viewer. The row thumbnails are too small to read a
   // contract number off, which is the one thing the admin needs to check.
   const [zoomPage, setZoomPage] = useState(null)  // page number | null
-  const [zoomRotate, setZoomRotate] = useState(0) // degrees; scans come in sideways
-  const [viewportW, setViewportW] = useState(() =>
-    typeof window === 'undefined' ? 900 : window.innerWidth)
+  // Rotation is per page and MANUAL only — nothing is ever auto-rotated.
+  // A single shared angle leaked the rotation applied to a landscape
+  // Employee Utilization page onto every certificate paged to afterwards,
+  // which are already upright. Keyed by page so a page the admin hasn't
+  // rotated always renders at its true orientation.
+  const [rotateByPage, setRotateByPage] = useState({})
+  // pdf.js document proxy — used to read page dimensions WITHOUT rendering,
+  // so the page can be sized to fit the screen on its first paint.
+  const [pdfProxy, setPdfProxy]   = useState(null)
+  const [pageSize, setPageSize]   = useState(null)   // { w, h } of zoomPage at scale 1
+  const [viewport, setViewport]   = useState(() => ({
+    w: typeof window === 'undefined' ? 1200 : window.innerWidth,
+    h: typeof window === 'undefined' ?  800 : window.innerHeight,
+  }))
 
   const busy = step === 'analyzing' || step === 'committing'
+  const zoomRotate = zoomPage === null ? 0 : (rotateByPage[zoomPage] || 0)
+  const rotateBy = (delta) => setRotateByPage(m => ({
+    ...m, [zoomPage]: (((m[zoomPage] || 0) + delta) % 360 + 360) % 360,
+  }))
 
   useEffect(() => {
-    const onResize = () => setViewportW(window.innerWidth)
+    const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight })
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
+
+  // Measure the page before rendering it. Reading the viewport off the
+  // pdf.js proxy avoids a render-then-resize flash — we know the aspect
+  // ratio up front, so the first paint is already the right size.
+  useEffect(() => {
+    if (!pdfProxy || zoomPage === null) { setPageSize(null); return }
+    let cancelled = false
+    pdfProxy.getPage(zoomPage)
+      .then(p => {
+        if (cancelled) return
+        const vp = p.getViewport({ scale: 1 })
+        setPageSize({ w: vp.width, h: vp.height })
+      })
+      .catch(() => { if (!cancelled) setPageSize(null) })
+    return () => { cancelled = true }
+  }, [pdfProxy, zoomPage])
+
+  // Fit the whole page on screen — both dimensions, so nothing needs
+  // scrolling. react-pdf's `width` is the POST-rotation width, so the
+  // page's own dimensions swap at 90°/270°.
+  const fittedWidth = useMemo(() => {
+    if (!pageSize) return null
+    const swapped = zoomRotate === 90 || zoomRotate === 270
+    const pw = swapped ? pageSize.h : pageSize.w
+    const ph = swapped ? pageSize.w : pageSize.h
+    const availW = Math.max(240, viewport.w - 32)
+    const availH = Math.max(240, viewport.h - 96)   // toolbar + padding
+    return Math.max(200, Math.floor(pw * Math.min(availW / pw, availH / ph)))
+  }, [pageSize, zoomRotate, viewport])
 
   useEffect(() => {
     const handler = (e) => {
@@ -64,7 +108,9 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
     return () => window.removeEventListener('keydown', handler)
   }, [onClose, busy, zoomPage, preview])
 
-  const openZoom = (pageNum) => { setZoomPage(pageNum); setZoomRotate(0) }
+  // Rotation is remembered per page (see rotateByPage), so re-opening a
+  // page the admin already straightened keeps it straight.
+  const openZoom = (pageNum) => setZoomPage(pageNum)
 
   // Candidate list for the dropdowns. Prefer the set the server echoed
   // back with the proposal — it's the same list the model chose from, so
@@ -77,6 +123,9 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
       setError(`File is too large (${(f.size / 1e6).toFixed(1)} MB). Max is 20 MB — split the stack and upload it in parts.`)
       return
     }
+    // Everything below is scoped to the previous file — a stale pdf proxy
+    // would measure pages from a document that is no longer on screen.
+    setZoomPage(null); setPdfProxy(null); setPageSize(null); setRotateByPage({})
     setFile(f); setError(''); setStep('analyzing')
     try {
       const fd = new FormData()
@@ -399,16 +448,16 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
           <div className="flex items-center gap-2 flex-shrink-0">
             <button
               type="button"
-              onClick={() => setZoomRotate(r => (r + 270) % 360)}
-              title="Rotate left"
+              onClick={() => rotateBy(-90)}
+              title="Rotate this page left"
               className="text-sm px-2.5 py-1 rounded bg-white/10 hover:bg-white/20"
             >
               ↺
             </button>
             <button
               type="button"
-              onClick={() => setZoomRotate(r => (r + 90) % 360)}
-              title="Rotate right"
+              onClick={() => rotateBy(90)}
+              title="Rotate this page right"
               className="text-sm px-2.5 py-1 rounded bg-white/10 hover:bg-white/20"
             >
               ↻
@@ -423,28 +472,33 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
           </div>
         </div>
 
+        {/* Centred, no scrolling: fittedWidth already constrains the page
+            to the space left over after the toolbar. */}
         <div
-          className="flex-1 min-h-0 overflow-auto px-4 pb-4 flex justify-center"
+          className="flex-1 min-h-0 px-4 pb-4 flex items-center justify-center overflow-hidden"
           onClick={e => e.stopPropagation()}
         >
           <Document
             file={file}
+            onLoadSuccess={setPdfProxy}
             loading={<p className="text-sm text-white/70 py-8">Loading page…</p>}
             error={<p className="text-sm text-red-300 py-8">Couldn&apos;t render this page.</p>}
           >
-            <Page
-              // Re-render on rotate as well as page change so react-pdf
-              // doesn't reuse the previous orientation's canvas.
-              key={`${zoomPage}:${zoomRotate}`}
-              pageNumber={zoomPage}
-              rotate={zoomRotate}
-              // Sized to the viewport rather than a fixed width: these are
-              // dense grids, and the whole point is being able to read one.
-              width={Math.min(Math.max(viewportW - 64, 320), 1400)}
-              renderTextLayer={false}
-              renderAnnotationLayer={false}
-              className="shadow-2xl bg-white"
-            />
+            {/* Held back until the page has been measured — rendering at a
+                guessed width first would paint an oversized page and snap. */}
+            {fittedWidth && (
+              <Page
+                // Re-render on rotate as well as page change so react-pdf
+                // doesn't reuse the previous orientation's canvas.
+                key={`${zoomPage}:${zoomRotate}`}
+                pageNumber={zoomPage}
+                rotate={zoomRotate}
+                width={fittedWidth}
+                renderTextLayer={false}
+                renderAnnotationLayer={false}
+                className="shadow-2xl bg-white"
+              />
+            )}
           </Document>
         </div>
       </div>
