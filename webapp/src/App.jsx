@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Routes, Route, NavLink, Navigate } from 'react-router-dom'
+import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
+import ErrorBoundary from './components/ErrorBoundary'
 import Dashboard   from './pages/Dashboard'
 import NavTab      from './pages/NavTab'
 import FieldReport from './pages/FieldReport'
@@ -359,6 +360,9 @@ function ColdStartCounts() {
 export default function App() {
   const role = useAccess()
   const { toast, dismissToast } = useQbAuthResult()
+  // Keying the boundary on the path clears a caught error when the user
+  // navigates away, so one broken page doesn't poison the whole session.
+  const { pathname } = useLocation()
 
   // Gate: undecided → spinner card; denied → locked card. Only a
   // resolved 'admin' | 'crew' renders the app. Hooks above run first so
@@ -374,6 +378,10 @@ export default function App() {
       <div className="min-h-screen flex flex-col">
         <Header role={role} />
         <main className="flex-1">
+          {/* Scoped to the page, not the shell: a crash leaves the header
+              and nav usable so the user can navigate out instead of being
+              stranded on a blank screen. */}
+          <ErrorBoundary key={pathname}>
           <Routes>
             {crewMode ? (
               // Crew: only Nav, Field Report, and Sign-In are reachable.
@@ -396,6 +404,7 @@ export default function App() {
               </>
             )}
           </Routes>
+          </ErrorBoundary>
         </main>
         <footer className="text-center text-slate-400 text-xs py-6 space-y-1">
           <div>Oneiro Collection LLC &mdash; Operations Platform</div>

@@ -65,16 +65,28 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
   // Measure the page before rendering it. Reading the viewport off the
   // pdf.js proxy avoids a render-then-resize flash — we know the aspect
   // ratio up front, so the first paint is already the right size.
+  //
+  // The try/catch is load-bearing, not defensive habit. Closing the viewer
+  // unmounts its <Document>, and react-pdf destroys the pdf.js loading
+  // task on cleanup; PDFDocumentProxy.getPage then reaches a torn-down
+  // transport and throws SYNCHRONOUSLY, so `.catch()` never sees it. An
+  // escaped throw here unmounts the whole React tree — a blank page with
+  // the route still in the URL. closeZoom drops the proxy so this should
+  // not arise, but the ordering is react-pdf's to change, not ours.
   useEffect(() => {
     if (!pdfProxy || zoomPage === null) { setPageSize(null); return }
     let cancelled = false
-    pdfProxy.getPage(zoomPage)
-      .then(p => {
-        if (cancelled) return
-        const vp = p.getViewport({ scale: 1 })
-        setPageSize({ w: vp.width, h: vp.height })
-      })
-      .catch(() => { if (!cancelled) setPageSize(null) })
+    try {
+      pdfProxy.getPage(zoomPage)
+        .then(p => {
+          if (cancelled) return
+          const vp = p.getViewport({ scale: 1 })
+          setPageSize({ w: vp.width, h: vp.height })
+        })
+        .catch(() => { if (!cancelled) setPageSize(null) })
+    } catch {
+      setPageSize(null)
+    }
     return () => { cancelled = true }
   }, [pdfProxy, zoomPage])
 
@@ -96,7 +108,7 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
       // Escape closes the page viewer first — otherwise it would dismiss
       // the whole modal and lose the assignments underneath it.
       if (e.key === 'Escape') {
-        if (zoomPage !== null) { setZoomPage(null); return }
+        if (zoomPage !== null) { closeZoom(); return }
         if (!busy) onClose?.()
         return
       }
@@ -111,6 +123,12 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
   // Rotation is remembered per page (see rotateByPage), so re-opening a
   // page the admin already straightened keeps it straight.
   const openZoom = (pageNum) => setZoomPage(pageNum)
+
+  // Closing unmounts the viewer's <Document>, and react-pdf destroys the
+  // underlying pdf.js task with it — so the proxy must be dropped at the
+  // same time. Holding it meant the next open measured against a dead
+  // worker and took the app down with it.
+  const closeZoom = () => { setZoomPage(null); setPdfProxy(null); setPageSize(null) }
 
   // Candidate list for the dropdowns. Prefer the set the server echoed
   // back with the proposal — it's the same list the model chose from, so
@@ -398,7 +416,7 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
       <div
         className="fixed inset-0 z-[60] flex flex-col"
         style={{ backgroundColor: 'rgba(15,23,42,0.92)' }}
-        onClick={() => setZoomPage(null)}
+        onClick={closeZoom}
       >
         <div
           className="flex items-center justify-between gap-3 px-4 py-2.5 text-white flex-shrink-0"
@@ -464,7 +482,7 @@ export default function MonthEndUploadModal({ candidates = [], onClose, onUpload
             </button>
             <button
               type="button"
-              onClick={() => setZoomPage(null)}
+              onClick={closeZoom}
               className="text-xs font-bold px-3 py-1.5 rounded bg-white/15 hover:bg-white/25"
             >
               Close
