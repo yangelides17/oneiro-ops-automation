@@ -4875,16 +4875,61 @@ function _withDriveRetry_(label, fn, attempts) {
   const maxAttempts = attempts || 3;
   let lastErr;
   for (let i = 0; i < maxAttempts; i++) {
+    const tAttempt = Date.now();
     try {
-      return fn();
+      const out = fn();
+      // Diagnostic: even a SUCCESSFUL first attempt is worth recording
+      // when it was slow, because a single slow Drive call is the seed
+      // of the failure chain below.
+      _noteDriveOp_(label, i + 1, Date.now() - tAttempt, true);
+      return out;
     } catch (err) {
       lastErr = err;
       const msg = String(err && err.message || err);
+      _noteDriveOp_(label, i + 1, Date.now() - tAttempt, false);
       Logger.log(`⚠️ Drive op "${label}" attempt ${i + 1}/${maxAttempts} failed: ${msg}`);
       if (i < maxAttempts - 1) Utilities.sleep(500 * (i + 1));
     }
   }
   throw lastErr;
+}
+
+
+// ── Drive-op diagnostic accumulator (2026-08-06) ──────────────────
+//
+// Testing a specific, measured hypothesis about the site-wide 500s.
+//
+// Captured failure: a get_drive_file_meta call — normally 216ms — had
+// hop0 (the POST to /exec, i.e. the whole execution) take 31,507ms, then
+// its googleusercontent echo URL bounced straight back to /exec and the
+// client got Google's "Script function not found: doGet" HTML page.
+//
+// Separately proven by experiment on an isolated script: the echo URL is
+// SINGLE-USE and expires between 15s and 60s. So once an execution runs
+// long enough to blow Apps Script's ~30-35s web-app response ceiling,
+// the output is gone and the bounce is inevitable — the bounce is a
+// symptom, not the cause.
+//
+// The suspected amplifier is right above: 3 attempts x a ~10s hung Drive
+// call + 1.5s of backoff sleeps ~= 31.5s, which matches the observed
+// 31,507ms almost exactly. If that is what is happening, a single
+// external Drive hiccup is being converted BY OUR RETRY LOOP into a hard
+// failure, and the fix is to bound the retry budget well under the
+// platform ceiling rather than to chase Google.
+//
+// This records what actually happened so the theory can be confirmed or
+// killed. Per-execution only; rides out in the `_t` block that
+// jsonResponse_ already attaches. No behavior change.
+var _DRIVE_OPS_ = [];
+function _noteDriveOp_(label, attempt, ms, ok) {
+  try {
+    // Only worth reporting the interesting ones: any failure, or a
+    // success slow enough to matter. Keeps the payload tiny.
+    if (ok && ms < 1000) return;
+    if (_DRIVE_OPS_.length < 12) {
+      _DRIVE_OPS_.push({ op: label, n: attempt, ms: ms, ok: ok });
+    }
+  } catch (_) { /* diagnostics must never break a handler */ }
 }
 
 
@@ -9586,6 +9631,10 @@ function jsonResponse_(obj, statusCode) {
       entry:  _T_DOPOST_ENTRY_,       // doPost invoked
       exit:   Date.now(),             // response being built
     };
+    // Slow/failed Drive ops seen during this execution, if any. Empty on
+    // a healthy call, so it costs nothing normally — but on a slow one it
+    // shows whether the time went into retried Drive calls.
+    if (_DRIVE_OPS_ && _DRIVE_OPS_.length) obj._t.drive = _DRIVE_OPS_;
   } catch (_) { /* never let instrumentation break a response */ }
   return ContentService
     .createTextOutput(JSON.stringify(obj))

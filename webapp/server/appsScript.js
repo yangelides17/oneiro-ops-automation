@@ -344,6 +344,16 @@ export async function callAppsScript(action, data = null) {
       `preScript=${preScriptMs}ms dispatch=${dispatchMs}ms handler=${handlerMs}ms ` +
       `(preScript = network + queue + fetch/parse/compile of Code.js)`
     )
+    // Slow/failed Drive ops inside that execution, when there were any.
+    // Testing whether _withDriveRetry_'s 3-attempt budget is what turns a
+    // ~10s Drive hiccup into a >30s execution that blows Apps Script's
+    // response ceiling and fails the whole request.
+    if (Array.isArray(json._t.drive) && json._t.drive.length) {
+      console.warn(
+        `[AS] DRIVE-OPS action=${action} handler=${handlerMs}ms ` +
+        json._t.drive.map(d => `${d.op}#${d.n}=${d.ms}ms/${d.ok ? 'ok' : 'FAIL'}`).join(' ')
+      )
+    }
   }
   if (json.error) {
     console.error(`[AS] JSON-ERROR action=${action} status=${result.status} error="${json.error}"`)
