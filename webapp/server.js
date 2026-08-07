@@ -34,6 +34,9 @@ import {
   callAppsScript, noteBatchDownloadStart, noteBatchDownloadEnd,
 } from './server/appsScript.js'
 import {
+  loadServiceAccount, getAccessToken, getFileMeta, fetchFileResponse,
+} from './server/googleDrive.js'
+import {
   getBytes as getCachedPreview,
   putBytes as putCachedPreview,
   invalidate as invalidatePreview,
@@ -85,6 +88,55 @@ const upload = multer({
  */
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'oneiro-ops-webapp', ts: new Date().toISOString() })
+})
+
+/**
+ * GET /api/diag/drive/:fileId
+ * Diagnostic only — READ ONLY, no behavior change anywhere else.
+ *
+ * Answers, step by step, whether this service can read an approval document
+ * from Drive directly instead of laundering it through Apps Script. Each
+ * stage is reported separately so a failure names itself rather than
+ * collapsing into "auth failed": env var present → parses → has the right
+ * fields → token exchange works → file metadata readable → bytes readable.
+ */
+app.get('/api/diag/drive/:fileId', async (req, res) => {
+  const { fileId } = req.params
+  const steps = []
+  const step = (name, ok, detail) => { steps.push({ name, ok, detail }) }
+  try {
+    const sa = loadServiceAccount()
+    step('service_account_json', sa.ok, sa.ok ? `client_email=${sa.client_email}` : sa.reason)
+    if (!sa.ok) return res.status(200).json({ ok: false, steps })
+
+    const t0 = Date.now()
+    await getAccessToken()
+    step('access_token', true, `${Date.now() - t0}ms`)
+
+    const t1 = Date.now()
+    const meta = await getFileMeta(fileId)
+    step('file_metadata', true,
+         `${meta.name} ${meta.size}B ${meta.mimeType} trashed=${meta.trashed} (${Date.now() - t1}ms)`)
+
+    const t2 = Date.now()
+    const resp = await fetchFileResponse(fileId)
+    const buf = Buffer.from(await resp.arrayBuffer())
+    const bytesMs = Date.now() - t2
+    step('file_bytes', true, `${buf.length}B in ${bytesMs}ms`)
+
+    // The comparison that decides whether this is worth building on.
+    res.json({
+      ok: true,
+      steps,
+      verdict: 'Drive is directly readable from this service',
+      bytes: buf.length,
+      direct_fetch_ms: bytesMs,
+      note: 'Compare against the Apps Script path, measured at ~4,500-11,000ms cold for this file.',
+    })
+  } catch (err) {
+    step('failed', false, err.message)
+    res.status(200).json({ ok: false, steps, error: err.message })
+  }
 })
 
 /**
