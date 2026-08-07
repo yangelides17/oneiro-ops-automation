@@ -206,13 +206,15 @@ export async function fetchThumbnail(fileId, { timeoutMs = 10000 } = {}) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
-    // The thumbnail host is a different origin from the Drive API; send the
-    // bearer token anyway since Drive-hosted thumbnails accept it, and fall
-    // back to the full image upstream if this ever stops working.
-    const res = await fetch(meta.thumbnailLink, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: ctrl.signal,
-    })
+    // Deliberately NO Authorization header.
+    //
+    // thumbnailLink points at lh3.googleusercontent.com, a different origin
+    // from the Drive API, and it is already a signed URL. Sending the bearer
+    // token there does not authenticate anything — it made the request hang
+    // for ~19s and time out (measured), where the same URL fetched with no
+    // auth returns in ~240ms. Attaching credentials to a third-party origin
+    // would be wrong even if it were fast.
+    const res = await fetch(meta.thumbnailLink, { signal: ctrl.signal })
     if (!res.ok) return null
     const buf = Buffer.from(await res.arrayBuffer())
     return { buf, mime: res.headers.get('content-type') || 'image/jpeg' }
