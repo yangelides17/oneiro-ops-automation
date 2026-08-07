@@ -14815,51 +14815,42 @@ function handleListWOPhotos_(body) {
     return jsonResponse_({ photos: [] });
   }
 
-  // First pass: collect image-file refs + created dates only — cheap, no
-  // thumbnail fetch. We sort newest-first and then pull thumbnails for at
-  // most MAX_THUMBS files. getThumbnail() is a per-file Drive round-trip
-  // (~250-400ms), and they run serially — at 120 that is 30-48s, which
-  // lands inside the window where the web app's response gets replaced by
-  // an HTML error page. 25 keeps the worst case under ~10s and is more
-  // than a crew needs to review a WO's work.
+  // ONE Drive.Files.list call returns everything this listing needs.
   //
-  // Do NOT "fix" the overflow by returning an empty thumbnail_b64: the
-  // client has no URL fallback (PhotoThumb renders previewUrl ||
-  // thumbnail_b64 || null), so those tiles would render blank.
-  const MAX_THUMBS = 25;
-  const refs = [];
-  const it = folder.getFiles();
-  while (it.hasNext()) {
-    const f = it.next();
-    const mime = f.getMimeType() || '';
-    if (mime.indexOf('image/') !== 0) continue;
-    refs.push({ file: f, mime: mime, created: f.getDateCreated() });
-  }
-  refs.sort((a, b) => b.created - a.created);   // newest first (Date math → ms)
-  if (refs.length > MAX_THUMBS) {
-    Logger.log('list_wo_photos: ' + woId + ' has ' + refs.length +
-               ' photos; returning newest ' + MAX_THUMBS);
-  }
+  // This used to be the most service-call-heavy handler in the app, and it
+  // showed: for a WO with N photos it made 2N DriveApp getters just to
+  // enumerate (getMimeType + getDateCreated per file), then FIVE more per
+  // file for the newest 25 — including getThumbnail(), a per-file Drive
+  // round trip at ~250-400ms that runs serially. A 60-photo WO was ~247
+  // service calls; failure rate scales with service calls, which is why
+  // this was the most error-prone screen in the app.
+  //
+  // MAX_THUMBS = 25 existed only to keep that serial thumbnail loop under
+  // the ~30-35s response ceiling. With one list call there is no loop to
+  // bound, so the cap is gone and crews see every photo again.
+  //
+  // Thumbnails are no longer base64'd into this payload either — the
+  // response returns Drive's own thumbnailLink and the webapp proxies it,
+  // which also takes the image bytes out of this JSON entirely.
+  const files = _withDriveRetry_('list WO photos', () =>
+    Drive.Files.list({
+      q: "'" + folder.getId() + "' in parents and trashed = false " +
+         "and mimeType contains 'image/'",
+      fields: 'files(id,name,mimeType,createdTime,thumbnailLink,webViewLink)',
+      orderBy: 'createdTime desc',
+      pageSize: 200,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+    }));
 
-  const out = refs.slice(0, MAX_THUMBS).map(r => {
-    const f = r.file;
-    let thumb = '';
-    try {
-      const blob = f.getThumbnail();
-      if (blob) thumb = Utilities.base64Encode(blob.getBytes());
-    } catch (e) {
-      // Drive sometimes refuses thumbnails for very fresh uploads — UI
-      // falls back to the file URL, no need to fail the whole listing.
-    }
-    return {
-      file_id:       f.getId(),
-      name:          f.getName(),
-      url:           f.getUrl(),
-      thumbnail_b64: thumb,
-      mime:          r.mime,
-      created_at:    r.created.toISOString(),
-    };
-  });
+  const out = (files.files || []).map(f => ({
+    file_id:        f.id,
+    name:           f.name,
+    url:            f.webViewLink || '',
+    thumbnail_link: f.thumbnailLink || '',
+    mime:           f.mimeType || 'image/jpeg',
+    created_at:     f.createdTime || '',
+  }));
   return jsonResponse_({ photos: out });
 }
 

@@ -929,7 +929,11 @@ function PhotoErrorNotice({ items }) {
 }
 
 function PhotoThumb({ item, onDelete, onRetry, onOpen }) {
+  // Order matters: a locally-captured blob wins (it's already in memory and
+  // may not be uploaded yet), then the server-proxied Drive thumbnail, then
+  // the legacy inline base64 for any payload predating that change.
   const src = item.previewUrl
+    || item.thumbnail_url
     || (item.thumbnail_b64 ? `data:${item.mime || 'image/jpeg'};base64,${item.thumbnail_b64}` : null)
   const inFlight = item.status === 'pending'
     || item.status === 'geocoding'

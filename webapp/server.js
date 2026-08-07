@@ -34,7 +34,7 @@ import {
   callAppsScript, noteBatchDownloadStart, noteBatchDownloadEnd,
 } from './server/appsScript.js'
 import {
-  fetchFileResponse, isConfigured as isDriveConfigured,
+  fetchFileResponse, fetchThumbnail, isConfigured as isDriveConfigured,
 } from './server/googleDrive.js'
 import {
   getBytes as getCachedPreview,
@@ -1831,8 +1831,32 @@ app.get('/api/wo-photos/:woId', async (req, res) => {
  * list_wo_photos thumbnail is only 220x220 and unreadable for review.
  */
 app.get('/api/wo-photos/:fileId/content', async (req, res) => {
+  const { fileId } = req.params
   try {
-    const data = await callAppsScript('get_wo_photo_content', { file_id: req.params.fileId })
+    // Same substitution as the Approvals preview: read Drive directly
+    // instead of having Apps Script base64 the image into JSON. Photos are
+    // multi-MB, so this is the same +33% inflation, script-load tax and
+    // ~30-35s ceiling — once per photo viewed.
+    const hit = getCachedPreview(fileId, 'photo')
+    if (hit) {
+      res.set('Content-Type', hit.mime || 'image/jpeg')
+      res.set('Cache-Control', 'private, max-age=3600')
+      return res.send(hit.buf)
+    }
+    if (isDriveConfigured()) {
+      try {
+        const resp = await fetchFileResponse(fileId)
+        const mime = resp.headers.get('content-type') || 'image/jpeg'
+        const buf  = Buffer.from(await resp.arrayBuffer())
+        putCachedPreview(fileId, 'photo', buf, mime, null)
+        res.set('Content-Type', mime)
+        res.set('Cache-Control', 'private, max-age=3600')
+        return res.send(buf)
+      } catch (driveErr) {
+        console.warn(`[PHOTO] drive failed, falling back file=${fileId}:`, driveErr.message)
+      }
+    }
+    const data = await callAppsScript('get_wo_photo_content', { file_id: fileId })
     if (data.error) return res.status(500).json({ error: data.error })
     const buf = Buffer.from(data.data || '', 'base64')
     res.set('Content-Type', data.mime || 'image/jpeg')
@@ -1840,7 +1864,50 @@ app.get('/api/wo-photos/:fileId/content', async (req, res) => {
     res.send(buf)
   } catch (err) {
     console.error('GET /api/wo-photos/:fileId/content error:', err.message)
-    res.status(500).json({ error: err.message })
+    if (!res.headersSent) res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * GET /api/wo-photos/:fileId/thumb
+ * Drive's own thumbnail for a photo, proxied and cached.
+ *
+ * Replaces the base64 thumbnails that list_wo_photos used to inline. Those
+ * cost a serial ~250-400ms Drive round trip PER FILE inside a single Apps
+ * Script execution, which is what forced the old 25-photo cap and made this
+ * the most failure-prone screen in the app. Here the browser requests them
+ * concurrently and each one is cached, so the grid fills in parallel.
+ *
+ * Falls back to the full image if Drive has no thumbnail yet (common for
+ * very fresh uploads) so a tile never renders blank.
+ */
+app.get('/api/wo-photos/:fileId/thumb', async (req, res) => {
+  const { fileId } = req.params
+  try {
+    const hit = getCachedPreview(fileId, 'thumb')
+    if (hit) {
+      res.set('Content-Type', hit.mime || 'image/jpeg')
+      res.set('Cache-Control', 'private, max-age=3600')
+      return res.send(hit.buf)
+    }
+    if (!isDriveConfigured()) return res.status(503).json({ error: 'Drive not configured' })
+
+    let out = await fetchThumbnail(fileId)
+    if (!out) {
+      // No Drive thumbnail — serve the full image rather than a blank tile.
+      const resp = await fetchFileResponse(fileId)
+      out = {
+        buf:  Buffer.from(await resp.arrayBuffer()),
+        mime: resp.headers.get('content-type') || 'image/jpeg',
+      }
+    }
+    putCachedPreview(fileId, 'thumb', out.buf, out.mime, null)
+    res.set('Content-Type', out.mime)
+    res.set('Cache-Control', 'private, max-age=3600')
+    res.send(out.buf)
+  } catch (err) {
+    console.error(`GET /api/wo-photos/${fileId}/thumb error:`, err.message)
+    if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 })
 
@@ -1852,6 +1919,9 @@ app.get('/api/wo-photos/:fileId/content', async (req, res) => {
 app.delete('/api/wo-photos/:fileId', async (req, res) => {
   try {
     const data = await callAppsScript('trash_file', { file_id: req.params.fileId })
+    // Drop the cached thumbnail and full image too, or a deleted photo
+    // keeps rendering from cache for the rest of the TTL.
+    invalidatePreview(req.params.fileId)
     res.json(data)
   } catch (err) {
     console.error('DELETE /api/wo-photos error:', err.message)

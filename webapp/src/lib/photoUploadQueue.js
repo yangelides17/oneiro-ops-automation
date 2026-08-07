@@ -197,7 +197,14 @@ export function usePhotoUploadQueue(woId) {
         status:         'uploaded',
         drive_file_id:  p.file_id,
         drive_file_url: p.url,
-        thumbnail_b64:  p.thumbnail_b64,
+        // Thumbnails are now fetched per-tile from the server instead of
+        // being base64'd into the listing payload. The old inline version
+        // cost a serial ~250-400ms Drive round trip per file inside one
+        // Apps Script execution, which is what forced a 25-photo cap and
+        // made this the most error-prone screen in the app. As URLs the
+        // browser loads them concurrently and they cache.
+        thumbnail_url:  `/api/wo-photos/${encodeURIComponent(p.file_id)}/thumb`,
+        thumbnail_b64:  p.thumbnail_b64,   // legacy field; harmless if absent
         mime:           p.mime,
         filename:       p.name,
         captured_at:    p.created_at,

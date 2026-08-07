@@ -180,6 +180,50 @@ export async function fetchFileResponse(fileId, { timeoutMs = 20000 } = {}) {
   return res
 }
 
+/**
+ * A file's Drive-generated thumbnail bytes, or null if Drive has none.
+ *
+ * Two hops: `files.get` for the short-lived `thumbnailLink`, then fetch it.
+ * Both are cheap and run on Node, so a grid of them resolves in parallel
+ * across the browser's connections — the opposite of Apps Script's
+ * `getThumbnail()`, which is ~250-400ms per file and strictly serial.
+ *
+ * Returns null rather than throwing when Drive simply has no thumbnail yet
+ * (common for very fresh uploads); callers fall back to the full image.
+ */
+export async function fetchThumbnail(fileId, { timeoutMs = 10000 } = {}) {
+  const token = await getAccessToken()
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
+                  `?fields=thumbnailLink,mimeType&supportsAllDrives=true`
+  const metaRes = await fetch(metaUrl, { headers: { Authorization: `Bearer ${token}` } })
+  if (!metaRes.ok) {
+    const t = await metaRes.text()
+    throw new Error(`thumbnail meta failed (${metaRes.status}): ${t.slice(0, 200)}`)
+  }
+  const meta = await metaRes.json()
+  if (!meta.thumbnailLink) return null
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    // The thumbnail host is a different origin from the Drive API; send the
+    // bearer token anyway since Drive-hosted thumbnails accept it, and fall
+    // back to the full image upstream if this ever stops working.
+    const res = await fetch(meta.thumbnailLink, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctrl.signal,
+    })
+    if (!res.ok) return null
+    const buf = Buffer.from(await res.arrayBuffer())
+    return { buf, mime: res.headers.get('content-type') || 'image/jpeg' }
+  } catch (err) {
+    if (err?.name === 'AbortError') return null
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** True when the environment is configured well enough to try Drive at all. */
 export function isConfigured() {
   return loadServiceAccount().ok
