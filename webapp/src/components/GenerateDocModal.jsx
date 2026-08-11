@@ -1,5 +1,16 @@
 import { useEffect, useState } from 'react'
 
+// Warnings come back from Apps Script as tagged objects. The gross-pay
+// mismatch has a bespoke numeric layout; everything else renders from a
+// plain `message`. The fallback is deliberate — it lets Apps Script start
+// emitting a new warning type without a coupled webapp deploy.
+const isGrossWarning = w => w && (w.type === 'gross' || (w.type == null && w.expected != null))
+const warningText = w => {
+  if (typeof w === 'string') return w
+  if (!w) return ''
+  return w.message || w.name || JSON.stringify(w)
+}
+
 /**
  * GenerateDocModal — blocking modal for document-generation actions.
  *
@@ -76,6 +87,9 @@ export default function GenerateDocModal({
 
   if (!open) return null
 
+  const grossWarnings = warnings.filter(isGrossWarning)
+  const otherWarnings = warnings.filter(w => !isGrossWarning(w))
+
   const handleConfirm = async () => {
     if (state === 'submitting') return
     setState('submitting')
@@ -142,20 +156,33 @@ export default function GenerateDocModal({
                   {files.map((f, i) => <li key={i} className="truncate">• {f}</li>)}
                 </ul>
               )}
-              {warnings.length > 0 && (
+              {grossWarnings.length > 0 && (
                 <div className="text-left bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1">
                   <p className="text-[12px] font-bold text-amber-700">
-                    ⚠ Gross pay didn’t match the paystub for {warnings.length} employee{warnings.length === 1 ? '' : 's'}
+                    ⚠ Gross pay didn’t match the paystub for {grossWarnings.length} employee{grossWarnings.length === 1 ? '' : 's'}
                   </p>
                   <p className="text-[10px] text-amber-600">
                     Net Pay &amp; Withholdings were still filled. Check that this week’s hours are recorded correctly.
                   </p>
                   <ul className="text-[11px] text-amber-800 space-y-0.5 max-h-[120px] overflow-y-auto">
-                    {warnings.map((w, i) => (
+                    {grossWarnings.map((w, i) => (
                       <li key={i} className="tabular-nums">
                         <span className="font-semibold">{w.name}</span>: computed ${w.expected} vs paystub ${w.paystub}
                         <span className="text-amber-500"> (Δ ${w.delta})</span>
+                        {w.note && <span className="block text-[10px] text-amber-500">{w.note}</span>}
                       </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {otherWarnings.length > 0 && (
+                <div className="text-left bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1">
+                  <p className="text-[12px] font-bold text-amber-700">
+                    ⚠ {otherWarnings.length} thing{otherWarnings.length === 1 ? '' : 's'} worth checking
+                  </p>
+                  <ul className="text-[11px] text-amber-800 space-y-0.5 max-h-[120px] overflow-y-auto">
+                    {otherWarnings.map((w, i) => (
+                      <li key={i}>{warningText(w)}</li>
                     ))}
                   </ul>
                 </div>

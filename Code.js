@@ -3256,6 +3256,78 @@ function computePayPeriodGrossForEmployee_(signInData, empName, payrollRates, we
 }
 
 
+// Earnings codes that are NOT field hours at the prevailing-wage rate, and
+// therefore are not part of what Certified Payroll computes. They are real
+// pay — they stay in Net Pay and Withholdings — but they must come out of
+// the paystub's gross before it is compared against our hours-based gross.
+//
+//   BONUS  — flat production bonus, not attributable to hours.
+//   TRAVEL — travel time, paid at a different rate than field hours.
+//
+// Matched as a case-insensitive substring of the printed code, so "BONUS"
+// catches "BONUS EARN" and "TRAVEL" catches "REG TRAVEL". Codes NOT listed
+// here stay in the comparison — see _cpComparablePaystubGross_ for why.
+const CP_EXCLUDED_EARNINGS_CODES = ['BONUS', 'TRAVEL'];
+
+// Earnings codes known to be part of the prevailing-wage gross (base wages
+// plus the supplemental/fringe lines that our st_supp / ot_supp already
+// fold in). Used only to decide whether a code is "recognized" — anything
+// in neither list warns so the lists can be kept current.
+const CP_INCLUDED_EARNINGS_CODES = [
+  'REGULAR', 'REG UNION', 'OVT', 'OT', 'WAOT', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK',
+];
+
+/**
+ * Paystub gross, adjusted for comparison against our hours-based gross.
+ *
+ * Anchors on the Gross Pay figure printed on the stub and subtracts only the
+ * earnings lines we positively recognize as non-field-hours. Deliberately
+ * NOT "sum the included lines": if a line were ever missed or mis-read, that
+ * approach would silently shrink the total, whereas subtracting from the
+ * printed anchor leaves it in and lets it surface as a visible mismatch.
+ *
+ * Unknown codes are left IN for the same reason — an unknown line that
+ * should have been excluded shows up as a warning the user can act on,
+ * while defaulting to exclude could mask a genuine discrepancy.
+ *
+ * Returns { gross, excluded: [{code, amount}], unknown: [{code, amount}] }.
+ */
+function _cpComparablePaystubGross_(ps) {
+  const gross = Number(ps && ps.gross_pay);
+  const out = { gross: gross, excluded: [], unknown: [] };
+  if (!isFinite(gross)) { out.gross = NaN; return out; }
+  const lines = (ps && Array.isArray(ps.earnings_lines)) ? ps.earnings_lines : [];
+
+  // No breakdown available (e.g. a register that doesn't itemize): fall back
+  // to the `bonus` convenience field so bonus weeks still compare correctly.
+  if (lines.length === 0) {
+    const bonus = Number(ps && ps.bonus);
+    if (isFinite(bonus) && bonus > 0) {
+      out.excluded.push({ code: 'BONUS', amount: bonus });
+      out.gross = _roundCents_(gross - bonus);
+    }
+    return out;
+  }
+
+  let deduct = 0;
+  lines.forEach(l => {
+    const code = String(l && l.code || '').trim();
+    const amt  = Number(l && l.amount);
+    if (!code || !isFinite(amt)) return;
+    const upper = code.toUpperCase();
+    const isExcluded = CP_EXCLUDED_EARNINGS_CODES.some(c => upper.indexOf(c) !== -1);
+    if (isExcluded) {
+      deduct += amt;
+      out.excluded.push({ code: code, amount: amt });
+      return;
+    }
+    const isKnown = CP_INCLUDED_EARNINGS_CODES.some(c => upper.indexOf(c) !== -1);
+    if (!isKnown) out.unknown.push({ code: code, amount: amt });
+  });
+  out.gross = _roundCents_(gross - deduct);
+  return out;
+}
+
 function generateCertifiedPayroll(weekStartStr, opts) {
   // Parse MM/DD/YYYY explicitly to avoid UTC-shift issues
   const parts = weekStartStr.trim().split('/');
@@ -3273,21 +3345,55 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   // the paystub gross — a discrepancy warns (via opts.warningsOut) but
   // never blocks generation. Values are week-level per person and repeat
   // on each of that person's classification rows.
+  //
+  // Duplicate names are rejected upstream (both in the parse endpoint and
+  // in handleGenerateCPForDoc_), so a collision here means a caller
+  // bypassed those checks — log it rather than silently dropping a stub.
   const _psNorm = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const paystubByName = {};
   if (opts && opts.paystub && Array.isArray(opts.paystub.employees)) {
     opts.paystub.employees.forEach(e => {
       const n = _psNorm(e && e.name);
-      if (n) paystubByName[n] = e;
+      if (!n) return;
+      if (paystubByName[n]) {
+        Logger.log('⚠️ Certified Payroll: paystub lists ' + e.name + ' more than once — keeping the last entry.');
+      }
+      paystubByName[n] = e;
     });
   }
-  const warnedNames = {};   // dedupe gross warnings across a person's multiple classification rows
+  const warnedNames   = {};   // dedupe gross warnings across a person's multiple classification rows
+  const idWarnedNames = {};   // same, for employee-number corroboration
+  const _psWarn = (type, message) => {
+    if (opts && Array.isArray(opts.warningsOut)) opts.warningsOut.push({ type: type, message: message });
+  };
 
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const data = signInSheet.getDataRange().getValues();
   const empSheet = ss.getSheetByName('Employee Registry');
   const empData = empSheet.getDataRange().getValues();
+
+  // A paystub name that matches no Employee Registry row fills nothing and
+  // would otherwise fail silently. Checked against the REGISTRY, not against
+  // this run's contract groups: the generator loops per contract and a
+  // paystub legitimately contains people who worked other contracts that
+  // week, so a per-group check would be noise. Registry non-existence is
+  // contract-independent and always a real problem.
+  if (Object.keys(paystubByName).length) {
+    const registryNames = {};
+    empData.slice(1).forEach(r => {
+      const n = _psNorm(r[1]);
+      if (n) registryNames[n] = true;
+    });
+    Object.keys(paystubByName).forEach(k => {
+      if (!registryNames[k]) {
+        _psWarn('unmatched',
+          'Paystub lists "' + (paystubByName[k].name || k) + '", who has no Employee Registry row — ' +
+          'their Withholdings & Net Pay were left blank.');
+      }
+    });
+  }
+
   const clSheet = ss.getSheetByName('Contract Lookup');
   const clData = clSheet.getDataRange().getValues();
   const cpSheet = ss.getSheetByName('Certified Payroll Tracker');
@@ -3544,25 +3650,62 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         if (isFinite(psNet)) netPayStr     = psNet.toFixed(2);
         if (isFinite(psDed)) deductionsStr = psDed.toFixed(2);
 
-        // Gross verification: computed all-work gross vs paystub gross
-        // (a proxy for hours being recorded correctly). Tolerance is a
-        // couple cents so tiny rounding differences between our system and
-        // the payroll software don't warn, while any real hour discrepancy
-        // (≥ a fraction of an hour × rate = dollars) still does. Warn once
-        // per employee; still fill the values.
-        if (isFinite(psGross)) {
+        // Gross verification: computed all-work gross vs the paystub gross
+        // (a proxy for hours being recorded correctly).
+        //
+        // Certified Payroll counts only field hours at the prevailing-wage
+        // rate, so the paystub gross is first adjusted down by any earnings
+        // line that isn't field hours (bonus, travel — see
+        // CP_EXCLUDED_EARNINGS_CODES). Without that, every bonus week would
+        // warn spuriously. Note the fills above are NOT adjusted: the
+        // employee really was paid the bonus, so Net Pay and Withholdings
+        // stay exactly as printed. Only the comparison changes.
+        //
+        // Tolerance is a couple cents so tiny rounding differences between
+        // our system and the payroll software don't warn, while any real
+        // hour discrepancy (≥ a fraction of an hour × rate = dollars) still
+        // does. Warn once per employee; always still fill the values.
+        if (isFinite(psGross) && !warnedNames[normName(empName)]) {
+          const adj = _cpComparablePaystubGross_(ps);
           const tol = 0.02;
-          if (Math.abs(allWorkGross - psGross) > tol && !warnedNames[normName(empName)]) {
+          if (isFinite(adj.gross) && Math.abs(allWorkGross - adj.gross) > tol) {
             warnedNames[normName(empName)] = true;
+            let note = '';
+            if (adj.excluded.length) {
+              note = 'Paystub gross $' + psGross.toFixed(2) + ' less ' +
+                     adj.excluded.map(x => x.code + ' $' + Number(x.amount).toFixed(2)).join(', ') +
+                     ' = $' + adj.gross.toFixed(2) + ' compared.';
+            }
+            if (adj.unknown.length) {
+              note += (note ? ' ' : '') + 'Unrecognized earnings line' +
+                      (adj.unknown.length === 1 ? '' : 's') + ': ' +
+                      adj.unknown.map(x => x.code + ' $' + Number(x.amount).toFixed(2)).join(', ') +
+                      ' — left in the comparison; tell us if it should be excluded.';
+            }
             if (opts && Array.isArray(opts.warningsOut)) {
               opts.warningsOut.push({
+                type:     'gross',
                 name:     empName,
                 expected: allWorkGross.toFixed(2),
-                paystub:  psGross.toFixed(2),
-                delta:    (allWorkGross - psGross).toFixed(2),
+                paystub:  adj.gross.toFixed(2),
+                delta:    (allWorkGross - adj.gross).toFixed(2),
+                note:     note,
               });
             }
           }
+        }
+
+        // Employee-number corroboration. On these stubs the printed payroll
+        // ID matches the registry's last-4 SSN, so a disagreement is a hint
+        // the name matched the wrong person. Corroboration only — it never
+        // overrides the name match, and is never used as a join key.
+        if (ps.employee_number && empSsn4 &&
+            String(ps.employee_number).trim() !== String(empSsn4).trim() &&
+            !idWarnedNames[normName(empName)]) {
+          idWarnedNames[normName(empName)] = true;
+          _psWarn('id_mismatch',
+            empName + ': paystub employee # ' + ps.employee_number +
+            " doesn't match the registry's last-4 (" + empSsn4 + ') — check the name matched the right person.');
         }
       }
 
@@ -10150,6 +10293,41 @@ function handleGenerateCPForDoc_(body) {
   const v = _validateSignInDoneForWeek_(ss, parsed.anchor, parsed.contractNum, parsed.borough);
   if (!v.ok) {
     return jsonResponse_({ error: v.error, error_code: v.error_code, missing_dates: v.missing_dates || [] }, 400);
+  }
+
+  // Paystub preflight. Both checks run BEFORE the try block below, so a bad
+  // paystub is refused with nothing written to the Certified Payroll Tracker.
+  // The upload endpoint screens for these too; this is the authoritative
+  // pass, since the payload could reach here by another route.
+  if (d.paystub) {
+    // Wrong week. A paystub from a different week fills plausible but wrong
+    // Net Pay & Withholdings, so this blocks rather than warns.
+    const psPeriod = d.paystub.pay_period;
+    if (psPeriod && psPeriod.start && psPeriod.start !== parsed.anchor) {
+      return jsonResponse_({
+        error: 'That paystub covers the week of ' + psPeriod.start + ', but this Certified Payroll ' +
+               'is the week of ' + parsed.anchor + '. Upload the matching week\'s paystub, or generate without one.',
+        error_code: 'PAYSTUB_WEEK_MISMATCH',
+      }, 400);
+    }
+    // Same employee twice. The paystub is indexed by name downstream, so a
+    // duplicate would silently discard all but one of that person's stubs.
+    if (Array.isArray(d.paystub.employees)) {
+      const seenPs = {}, dupPs = [];
+      d.paystub.employees.forEach(e => {
+        const n = String(e && e.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        if (!n) return;
+        if (seenPs[n]) { if (dupPs.indexOf(e.name) === -1) dupPs.push(e.name); }
+        seenPs[n] = true;
+      });
+      if (dupPs.length) {
+        return jsonResponse_({
+          error: 'That paystub lists the same employee more than once (' + dupPs.join(', ') + '). ' +
+                 'A Certified Payroll week takes one stub per person — split the file and upload one pay period at a time.',
+          error_code: 'PAYSTUB_DUPLICATE_EMPLOYEE',
+        }, 400);
+      }
+    }
   }
 
   try {

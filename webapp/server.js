@@ -385,9 +385,13 @@ app.post('/api/tools/generate-cp-for-doc', async (req, res) => {
   try {
     const { doc_id, paystub } = req.body || {}
     if (!doc_id) return res.status(400).json({ error: 'Missing doc_id' })
-    // `paystub` (optional) = { employees: [{ name, gross_pay, net_pay, deductions }] }
-    // from the Upload Paystub step; Apps Script uses it to auto-fill
-    // Withholdings & Net Pay and to run the gross-pay verification.
+    // `paystub` (optional), from the Upload Paystub step, forwarded opaquely:
+    //   { employees: [{ name, gross_pay, net_pay, deductions, bonus,
+    //                   earnings_lines: [{ code, hours, amount }], ... }],
+    //     pay_period: { start, end }, layout, page_count }
+    // Apps Script uses it to auto-fill Withholdings & Net Pay, to refuse a
+    // wrong-week paystub, and to run the gross-pay verification (which
+    // subtracts non-field-hours earnings lines before comparing).
     const data = await callAppsScript('generate_cp_for_doc', { doc_id, paystub })
     if (data && data.error) return res.status(400).json(data)
     res.json(data)
@@ -1788,18 +1792,32 @@ Rules:
  * POST /api/tools/paystub/parse
  * Reads a payroll paystub with Claude vision so the CP Generate modal can
  * auto-fill each employee's Withholdings & Deductions and Net Pay (today
- * transcribed by hand from payrollforconstruction.com). Standard input is
- * the "Pre-Check Register" (one page, every employee, two rows each), as a
- * PDF or a JPEG/PNG screenshot; individual check stubs are also handled.
+ * transcribed by hand from payrollforconstruction.com). Two layouts:
+ *
+ *   "register" — the "Pre-Check Register": ONE page, every employee, two
+ *                stacked rows each. PDF or JPEG/PNG screenshot.
+ *   "stubs"    — a summary PDF where EACH PAGE is one employee's individual
+ *                check stub. N pages → N rows.
  *
  * Employee names are resolved against the Employee Registry closed list
  * (same closed-list trick as /api/signin-queue/parse-upload) so the "Last,
  * First M" register spelling maps to the exact registry name the CP data
  * joins on.
  *
+ * Every line of the Earnings block comes back verbatim in `earnings_lines`.
+ * That is what lets the CP gross check subtract non-field-hours earnings
+ * (bonus, regular travel) before comparing — see CP_EXCLUDED_EARNINGS_CODES
+ * in Code.js. This endpoint deliberately does NOT classify those lines; it
+ * only transcribes them.
+ *
+ * Rejects (400) two things that are never legitimate for one CP week: the
+ * same employee appearing twice, and a file spanning multiple pay periods.
+ *
  * Returns { employees: [{ name, employee_number, gross_pay, net_pay,
- * deductions }], filename }. No persistence — the caller passes the result
- * straight into POST /api/tools/generate-cp-for-doc.
+ * deductions, bonus, earnings_lines, page, pay_period_start,
+ * pay_period_end }], filename, layout, page_count, pay_period, warnings }.
+ * No persistence — the caller passes the result straight into POST
+ * /api/tools/generate-cp-for-doc.
  */
 app.post('/api/tools/paystub/parse', upload.single('file'), async (req, res) => {
   try {
@@ -1812,6 +1830,25 @@ app.post('/api/tools/paystub/parse', upload.single('file'), async (req, res) => 
     if (!ALLOWED.includes(mime)) {
       return res.status(400).json({ error: 'Unsupported file type (got ' + mime + '). Upload a PDF, JPEG, or PNG.' })
     }
+
+    // Real page count up front: it goes into the prompt (so the model knows
+    // how many stubs to expect) and backs the row/page reconciliation below.
+    // Degrade rather than fail — an unreadable count just means no guard.
+    let pageCount = null
+    if (mime === 'application/pdf') {
+      try {
+        const { PDFDocument } = await import('pdf-lib')
+        pageCount = (await PDFDocument.load(req.file.buffer, { ignoreEncryption: true })).getPageCount()
+      } catch (e) {
+        console.warn('Paystub upload: could not read page count:', e.message)
+      }
+    }
+    if (pageCount != null && pageCount > 100) {
+      return res.status(400).json({
+        error: `That PDF has ${pageCount} pages. The reader accepts at most 100 — split it by pay period and upload one week at a time.`,
+      })
+    }
+
     const base64 = req.file.buffer.toString('base64')
     // PDFs go in a `document` block; images in an `image` block.
     const sourceBlock = mime === 'application/pdf'
@@ -1832,48 +1869,85 @@ app.post('/api/tools/paystub/parse', upload.single('file'), async (req, res) => 
       ? employeeList.map(n => `  - ${n}`).join('\n')
       : '  (registry currently empty — return the name as printed)'
 
-    const prompt = `You are extracting per-employee pay figures from a construction payroll paystub produced by payrollforconstruction.com. Return ONLY valid JSON — no markdown fences, no commentary.
+    const pageCountText = pageCount != null
+      ? `This file has ${pageCount} page${pageCount === 1 ? '' : 's'}.`
+      : 'The page count of this file is unknown.'
 
-The document is USUALLY a "Pre-Check Register": a single table listing every employee for one weekly pay period. Each employee occupies TWO stacked rows:
+    const prompt = `You are extracting per-employee pay figures from a construction payroll paystub produced by payrollforconstruction.com. ${pageCountText}
+
+STEP 1 — Decide the layout, and report it as "layout":
+  "register" — a "Pre-Check Register": ONE page holding a single table that lists EVERY
+               employee for one weekly pay period, two stacked rows per employee.
+  "stubs"    — individual check stubs: ONE EMPLOYEE PER PAGE. A ${pageCount != null ? pageCount + '-page' : 'multi-page'} file in this
+               layout produces exactly one row per page${pageCount != null ? ` — ${pageCount} rows` : ''}.
+
+── If the layout is "register" ──
+Each employee occupies TWO stacked rows:
   - Row 1 columns: REG (hours) | QTY | REG Wages | Taxable Add | Tx Uni Frng | Gross Pay | FICA | State | Union | Net Pay
   - Row 2 columns: OVT (hours) | OTH | OVT Wages | Non-Tax Add | Emp Fringe | Tot Taxable | Federal | Local | Misc | Pay Method
 Each employee block is preceded by an employee number and a name like "Angelides , Stamatis D".
-
-For EACH employee return:
   - gross_pay: the number in the "Gross Pay" column (row 1) — the full weekly gross across all work.
   - net_pay:   the number in the "Net Pay" column (row 1).
   - deductions: gross_pay minus net_pay. (Sanity-check: it should also equal FICA + State + Union + Federal + Local + Misc summed across both rows — if that sum disagrees, still return gross_pay - net_pay.)
-  - employee_number: the payroll ID printed with the block (e.g. "3540"), or null.
-
-If instead the document is an individual check stub (one employee per page, with a "Summary" block), read Gross Pay, Total Deductions, and Net Pay directly from that Summary; deductions = Total Deductions.
-
 IGNORE any totals/summary rows at the bottom of a register (rows labeled "Employees:", "Total Checks", "Total Direct Deposits", "Total Adjustments"). Only return real employees.
 
-Schema:
-{
-  "employees": [
-    {
-      "name":            "<EXACTLY one name from the Employee Registry below — see Name matching rules>",
-      "employee_number": "<the payroll ID printed for this employee, or null>",
-      "gross_pay":       <number, no $ or commas>,
-      "net_pay":         <number, no $ or commas>,
-      "deductions":      <number, no $ or commas>
-    }
-  ]
-}
+── If the layout is "stubs" ──
+Each page is ONE employee's check stub. Read every page.
+
+Pay period: near the top each page prints "Dates MM/DD/YY-MM/DD/YY". Return it as
+pay_period_start / pay_period_end in YYYY-MM-DD form. The printed year is 2-digit:
+"07/12/26" is 2026-07-12, NOT 1926 or 2007.
+
+Money: lower on the page is a "Summary" block with THREE labelled rows (Gross Pay,
+Total Deductions, Net Pay) and TWO numeric columns side by side:
+        Current        Year To Date
+ALWAYS read the LEFT column, "Current" — this pay period only.
+NEVER read the "Year To Date" column.
+On an employee's first check of the year the two columns hold IDENTICAL numbers. That does
+NOT license reading either one — still read the left/Current column.
+  gross_pay  = Summary → Gross Pay        → Current
+  deductions = Summary → Total Deductions → Current
+  net_pay    = Summary → Net Pay          → Current
+
+VOID stamps: many stubs are stamped "Not Actual Check - VOID VOID". These are direct-deposit
+vouchers and are REAL, VALID payments. INCLUDE every one of them. Never skip a page because
+it is stamped void or marked non-negotiable.
+
+ONE ROW PER PAGE: return exactly one row per stub page, in page order, and set "page" to the
+1-based page number. Never merge, de-duplicate, consolidate, or collapse pages — if the same
+person appears on 3 pages, return 3 separate rows.
+
+── Earnings lines (BOTH layouts) ──
+Return every line of the "Earnings" block as earnings_lines, using the CURRENT column only
+(never Year To Date). Transcribe each line's code EXACTLY as printed — e.g. "REGULAR UN",
+"OVT", "BONUS EARN", "REG TRAVEL", "VACATION F", "CASH FRING", "WAOT".
+  - amount: that line's Current earnings dollars.
+  - hours:  that line's Current hours if the line has an hours figure, else null.
+Do NOT include the "Gross Pay" total row itself as an earnings line.
+Do NOT judge, classify, group, or rename the lines — transcribe them. Something downstream
+decides what each code means.
+Self-check: the earnings_lines amounts must sum to gross_pay. If they do not, you have
+missed or misread a line — re-read the Earnings block before answering.
+On a "register" layout, if individual earnings lines are not itemized, return an empty
+earnings_lines array rather than inventing lines.
+
+Also return, for every row:
+  - employee_number: the payroll ID printed with the block (e.g. "3540"), or null.
+  - bonus: the summed Current amount of any earnings line whose code contains "BONUS"
+    (0 when there is none). This is a convenience field — earnings_lines remains the
+    authoritative breakdown.
 
 Employee Registry (the ONLY valid values for employees[].name):
 ${employeeListText}
 
 Name matching rules:
-- The register prints names "Last , First M". For each, find the SINGLE registry entry above whose person matches (account for last/first order, middle initials, accents, abbreviations, minor misspellings — pick the best fit).
+- Stubs and registers print names in varying orders ("Last , First M", "First M. Last"). For each, find the SINGLE registry entry above whose person matches (account for last/first order, middle initials, accents, abbreviations, minor misspellings — pick the best fit).
 - Return that registry entry verbatim — exact capitalization and spelling as listed above.
 - If the registry list is empty, return the name as printed on the paystub.
 - Skip a row only if it has no employee at all.
 
 Numbers:
-- Strip "$" and thousands separators; "1,529.55" → 1529.55.
-- Never wrap the JSON in markdown fences.`
+- Strip "$" and thousands separators; "1,529.55" → 1529.55.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -1884,7 +1958,63 @@ Numbers:
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 4096,
+        // Rows carry an earnings breakdown now, so output is much larger than
+        // the 5 scalar fields this started with. 4096 silently truncated on a
+        // big register and surfaced as "Claude returned non-JSON text".
+        max_tokens: 16000,
+        // Structured outputs: the schema is enforced at the API, so there is
+        // no fence-stripping or JSON.parse guesswork on this path.
+        // `name` is deliberately NOT an enum of registry names — the registry
+        // can legitimately be empty, and an empty enum is an invalid schema.
+        // Name resolution stays prompt-side, where it is proven.
+        output_config: {
+          format: {
+            type: 'json_schema',
+            schema: {
+              type: 'object',
+              properties: {
+                layout: { type: 'string', enum: ['register', 'stubs'] },
+                employees: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name:             { type: 'string' },
+                      employee_number:  { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                      gross_pay:        { type: 'number' },
+                      net_pay:          { type: 'number' },
+                      deductions:       { type: 'number' },
+                      bonus:            { type: 'number' },
+                      page:             { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+                      pay_period_start: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                      pay_period_end:   { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                      earnings_lines: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            code:   { type: 'string' },
+                            hours:  { anyOf: [{ type: 'number' }, { type: 'null' }] },
+                            amount: { type: 'number' },
+                          },
+                          required: ['code', 'hours', 'amount'],
+                          additionalProperties: false,
+                        },
+                      },
+                    },
+                    required: [
+                      'name', 'employee_number', 'gross_pay', 'net_pay', 'deductions',
+                      'bonus', 'page', 'pay_period_start', 'pay_period_end', 'earnings_lines',
+                    ],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ['layout', 'employees'],
+              additionalProperties: false,
+            },
+          },
+        },
         messages: [{
           role: 'user',
           content: [ sourceBlock, { type: 'text', text: prompt } ],
@@ -1897,23 +2027,26 @@ Numbers:
       throw new Error(`Anthropic API error ${apiRes.status}: ${errText.slice(0, 300)}`)
     }
     const apiJson = await apiRes.json()
+    if (apiJson.stop_reason === 'refusal') {
+      throw new Error('The paystub reader declined this file. Enter the figures manually.')
+    }
+    if (apiJson.stop_reason === 'max_tokens') {
+      throw new Error(
+        `Ran out of room reading this paystub (${pageCount != null ? pageCount + ' pages' : 'too many employees'}). ` +
+        'Split it into smaller files — one pay period at a time — and upload each.'
+      )
+    }
     const textBlock = (apiJson.content || []).find(b => b.type === 'text')
     if (!textBlock) throw new Error('Anthropic response had no text block')
-
-    let raw = String(textBlock.text || '').trim()
-    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim()
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (e) {
-      throw new Error('Claude returned non-JSON text — first 200 chars: ' + raw.slice(0, 200))
-    }
+    const parsed = JSON.parse(String(textBlock.text || ''))
 
     // Normalize into a clean numeric array; drop rows missing a name.
     const num = v => {
       const n = Number(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''))
       return isFinite(n) ? n : null
     }
+    const isoDate = v => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '').trim()) ? String(v).trim() : null)
+    const layout = parsed.layout === 'stubs' ? 'stubs' : 'register'
     const employees = (Array.isArray(parsed.employees) ? parsed.employees : [])
       .map(e => ({
         name:            String(e.name || '').trim(),
@@ -1921,10 +2054,99 @@ Numbers:
         gross_pay:       num(e.gross_pay),
         net_pay:         num(e.net_pay),
         deductions:      num(e.deductions),
+        bonus:           num(e.bonus) || 0,
+        page:            Number.isInteger(e.page) ? e.page : null,
+        pay_period_start: isoDate(e.pay_period_start),
+        pay_period_end:   isoDate(e.pay_period_end),
+        earnings_lines: (Array.isArray(e.earnings_lines) ? e.earnings_lines : [])
+          .map(l => ({
+            code:   String(l && l.code || '').trim(),
+            hours:  num(l && l.hours),
+            amount: num(l && l.amount),
+          }))
+          .filter(l => l.code),
       }))
       .filter(e => e.name)
 
-    res.json({ employees, filename: req.file.originalname })
+    if (employees.length === 0) {
+      return res.status(400).json({ error: 'No employees found on that paystub. Check the file and try again.' })
+    }
+
+    // ── Deterministic checks ──
+    // These need no model: we know the page count and can see the rows, so
+    // anything that doesn't line up is caught before it reaches the CP.
+    const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ')
+
+    // Reject #1 — the same person twice. Never legitimate for one CP week,
+    // and Code.js indexes the paystub by name, so a duplicate would silently
+    // discard all but one of them.
+    const byName = new Map()
+    employees.forEach(e => {
+      const k = normName(e.name)
+      byName.set(k, (byName.get(k) || []).concat(e))
+    })
+    const dupNames = [...byName.entries()].filter(([, rows]) => rows.length > 1)
+    if (dupNames.length) {
+      const detail = dupNames
+        .map(([, rows]) => `${rows[0].name} (${rows.length}× — page${rows.length === 1 ? '' : 's'} ${rows.map(r => r.page ?? '?').join(', ')})`)
+        .join('; ')
+      return res.status(400).json({
+        error: `This file lists the same employee more than once: ${detail}. ` +
+               'A Certified Payroll week takes one stub per person — split the file and upload one pay period at a time.',
+      })
+    }
+
+    // Reject #2 — more than one pay period in a single file. A CP covers one
+    // Sun–Sat week, so a multi-period upload would fill the wrong figures.
+    const periodKeys = [...new Set(
+      employees.filter(e => e.pay_period_start).map(e => `${e.pay_period_start}|${e.pay_period_end || ''}`)
+    )]
+    if (periodKeys.length > 1) {
+      const list = periodKeys.map(k => k.split('|')[0]).sort().join(', ')
+      return res.status(400).json({
+        error: `This file spans ${periodKeys.length} pay periods (${list}). ` +
+               'Upload one pay period at a time — a Certified Payroll covers a single week.',
+      })
+    }
+    const payPeriod = periodKeys.length === 1
+      ? { start: periodKeys[0].split('|')[0], end: periodKeys[0].split('|')[1] || null }
+      : null
+
+    // Warnings — non-blocking, surfaced in the upload panel.
+    const warnings = []
+    if (layout === 'stubs' && pageCount != null && employees.length !== pageCount) {
+      warnings.push(
+        employees.length < pageCount
+          ? `Read ${employees.length} employees from a ${pageCount}-page file. ${pageCount - employees.length} page(s) produced no row — pages may have been skipped or merged.`
+          : `Read ${employees.length} employees from a ${pageCount}-page file — more rows than pages.`
+      )
+    }
+    if (layout === 'stubs') {
+      const pages = employees.map(e => e.page).filter(p => p != null)
+      const dupPages = [...new Set(pages.filter((p, i) => pages.indexOf(p) !== i))]
+      if (dupPages.length) warnings.push(`Page ${dupPages.join(', ')} was read more than once.`)
+      if (!employees.every(e => e.pay_period_start)) {
+        warnings.push('Some stubs had no readable pay period — the week could not be verified for those.')
+      }
+    }
+    // The earnings breakdown drives the CP gross check, so flag any row where
+    // it does not reconcile to the gross printed on the stub.
+    employees.forEach(e => {
+      if (!e.earnings_lines.length || e.gross_pay == null) return
+      const sum = e.earnings_lines.reduce((t, l) => t + (l.amount || 0), 0)
+      if (Math.abs(sum - e.gross_pay) > 0.02) {
+        warnings.push(`${e.name}: earnings lines total $${sum.toFixed(2)} but gross pay reads $${e.gross_pay.toFixed(2)} — the breakdown may be incomplete.`)
+      }
+    })
+
+    res.json({
+      employees,
+      filename:   req.file.originalname,
+      layout,
+      page_count: pageCount,
+      pay_period: payPeriod,
+      warnings,
+    })
   } catch (err) {
     console.error('POST /api/tools/paystub/parse error:', err.message)
     res.status(500).json({ error: err.message })

@@ -919,7 +919,9 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
   // GenerateDocModal state — `pendingItem` is the pending-list row the
   // user clicked Generate on; null = modal closed.
   const [pendingItem, setPendingItem] = useState(null)
-  // Parsed paystub rows for the CP generate modal (null = none uploaded).
+  // Parsed paystub payload for the CP generate modal (null = none uploaded).
+  // Holds the whole /api/tools/paystub/parse response — employees plus the
+  // pay period, layout and page count — not just the employee rows.
   const [paystub, setPaystub] = useState(null)
 
   // Push the pending count into the shared context so the Doc Status
@@ -1209,7 +1211,16 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
       body:    JSON.stringify({
         doc_id: pendingItem.doc_id,
         // Optional paystub auto-fill — CP only, when one was uploaded.
-        ...(isCp && paystub ? { paystub: { employees: paystub } } : {}),
+        // `pay_period` lets Apps Script refuse a wrong-week paystub before
+        // anything is written to the tracker.
+        ...(isCp && paystub ? {
+          paystub: {
+            employees:  paystub.employees,
+            pay_period: paystub.pay_period,
+            layout:     paystub.layout,
+            page_count: paystub.page_count,
+          },
+        } : {}),
       }),
     })
     const body = await res.json().catch(() => ({}))
@@ -1325,7 +1336,7 @@ export default function DocStatusTab({ wos, qbConnected, onDocsChange, onInvoice
         onConfirm={handleGenerateConfirm}
         onClose={closeGenerateModal}
         idleExtra={pendingItem?.missing?.[0] === 'CP Done'
-          ? <PaystubUpload onParsed={setPaystub} />
+          ? <PaystubUpload onParsed={setPaystub} expectedWeekStart={pendingItem.anchor} />
           : null}
       />
     </div>
