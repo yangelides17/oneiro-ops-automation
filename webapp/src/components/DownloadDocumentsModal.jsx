@@ -105,6 +105,10 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   const [granularity, setGranularity] = useState('week')   // 'week' | 'month'
   const [periodWeek,  setPeriodWeek]  = useState('')       // ISO Sunday
   const [periodMonth, setPeriodMonth] = useState('')       // YYYY-MM
+  // 'individual' = today's zip of separate files; 'combined' = one merged
+  // PDF per contract-borough. Month only — a week has no Employee
+  // Utilization or certificates to package.
+  const [downloadType, setDownloadType] = useState('individual')
   const weekOpts  = useMemo(() => recentWeeks(16), [])
   const monthOpts = useMemo(() => recentMonths(12), [])
   // Preview
@@ -123,6 +127,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
   const [submitState, setSubmitState] = useState('idle')   // idle | working | cancelled | done | error
   const [submitError, setSubmitError] = useState(null)
   const abortRef = useRef(null)
+  // Explicit acknowledgement when the completeness check found gaps.
+  const [ackIncomplete, setAckIncomplete] = useState(false)
+
+  // Combined PDF is a payroll-MONTH option: the package is built around the
+  // month's Employee Utilization and certificates, which a week doesn't have.
+  const combinedAvailable = mode === 'payroll_period' && granularity === 'month'
+  const combinedOn = combinedAvailable && downloadType === 'combined'
 
   // Close on Escape (only if not mid-download)
   useEffect(() => {
@@ -151,6 +162,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
     } else {
       setSelectedDocTypes([])
     }
+    setDownloadType('individual')
   }, [mode])
 
   // Elapsed-seconds readout while the preview loads. Apps Script returns
@@ -195,9 +207,12 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
       f.granularity = granularity
       if (granularity === 'week') f.week_start = periodWeek
       else                        f.month      = periodMonth
+      // Belongs in `filters`, unlike mark_sent: it changes what the preview
+      // returns, so a re-preview on toggle is the correct behaviour.
+      if (combinedOn) f.download_type = 'combined'
     }
     return f
-  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos, granularity, periodWeek, periodMonth])
+  }, [mode, selectedContractors, selectedDocTypes, woInput, dateStart, dateEnd, includeSIsWithCP, includePhotos, granularity, periodWeek, periodMonth, combinedOn])
 
   // ── Step transitions ──────────────────────────────────────────
   // Step 3 is shown IMMEDIATELY and renders its own loading state. The
@@ -280,6 +295,9 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
           ...filters,
           mark_sent:   markSent,
           batch_token: preview?.batch_token,
+          // Download-time only, like mark_sent — kept out of `filters` so it
+          // can't invalidate the previewed listing.
+          ...(ackIncomplete ? { acknowledge_incomplete: true } : {}),
         }),
         signal:  controller.signal,
       })
@@ -404,11 +422,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                     const allOn = opts.length > 0 && opts.every(dt => selectedDocTypes.indexOf(dt) !== -1)
                     return (
                       <button
+                        disabled={combinedOn}
                         onClick={() => setSelectedDocTypes(allOn ? [] : opts.slice())}
                         className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
                           ${allOn
                             ? 'bg-navy text-white border-navy'
-                            : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
+                            : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}
+                          ${combinedOn ? 'opacity-60 cursor-not-allowed' : ''}`}
                       >
                         {allOn ? '✓ All' : 'All'}
                       </button>
@@ -419,11 +439,13 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                     return (
                       <button
                         key={dt}
+                        disabled={combinedOn}
                         onClick={() => toggleDocType(dt)}
                         className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-all
                           ${on
                             ? 'bg-navy text-white border-navy'
-                            : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}`}
+                            : 'bg-white text-slate-600 border-slate-200 hover:border-navy/40'}
+                          ${combinedOn ? 'opacity-60 cursor-not-allowed' : ''}`}
                       >
                         {dt}
                       </button>
@@ -575,6 +597,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                             if (g === 'week') {
                               setSelectedDocTypes(prev =>
                                 prev.filter(dt => MONTH_END_TYPES.indexOf(dt) === -1))
+                              setDownloadType('individual')
                             }
                           }}
                           className={`text-sm font-semibold px-4 py-1.5 transition-all ${
@@ -600,9 +623,50 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       </select>
                     )}
                   </div>
+                  {combinedAvailable && (
+                    <div>
+                      <label className="block text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-2">
+                        Download type
+                      </label>
+                      <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden">
+                        {[
+                          { id: 'individual', label: 'Individual Files' },
+                          { id: 'combined',   label: 'Combined PDF' },
+                        ].map(o => (
+                          <button
+                            key={o.id}
+                            type="button"
+                            onClick={() => {
+                              setDownloadType(o.id)
+                              setAckIncomplete(false)
+                              // The package contents are fixed — a half-selected
+                              // month-end package would go out looking complete.
+                              if (o.id === 'combined') {
+                                setSelectedDocTypes(
+                                  ['Certified Payroll', 'Sign-In'].concat(MONTH_END_TYPES))
+                              }
+                            }}
+                            className={`text-sm font-semibold px-4 py-1.5 transition-all ${
+                              downloadType === o.id ? 'bg-navy text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
+                            }`}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <p className="text-[11px] text-slate-400">
-                    Certified Payroll + Sign-Ins for the selected period. Deselect a doc type above to narrow it (e.g. Sign-Ins only, to reconcile a CP).
-                    {granularity === 'month' && ' Month also offers the signed Employee Utilization + Certificates — they arrive in one flat Month-End Docs folder.'}
+                    {combinedOn ? (
+                      <>One PDF per contract &amp; borough, containing that month&rsquo;s Certified Payroll,
+                      its Sign-Ins, the Employee Utilization form and the Certificates &mdash; in submission
+                      order, behind a cover page. Package contents are fixed, so the doc types above are
+                      locked.</>
+                    ) : (
+                      <>Certified Payroll + Sign-Ins for the selected period. Deselect a doc type above to narrow it (e.g. Sign-Ins only, to reconcile a CP).
+                      {granularity === 'month' && ' Month also offers the signed Employee Utilization + Certificates — they arrive in one flat Month-End Docs folder.'}</>
+                    )}
                   </p>
                 </div>
               )}
@@ -686,6 +750,71 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       ))}
                     </div>
                   </div>
+
+                  {/* Combined PDF: what the zip will actually contain. */}
+                  {(preview.merge_groups || []).length > 0 && (
+                    <div>
+                      <p className="text-xs font-extrabold uppercase tracking-widest text-slate-500 mb-1.5">
+                        {preview.merge_groups.length} combined PDF{preview.merge_groups.length === 1 ? '' : 's'}
+                      </p>
+                      <div className="space-y-1">
+                        {preview.merge_groups.map(g => (
+                          <div key={g.group_key}
+                               className="flex items-baseline justify-between gap-3 text-xs bg-slate-50 rounded-lg px-3 py-2">
+                            <span className="font-medium text-slate-700 truncate">{g.filename}</span>
+                            <span className="text-slate-400 whitespace-nowrap">{g.doc_count} docs</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Completeness check. Report-only until merge_gate_active. */}
+                  {(preview.merge_incomplete || []).length > 0 && (() => {
+                    const gaps = preview.merge_incomplete
+                    const byGroup = gaps.reduce((m, x) => {
+                      (m[x.group_key] ||= []).push(x); return m
+                    }, {})
+                    const blocking = !!preview.merge_blocked
+                    return (
+                      <div className={`card p-3 ${blocking ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'}`}>
+                        <p className={`text-xs font-bold mb-1.5 ${blocking ? 'text-red-800' : 'text-amber-800'}`}>
+                          {blocking ? '⚠' : 'ℹ'} {gaps.length} document{gaps.length === 1 ? '' : 's'} for this month
+                          {' '}{blocking ? 'must be completed before a combined download' : 'are not on file yet'}
+                        </p>
+                        <div className={`text-[11px] max-h-40 overflow-y-auto space-y-1.5 ${blocking ? 'text-red-700' : 'text-amber-700'}`}>
+                          {Object.entries(byGroup).map(([k, list]) => (
+                            <div key={k}>
+                              <p className="font-semibold">
+                                {list[0].contractor} · {list[0].contract_num} {list[0].borough}
+                              </p>
+                              {list.slice(0, 12).map((m, i) => (
+                                <p key={i} className="pl-3">{m.doc_type} — {m.period} — {m.state}</p>
+                              ))}
+                              {list.length > 12 && (
+                                <p className="pl-3 italic">…and {list.length - 12} more (full list in MANIFEST.txt)</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                        <p className={`text-[11px] mt-2 ${blocking ? 'text-red-600' : 'text-amber-600'}`}>
+                          Complete these on the Doc Status page, then re-run the preview.
+                        </p>
+                        {blocking && (
+                          <label className="flex items-start gap-2 mt-2.5 text-[11px] text-red-800 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={ackIncomplete}
+                              onChange={e => setAckIncomplete(e.target.checked)}
+                              className="mt-0.5"
+                            />
+                            <span>I&rsquo;ve reviewed this and want to build the packages anyway &mdash;
+                              they&rsquo;ll be named <em>(INCOMPLETE)</em>.</span>
+                          </label>
+                        )}
+                      </div>
+                    )
+                  })()}
 
                   {preview.missing && preview.missing.length > 0 && (
                     <div className="card p-3 border-amber-200 bg-amber-50">
@@ -781,15 +910,22 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                 Preview
               </button>
             )}
-            {step === 3 && submitState === 'idle' && (
-              <button
-                onClick={submit}
-                disabled={!preview || (preview.files || []).length === 0}
-                className="btn-primary text-sm px-4 py-2 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Download {(preview?.counts?.total ?? 0)} file{preview?.counts?.total === 1 ? '' : 's'}
-              </button>
-            )}
+            {step === 3 && submitState === 'idle' && (() => {
+              const pkgs = (preview?.merge_groups || []).length
+              const gated = !!preview?.merge_blocked && !ackIncomplete
+              return (
+                <button
+                  onClick={submit}
+                  disabled={!preview || (preview.files || []).length === 0 || gated}
+                  title={gated ? 'Some documents for this month are not complete yet.' : undefined}
+                  className="btn-primary text-sm px-4 py-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {pkgs > 0
+                    ? `Download ${pkgs} combined PDF${pkgs === 1 ? '' : 's'}`
+                    : `Download ${(preview?.counts?.total ?? 0)} file${preview?.counts?.total === 1 ? '' : 's'}`}
+                </button>
+              )
+            })()}
             {step === 3 && submitState === 'working' && (
               <button
                 onClick={cancelDownload}

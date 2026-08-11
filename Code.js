@@ -13900,6 +13900,133 @@ const _DOC_TYPE_INTERNAL_TO_FRIENDLY_ = Object.freeze({
 
 const MAX_BATCH_FILES_ = 500;
 
+// Flip to true once _payrollMonthCompleteness_ has been validated against
+// real months (see the plan's verification step 2). Until then the check
+// reports its findings in the preview but never refuses a download — a
+// false positive would block the admin from paperwork they actually need.
+const MERGE_GATE_BLOCKS_ = false;
+
+/**
+ * Which documents a payroll month still owes, for the Combined-PDF gate.
+ *
+ * Deliberately NOT built on _buildDocStatusPayload_'s pending[] list, for two
+ * reasons: that list is all-time rather than month-scoped, and its entries are
+ * suppressed by due-date gates (CP Done hidden until weekStart+11, EU/CERT
+ * until monthLastWeekStart+7). A month being sent to the prime has to be
+ * finished whether or not it is "due", so those gates give the wrong answer.
+ *
+ * It DOES reuse Doc Status's exact key construction — same WDL row guard, same
+ * billing helpers, same id builders — because that matching runs in daily
+ * production use. Agreement with it is the defence against false positives, so
+ * anything here that diverges from it is a bug, not a feature. The two
+ * intended differences:
+ *
+ *   1. no due-date gates (above);
+ *   2. a doc must have an archived file_id, not just Done — a manual Mark Done
+ *      can flip the pill with nothing in Drive, and there'd be no bytes to
+ *      merge. Reported as a distinct state so the admin knows which to chase.
+ *
+ * Production Log is out of scope: it isn't in the package, so it must not block.
+ *
+ * `logById` is the caller's already-read lifecycle index — don't re-read it.
+ * Returns [] when the month is complete.
+ */
+function _payrollMonthCompleteness_(ss, monthIso, contractorSet, logById) {
+  const wdlSheet = ss.getSheetByName('Work Day Log');
+  if (!wdlSheet) return [];
+  const wdl = wdlSheet.getDataRange().getValues();
+
+  const ymd = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    const m = String(v || '').trim().match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  };
+  const dayLabel = (iso) => {
+    const [y, m, dd] = iso.split('-').map(Number);
+    return Utilities.formatDate(new Date(y, m - 1, dd), CONFIG.TIMEZONE, 'MMM d');
+  };
+  const monLabel = (mIso) => {
+    const [y, m] = mIso.split('-').map(Number);
+    return Utilities.formatDate(new Date(y, m - 1, 1), CONFIG.TIMEZONE, 'MMM yyyy');
+  };
+
+  // doc_id → the expectation that produced it. A doc_id is expected at most
+  // once no matter how many work days point at it.
+  const expected = {};
+  const expect = (docId, meta) => { if (docId && !expected[docId]) expected[docId] = meta; };
+
+  for (let i = 1; i < wdl.length; i++) {
+    const r = wdl[i];
+    const dateIso = ymd(r[0]);
+    if (!dateIso) continue;
+    // Same payroll-month rule the docs themselves were bucketed by.
+    if (_payrollMonthIso_(dateIso) !== monthIso) continue;
+
+    const woId        = String(r[1] || '').trim();
+    const contractor  = String(r[2] || '').trim();
+    const contractNum = String(r[3] || '').split('/')[0].trim();
+    const borough     = String(r[4] || '').trim();
+    const crewChief   = String(r[7] || '').trim();
+    // Doc Status drops rows missing any of these four (Code.js:15221). A row
+    // that can't identify itself must not manufacture a phantom expectation.
+    if (!woId || !contractor || !contractNum || !borough) continue;
+    if (contractorSet && !contractorSet.has(contractor)) continue;
+
+    // SI + CP identities remap at DAY granularity; month-end at MONTH.
+    // Using one for the other yields an id that will never exist.
+    const billed = _billingRemapAsOf_(dateIso, contractNum, borough, contractor);
+    const groupKey = contractor + '|' + billed.contractNum + '|' + billed.borough;
+    const base = {
+      contractor: contractor, contract_num: billed.contractNum, borough: billed.borough,
+      group_key: groupKey,
+    };
+
+    expect(_docLifecycleId_('Sign-In', dateIso, billed.contractNum, billed.borough, crewChief), {
+      base: base, doc_type: 'Sign-In',
+      period: dayLabel(dateIso) + (crewChief ? ' · ' + crewChief : ''),
+    });
+
+    const wkStart = _weekStartIsoOf_(dateIso);
+    expect(_docLifecycleId_('Certified Payroll', wkStart, billed.contractNum, billed.borough), {
+      base: base, doc_type: 'Certified Payroll', period: 'week of ' + dayLabel(wkStart),
+    });
+
+    const bm = _billingRemapForMonth_(monthIso, contractNum, borough, contractor);
+    const meBase = {
+      contractor: contractor, contract_num: bm.contractNum, borough: bm.borough,
+      group_key: contractor + '|' + bm.contractNum + '|' + bm.borough,
+    };
+    MONTH_END_DOCS_.forEach(md => {
+      expect(_monthEndDocId_(md.key, monthIso, bm.contractNum, bm.borough, contractor), {
+        base: meBase, doc_type: md.doc_type, period: monLabel(monthIso),
+      });
+    });
+  }
+
+  const missing = [];
+  Object.keys(expected).forEach(docId => {
+    const e = expected[docId];
+    const row = logById[docId];
+    let state = '';
+    if (!row || !row.done) state = 'awaiting approval';
+    else if (!row.file_id) state = 'approved but not archived — run Process Approved Docs';
+    else return;   // complete
+    missing.push({
+      doc_id: docId, doc_type: e.doc_type, period: e.period, state: state,
+      contractor: e.base.contractor, contract_num: e.base.contract_num,
+      borough: e.base.borough, group_key: e.base.group_key,
+    });
+  });
+
+  missing.sort((a, b) =>
+    (a.group_key < b.group_key ? -1 : a.group_key > b.group_key ? 1 :
+      a.doc_type < b.doc_type ? -1 : a.doc_type > b.doc_type ? 1 :
+        a.doc_id < b.doc_id ? -1 : a.doc_id > b.doc_id ? 1 : 0));
+  return missing;
+}
+
 /**
  * Payroll-period batch listing: all Certified Payroll + Sign-In docs for a
  * single payroll week (Sun–Sat) or a whole payroll month, read straight from
@@ -13950,8 +14077,21 @@ function handlePayrollPeriodBatch_(d) {
   const ALLOWED_TYPES_ = WEEKLY_TYPES_.concat(granularity === 'month' ? MONTH_END_TYPES_ : [])
     .reduce((m, t) => { m[t] = 1; return m; }, {});
 
-  const askedTypes = (Array.isArray(d.doc_types) && d.doc_types.length
-    ? d.doc_types.map(s => String(s).trim()) : WEEKLY_TYPES_.slice());
+  // Combined PDF: one merged package per contract-borough. Only meaningful
+  // for a month — a week has no Employee Utilization or certificates — and
+  // the package contents are fixed, so doc_types is ignored rather than
+  // letting a half-selected package go out as if it were complete.
+  const combined = String(d.download_type || 'individual').trim() === 'combined'
+    && granularity === 'month';
+  if (String(d.download_type || '').trim() === 'combined' && granularity !== 'month') {
+    warnings.push('Combined PDF is only available for a whole month — '
+      + 'falling back to individual files.');
+  }
+
+  const askedTypes = combined
+    ? WEEKLY_TYPES_.concat(MONTH_END_TYPES_)
+    : (Array.isArray(d.doc_types) && d.doc_types.length
+      ? d.doc_types.map(s => String(s).trim()) : WEEKLY_TYPES_.slice());
   // A stale client can still send month-end types under week granularity.
   // Drop them, but say so — a zip quietly missing what was asked for is worse
   // than one that explains itself.
@@ -13971,13 +14111,18 @@ function handlePayrollPeriodBatch_(d) {
   const wantsMonthEnd = MONTH_END_TYPES_.some(t => wantSet.has(t));
 
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  const { rows } = _readDocLifecycle_(ss);
+  const { rows, byId: logById } = _readDocLifecycle_(ss);
 
   // "Jun 7 – Jun 13" from a Sunday ISO.
   const weekLabel = (wkIso) => {
     const [y, m, dd] = wkIso.split('-').map(Number);
     const fmt = (x) => Utilities.formatDate(x, CONFIG.TIMEZONE, 'MMM d');
     return fmt(new Date(y, m - 1, dd)) + ' – ' + fmt(new Date(y, m - 1, dd + 6));
+  };
+  // "Jun 9" from a YYYY-MM-DD.
+  const dayLabel = (iso) => {
+    const [y, m, dd] = String(iso).split('-').map(Number);
+    return Utilities.formatDate(new Date(y, m - 1, dd), CONFIG.TIMEZONE, 'MMM d');
   };
   // "Jun 2026" from a YYYY-MM.
   const monthLabel = (mIso) => {
@@ -13991,6 +14136,26 @@ function handlePayrollPeriodBatch_(d) {
   const missing = [];
   const seen = new Set();
   let monthEndRowsSeen = 0;
+
+  // Combined mode groups by contract-borough and orders within a group:
+  // week 1's CP, its Sign-Ins, week 2's CP, its Sign-Ins, … then Employee
+  // Utilization, then Certificates. The sort key is a plain string because
+  // the week anchors are ISO dates and sort lexicographically; '9999-99-99'
+  // parks the two month-end docs after every week.
+  const groupKeyOf = (co, cn, bor) => co + '|' + cn + '|' + bor;
+  const ME_RANK_ = MONTH_END_DOCS_.reduce((m, md, i) => { m[md.doc_type] = i; return m; }, {});
+  const mergeSortKey = {
+    weekly: (dt, wk, anchor, chief) => (dt === 'Certified Payroll')
+      ? wk + '|0'
+      : wk + '|1|' + anchor + '|' + chief,
+    monthEnd: (dt) => '9999-99-99|' + ME_RANK_[dt],
+  };
+  // Sign-In doc_ids carry the crew chief as a `_chief-<slug>` suffix; it
+  // isn't a lifecycle column, so recover it for ordering and cover labels.
+  const chiefOf = (docId) => {
+    const m = String(docId || '').match(/_chief-([A-Za-z0-9]+)$/);
+    return m ? m[1] : '';
+  };
 
   rows.forEach(r => {
     const dt = String(r.doc_type || '').trim();
@@ -14052,6 +14217,9 @@ function handlePayrollPeriodBatch_(d) {
         done:         !!r.done,
         sent:         !!r.sent,
         zip_path:     'Month-End Docs/' + meName,
+        merge_group:  groupKeyOf(contractor, cn, bor),
+        _msort:       mergeSortKey.monthEnd(dt),
+        merge_label:  dt,
       });
       return;
     }
@@ -14068,6 +14236,7 @@ function handlePayrollPeriodBatch_(d) {
 
     if (contractorSet && !contractorSet.has(contractor)) return;
 
+    const chief = (dt === 'Sign-In') ? chiefOf(r.doc_id) : '';
     const filename = (dt === 'Certified Payroll' ? 'Certified_Payroll_' : 'SignIn_')
       + cn + '_' + bor + '_' + anchor + '.pdf';
 
@@ -14091,15 +14260,32 @@ function handlePayrollPeriodBatch_(d) {
       doc_id:       r.doc_id,
       done:         !!r.done,
       sent:         !!r.sent,
+      crew_chief:   chief,
       zip_path:     'Week of ' + weekLabel(wk) + '/' + (contractor || 'Unknown')
         + '/' + cn + ' - ' + getBoroughName_(bor) + '/' + filename,
+      merge_group:  groupKeyOf(contractor, cn, bor),
+      _msort:       mergeSortKey.weekly(dt, wk, anchor, chief),
+      merge_label:  (dt === 'Certified Payroll')
+        ? 'Certified Payroll — week of ' + dayLabel(wk)
+        : 'Sign-In — ' + dayLabel(anchor) + (chief ? ' · ' + chief : ''),
     });
   });
 
-  // Sorted by zip_path, so "Month-End Docs/" sorts ahead of "Week of …" —
-  // which also means the handful of month-end files survive the cap below
-  // rather than being the ones sliced off a busy month.
-  files.sort((a, b) => (a.zip_path < b.zip_path ? -1 : a.zip_path > b.zip_path ? 1 : 0));
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  if (combined) {
+    // Group-major, so each contract's package is a contiguous run and the
+    // Node side can merge one at a time instead of holding the whole month.
+    files.sort((a, b) => cmp(a.merge_group, b.merge_group) || cmp(a._msort, b._msort));
+    files.forEach((f, i) => { f.merge_seq = i; delete f._msort; });
+  } else {
+    // Sorted by zip_path, so "Month-End Docs/" sorts ahead of "Week of …" —
+    // which also means the handful of month-end files survive the cap below
+    // rather than being the ones sliced off a busy month.
+    files.sort((a, b) => cmp(a.zip_path, b.zip_path));
+    files.forEach(f => {
+      delete f._msort; delete f.merge_group; delete f.merge_label;
+    });
+  }
 
   const capped = files.length > MAX_BATCH_FILES_ ? files.slice(0, MAX_BATCH_FILES_) : files;
   const counts = { total: capped.length, by_doc_type: {}, by_contractor: {} };
@@ -14119,7 +14305,48 @@ function handlePayrollPeriodBatch_(d) {
       + ' — check Doc Status for what is still outstanding.');
   }
 
-  return jsonResponse_({ files: capped, counts, missing, warnings, truncated: files.length > MAX_BATCH_FILES_ });
+  const payload = {
+    files: capped, counts, missing, warnings,
+    truncated: files.length > MAX_BATCH_FILES_,
+  };
+
+  if (combined) {
+    // One package per contract-borough, in the order the groups appear.
+    const groups = [];
+    const byGroup = {};
+    capped.forEach(f => {
+      if (!byGroup[f.merge_group]) {
+        byGroup[f.merge_group] = {
+          group_key:    f.merge_group,
+          contractor:   f.contractor,
+          contract_num: f.contract_num,
+          borough:      f.borough,
+          label:        (f.contractor || 'Unknown') + ' — ' + f.contract_num + ' '
+            + getBoroughName_(f.borough) + ' — ' + monthLabel(monthIso),
+          filename:     flat(f.contractor || 'Unknown') + ' - ' + flat(f.contract_num) + ' '
+            + getBoroughName_(f.borough) + ' - ' + monthLabel(monthIso) + '.pdf',
+          // Cover-page strings, built here so Node never has to
+          // reconstruct an identity it would have to keep in sync.
+          title:        'Oneiro Month End Documents for ' + f.contract_num
+            + ' - ' + getBoroughName_(f.borough),
+          month_label:  monthLabel(monthIso),
+          doc_count:    0,
+        };
+        groups.push(byGroup[f.merge_group]);
+      }
+      byGroup[f.merge_group].doc_count++;
+    });
+    payload.merge_groups = groups;
+
+    const incomplete = _payrollMonthCompleteness_(ss, monthIso, contractorSet, logById);
+    payload.merge_incomplete = incomplete;
+    // Report-only until the check has been validated against real months —
+    // see MERGE_GATE_BLOCKS_. The client shows the findings either way.
+    payload.merge_blocked    = MERGE_GATE_BLOCKS_ && incomplete.length > 0;
+    payload.merge_gate_active = MERGE_GATE_BLOCKS_;
+  }
+
+  return jsonResponse_(payload);
 }
 
 function handleListDocumentsForBatch_(body) {

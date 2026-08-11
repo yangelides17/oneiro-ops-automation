@@ -30,6 +30,7 @@ import {
 } from './server/qb.js'
 import { assertQbItemsConfigured } from './server/qbItems.js'
 import { putListing, resolveListing } from './server/batchListingCache.js'
+import { mergeContractPackage } from './server/pdfMerge.js'
 import {
   callAppsScript, noteBatchDownloadStart, noteBatchDownloadEnd,
 } from './server/appsScript.js'
@@ -2625,6 +2626,14 @@ app.post('/api/documents/list-batch', async (req, res) => {
 // to 1, restoring the old strictly-serial behaviour — without a deploy.
 const BATCH_FETCH_WINDOW = Math.max(1, Number(process.env.BATCH_FETCH_WINDOW) || 4)
 
+// Ceiling on the total source bytes for one Combined-PDF package. Archived
+// documents are mostly scans, and pdf-lib holds a parse tree several times
+// file size, so an unusually large contract-month could otherwise push the
+// process into an out-of-memory. Above this we deliver that group's files
+// individually and say so, rather than failing the download.
+const MAX_MERGE_PACKAGE_BYTES =
+  Math.max(1, Number(process.env.MAX_MERGE_PACKAGE_MB) || 250) * 1024 * 1024
+
 // Doc types with a Sent flag in the Doc Lifecycle Log, flipped after a
 // mark_sent batch download. Sign-In is deliberately absent: it rides out
 // with the Certified Payroll and has no Sent of its own.
@@ -2687,7 +2696,28 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
         warnings: listing.warnings || [],
       })
     }
-    console.log(`batch-download: starting zip with ${files.length} files`)
+
+    // Combined PDF: one merged package per contract-borough. Driven off the
+    // listing rather than the request, so a client asking for `combined` on a
+    // listing that couldn't produce groups just gets the individual files.
+    const mergeGroups = Array.isArray(listing.merge_groups) ? listing.merge_groups : []
+    const combined = String(filters.download_type || '') === 'combined' && mergeGroups.length > 0
+    const groupByKey = Object.fromEntries(mergeGroups.map(g => [g.group_key, g]))
+    const incomplete = Array.isArray(listing.merge_incomplete) ? listing.merge_incomplete : []
+
+    // The gate is enforced here as well as in the UI: the listing is cached
+    // for 30 minutes, so a client holding a stale preview must not be able to
+    // stream a package that is knowingly short. `acknowledge_incomplete` is
+    // the admin's explicit override.
+    if (combined && listing.merge_blocked && !filters.acknowledge_incomplete) {
+      return res.status(400).json({
+        error: 'Some documents for this month are not complete yet.',
+        merge_incomplete: incomplete,
+      })
+    }
+    const overrode = combined && incomplete.length > 0
+    console.log(`batch-download: starting zip with ${files.length} files` +
+      (combined ? ` → ${mergeGroups.length} combined package(s)` : ''))
 
     const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
     res.setHeader('Content-Type', 'application/zip')
@@ -2795,6 +2825,78 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
 
     let appended = 0
     let failed   = 0
+
+    // Combined mode accumulates one group at a time. The listing is sorted
+    // group-major by Apps Script, so a group is a contiguous run and we can
+    // merge and release it before the next one starts — peak memory is one
+    // package, not the whole month. Scans are image-heavy, so that matters.
+    let pending = []                 // [{ label, bytes }] for the current group
+    let pendingBytes = 0
+    const notes = []                 // anything the admin needs told about
+
+    const flushGroup = async (groupKey) => {
+      const group = groupByKey[groupKey]
+      const batch = pending
+      pending = []
+      const totalBytes = pendingBytes
+      pendingBytes = 0
+      if (!group || batch.length === 0) return
+
+      // Fall back rather than risk an out-of-memory on a very large month.
+      if (totalBytes > MAX_MERGE_PACKAGE_BYTES) {
+        notes.push(`${group.label}: ${(totalBytes / 1048576).toFixed(0)}MB of source documents ` +
+          `exceeds the ${(MAX_MERGE_PACKAGE_BYTES / 1048576).toFixed(0)}MB merge limit — ` +
+          `delivered as individual files instead.`)
+        batch.forEach((s, n) => {
+          // Index-prefixed and slash-stripped: the label is data, and a
+          // duplicate or a '/' in it would collide or invent a zip folder.
+          const safe = String(s.label).replace(/[\/\\]+/g, '-')
+          archive.append(s.bytes, {
+            name: `${group.filename.replace(/\.pdf$/i, '')}/${String(n + 1).padStart(2, '0')} ${safe}.pdf`,
+          })
+          appended++
+        })
+        return
+      }
+
+      const outName = overrode
+        ? group.filename.replace(/\.pdf$/i, ' (INCOMPLETE).pdf')
+        : group.filename
+      try {
+        const merged = await mergeContractPackage(batch, {
+          title:       group.title,
+          contractor:  group.contractor,
+          month:       group.month_label,
+          incompleteNote: overrode
+            ? 'INCOMPLETE — some documents for this month were not on file. See MANIFEST.txt.'
+            : '',
+        })
+        archive.append(merged.bytes, { name: outName })
+        appended++
+        console.log(`batch-download: merged ${batch.length} docs → ${outName} ` +
+          `(${merged.pageCount}pp, ${(merged.bytes.length / 1048576).toFixed(1)}MB, ` +
+          `${merged.renamed} fields renamed)`)
+        for (const o of merged.omitted) {
+          notes.push(`${group.label}: could not include "${o.label}" — ${o.error}`)
+        }
+      } catch (e) {
+        // A failed merge must not cost the documents. Ship them individually
+        // under a folder so the admin still has everything.
+        console.warn(`batch-download: merge failed for ${groupKey}: ${e.message}`)
+        notes.push(`${group.label}: could not be combined (${e.message}) — ` +
+          `delivered as individual files instead.`)
+        batch.forEach((s, n) => {
+          // Index-prefixed and slash-stripped: the label is data, and a
+          // duplicate or a '/' in it would collide or invent a zip folder.
+          const safe = String(s.label).replace(/[\/\\]+/g, '-')
+          archive.append(s.bytes, {
+            name: `${group.filename.replace(/\.pdf$/i, '')}/${String(n + 1).padStart(2, '0')} ${safe}.pdf`,
+          })
+          appended++
+        })
+      }
+    }
+
     for (let i = 0; i < files.length; i++) {
       if (cancelled) break
       const file = files[i]
@@ -2807,19 +2909,45 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
         if (!settled.ok) throw settled.error
         const fetched = settled.result
         if (!fetched || !fetched.data) {
-          console.warn(`batch-download: get_drive_file_bytes returned no bytes for ${file.filename}`)
-          failed++
-          continue
+          throw new Error('get_drive_file_bytes returned no bytes')
         }
         const buf = Buffer.from(fetched.data, 'base64')
-        const prepared = await prepPdfForDelivery(buf, file.filename)
-        archive.append(prepared, { name: zipPathFor(file) })
-        appended++
+        if (combined) {
+          // No prepPdfForDelivery here: mergeContractPackage does the
+          // equivalent field rename inside its single parse, and running both
+          // would parse every source twice for no gain.
+          pending.push({ label: file.merge_label || file.filename, bytes: buf })
+          pendingBytes += buf.length
+        } else {
+          const prepared = await prepPdfForDelivery(buf, file.filename)
+          archive.append(prepared, { name: zipPathFor(file) })
+          appended++
+        }
       } catch (e) {
         failed++
         console.warn(`batch-download: failed to fetch ${file.filename}: ${e.message}`)
+        if (combined) {
+          notes.push(`Could not include "${file.merge_label || file.filename}" — ${e.message}`)
+        }
         // Continue with the other files rather than aborting the whole zip.
       }
+      // Group boundary — merge and release before the next group starts.
+      // Runs whether or not this file succeeded, so one bad fetch can't
+      // strand a whole package in `pending`.
+      if (combined) {
+        const next = files[i + 1]
+        if (!next || next.merge_group !== file.merge_group) {
+          await flushGroup(file.merge_group)
+        }
+      }
+    }
+
+    // A package that is quietly short reads as complete. Say so, in the zip.
+    if (combined && notes.length && !cancelled) {
+      archive.append(
+        'These documents could not be included in the combined PDFs:\n\n'
+        + notes.map(n => '  - ' + n).join('\n') + '\n',
+        { name: 'INCOMPLETE.txt' })
     }
     // On cancel, whatever is still in flight is left to settle on its own.
     // fetchOne never rejects, so those are harmless; awaiting them here
@@ -3088,10 +3216,14 @@ function buildBatchManifest(filters, listing) {
   if (filters.mode === 'wo_numbers') detail.push('wos=[' + (filters.wo_ids || []).join(', ') + ']')
   if (detail.length) lines.push('Filters: ' + detail.join('  '))
 
-  // Distinct WO count across the batch
+  // Distinct WO count across the batch. Month-end and combined batches carry
+  // no WO ids, so that framing only makes sense for the WO-driven modes.
   const allWos = new Set()
   files.forEach(f => (f.wo_ids || []).forEach(id => allWos.add(id)))
-  lines.push(`Total: ${files.length} file${files.length === 1 ? '' : 's'} across ${allWos.size} work order${allWos.size === 1 ? '' : 's'}`)
+  const nGroups = Array.isArray(listing.merge_groups) ? listing.merge_groups.length : 0
+  lines.push(nGroups
+    ? `Total: ${files.length} document${files.length === 1 ? '' : 's'} in ${nGroups} combined PDF${nGroups === 1 ? '' : 's'}`
+    : `Total: ${files.length} file${files.length === 1 ? '' : 's'} across ${allWos.size} work order${allWos.size === 1 ? '' : 's'}`)
   lines.push('')
 
   // Natural-sort comparator for WO numbers like "RM-43101", "PT-12345":
@@ -3109,6 +3241,38 @@ function buildBatchManifest(filters, listing) {
 
   const sectionRule = '─'.repeat(40)
   const bullet      = '  - '
+
+  // ── Combined PDF: the zip holds one merged package per contract-borough,
+  // so itemize each package's contents in page order. The by-doc-type
+  // sections below describe a zip of separate files and don't apply.
+  const mergeGroups = Array.isArray(listing.merge_groups) ? listing.merge_groups : []
+  if (mergeGroups.length) {
+    const incomplete = Array.isArray(listing.merge_incomplete) ? listing.merge_incomplete : []
+    for (const g of mergeGroups) {
+      const inGroup = files
+        .filter(f => f.merge_group === g.group_key)
+        .sort((a, b) => (a.merge_seq || 0) - (b.merge_seq || 0))
+      lines.push(sectionRule)
+      lines.push(g.filename)
+      lines.push(sectionRule)
+      lines.push(`  Prime Contractor: ${g.contractor || '—'}`)
+      lines.push(`  ${g.contract_num} ${g.borough} — ${g.month_label}`)
+      lines.push(`  ${inGroup.length} document${inGroup.length === 1 ? '' : 's'}, in order:`)
+      inGroup.forEach(f => lines.push(`${bullet}${f.merge_label || f.filename}`))
+      const gaps = incomplete.filter(m => m.group_key === g.group_key)
+      if (gaps.length) {
+        lines.push('')
+        lines.push(`  NOT ON FILE for ${g.month_label} (${gaps.length}):`)
+        gaps.forEach(m => lines.push(`${bullet}${m.doc_type} — ${m.period} — ${m.state}`))
+      }
+      lines.push('')
+    }
+    if (listing.truncated) {
+      lines.push('NOTE: Result truncated at the server limit. Narrow the filters and re-run for the rest.')
+      lines.push('')
+    }
+    return lines.join('\n')
+  }
 
   // Each section: a labeled header line ("X for:") followed by a
   // bulleted list. Per-WO docs (CFR, Invoice) sort by WO ascending;
