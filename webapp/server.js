@@ -1926,6 +1926,10 @@ Return every line of the "Earnings" block as earnings_lines, using the CURRENT c
 Do NOT include the "Gross Pay" total row itself as an earnings line.
 Do NOT judge, classify, group, or rename the lines — transcribe them. Something downstream
 decides what each code means.
+Some lines carry a Year To Date figure but leave the Current amount BLANK (common for
+CASH FRING). For those, return amount 0. NEVER fill a blank Current amount from the Year To
+Date column, and never from the "Taxes & Deductions" block on the right side of the page —
+those are different numbers entirely.
 Self-check: the earnings_lines amounts must sum to gross_pay. If they do not, you have
 missed or misread a line — re-read the Earnings block before answering.
 On a "register" layout, if individual earnings lines are not itemized, return an empty

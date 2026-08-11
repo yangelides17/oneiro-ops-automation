@@ -3309,6 +3309,24 @@ function _cpComparablePaystubGross_(ps) {
     return out;
   }
 
+  // The breakdown has to reconcile to the printed gross before we trust it
+  // to drive a subtraction. A read that doesn't add up (a misread column, a
+  // dropped line) could otherwise subtract a wrong amount and quietly move
+  // the comparison. Fall back to the `bonus` field and say so.
+  const lineSum = lines.reduce((t, l) => {
+    const a = Number(l && l.amount);
+    return t + (isFinite(a) ? a : 0);
+  }, 0);
+  if (Math.abs(lineSum - gross) > 0.02) {
+    out.unreliable = true;
+    const bonus = Number(ps && ps.bonus);
+    if (isFinite(bonus) && bonus > 0) {
+      out.excluded.push({ code: 'BONUS', amount: bonus });
+      out.gross = _roundCents_(gross - bonus);
+    }
+    return out;
+  }
+
   let deduct = 0;
   lines.forEach(l => {
     const code = String(l && l.code || '').trim();
@@ -3675,6 +3693,11 @@ function generateCertifiedPayroll(weekStartStr, opts) {
               note = 'Paystub gross $' + psGross.toFixed(2) + ' less ' +
                      adj.excluded.map(x => x.code + ' $' + Number(x.amount).toFixed(2)).join(', ') +
                      ' = $' + adj.gross.toFixed(2) + ' compared.';
+            }
+            if (adj.unreliable) {
+              note += (note ? ' ' : '') +
+                      'The paystub\'s earnings breakdown did not add up to its gross, so it was not ' +
+                      'used — only the bonus figure was subtracted. Re-upload the paystub if this delta looks wrong.';
             }
             if (adj.unknown.length) {
               note += (note ? ' ' : '') + 'Unrecognized earnings line' +
