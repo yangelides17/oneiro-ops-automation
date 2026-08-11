@@ -18,11 +18,17 @@ import { useEffect, useMemo, useRef, useState } from 'react'
  */
 
 const ALL_DOC_TYPES = ['CFR', 'Production Log', 'Sign-In', 'Certified Payroll', 'Invoice']
+// Month-end forms are contract-MONTH documents with no payroll week, so they
+// only appear once the payroll-period picker is set to Month. They're also
+// absent from the WO-driven modes, which enumerate the archive from the Work
+// Order Tracker and have no way to reach a doc that belongs to no WO.
+const MONTH_END_TYPES = ['Employee Utilization', 'Certificates']
 // SI is hidden from the unsent picker — admin gets a checkbox to bundle
 // SIs alongside CP instead. Other modes still expose SI as a regular pill.
-const docTypesForMode = (mode) =>
+const docTypesForMode = (mode, granularity) =>
   mode === 'unsent'           ? ALL_DOC_TYPES.filter(dt => dt !== 'Sign-In')
   : mode === 'payroll_period' ? ['Certified Payroll', 'Sign-In']
+      .concat(granularity === 'month' ? MONTH_END_TYPES : [])
   : ALL_DOC_TYPES
 
 const MODES = [
@@ -33,7 +39,7 @@ const MODES = [
   { id: 'date_range', title: 'Date range',
     sub: 'Every doc whose work-end date falls in the chosen window' },
   { id: 'payroll_period', title: 'Payroll period',
-    sub: 'All Certified Payroll + Sign-Ins for a payroll week or month' },
+    sub: 'Certified Payroll + Sign-Ins for a payroll week or month — plus month-end forms' },
 ]
 
 // Recent payroll weeks (Sundays), newest first — value = ISO Sunday.
@@ -394,7 +400,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {(() => {
-                    const opts = docTypesForMode(mode)
+                    const opts = docTypesForMode(mode, granularity)
                     const allOn = opts.length > 0 && opts.every(dt => selectedDocTypes.indexOf(dt) !== -1)
                     return (
                       <button
@@ -408,7 +414,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                       </button>
                     )
                   })()}
-                  {docTypesForMode(mode).map(dt => {
+                  {docTypesForMode(mode, granularity).map(dt => {
                     const on = selectedDocTypes.indexOf(dt) !== -1
                     return (
                       <button
@@ -561,7 +567,16 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                         <button
                           key={g}
                           type="button"
-                          onClick={() => setGranularity(g)}
+                          onClick={() => {
+                            setGranularity(g)
+                            // The month-end pills vanish under week granularity;
+                            // drop them from the selection too, or a stale pick
+                            // rides along to a request that can't honor it.
+                            if (g === 'week') {
+                              setSelectedDocTypes(prev =>
+                                prev.filter(dt => MONTH_END_TYPES.indexOf(dt) === -1))
+                            }
+                          }}
                           className={`text-sm font-semibold px-4 py-1.5 transition-all ${
                             granularity === g ? 'bg-navy text-white' : 'bg-white text-slate-600 hover:bg-slate-50'
                           }`}
@@ -587,6 +602,7 @@ export default function DownloadDocumentsModal({ contractors = [], onClose }) {
                   </div>
                   <p className="text-[11px] text-slate-400">
                     Certified Payroll + Sign-Ins for the selected period. Deselect a doc type above to narrow it (e.g. Sign-Ins only, to reconcile a CP).
+                    {granularity === 'month' && ' Month also offers the signed Employee Utilization + Certificates — they arrive in one flat Month-End Docs folder.'}
                   </p>
                 </div>
               )}

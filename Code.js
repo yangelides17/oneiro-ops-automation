@@ -13906,8 +13906,18 @@ const MAX_BATCH_FILES_ = 500;
  * the Doc Lifecycle Log (which stores each archived doc's Drive file_id in
  * col 9 — no Drive walk). Zip is organized Week → Contractor → "cn - Borough".
  *
+ * Month granularity additionally offers the two month-end doc types (Employee
+ * Utilization / Certificates). Those are contract-MONTH documents with no
+ * payroll week, so they're rejected under week granularity, and they land in a
+ * single flat "Month-End Docs/" folder rather than the week tree — the admin
+ * drags the whole folder into one email instead of opening a folder per
+ * contract. Their filenames carry contractor + contract + borough + month so
+ * they stay distinguishable side by side.
+ *
  * data: { granularity:'week'|'month', week_start?:'YYYY-MM-DD', month?:'YYYY-MM',
- *         contractors?:[], doc_types?:['Certified Payroll','Sign-In'] }
+ *         contractors?:[],
+ *         doc_types?:['Certified Payroll','Sign-In',
+ *                     'Employee Utilization','Certificates'] }
  */
 function handlePayrollPeriodBatch_(d) {
   const granularity = String(d.granularity || '').trim();
@@ -13927,15 +13937,38 @@ function handlePayrollPeriodBatch_(d) {
     ? d.contractors.map(s => String(s).trim()).filter(Boolean) : [];
   const contractorSet = contractorsFilter.length ? new Set(contractorsFilter) : null;
 
-  // Only CP + Sign-In; default both. (Sign-Ins-without-CP is a valid pick.)
-  const ALLOWED_TYPES_ = { 'Certified Payroll': 1, 'Sign-In': 1 };
-  const wantTypes = (Array.isArray(d.doc_types) && d.doc_types.length
-    ? d.doc_types.map(s => String(s).trim()) : Object.keys(ALLOWED_TYPES_))
-    .filter(t => ALLOWED_TYPES_[t]);
+  const warnings = [];
+
+  // Weekly types + the two month-end types. MONTH_END_DOCS_ is the single
+  // source for those doc_type strings (it also names the archive subfolder
+  // and the Log's Doc Type value) — don't re-type them here.
+  const WEEKLY_TYPES_    = ['Certified Payroll', 'Sign-In'];
+  const MONTH_END_TYPES_ = MONTH_END_DOCS_.map(md => md.doc_type);
+  const IS_MONTH_END_TYPE_ = MONTH_END_TYPES_.reduce((m, t) => { m[t] = 1; return m; }, {});
+  // Defaulting to weekly-only keeps an omitted doc_types behaving exactly as
+  // it did before month-end docs existed — month-end is strictly opt-in.
+  const ALLOWED_TYPES_ = WEEKLY_TYPES_.concat(granularity === 'month' ? MONTH_END_TYPES_ : [])
+    .reduce((m, t) => { m[t] = 1; return m; }, {});
+
+  const askedTypes = (Array.isArray(d.doc_types) && d.doc_types.length
+    ? d.doc_types.map(s => String(s).trim()) : WEEKLY_TYPES_.slice());
+  // A stale client can still send month-end types under week granularity.
+  // Drop them, but say so — a zip quietly missing what was asked for is worse
+  // than one that explains itself.
+  if (granularity === 'week' && askedTypes.some(t => IS_MONTH_END_TYPE_[t])) {
+    warnings.push(MONTH_END_TYPES_.join(' / ') + ' are month documents — '
+      + 'switch the period to Month to include them.');
+  }
+  const wantTypes = askedTypes.filter(t => ALLOWED_TYPES_[t]);
   if (wantTypes.length === 0) {
-    return jsonResponse_({ error: 'doc_types must include Certified Payroll and/or Sign-In' }, 400);
+    return jsonResponse_({
+      error: 'doc_types had no values valid for ' + granularity + ' granularity '
+        + '(allowed: ' + Object.keys(ALLOWED_TYPES_).join(', ') + ')',
+      warnings: warnings,
+    }, 400);
   }
   const wantSet = new Set(wantTypes);
+  const wantsMonthEnd = MONTH_END_TYPES_.some(t => wantSet.has(t));
 
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const { rows } = _readDocLifecycle_(ss);
@@ -13946,15 +13979,85 @@ function handlePayrollPeriodBatch_(d) {
     const fmt = (x) => Utilities.formatDate(x, CONFIG.TIMEZONE, 'MMM d');
     return fmt(new Date(y, m - 1, dd)) + ' – ' + fmt(new Date(y, m - 1, dd + 6));
   };
+  // "Jun 2026" from a YYYY-MM.
+  const monthLabel = (mIso) => {
+    const [y, m] = String(mIso).split('-').map(Number);
+    return Utilities.formatDate(new Date(y, m - 1, 1), CONFIG.TIMEZONE, 'MMM yyyy');
+  };
+  // A slash in a name would silently become a folder inside the zip.
+  const flat = (s) => String(s || '').replace(/[\/\\]+/g, '-').trim();
 
   const files = [];
   const missing = [];
   const seen = new Set();
+  let monthEndRowsSeen = 0;
 
   rows.forEach(r => {
     const dt = String(r.doc_type || '').trim();
-    if (dt !== 'Certified Payroll' && dt !== 'Sign-In') return;
     if (!wantSet.has(dt)) return;
+
+    const contractor = String(r.contractor || '').trim();
+    const cn  = String(r.contract_num || '').trim();
+    const bor = String(r.borough || '').trim();
+
+    // ── Month-end docs (Employee Utilization / Certificates) ──────
+    // Bucket on the doc_id's own YYYY-MM, NOT _payrollMonthIso_(r.anchor).
+    //
+    // For PL/SI/CP the anchor is a real work date, so running the payroll-month
+    // rule on it is exactly right. Month-end docs are different: their anchor is
+    // synthetic — archiveDocument_ stores `monthIso + '-01'`, and that monthIso
+    // was ALREADY produced by _payrollMonthIso_ over the work dates that built
+    // the month's obligation. The '-01' is filler to make it a sortable date,
+    // not a day anything happened on.
+    //
+    // So calling _payrollMonthIso_ on it applies the rule a second time, and the
+    // rule is not idempotent: the 1st of a month usually sits in a week that
+    // began in the prior month, so it re-snaps backwards. Measured over 2025–26,
+    // that shifts 20 of 24 months — June 2026's forms (anchor 2026-06-01) would
+    // list under a MAY pull and vanish from June's.
+    if (IS_MONTH_END_TYPE_[dt]) {
+      const p = _parseMonthEndDocId_(r.doc_id);
+      const rowMonth = p ? p.monthIso : String(r.anchor || '').trim().slice(0, 7);
+      if (rowMonth !== monthIso) return;
+      if (contractorSet && !contractorSet.has(contractor)) return;
+      monthEndRowsSeen++;
+
+      // Flat folder, so the name has to carry the full identity on its own.
+      const meName = flat(contractor || 'Unknown') + ' - ' + flat(cn) + ' '
+        + getBoroughName_(bor) + ' - ' + dt + ' - ' + monthLabel(monthIso) + '.pdf';
+
+      if (!r.file_id) {
+        missing.push({
+          doc_type: dt, contractor: contractor, contract_num: cn, borough: bor,
+          work_date: monthIso,
+          reason: r.downloaded_at
+            ? 'Downloaded, awaiting signed upload'
+            : 'Not archived yet (no file in Drive)',
+        });
+        return;
+      }
+      if (seen.has(r.file_id)) return;
+      seen.add(r.file_id);
+
+      files.push({
+        file_id:      r.file_id,
+        filename:     meName,
+        contractor:   contractor,
+        contract_num: cn,
+        borough:      bor,
+        doc_type:     dt,
+        wo_ids:       Array.isArray(r.wo_ids) ? r.wo_ids : [],
+        work_date:    monthIso,
+        doc_id:       r.doc_id,
+        done:         !!r.done,
+        sent:         !!r.sent,
+        zip_path:     'Month-End Docs/' + meName,
+      });
+      return;
+    }
+
+    // ── Weekly docs (Certified Payroll / Sign-In) ─────────────────
+    if (dt !== 'Certified Payroll' && dt !== 'Sign-In') return;
     const anchor = String(r.anchor || '').trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(anchor)) return;
 
@@ -13963,11 +14066,8 @@ function handlePayrollPeriodBatch_(d) {
     if (granularity === 'week') { if (wk !== weekStart) return; }
     else if (_payrollMonthIso_(anchor) !== monthIso) return;
 
-    const contractor = String(r.contractor || '').trim();
     if (contractorSet && !contractorSet.has(contractor)) return;
 
-    const cn  = String(r.contract_num || '').trim();
-    const bor = String(r.borough || '').trim();
     const filename = (dt === 'Certified Payroll' ? 'Certified_Payroll_' : 'SignIn_')
       + cn + '_' + bor + '_' + anchor + '.pdf';
 
@@ -13996,6 +14096,9 @@ function handlePayrollPeriodBatch_(d) {
     });
   });
 
+  // Sorted by zip_path, so "Month-End Docs/" sorts ahead of "Week of …" —
+  // which also means the handful of month-end files survive the cap below
+  // rather than being the ones sliced off a busy month.
   files.sort((a, b) => (a.zip_path < b.zip_path ? -1 : a.zip_path > b.zip_path ? 1 : 0));
 
   const capped = files.length > MAX_BATCH_FILES_ ? files.slice(0, MAX_BATCH_FILES_) : files;
@@ -14005,8 +14108,16 @@ function handlePayrollPeriodBatch_(d) {
     counts.by_contractor[f.contractor] = (counts.by_contractor[f.contractor] || 0) + 1;
   });
 
-  const warnings = [];
   if (files.length > MAX_BATCH_FILES_) warnings.push('Result capped at ' + MAX_BATCH_FILES_ + ' files.');
+  // A month-end doc that was never downloaded has no Log row at all, so it
+  // can't show up in `missing` — deriving the truly-expected set means
+  // scanning the Work Day Log, which would turn this pure sheet read into an
+  // expensive one. Doc Status already owns that list; point at it rather than
+  // letting an empty result read as "nothing outstanding".
+  if (wantsMonthEnd && monthEndRowsSeen === 0) {
+    warnings.push('No ' + MONTH_END_TYPES_.join(' / ') + ' on file for ' + monthLabel(monthIso)
+      + ' — check Doc Status for what is still outstanding.');
+  }
 
   return jsonResponse_({ files: capped, counts, missing, warnings, truncated: files.length > MAX_BATCH_FILES_ });
 }

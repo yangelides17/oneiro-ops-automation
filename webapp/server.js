@@ -2625,6 +2625,16 @@ app.post('/api/documents/list-batch', async (req, res) => {
 // to 1, restoring the old strictly-serial behaviour — without a deploy.
 const BATCH_FETCH_WINDOW = Math.max(1, Number(process.env.BATCH_FETCH_WINDOW) || 4)
 
+// Doc types with a Sent flag in the Doc Lifecycle Log, flipped after a
+// mark_sent batch download. Sign-In is deliberately absent: it rides out
+// with the Certified Payroll and has no Sent of its own.
+const SENT_TRACKED_DOC_TYPES = new Set([
+  'Production Log',
+  'Certified Payroll',
+  'Employee Utilization',
+  'Certificates',
+])
+
 app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async (req, res) => {
   const filters  = req.body || {}
   const markSent = !!filters.mark_sent
@@ -2842,7 +2852,7 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
     // Two storage shapes to handle:
     //   - CFR + Invoice + PICS → per-WO via /api/documents/flags-style
     //                      updates (wo_id + doc_type + sent).
-    //   - PL / SI / CP   → per-doc via Doc Lifecycle Log keyed by Doc ID.
+    //   - PL / SI / CP / month-end → per-doc via Doc Lifecycle Log keyed by
     //                      Doc ID = <PREFIX>_<ANCHOR>_<CONTRACTNUM>_<BOROUGH>
     //                      where ANCHOR is the work_date (already in
     //                      the listing payload) and PREFIX is PL/SI/CP.
@@ -2877,8 +2887,13 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
           })
           return
         }
-        // Only PL + CP carry a tracked Sent flag (SI rides out with the CP).
-        if (f.doc_type !== 'Production Log' && f.doc_type !== 'Certified Payroll') return
+        // Types carrying a tracked Sent flag. SI is absent on purpose — it
+        // rides out with the CP and has no Sent of its own. Month-end docs
+        // (Employee Utilization / Certificates) do have one, surfaced on Doc
+        // Status, and always arrive with an f.doc_id from the listing, so
+        // they take the preferred branch below and never reach the PL/CP
+        // reconstruction fallback.
+        if (!SENT_TRACKED_DOC_TYPES.has(f.doc_type)) return
         // Prefer the lifecycle doc_id the listing handler computed — for
         // multi-crew PLs it already includes the per-crew `_chief-<slug>`
         // suffix, so each crew's PL flips its OWN row instead of colliding
@@ -2911,7 +2926,7 @@ app.post('/api/documents/batch-download', express.json({ limit: '1mb' }), async 
         })
       }
       if (perDocUpdates.length) {
-        console.log(`batch-download: marking ${perDocUpdates.length} per-doc (PL/SI/CP) entries sent`)
+        console.log(`batch-download: marking ${perDocUpdates.length} per-doc (PL/CP/month-end) entries sent`)
         callAppsScript('set_doc_status', { updates: perDocUpdates }).catch(e => {
           console.warn('batch-download: set_doc_status (per-doc) failed:', e.message)
         })
@@ -3181,6 +3196,27 @@ function buildBatchManifest(filters, listing) {
     lines.push('')
   }
 
+  // ── Month-End Documents (Employee Utilization + Certificates).
+  // Contract-month docs with no WO and no week — identified by contractor +
+  // contract + month, which is also exactly what their filename carries.
+  const meFiles = files.filter(f => f.doc_type === 'Employee Utilization' || f.doc_type === 'Certificates')
+    .sort((a, b) => String(a.contractor || '').localeCompare(String(b.contractor || ''))
+                 || String(a.contract_num || '').localeCompare(String(b.contract_num || ''))
+                 || String(a.borough      || '').localeCompare(String(b.borough      || ''))
+                 || String(a.doc_type     || '').localeCompare(String(b.doc_type     || '')))
+  if (meFiles.length) {
+    lines.push(sectionRule)
+    lines.push(`Month-End Documents for: (${meFiles.length})`)
+    lines.push(sectionRule)
+    meFiles.forEach(f => {
+      const who      = f.contractor   || '?'
+      const contract = f.contract_num || '?'
+      const borough  = f.borough      || '?'
+      lines.push(`${bullet}${who} — ${contract} ${borough} — ${f.doc_type} — ${f.work_date || '?'}`)
+    })
+    lines.push('')
+  }
+
   if (missing.length) {
     lines.push(sectionRule)
     lines.push(`NOT INCLUDED — requested but not yet generated/approved (${missing.length})`)
@@ -3189,7 +3225,12 @@ function buildBatchManifest(filters, listing) {
       woCompare(a.wo_id, b.wo_id) || String(a.doc_type).localeCompare(String(b.doc_type))
     )
     sortedMissing.forEach(m => {
-      lines.push(`${bullet}${m.wo_id} — ${m.doc_type} — ${m.reason}`)
+      // Master-copy and month-end docs have no WO — fall back to the
+      // contract/borough/date tuple rather than printing "undefined".
+      const label = m.wo_id
+        || [m.contract_num, m.borough, m.work_date].filter(Boolean).join(' ')
+        || '—'
+      lines.push(`${bullet}${label} — ${m.doc_type} — ${m.reason}`)
     })
     lines.push('')
   }
