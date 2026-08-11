@@ -1937,13 +1937,27 @@ Also return, for every row:
     (0 when there is none). This is a convenience field — earnings_lines remains the
     authoritative breakdown.
 
+── NAMES — read this carefully ──
+The "transcribe exactly as printed" rule above applies to EARNINGS CODES ONLY.
+It does NOT apply to employee names. Names must be REWRITTEN to the registry spelling.
+
 Employee Registry (the ONLY valid values for employees[].name):
 ${employeeListText}
 
 Name matching rules:
-- Stubs and registers print names in varying orders ("Last , First M", "First M. Last"). For each, find the SINGLE registry entry above whose person matches (account for last/first order, middle initials, accents, abbreviations, minor misspellings — pick the best fit).
-- Return that registry entry verbatim — exact capitalization and spelling as listed above.
-- If the registry list is empty, return the name as printed on the paystub.
+- Stubs and registers print names in varying orders and with extra parts: "Last , First M",
+  "First M. Last", "First A. Last SecondLast".
+- For each row, find the SINGLE registry entry above that refers to the same person (account
+  for last/first order, middle initials, second surnames, accents, abbreviations, minor
+  misspellings and shortened forms — pick the best fit).
+- Output that registry entry VERBATIM. Do NOT output the name as printed on the paystub.
+  Drop middle initials and extra surnames that the registry entry does not have.
+  Worked examples (assuming those registry entries exist):
+    printed "Carlos A. Solorzano Majano"  → output "Carlos Solorzano"
+    printed "Stamatis D. Angelides"       → output "Stamati Angelides"
+    printed "Angelides , Gregory S"       → output "Gregory Angelides"
+- Two different registry people can share a surname, so match on the FIRST name too.
+- Only if the registry list above is empty, return the name as printed.
 - Skip a row only if it has no employee at all.
 
 Numbers:
@@ -2070,6 +2084,34 @@ Numbers:
 
     if (employees.length === 0) {
       return res.status(400).json({ error: 'No employees found on that paystub. Check the file and try again.' })
+    }
+
+    // Snap names to the registry spelling. The prompt asks for this, but the
+    // CP joins on the registry name, so it is too load-bearing to leave to
+    // the model — a stub printing "Carlos A. Solorzano Majano" must become
+    // "Carlos Solorzano" or the row silently fills nothing.
+    //
+    // Conservative on purpose: a registry entry matches only when EVERY one
+    // of its name parts lines up with a printed part (prefix either way, so
+    // "Stamati" matches "Stamatis"), and the snap happens only when exactly
+    // one registry entry matches. Anything ambiguous is left untouched for
+    // the Apps Script unmatched-name warning to surface.
+    if (employeeList.length) {
+      const parts = s => String(s || '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(p => p.length > 1)
+      const registryParts = employeeList.map(n => ({ name: n, parts: parts(n) }))
+      const exact = new Set(employeeList.map(n => n.trim().toLowerCase()))
+      employees.forEach(e => {
+        if (exact.has(e.name.trim().toLowerCase())) return
+        const printed = parts(e.name)
+        const hits = registryParts.filter(r =>
+          r.parts.length > 0 &&
+          r.parts.every(rp => printed.some(pp => (rp.length >= 3 && pp.length >= 3) && (pp.startsWith(rp) || rp.startsWith(pp))))
+        )
+        if (hits.length === 1) {
+          console.log(`Paystub upload: resolved "${e.name}" → registry "${hits[0].name}"`)
+          e.name = hits[0].name
+        }
+      })
     }
 
     // ── Deterministic checks ──
