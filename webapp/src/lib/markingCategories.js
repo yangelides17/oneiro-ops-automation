@@ -92,6 +92,29 @@ export const CATEGORY_UNITS = {
 
 export const UNIT_OPTIONS = ['SF', 'LF', 'EA']
 
+// Fixed Color/Material per MMA Marking Type. The color is a property of
+// the marking itself — a bike lane is always green, a bus lane always
+// red, a pedestrian space always truffle — so it's derived from the
+// category rather than typed. Categories omitted here fall back to the
+// MMA_COLORS picker (only reachable when work_type is MMA but the
+// category isn't one of the three). Keep in sync with the mirror
+// CATEGORY_COLORS_ map in Apps Script Code.js.
+export const CATEGORY_COLORS = {
+  'Bike Lane':        'Green',
+  'Bus Lane':         'Red',
+  'Pedestrian Space': 'Truffle',
+}
+
+export const MMA_COLORS = ['Green', 'Truffle', 'Red']
+
+export function colorForCategory(category) {
+  return CATEGORY_COLORS[category] || null
+}
+
+export function colorIsLocked(category) {
+  return CATEGORY_COLORS[category] != null
+}
+
 // Display-only aliases. The KEY is the canonical stored/routing string
 // (unchanged everywhere — sheet value, pricing, unit, and PDF routing all
 // still key on it); the VALUE is only what the crew sees in the UI. Apply
@@ -130,11 +153,21 @@ export function rowRequiresColor(item) {
   return String(item.work_type || '').toLowerCase() === 'mma'
 }
 
+// The color a row actually carries: derived from the Marking Type when
+// that type has a fixed color, else whatever is stored. Legacy rows
+// written before colors were derived may have a blank or free-text
+// col K — those still read as Green/Red/Truffle here, which is what the
+// UI shows and what the server rewrites on the next save.
+export function effectiveColor(item) {
+  return colorForCategory(item.category || '')
+    || String(item.color_material || '').trim()
+}
+
 export function rowIsCompletable(item) {
   if (item.status === 'Completed') return true
   const qty = parseFloat(item.quantity)
   if (isNaN(qty) || qty <= 0) return false
   if (!String(item.unit || '').trim()) return false
-  if (rowRequiresColor(item) && !String(item.color_material || '').trim()) return false
+  if (rowRequiresColor(item) && !effectiveColor(item)) return false
   return true
 }

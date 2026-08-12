@@ -6,6 +6,7 @@ import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
 import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
+  MMA_COLORS, colorForCategory, effectiveColor,
   pickLayout, rowIsCompletable, rowRequiresColor, displayCategory,
 } from '../lib/markingCategories'
 import { parseQty }    from '../lib/parseQty'
@@ -328,16 +329,23 @@ function MarkingItemRow({
         className={locked ? LOCK : INPUT}>
         {UNIT_OPTIONS.map(u => <option key={u}>{u}</option>)}
       </select>
-  const ColorBox = (
-    <input type="text" placeholder="Color / Material"
-      value={item.color_material ?? ''}
-      onChange={onLocalText('color_material')}
-      onBlur={onCommitText('color_material')}
-      onKeyDown={onEnterBlur}
-      readOnly={locked}
-      className={locked ? LOCK : INPUT}
-    />
-  )
+  // Color, like Unit, is derived from the Marking Type — bike lane is
+  // always green, bus lane red, pedestrian space truffle — so it renders
+  // as read-only text rather than a typed field. The picker is only
+  // reachable on the fallback layout (work_type MMA, category isn't one
+  // of the three), where there's nothing to derive from.
+  const derivedColor = colorForCategory(item.category)
+  const ColorBox = derivedColor
+    ? <div className="text-sm py-2 text-center font-semibold text-slate-500">
+        {derivedColor}
+      </div>
+    : <select value={item.color_material || ''}
+        onChange={onDropdown('color_material')}
+        disabled={locked}
+        className={locked ? LOCK : INPUT}>
+        <option value="" disabled>Color</option>
+        {MMA_COLORS.map(c => <option key={c}>{c}</option>)}
+      </select>
   const CheckboxCell = bulkMode ? (
     <input type="checkbox" checked={selected}
       onChange={e => onToggleSelect(item.item_id, e.target.checked)}
@@ -1778,7 +1786,7 @@ export default function FieldReport() {
     // completion. (rowIsCompletable already enforces this when WO is
     // marked complete; this check covers partial submits too.)
     const missingColor = markingItems.filter(i =>
-      rowRequiresColor(i) && !String(i.color_material || '').trim()
+      rowRequiresColor(i) && !effectiveColor(i)
     )
     if (missingColor.length > 0) {
       const labels = missingColor.slice(0, 6).map(i => `• ${displayCategory(i.category)}`).join('\n')

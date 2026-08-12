@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  MARKING_CATEGORIES, UNIT_OPTIONS,
-  unitForCategory, unitIsLocked, pickLayout, displayCategory,
+  MARKING_CATEGORIES, UNIT_OPTIONS, MMA_COLORS,
+  unitForCategory, unitIsLocked, colorForCategory, pickLayout, displayCategory,
 } from '../lib/markingCategories'
 import { parseQty } from '../lib/parseQty'
 import { validateQty } from '../lib/qtyValidation'
@@ -13,7 +13,8 @@ const DIRECTIONS = ['', 'N', 'E', 'S', 'W']
  * MarkingFormModal — shared create/edit dialog for Marking Items.
  *
  * Visible inputs adapt to the picked Marking Type via pickLayout():
- *   mma     — Color/Material + Qty + Unit (locked SF) + Description + Notes
+ *   mma     — Color/Material (locked, derived from type) + Qty
+ *             + Unit (locked SF) + Description + Notes
  *   grid    — Intersection + Direction + Qty + Unit (locked) + Description + Notes
  *   default — Qty + Unit + Description + Notes
  *
@@ -87,6 +88,12 @@ export default function MarkingFormModal({
     [form.category, workType]
   )
 
+  // Color is a property of the marking type (bike lane = green, bus lane
+  // = red, pedestrian space = truffle), so it's derived and shown
+  // read-only. Null only for the work_type-is-MMA-but-category-isn't
+  // fallback, which still gets a picker.
+  const lockedColor = colorForCategory(form.category)
+
   // Close on Escape (only when nothing is mid-flight).
   useEffect(() => {
     const handler = (e) => {
@@ -106,6 +113,9 @@ export default function MarkingFormModal({
       const derived = unitForCategory(v)
       if (derived) next.unit = derived
       else if (!next.unit) next.unit = 'EA'
+      // Color follows the type the same way unit does.
+      const derivedColor = colorForCategory(v)
+      if (derivedColor) next.color_material = derivedColor
     }
     return next
   })
@@ -130,7 +140,9 @@ export default function MarkingFormModal({
       description:    form.description.trim(),
       quantity:       qtyNum,
       unit:           finalUnit,
-      color_material: form.color_material.trim(),
+      // Derived value always wins — an existing row carrying a legacy
+      // typed value gets normalized the moment it's re-saved.
+      color_material: colorForCategory(category) || form.color_material.trim(),
       notes:          form.notes.trim(),
     }
 
@@ -213,7 +225,9 @@ export default function MarkingFormModal({
       setError('Marking Type is required.')
       return
     }
-    if (layout === 'mma' && !form.color_material.trim()) {
+    // Only reachable on the fallback layout — the three MMA types derive
+    // their color from the type, so it can never be blank there.
+    if (layout === 'mma' && !lockedColor && !form.color_material.trim()) {
       setError('Color / Material is required for MMA items.')
       return
     }
@@ -321,13 +335,22 @@ export default function MarkingFormModal({
 
           {layout === 'mma' && (
             <Field label="Color / Material" required>
-              <input
-                type="text"
-                value={form.color_material}
-                onChange={e => setField('color_material', e.target.value)}
-                placeholder="e.g. White Thermo"
-                className="field-input"
-              />
+              {lockedColor ? (
+                <div className="field-input bg-slate-50 text-slate-500
+                                flex items-center font-semibold
+                                cursor-not-allowed">
+                  {lockedColor}
+                </div>
+              ) : (
+                <select
+                  value={form.color_material}
+                  onChange={e => setField('color_material', e.target.value)}
+                  className="field-input"
+                >
+                  <option value="" disabled>—</option>
+                  {MMA_COLORS.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              )}
             </Field>
           )}
 

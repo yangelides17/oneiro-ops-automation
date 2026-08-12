@@ -10535,6 +10535,23 @@ function unitForCategory_(category) {
 }
 
 
+// Fixed Color/Material per MMA Marking Type. The color is a property of
+// the marking itself, not a crew choice — a bike lane is always green, a
+// bus lane always red, a pedestrian space always truffle. Derived here
+// (not just in the UI) so a stale client or a direct sheet edit can't
+// reintroduce free text into col K. Mirror of CATEGORY_COLORS in
+// webapp/src/lib/markingCategories.js.
+const CATEGORY_COLORS_ = {
+  'Bike Lane':        'Green',
+  'Bus Lane':         'Red',
+  'Pedestrian Space': 'Truffle',
+};
+
+function colorForCategory_(category) {
+  return CATEGORY_COLORS_[String(category || '').trim()] || '';
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // PRICING ENGINE — Marking Type → revenue
 // ═══════════════════════════════════════════════════════════════
@@ -11270,10 +11287,10 @@ function seedMarkingItems_(ss, d) {
 
   // ── Color Surface auto-seed (Paint / PT WOs) ──────────────────
   // A PT- WO is a Paint / Color Surface (MMA) job. Seed one Color Surface
-  // item so the crew just confirms the sub-type and fills SQFT + color.
+  // item so the crew just confirms the sub-type and fills SQFT.
   // Defaults to 'Bike Lane' (an MMA category, unit SF) — the crew switches
-  // to Bus Lane / Pedestrian Space if needed. Color/Material is left blank
-  // and is required before the item can be marked Completed.
+  // to Bus Lane / Pedestrian Space if needed, and the color repaints
+  // itself from the type (green / red / truffle) when they do.
   if (isPaintWO) {
     rows.push([
       `${woId}-${pad3(n++)}`,                 // A  Item ID
@@ -11283,10 +11300,10 @@ function seedMarkingItems_(ss, d) {
       'Bike Lane',                             // E  Marking Type (Color Surface default)
       '',                                      // F  Intersection
       '',                                      // G  Direction
-      'Color Surface — confirm type & color',  // H  Description
+      'Color Surface — confirm type & SQFT',   // H  Description
       '',                                      // I  Quantity Completed (blank — crew fills SQFT)
       unitForCategory_('Bike Lane') || 'SF',   // J  Unit (= SF)
-      '',                                      // K  Color/Material (crew fills — required)
+      colorForCategory_('Bike Lane'),          // K  Color/Material (= Green, follows type)
       '',                                      // L  Date Completed
       'Pending',                               // M  Status
       'Scanner',                               // N  Added By
@@ -11340,9 +11357,14 @@ function applyMarkingUpdates_(ss, updates, dateOfWork) {
     const qty    = parseFloat(u.quantity);
     const hasQty = !isNaN(qty) && qty > 0;
 
+    // Color follows the row's Marking Type (col E) when that type has a
+    // fixed color; the client value is only honored for types that don't.
+    const rowCat = String(data[rowNum - 1][4] || '').trim();
+    const color  = colorForCategory_(rowCat) || String(u.color_material || '').trim();
+
     sheet.getRange(rowNum, 9).setValue(hasQty ? qty : '');                       // I Quantity
     if (u.unit) sheet.getRange(rowNum, 10).setValue(String(u.unit).trim());      // J Unit
-    sheet.getRange(rowNum, 11).setValue(String(u.color_material || '').trim()); // K Color/Material
+    sheet.getRange(rowNum, 11).setValue(color);                                  // K Color/Material
     sheet.getRange(rowNum, 12).setValue(hasQty ? dateOfWork : '');               // L Date Completed
     sheet.getRange(rowNum, 13).setValue(hasQty ? 'Completed' : 'Pending');       // M Status
     if (u.notes !== undefined) {
@@ -11395,7 +11417,8 @@ function applyMarkingNew_(ss, woId, workType, newItems, dateOfWork) {
       String(item.description || '').trim(),        // H Description
       hasQty ? qty : '',                            // I Quantity
       String(item.unit || 'SF').trim(),             // J Unit
-      String(item.color_material || '').trim(),     // K Color/Material
+      colorForCategory_(item.category)
+        || String(item.color_material || '').trim(), // K Color/Material (derived)
       hasQty ? dateOfWork : '',                     // L Date Completed
       hasQty ? 'Completed' : 'Pending',             // M Status
       'Manual',                                     // N Added By
@@ -11679,6 +11702,10 @@ function handleCreateMarkingItem_(body) {
   const lockedUnit = unitForCategory_(cat);
   const finalUnit  = lockedUnit || String(d.unit || 'EA').trim();
 
+  // Color: same deal — derived from the category when the category has a
+  // fixed color, otherwise accept the client's pick.
+  const finalColor = colorForCategory_(cat) || String(d.color_material || '').trim();
+
   const row = [
     newId,                                      // A Item ID
     woId,                                       // B Work Order #
@@ -11690,7 +11717,7 @@ function handleCreateMarkingItem_(body) {
     String(d.description  || '').trim(),        // H Description
     hasQty ? qty : '',                          // I Quantity
     finalUnit,                                  // J Unit (derived from category)
-    String(d.color_material || '').trim(),      // K Color/Material
+    finalColor,                                 // K Color/Material (derived from category)
     '',                                         // L Date Completed — always blank until submit
     'Pending',                                  // M Status — always Pending until submit
     'Manual',                                   // N Added By
@@ -11778,6 +11805,11 @@ function handleUpdateMarkingItem_(body) {
       // Force unit into the patch — overrides anything the client sent.
       d.unit = lockedUnit;
     }
+    // Same for color on the MMA types, so switching e.g. Bike Lane →
+    // Bus Lane repaints col K from green to red even if the client
+    // didn't patch color_material.
+    const lockedColor = colorForCategory_(newCat);
+    if (lockedColor) d.color_material = lockedColor;
   }
 
   // Write each patchable string field present in the request. These are
@@ -12218,6 +12250,15 @@ function handleEditCompletedWO_(body) {
       if (!itemId) return;
       const sheetRow = rowByItemId[itemId];
       if (!sheetRow) return;
+      // Color/category coupling is enforced here (not just client-side):
+      // resolve against the patched category when the patch changes it,
+      // else the row's current one.
+      const effCat = patch.category !== undefined
+        ? String(patch.category || '').trim()
+        : String(miData[sheetRow - 1][4] || '').trim();
+      const lockedColor = colorForCategory_(effCat);
+      if (lockedColor) patch.color_material = lockedColor;
+
       // Write each changed column. Unit/category coupling (unitForCategory_)
       // is enforced client-side via MarkingFormModal already.
       ['work_type','section','category','intersection','direction',
