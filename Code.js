@@ -65,7 +65,7 @@ const CONFIG = {
     address: '435 South Avenue Apt 220, Garwood, NJ 07027',
     email:   'anthe@theoneiro.com',
     phone:   '',
-    tax_id:  '0450359615'
+    tax_id:  '833949187'
   },
 
   // Signatory for certified payroll
