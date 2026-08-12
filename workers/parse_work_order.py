@@ -110,6 +110,7 @@ If a field is not visible, illegible, or not applicable, use null. Never guess.
   "prep_by":            "The 'Prep By' or 'Prepared By' name printed in the bottom block of the form (not a signature — the printed name). Transcribe exactly.",
   "water_blast_sqft":   "If any waterblasting square footage is handwritten anywhere on the form, extract the number as an integer. Otherwise null.",
   "general_remarks":    "The full text of the General Remarks section (middle of the form, labeled 'General Remarks>>>>>'). Transcribe exactly as written, including handwritten text.",
+  "mma_marking_type":   "Which MMA colored-surface treatment the General Remarks call for: exactly one of 'Bike Lane', 'Bus Lane', 'Pedestrian Space', or null if the remarks give no MMA type and no qualifying color word. See the mma_marking_type rules below.",
 
   "top_markings": [
     {
@@ -176,6 +177,10 @@ Rules:
   • Do NOT source anything for this field from the standard top-table rows (Double Yellow /
     Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road / Others) or the
     intersection grid — those are handled by top_markings / intersection_grid.
+  • 'PED SPACE' / 'PEDESTRIAN SPACE' / 'PED STOP' is an MMA colored SURFACE, not a preform
+    symbol — it never produces a 'Pedestrian Men' entry. Likewise a bare 'BIKE LANE' (as in
+    'INSTALL BIKE LANE' or 'GREEN MMA') is the green surface, not a 'Bike Symbol' or
+    'Bike Arrow'. Those all belong to mma_marking_type instead.
   • If neither place mentions any bike/ped symbol, return an empty array [].
 
 Examples:
@@ -192,6 +197,56 @@ Examples:
     (no count given, but Bike Symbols are still required)
   'SEE DWG MD-19232_3  13 BS' →
     [{"type":"Bike Symbol","quantity":13,"source":"general_remarks"}]
+
+mma_marking_type rules — a SEPARATE, self-contained CLASSIFICATION. It does NOT change
+anything above: general_remarks is still transcribed verbatim (never rewrite a color word
+into a type name), and top_markings / intersection_grid / bike_lane_markings are
+unchanged. Read ONLY the General Remarks line. Decide which colored MMA surface treatment
+the work order calls for and return exactly one of these three strings:
+  • 'Bike Lane'         — named as BIKE LANE, or by its color GREEN ('GREEN MMA', 'GREEN PAINT')
+  • 'Bus Lane'          — named as BUS LANE, or by its color RED ('RED MMA', 'RED PAINT')
+  • 'Pedestrian Space'  — named as PEDESTRIAN SPACE / PED SPACE / PEDESTRIAN STOP / PED STOP,
+                          or by its color TRUFFLE ('TRUFFLE MMA', 'TRUFFLE PAINT')
+Each treatment has exactly one fixed color — a bike lane is always green, a bus lane always
+red, a pedestrian space always truffle — so a color word alone identifies the type. Always
+return the TYPE name, never the color.
+
+Rules:
+  • A color word counts ONLY when it describes the material or surface being applied — i.e.
+    it sits next to MMA, PAINT, SURFACE, COLOR or TREATMENT, or next to a verb like INSTALL /
+    RECAP / REFURB / W/B / WB. 'INSTALL GREEN MMA' → 'Bike Lane'.
+  • NEVER take a color word that is part of a place name. 'GREEN ST', 'GREENE AVE',
+    'GREENPOINT AV', 'RED HOOK LN' are streets and neighborhoods, not colors. If the only
+    GREEN or RED on the line is followed by a street suffix (ST, AVE, AV, BLVD, PL, RD, DR,
+    LN, PKWY, HWY, EXPY) or is part of a longer word, it indicates nothing — return null.
+  • The verb does NOT matter. INSTALL, RECAP, REFURB, REPLACE, W/B and WB all describe work
+    on the same surface — only the type or color word decides the answer. 'RECAP RED MMA' and
+    'INSTALL RED MMA' both → 'Bus Lane'.
+  • IGNORE drawing/plan references entirely: 'SEE DWG MD-644_3', 'MD-1098_2', 'MD-882-2,1'
+    are plan numbers. A type is never inferred from a drawing number.
+  • If a name AND a color both appear and they agree ('INSTALL GREEN MMA FOR BIKE LANE'),
+    return that type. If they DISAGREE ('RED MMA FOR BIKE LANE'), trust the COLOR word — the
+    color names the physical material actually being installed.
+  • If two or more different treatments are named, return the FIRST one mentioned and ignore
+    the rest. Never return a list, and never invent a combined value.
+  • 'PEDESTRIAN SPACE' / 'PED SPACE' / 'PED STOP' is an MMA colored SURFACE, not a preform
+    pedestrian symbol — it belongs here and must never produce a 'Pedestrian Men' entry in
+    bike_lane_markings. Likewise 'BIKE LANE' here is the green surface, not a 'Bike Symbol'
+    or 'Bike Arrow'; only the tokens BS / BA / BSA / PED MEN (or their full names) feed
+    bike_lane_markings.
+  • Do NOT source this field from the top table, the 'Bike Lane Work (NEW)' cell or the
+    intersection grid, and do NOT infer it from the work order number, the boro, or the
+    Pavement Work type. General Remarks only.
+  • If the General Remarks give no MMA type and no qualifying color word, return null.
+
+Examples:
+  'WB & INSTALL GREEN MMA SEE DWG MD-644_3'                    → 'Bike Lane'
+  'W/B & INSTALL TRUFFLE PAINT SEE HIGHLIGHTED DWG MD-1098_2'  → 'Pedestrian Space'
+  'RECAP RED MMA'                                              → 'Bus Lane'
+  'INSTALL BIKE LANE SEE DWG MD-646_2'                         → 'Bike Lane'
+  'W/B & RECAP PED SPACE'                                      → 'Pedestrian Space'
+  'RECAP FROM GREENE AVE TO CLASSON AVE'                       → null
+  'SEE DWG MD-762_4  3 BS  2 PED MEN'                          → null
 
 top_markings rules:
 - This is the upper table that lists marking CATEGORIES down the middle column (Double Yellow CenterLine / Lane Lines / Gores / Messages / Arrows / Solid Lines / Rail Road X / Diamond / Others).
@@ -548,6 +603,34 @@ def normalize_wo_data(raw: dict) -> dict:
             _deduped[t] = bm
     bike_lane_markings = list(_deduped.values())
 
+    # ── Normalize mma_marking_type ────────────────────────────────
+    # Which MMA colored-surface treatment the General Remarks call for.
+    # Only meaningful on PT- (paint) WOs: the Apps Script seeder uses it to
+    # pick the Marking Type of the single auto-seeded Color Surface item and
+    # falls back to 'Bike Lane' when it's blank. The COLOR is deliberately
+    # not carried here — it's derived from the type on both the Apps Script
+    # (CATEGORY_COLORS_) and webapp (CATEGORY_COLORS) sides. Accept the three
+    # canonical names, their common short forms, and a bare color word, in
+    # case the model answers with the color it read off the page. Anything
+    # unrecognized collapses to '' and the seeder keeps today's default.
+    #
+    # Deliberately NOT falling back to a regex over `remarks` when this comes
+    # back empty: the model reads the same text plus the image, so a regex
+    # would only add false positives on street names ('GREENE AVE').
+    MMA_TYPE_ALIASES = {
+        'bike lane':        'Bike Lane',
+        'green':            'Bike Lane',
+        'bus lane':         'Bus Lane',
+        'red':              'Bus Lane',
+        'pedestrian space': 'Pedestrian Space',
+        'ped space':        'Pedestrian Space',
+        'pedestrian stop':  'Pedestrian Space',
+        'ped stop':         'Pedestrian Space',
+        'truffle':          'Pedestrian Space',
+    }
+    mma_marking_type = MMA_TYPE_ALIASES.get(
+        str(raw.get('mma_marking_type') or '').strip().lower(), '')
+
     # ── Derive work_type (MMA vs Thermo) ──────────────────────────
     # MMA detection above already sets water_blast_required = 'Yes - MMA'
     # when remarks/handwritten WB SQFT indicate MMA work. Intersection
@@ -600,6 +683,11 @@ def normalize_wo_data(raw: dict) -> dict:
         'top_markings':          top_markings,
         'intersection_grid':     intersection_grid,
         'bike_lane_markings':    bike_lane_markings,
+        'mma_marking_type':      mma_marking_type,
+        # Carried through so the seeded Color Surface item can record WHY it
+        # picked its type. Until now the transcription was scanned for MMA
+        # keywords and then thrown away.
+        'general_remarks':       remarks,
         'date_entered':          (raw.get('date_entered') or '').strip(),
         'school':                (raw.get('school') or 'NA').strip() or 'NA',
         'prep_by':               (raw.get('prep_by') or '').strip(),

@@ -11288,26 +11288,39 @@ function seedMarkingItems_(ss, d) {
   // ── Color Surface auto-seed (Paint / PT WOs) ──────────────────
   // A PT- WO is a Paint / Color Surface (MMA) job. Seed one Color Surface
   // item so the crew just confirms the sub-type and fills SQFT.
-  // Defaults to 'Bike Lane' (an MMA category, unit SF) — the crew switches
-  // to Bus Lane / Pedestrian Space if needed, and the color repaints
-  // itself from the type (green / red / truffle) when they do.
+  //
+  // The Marking Type comes from the Vision parse of the WO's General
+  // Remarks (d.mma_marking_type — 'INSTALL GREEN MMA' → Bike Lane,
+  // 'RECAP RED MMA' → Bus Lane, 'INSTALL TRUFFLE PAINT' → Pedestrian
+  // Space). colorForCategory_ returns a color ONLY for those three MMA
+  // types, so it doubles as the validity test: a blank, unknown, or
+  // non-MMA value falls back to 'Bike Lane' — i.e. the behavior from
+  // before the remarks were parsed. The crew can still switch the type in
+  // the app, and the color repaints itself from the type when they do.
   if (isPaintWO) {
+    const scannedType = String(d.mma_marking_type || '').trim();
+    const mmaScanned  = !!colorForCategory_(scannedType);
+    const mmaCat      = mmaScanned ? scannedType : 'Bike Lane';
     rows.push([
       `${woId}-${pad3(n++)}`,                 // A  Item ID
       woId,                                    // B  Work Order #
       workType,                                // C  Work Type (= MMA for PT)
       'Top Table',                             // D  WO Section
-      'Bike Lane',                             // E  Marking Type (Color Surface default)
+      mmaCat,                                  // E  Marking Type (from remarks; default Bike Lane)
       '',                                      // F  Intersection
       '',                                      // G  Direction
-      'Color Surface — confirm type & SQFT',   // H  Description
+      mmaScanned                               // H  Description
+        ? 'Color Surface — confirm SQFT'
+        : 'Color Surface — confirm type & SQFT',
       '',                                      // I  Quantity Completed (blank — crew fills SQFT)
-      unitForCategory_('Bike Lane') || 'SF',   // J  Unit (= SF)
-      colorForCategory_('Bike Lane'),          // K  Color/Material (= Green, follows type)
+      unitForCategory_(mmaCat) || 'SF',        // J  Unit (= SF)
+      colorForCategory_(mmaCat),               // K  Color/Material (follows the type)
       '',                                      // L  Date Completed
       'Pending',                               // M  Status
       'Scanner',                               // N  Added By
-      ''                                       // O  Notes
+      mmaScanned                               // O  Notes — why this type was picked
+        ? `From WO remarks: ${String(d.general_remarks || '').trim().slice(0, 150)}`
+        : ''
     ]);
   }
 
