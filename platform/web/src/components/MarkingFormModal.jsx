@@ -1,0 +1,729 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  MARKING_CATEGORIES, UNIT_OPTIONS,
+  unitForCategory, unitIsLocked, pickLayout, displayCategory,
+} from '../lib/markingCategories'
+import { parseQty } from '../lib/parseQty'
+import { validateQty } from '../lib/qtyValidation'
+import ConfirmModal from './ConfirmModal'
+
+const DIRECTIONS = ['', 'N', 'E', 'S', 'W']
+
+/**
+ * MarkingFormModal — shared create/edit dialog for Marking Items.
+ *
+ * Visible inputs adapt to the picked Marking Type via pickLayout():
+ *   mma     — Color/Material + Qty + Unit (locked SF) + Description + Notes
+ *   grid    — Intersection + Direction + Qty + Unit (locked) + Description + Notes
+ *   default — Qty + Unit + Description + Notes
+ *
+ * Marking Type is a custom searchable dropdown (no native datalist) so
+ * mobile crews don't get word-prediction over the keyboard, and so users
+ * can't type their own custom names that route incorrectly downstream.
+ *
+ * Intersection is a combobox of the WO's intersections (passed in via
+ * `wo_intersections`) + derived between-pairs (`wo_betweens`) + an
+ * "Other" option that flips to free text.
+ *
+ * Qty accepts arithmetic (`15*10`, `5+5+5`) via parseQty + runs the
+ * same out-of-range check (validateQty) the inline grid uses on
+ * HVX Crosswalk / Stop Line / Stop Msg.
+ *
+ * Props:
+ *   mode             — 'add' | 'edit'
+ *   item             — the existing item object (edit mode) or null (add mode)
+ *   woId             — required in add mode
+ *   workType         — 'MMA' | 'Thermo' | '' — drives layout fallback
+ *   wo_intersections — string[] of distinct intersection names (in WO order)
+ *   wo_betweens      — string[] of derived "X – Y" between-pairs
+ *   deferred         — when true (admin editing a Completed WO), the
+ *                       modal does NOT call the network. It builds the
+ *                       full item object client-side and returns it via
+ *                       onSaved. Parent buffers the change; everything
+ *                       flushes in one batched call on save mode click.
+ *                       Lets the user revert or abandon the edit session
+ *                       without leaving partial state on the server.
+ *   tempIdFactory    — () => string — used when `deferred` + add mode to
+ *                       mint a stable client-side ID like "_temp_3".
+ *                       Required when deferred=true & mode==='add'.
+ *   onClose          — close without saving
+ *   onSaved          — (updatedItem) => void   — called after a successful API call
+ *                       (or, in deferred mode, with the locally-built item)
+ */
+export default function MarkingFormModal({
+  mode, item, woId, workType,
+  wo_intersections = [], wo_betweens = [],
+  deferred = false,
+  tempIdFactory,
+  onClose, onSaved,
+}) {
+  const isEdit          = mode === 'edit'
+  const isAutoPopulated = isEdit && item?.addedBy === 'Scanner'
+
+  const [form, setForm] = useState(() => ({
+    category:       item?.category       ?? '',
+    intersection:   item?.intersection   ?? '',
+    direction:      item?.direction      ?? '',
+    description:    item?.description    ?? '',
+    quantity:       item?.quantity != null ? String(item.quantity) : '',
+    unit:           item?.unit           || 'SF',
+    colorMaterial: item?.colorMaterial ?? '',
+    notes:          item?.notes          ?? '',
+  }))
+  const [saving, setSaving] = useState(false)
+  const [error,  setError]  = useState('')
+  // Pending confirmation when validateQty flags an out-of-range value —
+  // shape: { message, parsedStr } or null.
+  const [qtyConfirm, setQtyConfirm] = useState(null)
+  // Pending confirmation when a crew edits the QUANTITY of an
+  // already-Completed item — shape: { parsedStr } or null. A quantity
+  // edit is a same-day correction that stays on the item's original date;
+  // this blocking modal makes the crew acknowledge that so they don't use
+  // it to log a different day's production (which belongs in a new item).
+  const [completedEditConfirm, setCompletedEditConfirm] = useState(null)
+
+  const layout = useMemo(
+    () => pickLayout({ category: form.category, workType: workType }),
+    [form.category, workType]
+  )
+
+  // Close on Escape (only when nothing is mid-flight).
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key !== 'Escape') return
+      if (saving || qtyConfirm || completedEditConfirm) return
+      onClose?.()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [saving, qtyConfirm, completedEditConfirm, onClose])
+
+  // When category changes, auto-update the unit from the category map
+  // (variable categories like "Others" keep the user's last pick).
+  const setField = (k, v) => setForm(f => {
+    const next = { ...f, [k]: v }
+    if (k === 'category') {
+      const derived = unitForCategory(v)
+      if (derived) next.unit = derived
+      else if (!next.unit) next.unit = 'EA'
+    }
+    return next
+  })
+
+  // Build the final payload + actually POST/PATCH it. Called either
+  // directly from handleConfirm (when no Qty warning) or from the
+  // ConfirmModal's confirm callback (when admin OK'd a flagged Qty).
+  async function persist(qtyParsedStr) {
+    setError('')
+    const category = form.category.trim()
+    if (!category) { setError('Marking Type is required.'); return }
+
+    const finalUnit = unitForCategory(category) || form.unit || 'EA'
+    const qtyNum = (qtyParsedStr === '' || qtyParsedStr == null)
+      ? null
+      : parseFloat(qtyParsedStr)
+
+    const payload = {
+      category,
+      intersection:   form.intersection.trim(),
+      direction:      form.direction,
+      description:    form.description.trim(),
+      quantity:       qtyNum,
+      unit:           finalUnit,
+      colorMaterial: form.colorMaterial.trim(),
+      notes:          form.notes.trim(),
+    }
+
+    setSaving(true)
+    try {
+      // Deferred path: build the item object locally and return it via
+      // onSaved. No network call — the parent buffers the change in its
+      // markingItems state and flushes the diff to the server on save
+      // mode click. Cancel just discards.
+      if (deferred) {
+        if (isEdit) {
+          const merged = { ...item, ...payload }
+          onSaved?.(merged)
+        } else {
+          if (!tempIdFactory) throw new Error('Internal: tempIdFactory required for deferred add')
+          const newItem = {
+            item_id:        tempIdFactory(),
+            work_order_id:  woId,
+            workType:      workType || '',
+            section:        'Manual',
+            ...payload,
+            dateCompleted: '',
+            status:         'Pending',
+            addedBy:       'Manual',
+          }
+          onSaved?.(newItem)
+        }
+        setSaving(false)
+        return
+      }
+
+      let res
+      if (isEdit) {
+        res = await fetch(`/api/markings/${encodeURIComponent(item.item_id)}`, {
+          method:  'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(payload),
+        })
+      } else {
+        res = await fetch('/api/markings', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ ...payload, woId: woId, workType: workType || '' }),
+        })
+      }
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      if (!data.item) throw new Error('Server did not return an item')
+      onSaved?.(data.item)
+    } catch (e) {
+      setError(e.message || 'Save failed')
+      setSaving(false)
+    }
+  }
+
+  // Final gate before persist: if this edit changes the QUANTITY of an
+  // already-Completed item to a new positive value, make the crew confirm
+  // (the change corrects the item's original day; it does NOT move it to
+  // today). Clearing qty to 0/blank is exempt — that's the "didn't get
+  // done" → Pending path. `deferred` (admin edit-completed-WO batch) is
+  // exempt too — it flows through a separate server handler.
+  function persistWithCompletedGate(parsedStr) {
+    const origQty = item?.quantity
+    const newQty  = (parsedStr === '' || parsedStr == null) ? null : parseFloat(parsedStr)
+    const changedToPositive =
+      newQty != null && newQty > 0 && String(newQty) !== String(origQty ?? '')
+    if (isEdit && !deferred && item?.status === 'Completed' && changedToPositive) {
+      setCompletedEditConfirm({ parsedStr })
+      return
+    }
+    persist(parsedStr)
+  }
+
+  // Save click — parses Qty arithmetic, runs the same out-of-range
+  // validation the inline grid uses, then either prompts for confirm
+  // (out of range) or persists immediately.
+  function handleConfirm() {
+    setError('')
+    if (!form.category.trim()) {
+      setError('Marking Type is required.')
+      return
+    }
+    if (layout === 'mma' && !form.colorMaterial.trim()) {
+      setError('Color / Material is required for MMA items.')
+      return
+    }
+    // Grid categories (HVX Crosswalk / Stop Line / Stop Msg) must land in a
+    // specific cell of the intersection grid, so location is mandatory.
+    if (layout === 'grid') {
+      if (!form.intersection.trim()) {
+        setError('Intersection is required for Crosswalk / Stop Line / Stop Msg.')
+        return
+      }
+      if (!form.direction) {
+        setError('Direction is required for Crosswalk / Stop Line / Stop Msg.')
+        return
+      }
+    }
+    const parsedStr = parseQty(form.quantity)
+    if (parsedStr !== form.quantity) {
+      // Reflect the resolved number in the input so the modal message
+      // and the eventually-saved value align with what the user sees.
+      setField('quantity', parsedStr)
+    }
+    const check = validateQty(form.category, parsedStr)
+    if (!check.ok) {
+      setQtyConfirm({ message: check.message, parsedStr })
+      return
+    }
+    persistWithCompletedGate(parsedStr)
+  }
+
+  return (
+    <>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)' }}
+      onClick={() => { if (!saving && !qtyConfirm && !completedEditConfirm) onClose?.() }}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 space-y-4 max-h-[92vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}
+      >
+        <div>
+          <h2 className="text-lg font-black text-navy">
+            {isEdit ? 'Edit Marking Item' : 'Add Marking Item'}
+          </h2>
+          {isEdit && (
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">{item?.item_id}</p>
+          )}
+        </div>
+
+        {isAutoPopulated && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 leading-relaxed">
+            <span className="font-bold">⚠ Auto-populated item.</span>{' '}
+            This row was extracted from the WO scan. Changes here will overwrite the scanned values.
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-700">
+            {error}
+          </div>
+        )}
+
+        {/* Form */}
+        <div className="space-y-2.5">
+          <Field label="Marking Type" required>
+            <CategorySelect
+              value={form.category}
+              onChange={(v) => setField('category', v)}
+            />
+          </Field>
+
+          {layout === 'grid' && (
+            <div className="grid grid-cols-[1fr_80px] gap-2">
+              <Field label="Intersection" required>
+                <IntersectionSelect
+                  value={form.intersection}
+                  onChange={(v) => setField('intersection', v)}
+                  intersections={wo_intersections}
+                  betweens={wo_betweens}
+                />
+              </Field>
+              <Field label="Direction" required>
+                <select
+                  value={form.direction}
+                  onChange={e => setField('direction', e.target.value)}
+                  className="field-input"
+                >
+                  <option value="" disabled>—</option>
+                  {DIRECTIONS.filter(Boolean).map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </Field>
+            </div>
+          )}
+
+          {layout === 'default' && (
+            <Field label="Intersection / Between (optional)">
+              <IntersectionSelect
+                value={form.intersection}
+                onChange={(v) => setField('intersection', v)}
+                intersections={wo_intersections}
+                betweens={wo_betweens}
+              />
+            </Field>
+          )}
+
+          {layout === 'mma' && (
+            <Field label="Color / Material" required>
+              <input
+                type="text"
+                value={form.colorMaterial}
+                onChange={e => setField('colorMaterial', e.target.value)}
+                placeholder="e.g. White Thermo"
+                className="field-input"
+              />
+            </Field>
+          )}
+
+          <div className="grid grid-cols-[1fr_80px] gap-2">
+            <Field label="Quantity">
+              <input
+                type="text"
+                inputMode="text"
+                value={form.quantity}
+                onChange={e => {
+                  // Same character allowlist the inline grid uses so paste
+                  // / stray taps can't land letters / units in the field.
+                  const v = (e.target.value.match(/[\d.+*xX\s]/g) || []).join('')
+                  setField('quantity', v)
+                }}
+                placeholder="Type Qty (or 15*10, 150+200)"
+                className="field-input"
+              />
+            </Field>
+            <Field label="Unit">
+              {unitIsLocked(form.category) ? (
+                <div className="field-input bg-slate-50 text-slate-500
+                                flex items-center justify-center font-semibold
+                                cursor-not-allowed">
+                  {unitForCategory(form.category)}
+                </div>
+              ) : (
+                <select
+                  value={form.unit}
+                  onChange={e => setField('unit', e.target.value)}
+                  className="field-input"
+                >
+                  {UNIT_OPTIONS.map(u => <option key={u}>{u}</option>)}
+                </select>
+              )}
+            </Field>
+          </div>
+
+          <Field label="Description">
+            <input
+              type="text"
+              value={form.description}
+              onChange={e => setField('description', e.target.value)}
+              placeholder="e.g. RECAP FROM HAMILTON PL TO 2ND AV"
+              className="field-input"
+            />
+          </Field>
+
+          <Field label="Notes">
+            <textarea
+              value={form.notes}
+              onChange={e => setField('notes', e.target.value)}
+              rows={2}
+              placeholder="Optional notes for the admin…"
+              className="field-input resize-none"
+            />
+          </Field>
+        </div>
+
+        {/* Buttons */}
+        <div className="flex flex-col gap-2 pt-1">
+          <button
+            type="button"
+            onClick={handleConfirm}
+            disabled={saving}
+            className="w-full py-3 rounded-xl font-bold text-sm
+                       bg-navy text-white hover:opacity-90 active:opacity-80
+                       disabled:opacity-60 disabled:cursor-not-allowed transition-all"
+          >
+            {saving
+              ? 'Saving…'
+              : isEdit ? 'Confirm changes' : 'Confirm & add'}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saving}
+            className="w-full py-3 rounded-xl font-bold text-sm bg-slate-100
+                       text-slate-600 hover:bg-slate-200 disabled:opacity-60
+                       disabled:cursor-not-allowed transition-all"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+
+    {qtyConfirm && (
+      <ConfirmModal
+        title="Quantity outside typical range"
+        message={qtyConfirm.message}
+        confirmLabel="Yes, keep it"
+        cancelLabel="Edit value"
+        onConfirm={() => {
+          const { parsedStr } = qtyConfirm
+          setQtyConfirm(null)
+          persistWithCompletedGate(parsedStr)
+        }}
+        onCancel={() => setQtyConfirm(null)}
+      />
+    )}
+
+    {completedEditConfirm && (
+      <ConfirmModal
+        title="This item is already complete"
+        message={`Logged as complete for ${item?.dateCompleted || 'its recorded day'}. Changing the quantity here corrects that day's record — it will NOT move to today. To log additional work done on a different day, cancel and use "Add marking" to create a new entry.`}
+        confirmLabel={`Yes, correct ${item?.dateCompleted || 'that day'}'s record`}
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          const { parsedStr } = completedEditConfirm
+          setCompletedEditConfirm(null)
+          persist(parsedStr)
+        }}
+        onCancel={() => setCompletedEditConfirm(null)}
+      />
+    )}
+    </>
+  )
+}
+
+function Field({ label, required, children }) {
+  return (
+    <div className="space-y-1">
+      <label className="field-label">
+        {label}{required && <span className="text-red-400 ml-0.5">*</span>}
+      </label>
+      {children}
+    </div>
+  )
+}
+
+// ── CategorySelect ────────────────────────────────────────────────
+// Custom searchable dropdown for Marking Type. Replaces the native
+// <input list="datalist"> which on mobile shows word-prediction
+// suggestions over the keyboard and lets users type custom names.
+//
+// No free-text on the trigger — picking from the list is the only
+// way to set the category. Edit-mode preserves legacy values not in
+// MARKING_CATEGORIES via a "Legacy: <value>" sentinel option.
+function CategorySelect({ value, onChange }) {
+  const [open, setOpen]     = useState(false)
+  const [query, setQuery]   = useState('')
+  const wrapRef = useRef(null)
+  const searchRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    setQuery('')
+    setTimeout(() => searchRef.current?.focus(), 0)
+    const handler = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
+    }
+    const esc = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    document.addEventListener('keydown', esc)
+    return () => {
+      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('keydown', esc)
+    }
+  }, [open])
+
+  const isLegacy = value && MARKING_CATEGORIES.indexOf(value) === -1
+  const opts = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const list = isLegacy ? [`Legacy: ${value}`, ...MARKING_CATEGORIES] : MARKING_CATEGORIES
+    if (!q) return list
+    // Match against BOTH the raw category and its display alias so a
+    // search for e.g. "bump"/"arrow" still finds "Speed Hump Markings"
+    // (shown as "Speed Bump Arrow"). pick()/keys still use the raw string.
+    return list.filter(c =>
+      c.toLowerCase().indexOf(q) !== -1 ||
+      displayCategory(c).toLowerCase().indexOf(q) !== -1)
+  }, [query, isLegacy, value])
+
+  const pick = (c) => {
+    if (c.startsWith('Legacy: ')) {
+      // Keep the legacy value verbatim.
+      onChange(c.slice('Legacy: '.length))
+    } else {
+      onChange(c)
+    }
+    setOpen(false)
+  }
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="field-input w-full text-left flex items-center justify-between"
+      >
+        <span className={value ? 'text-slate-800' : 'text-slate-400'}>
+          {value ? displayCategory(value) : 'Select a marking type'}
+        </span>
+        <span className="text-slate-400 text-xs ml-2">▾</span>
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-1 left-0 right-0 bg-white rounded-xl shadow-lg border border-slate-200 overflow-hidden">
+          <div className="p-2 border-b border-slate-100">
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Search marking types…"
+              className="field-input text-base sm:text-sm"
+            />
+          </div>
+          <div className="max-h-[260px] overflow-y-auto">
+            {opts.length === 0 && (
+              <p className="px-3 py-2 text-xs text-slate-400 italic">No matches</p>
+            )}
+            {opts.map((c) => {
+              const isSelected = (isLegacy && c === `Legacy: ${value}`) || c === value
+              return (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => pick(c)}
+                  className={`w-full text-left px-3 py-2 text-sm
+                              hover:bg-slate-50
+                              ${isSelected ? 'bg-navy/5 font-semibold text-navy' : 'text-slate-700'}`}
+                >
+                  {displayCategory(c)}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── IntersectionSelect ────────────────────────────────────────────
+// Combobox: search + scrollable list of the WO's intersections, then
+// derived between-pairs ("X – Y"), then "Other" → free-text.
+function IntersectionSelect({ value, onChange, intersections = [], betweens = [] }) {
+  const [open, setOpen]   = useState(false)
+  const [query, setQuery] = useState('')
+  const [customMode, setCustomMode] = useState(false)
+  const wrapRef = useRef(null)
+  const searchRef = useRef(null)
+  const customRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    setQuery('')
+    setTimeout(() => {
+      if (customMode) customRef.current?.focus()
+      else searchRef.current?.focus()
+    }, 0)
+    const handler = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
+    }
+    const esc = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    document.addEventListener('keydown', esc)
+    return () => {
+      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('keydown', esc)
+    }
+  }, [open, customMode])
+
+  const filterMatch = (s) => !query.trim() || s.toLowerCase().indexOf(query.trim().toLowerCase()) !== -1
+  const filteredIntersections = intersections.filter(filterMatch)
+  const filteredBetweens      = betweens.filter(filterMatch)
+
+  const pick = (v) => {
+    onChange(v)
+    setOpen(false)
+    setCustomMode(false)
+  }
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <button
+        type="button"
+        onClick={() => { setOpen(o => !o); setCustomMode(false) }}
+        className="field-input w-full text-left flex items-center justify-between"
+      >
+        <span className={value ? 'text-slate-800' : 'text-slate-400'}>
+          {value || 'Select an intersection'}
+        </span>
+        <span className="text-slate-400 text-xs ml-2">▾</span>
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-1 left-0 right-0 bg-white rounded-xl shadow-lg border border-slate-200 overflow-hidden">
+          {customMode ? (
+            <div className="p-2 space-y-2">
+              <input
+                ref={customRef}
+                type="text"
+                defaultValue={value || ''}
+                placeholder="e.g. 5 AV"
+                className="field-input text-base sm:text-sm"
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    pick(e.target.value.trim())
+                  }
+                }}
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => pick(customRef.current?.value.trim() || '')}
+                  className="flex-1 py-2 rounded-lg text-xs font-bold bg-navy text-white hover:opacity-90"
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCustomMode(false)}
+                  className="flex-1 py-2 rounded-lg text-xs font-bold bg-slate-100 text-slate-600 hover:bg-slate-200"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="p-2 border-b border-slate-100">
+                <input
+                  ref={searchRef}
+                  type="text"
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  placeholder="Search intersections…"
+                  className="field-input text-base sm:text-sm"
+                />
+              </div>
+              <div className="max-h-[260px] overflow-y-auto">
+                {filteredIntersections.length > 0 && (
+                  <>
+                    <p className="px-3 pt-2 pb-1 text-[10px] font-extrabold uppercase tracking-widest text-slate-400">
+                      Intersections
+                    </p>
+                    {filteredIntersections.map((c) => (
+                      <button
+                        key={'i-' + c}
+                        type="button"
+                        onClick={() => pick(c)}
+                        className={`w-full text-left px-3 py-2 text-sm hover:bg-slate-50
+                                    ${c === value ? 'bg-navy/5 font-semibold text-navy' : 'text-slate-700'}`}
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </>
+                )}
+                {filteredBetweens.length > 0 && (
+                  <>
+                    <p className="px-3 pt-2 pb-1 text-[10px] font-extrabold uppercase tracking-widest text-slate-400">
+                      Between
+                    </p>
+                    {filteredBetweens.map((c) => (
+                      <button
+                        key={'b-' + c}
+                        type="button"
+                        onClick={() => pick(c)}
+                        className={`w-full text-left px-3 py-2 text-sm hover:bg-slate-50
+                                    ${c === value ? 'bg-navy/5 font-semibold text-navy' : 'text-slate-700'}`}
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </>
+                )}
+                {filteredIntersections.length === 0 && filteredBetweens.length === 0 && (
+                  <p className="px-3 py-2 text-xs text-slate-400 italic">
+                    No matches — pick "Other" to enter a custom value.
+                  </p>
+                )}
+                <div className="border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => setCustomMode(true)}
+                    className="w-full text-left px-3 py-2 text-sm font-semibold text-navy hover:bg-slate-50"
+                  >
+                    Other (type a custom value)…
+                  </button>
+                  {value && (
+                    <button
+                      type="button"
+                      onClick={() => pick('')}
+                      className="w-full text-left px-3 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 border-t border-slate-100"
+                    >
+                      Clear selection
+                    </button>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

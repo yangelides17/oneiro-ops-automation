@@ -39,5 +39,12 @@ webapp/node_modules/
 webapp/dist/
 webapp/.vite/
 
+# Platform (new app)
+platform/api/node_modules/
+platform/api/dist/
+platform/web/node_modules/
+platform/web/dist/
+platform/web/.vite/
+
 # Claude Code local state (worktrees, plans, settings)
 .claude/

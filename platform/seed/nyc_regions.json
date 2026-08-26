@@ -1,0 +1,7 @@
+[
+  { "code": "MN", "name": "Manhattan", "sortOrder": 0 },
+  { "code": "BK", "name": "Brooklyn", "sortOrder": 1 },
+  { "code": "BX", "name": "Bronx", "sortOrder": 2 },
+  { "code": "QU", "name": "Queens", "sortOrder": 3 },
+  { "code": "SI", "name": "Staten Island", "sortOrder": 4 }
+]

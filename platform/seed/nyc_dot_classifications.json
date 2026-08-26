@@ -1,0 +1,30 @@
+{
+  "classifications": [
+    { "code": "LP", "name": "Line Person", "sortOrder": 0 },
+    { "code": "SAT", "name": "Striping Assistant", "sortOrder": 1 },
+    { "code": "OP", "name": "Operator", "sortOrder": 2 },
+    { "code": "LAB", "name": "Laborer", "sortOrder": 3 },
+    { "code": "FGL", "name": "Flagger", "sortOrder": 4 },
+    { "code": "SUP", "name": "Supervisor", "sortOrder": 5 }
+  ],
+  "rates": [
+    {
+      "classificationCode": "LP",
+      "effectiveDate": "2025-07-01",
+      "rateSt": "46.00",
+      "rateOt": "69.00",
+      "suppSt": "21.17",
+      "suppOt": "22.87",
+      "notes": "Line Person — schedule effective through 2026-06-20"
+    },
+    {
+      "classificationCode": "SAT",
+      "effectiveDate": "2025-07-01",
+      "rateSt": "40.00",
+      "rateOt": "60.00",
+      "suppSt": "21.17",
+      "suppOt": "22.87",
+      "notes": "Striping Assistant — schedule effective through 2026-06-20"
+    }
+  ]
+}
