@@ -345,6 +345,7 @@ export default function NavTab() {
               collapsed={false}
               onToggle={() => {}}
               onClose={() => { setPreviewWo(null); setPreviewUrl(null) }}
+              fillParent
               onRefresh={async () => {
                 const r = await fetch(`/api/wos/${encodeURIComponent(previewWo.id)}/files`)
                 const d = await r.json()

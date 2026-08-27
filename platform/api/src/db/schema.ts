@@ -234,12 +234,15 @@ export const workOrders = pgTable('work_orders', {
   scanCombinedId: text('scan_combined_id'),
   originalFilename: text('original_filename'),
   scanData: jsonb('scan_data'),
+  assignedTo: uuid('assigned_to').references(() => users.id),
+  assignedAt: timestamp('assigned_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   uniq: uniqueIndex('uq_wo_org_number').on(t.orgId, t.woNumber),
   statusIdx: index('idx_wo_org_status').on(t.orgId, t.status),
   contractorIdx: index('idx_wo_org_contractor').on(t.orgId, t.contractorId),
+  assignedIdx: index('idx_wo_org_assigned').on(t.orgId, t.assignedTo),
 }));
 
 export const markingItems = pgTable('marking_items', {

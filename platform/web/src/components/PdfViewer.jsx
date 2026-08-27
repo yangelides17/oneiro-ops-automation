@@ -28,6 +28,7 @@ export default function PdfViewer({
   onToggle,
   onClose,
   onRefresh,
+  fillParent = false,
   className = '',
 }) {
   const [numPages, setNumPages] = useState(null)
@@ -146,7 +147,7 @@ export default function PdfViewer({
         <div
           ref={containerRef}
           className="relative overflow-auto bg-slate-100 flex-1"
-          style={{ minHeight: 200 }}
+          style={{ minHeight: 200, ...(fillParent ? {} : { maxHeight: '60vh' }) }}
         >
           {loading && (
             <div className="absolute inset-0 flex items-center justify-center bg-slate-50/80 z-10">

@@ -110,12 +110,16 @@ export async function processScanResult(
   }
 
   // Intersection grid → marking items (HVX Crosswalk, Stop Msg, Stop Line)
+  // Port of Code.js seedMarkingItems_ (lines 10191–10229).
   if (scanResult.intersectionGrid) {
+    const { expandDirections } = await import('./markingItemLogic.js');
     for (const ig of scanResult.intersectionGrid) {
       if (!ig.intersection) continue;
-      // Each direction with HVX generates an HVX Crosswalk item
+
+      // MI-4: Any non-empty direction cell → HVX Crosswalk item
+      // (old app accepted any truthy value, not just "HVX")
       for (const dir of ['n', 'e', 's', 'w'] as const) {
-        if (ig[dir] && ig[dir].toUpperCase().includes('HVX')) {
+        if (ig[dir] && String(ig[dir]).trim()) {
           markingRows.push({
             category: 'HVX Crosswalk',
             woSection: 'intersection_grid',
@@ -125,21 +129,51 @@ export async function processScanResult(
           });
         }
       }
+
+      // MI-3: Stop Msg/Lines expanded per-direction
+      // e.g. "EW" → two rows: direction E and direction W
       if (ig.stopMsg) {
-        markingRows.push({
-          category: 'Stop Msg',
-          woSection: 'intersection_grid',
-          intersection: ig.intersection,
-          addedBy: 'scanner',
-        });
+        const dirs = expandDirections(ig.stopMsg);
+        if (dirs.length > 0) {
+          for (const d of dirs) {
+            markingRows.push({
+              category: 'Stop Msg',
+              woSection: 'intersection_grid',
+              intersection: ig.intersection,
+              direction: d,
+              addedBy: 'scanner',
+            });
+          }
+        } else {
+          // No parseable direction — create one row without direction
+          markingRows.push({
+            category: 'Stop Msg',
+            woSection: 'intersection_grid',
+            intersection: ig.intersection,
+            addedBy: 'scanner',
+          });
+        }
       }
       if (ig.stopLines) {
-        markingRows.push({
-          category: 'Stop Line',
-          woSection: 'intersection_grid',
-          intersection: ig.intersection,
-          addedBy: 'scanner',
-        });
+        const dirs = expandDirections(ig.stopLines);
+        if (dirs.length > 0) {
+          for (const d of dirs) {
+            markingRows.push({
+              category: 'Stop Line',
+              woSection: 'intersection_grid',
+              intersection: ig.intersection,
+              direction: d,
+              addedBy: 'scanner',
+            });
+          }
+        } else {
+          markingRows.push({
+            category: 'Stop Line',
+            woSection: 'intersection_grid',
+            intersection: ig.intersection,
+            addedBy: 'scanner',
+          });
+        }
       }
     }
   }

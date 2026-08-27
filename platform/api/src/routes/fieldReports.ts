@@ -15,13 +15,13 @@ import { JOB_TYPES } from '../jobs/types.js';
 const submitSchema = z.object({
   woId: z.string().uuid(),
   markComplete: z.boolean().optional(),
-  wo_complete: z.enum(['yes', 'no']).optional(),
+  wo_complete: z.union([z.string(), z.boolean()]).optional(),
   crewChief: z.string().optional(),
   issues: z.string().optional(),
   date: z.string().optional(),
   workType: z.string().optional(),
-  photos_uploaded: z.string().optional(),
-});
+  photos_uploaded: z.union([z.string(), z.boolean()]).optional(),
+}).passthrough(); // allow extra fields the frontend may send
 
 const router = Router();
 
@@ -36,7 +36,7 @@ router.post('/', requireRole('owner', 'admin', 'foreman', 'crew'), async (req, r
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
 
   const orgId = getOrgId(req);
-  const isComplete = parsed.data.markComplete === true || parsed.data.wo_complete === 'yes';
+  const isComplete = parsed.data.markComplete === true || parsed.data.wo_complete === 'yes' || parsed.data.wo_complete === true;
 
   try {
     // ── Core orchestration (all business logic lives here) ────

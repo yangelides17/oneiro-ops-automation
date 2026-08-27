@@ -3,7 +3,7 @@ import { db } from '../db/client.js';
 import {
   getWorkOrder, getWorkOrderByNumber, createWorkOrder, updateWorkOrder,
   deleteWorkOrder, listWorkOrdersForMap, getDashboardData,
-  listWorkOrdersWithContractor,
+  listWorkOrdersWithContractor, listMyWork,
 } from '../db/queries/workOrders.js';
 import { getOrgId } from '../middleware/tenant.js';
 import { requireRole } from '../middleware/roles.js';
@@ -12,6 +12,8 @@ import { createAuditEntry } from '../db/queries/audit.js';
 import { detachWdlRows, lookupContractId } from '../services/woLifecycle.js';
 import { statusToDisplay, statusToDb } from '../utils/statusFormat.js';
 import { z } from 'zod';
+import { eq, and, inArray } from 'drizzle-orm';
+import { workOrders as woTable, users } from '../db/schema.js';
 
 /** Whitelist schema for WO PATCH — only these fields can be updated. */
 const updateWoSchema = z.object({
@@ -38,6 +40,7 @@ const updateWoSchema = z.object({
   contractorId: z.string().uuid().optional(),
   contractNum: z.string().optional(),
   regionCode: z.string().optional(),
+  assignedTo: z.string().uuid().nullable().optional(),
 }).strict(); // reject unknown fields
 
 /** Normalize WO status fields from DB snake_case to frontend Title Case. */
@@ -76,6 +79,51 @@ router.get('/map', async (req, res) => {
   const unmapped = all.filter(w => !w.lat || !w.lng);
 
   res.json({ mapped, unmapped });
+});
+
+/** POST /api/wos/assign — Bulk assign WOs to a user (or unassign). */
+router.post('/assign', requireRole('owner', 'admin', 'foreman'), async (req, res) => {
+  const { woIds, userId } = req.body;
+  if (!Array.isArray(woIds) || woIds.length === 0) {
+    return res.status(400).json({ error: 'woIds array required' });
+  }
+
+  const orgId = getOrgId(req);
+
+  // Validate userId belongs to this org (if assigning, not unassigning)
+  if (userId) {
+    const [user] = await db.select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.orgId, orgId)))
+      .limit(1);
+    if (!user) return res.status(400).json({ error: 'User not found in this organization' });
+  }
+
+  const updated = await db.update(woTable)
+    .set({
+      assignedTo: userId || null,
+      assignedAt: userId ? new Date() : null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(woTable.orgId, orgId), inArray(woTable.id, woIds)))
+    .returning({ id: woTable.id });
+
+  res.json({ ok: true, count: updated.length });
+});
+
+/** GET /api/wos/my-work — WOs assigned to the current user. */
+router.get('/my-work', async (req, res) => {
+  const orgId = getOrgId(req);
+  const userId = req.user!.userId;
+  const wos = await listMyWork(db, orgId, userId);
+
+  // Transform same as map endpoint
+  const transformed = wos.map((wo: any) => ({
+    ...wo,
+    status: statusToDisplay(wo.status),
+  }));
+
+  res.json({ wos: transformed });
 });
 
 /** GET /api/wos/:id — Single WO. Supports lookup by UUID or WO number. */

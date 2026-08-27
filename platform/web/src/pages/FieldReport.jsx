@@ -1074,14 +1074,31 @@ export default function FieldReport() {
   // seeded from d.intersection_grid at WO intake).
   const woIntersections = useMemo(() => {
     const seen = new Set(), out = []
+    const add = (v) => {
+      const trimmed = String(v || '').trim()
+      if (!trimmed) return
+      const key = trimmed.toUpperCase()
+      if (seen.has(key)) return
+      seen.add(key)
+      out.push(trimmed)
+    }
+
+    // Start with WO's from/to streets — these define the job boundaries
+    const wo = wos.find(w => w.id === selectedWOId)
+    if (wo) {
+      add(wo.fromStreet)
+      add(wo.toStreet)
+    }
+
+    // Add intersections from existing grid marking items
     markingItems.forEach(it => {
-      if (it.section !== 'Intersection Grid') return
-      const v = String(it.intersection || '').trim()
-      if (!v || seen.has(v)) return
-      seen.add(v); out.push(v)
+      const sec = (it.section || it.woSection || '').toLowerCase()
+      if (sec !== 'intersection grid' && sec !== 'intersection_grid') return
+      add(it.intersection)
     })
+
     return out
-  }, [markingItems])
+  }, [markingItems, wos, selectedWOId])
   const woBetweens = useMemo(() => {
     const out = []
     for (let i = 1; i < woIntersections.length; i++) {

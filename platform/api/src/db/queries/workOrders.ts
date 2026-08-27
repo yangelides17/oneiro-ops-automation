@@ -48,8 +48,9 @@ export async function deleteWorkOrder(db: Db, orgId: string, id: string) {
     .where(and(eq(workOrders.id, id), eq(workOrders.orgId, orgId)));
 }
 
-/** WOs with coordinates for map view — includes contractor name. */
+/** WOs with coordinates for map view — includes contractor name + assignee. */
 export async function listWorkOrdersForMap(db: Db, orgId: string) {
+  const assigneeAlias = sql`(SELECT name FROM users WHERE id = ${workOrders.assignedTo})`.as('assignedToName');
   return db.select({
     id: workOrders.id,
     woNumber: workOrders.woNumber,
@@ -68,10 +69,44 @@ export async function listWorkOrdersForMap(db: Db, orgId: string) {
     longitude: workOrders.longitude,
     geocodeWarning: workOrders.geocodeWarning,
     scanFileKey: workOrders.scanFileKey,
+    assignedTo: workOrders.assignedTo,
+    assignedToName: assigneeAlias,
   })
     .from(workOrders)
     .leftJoin(contractors, eq(workOrders.contractorId, contractors.id))
     .where(eq(workOrders.orgId, orgId));
+}
+
+/** WOs assigned to a specific user — for "My Work" view. */
+export async function listMyWork(db: Db, orgId: string, userId: string) {
+  return db.select({
+    id: workOrders.id,
+    woNumber: workOrders.woNumber,
+    contractorName: contractors.name,
+    contractNum: workOrders.contractNum,
+    regionCode: workOrders.regionCode,
+    location: workOrders.location,
+    fromStreet: workOrders.fromStreet,
+    toStreet: workOrders.toStreet,
+    status: workOrders.status,
+    workType: workOrders.workType,
+    priority: workOrders.priority,
+    dueDate: workOrders.dueDate,
+    latitude: workOrders.latitude,
+    longitude: workOrders.longitude,
+    scanFileKey: workOrders.scanFileKey,
+  })
+    .from(workOrders)
+    .leftJoin(contractors, eq(workOrders.contractorId, contractors.id))
+    .where(and(eq(workOrders.orgId, orgId), eq(workOrders.assignedTo, userId)))
+    .orderBy(
+      sql`CASE ${workOrders.status}
+        WHEN 'in_progress' THEN 0
+        WHEN 'dispatched' THEN 1
+        WHEN 'received' THEN 2
+        WHEN 'completed' THEN 3
+        ELSE 4 END`,
+    );
 }
 
 /**

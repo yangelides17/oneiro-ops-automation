@@ -10,6 +10,7 @@ import { authMiddleware } from './middleware/auth.js';
 import { tenantMiddleware, getOrgId } from './middleware/tenant.js';
 import { requireRole } from './middleware/roles.js';
 import { db } from './db/client.js';
+import multer from 'multer';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -184,6 +185,40 @@ export function createApp() {
     if (!photo) return res.status(404).json({ error: 'Photo not found' });
     r2Storage.delete(orgId, photo.storageKey).catch(() => {});
     res.json({ ok: true });
+  });
+
+  // /api/upload-photo — compat route for photoUploadQueue.js
+  const photoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+  app.post('/api/upload-photo', requireRole('owner', 'admin', 'foreman', 'crew'), photoUpload.single('photo'), async (req: any, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file attached' });
+    const orgId = getOrgId(req);
+    const woId = req.body.woId;
+    if (!woId) return res.status(400).json({ error: 'woId required' });
+
+    const { getWorkOrder } = await import('./db/queries/workOrders.js');
+    const wo = await getWorkOrder(db, orgId, woId);
+    if (!wo) return res.status(404).json({ error: 'Work order not found' });
+
+    const { r2Storage } = await import('./integrations/storage/r2.js');
+    const { createPhoto } = await import('./db/queries/photos.js');
+
+    const path = `photos/${woId}/${Date.now()}_${req.file.originalname}`;
+    const storageKey = await r2Storage.upload(orgId, path, req.file.buffer, req.file.mimetype);
+
+    const photo = await createPhoto(db, orgId, {
+      orgId,
+      woId,
+      storageKey,
+      filename: req.file.originalname,
+      mimeType: req.file.mimetype,
+      sizeBytes: req.file.size,
+      latitude: req.body.latitude ? String(req.body.latitude) : undefined,
+      longitude: req.body.longitude ? String(req.body.longitude) : undefined,
+      address: req.body.address || undefined,
+    });
+
+    const url = await r2Storage.getSignedUrl(orgId, storageKey, 3600).catch(() => null);
+    res.json({ success: true, fileId: photo.id, file_id: photo.id, file_url: url });
   });
 
   // /api/signin/queue/parse-upload — parse uploaded sign-in PDF via Claude Vision

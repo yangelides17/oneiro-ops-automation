@@ -283,6 +283,7 @@ export default function FileBrowser() {
                 collapsed={false}
                 onToggle={() => {}}
                 onClose={() => setSelectedFile(null)}
+                fillParent
               />
             )}
           </div>
