@@ -55,8 +55,27 @@ router.get('/', async (req, res) => {
 
 /** GET /api/wos/map — WOs with coordinates for map view. */
 router.get('/map', async (req, res) => {
-  const wos = await listWorkOrdersForMap(db, getOrgId(req));
-  res.json({ wos });
+  const raw = await listWorkOrdersForMap(db, getOrgId(req));
+
+  // Transform to the shape the frontend NavTab.jsx expects:
+  // - woId = WO number (for display + field-report deep-link)
+  // - id = UUID (for API calls like /api/wos/:id/files)
+  // - Split into mapped (has coords) vs unmapped (needs geocoding)
+  const transform = (wo: any) => ({
+    ...wo,
+    woId: wo.woNumber,                    // NavTab uses woId for display
+    lat: wo.latitude ? Number(wo.latitude) : null,
+    lng: wo.longitude ? Number(wo.longitude) : null,
+    status: statusToDisplay(wo.status),
+    marking_item_count: 0,                // TODO: add rollup if needed
+    marking_completed_count: 0,
+  });
+
+  const all = raw.map(transform);
+  const mapped = all.filter(w => w.lat && w.lng);
+  const unmapped = all.filter(w => !w.lat || !w.lng);
+
+  res.json({ mapped, unmapped });
 });
 
 /** GET /api/wos/:id — Single WO. Supports lookup by UUID or WO number. */
@@ -179,12 +198,31 @@ router.delete('/:id', requireRole('owner', 'admin'), async (req, res) => {
   const wo = await getWorkOrder(db, orgId, woId);
   if (!wo) return res.status(404).json({ error: 'Work order not found' });
 
-  // Detach Work Day Log rows before deleting (FK constraint safety).
-  // Old app preserved WDL rows; we remove them since signin_entries
-  // holds the permanent payroll records.
+  // Remove all referencing rows before deleting the WO.
+  // marking_items + photos cascade automatically via FK onDelete.
+  // These tables have NO ACTION FK and need manual cleanup:
+  const { signinEntries, invoices, signatures, documents: docsTable, jobs: jobsTable } = await import('../db/schema.js');
+  const { eq: eqOp, and: andOp, sql: sqlOp } = await import('drizzle-orm');
+  await db.delete(signinEntries).where(andOp(eqOp(signinEntries.orgId, orgId), eqOp(signinEntries.woId, woId)));
+  await db.delete(invoices).where(andOp(eqOp(invoices.orgId, orgId), eqOp(invoices.woId, woId)));
+  await db.delete(signatures).where(eqOp(signatures.woId, woId));
   const wdlRemoved = await detachWdlRows(db, orgId, woId);
 
-  // Marking items cascade-delete via FK (schema: onDelete: 'cascade')
+  // Clean up documents that reference this WO number (text array, not FK).
+  // A document's woIds might reference multiple WOs, so only delete if
+  // this WO is the only one. Otherwise remove it from the array.
+  await db.delete(docsTable).where(andOp(
+    eqOp(docsTable.orgId, orgId),
+    sqlOp`${docsTable.woIds} @> ARRAY[${wo.woNumber}]::text[]`,
+    sqlOp`array_length(${docsTable.woIds}, 1) <= 1`,
+  ));
+  // For multi-WO documents, remove this WO from the array
+  await db.execute(sqlOp`
+    UPDATE documents
+    SET wo_ids = array_remove(wo_ids, ${wo.woNumber})
+    WHERE org_id = ${orgId} AND wo_ids @> ARRAY[${wo.woNumber}]::text[]
+  `);
+
   await deleteWorkOrder(db, orgId, woId);
 
   await createAuditEntry(db, orgId, {

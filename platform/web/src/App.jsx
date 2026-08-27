@@ -5,6 +5,7 @@ import NavTab      from './pages/NavTab'
 import FieldReport from './pages/FieldReport'
 import SignIn      from './pages/SignIn'
 import ScanWO      from './pages/ScanWO'
+import FileBrowser from './pages/FileBrowser'
 import Approvals   from './pages/Approvals'
 import Login       from './pages/Login'
 import Signup      from './pages/Signup'
@@ -75,6 +76,7 @@ function isAdmin(role) { return role === 'owner' || role === 'admin' }
 const NAV_ITEMS = [
   { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/nav',          label: 'Nav',          end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
+  { to: '/files',        label: 'Files',        end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
   { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman']           },
   { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review', roles: ['owner', 'admin']                      },
   { to: '/field-report', label: 'Field Report', end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
@@ -171,6 +173,7 @@ function AuthenticatedApp() {
               <>
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/nav" element={<NavTab />} />
+                <Route path="/files" element={<FileBrowser />} />
                 <Route path="/scan-wo" element={<ScanWO />} />
                 <Route path="/approvals" element={<Approvals />} />
                 <Route path="/field-report" element={<FieldReport />} />
@@ -180,6 +183,7 @@ function AuthenticatedApp() {
             ) : role === 'foreman' ? (
               <>
                 <Route path="/nav" element={<NavTab />} />
+                <Route path="/files" element={<FileBrowser />} />
                 <Route path="/scan-wo" element={<ScanWO />} />
                 <Route path="/field-report" element={<FieldReport />} />
                 <Route path="/sign-in" element={<SignIn />} />
@@ -188,6 +192,7 @@ function AuthenticatedApp() {
             ) : (
               <>
                 <Route path="/nav" element={<NavTab />} />
+                <Route path="/files" element={<FileBrowser />} />
                 <Route path="/field-report" element={<FieldReport />} />
                 <Route path="/sign-in" element={<SignIn />} />
                 <Route path="*" element={<Navigate to="/field-report" replace />} />

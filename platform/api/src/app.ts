@@ -24,6 +24,7 @@ import toolRoutes from './routes/tools.js';
 import dashboardRoutes from './routes/dashboards.js';
 import geocodingRoutes from './routes/geocoding.js';
 import integrationRoutes from './routes/integrations.js';
+import fileRoutes from './routes/files.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -64,6 +65,7 @@ export function createApp() {
   app.use('/api', dashboardRoutes);          // Mounts /api/dashboard, /api/revenue, /api/production, /api/pending-counts
   app.use('/api', geocodingRoutes);          // Mounts /api/geocode, /api/reverse-geocode
   app.use('/api/integrations', integrationRoutes);
+  app.use('/api', fileRoutes);              // Mounts /api/wos/:woId/files + /api/files
 
   // ─── Additional endpoints the React frontend expects ─────────
 

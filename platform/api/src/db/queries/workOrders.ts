@@ -67,6 +67,7 @@ export async function listWorkOrdersForMap(db: Db, orgId: string) {
     latitude: workOrders.latitude,
     longitude: workOrders.longitude,
     geocodeWarning: workOrders.geocodeWarning,
+    scanFileKey: workOrders.scanFileKey,
   })
     .from(workOrders)
     .leftJoin(contractors, eq(workOrders.contractorId, contractors.id))

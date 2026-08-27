@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF } from '@react-google-maps/api'
 import StatusBadge from '../components/StatusBadge'
 import EditCoordinatesModal from '../components/EditCoordinatesModal'
+import PdfViewer from '../components/PdfViewer'
 
 // Default center = midtown Manhattan-ish. Zoom level fits all 5 boroughs.
 const NYC_CENTER = { lat: 40.7128, lng: -74.0060 }
@@ -11,8 +12,9 @@ const NYC_ZOOM   = 11
 // Width is inline (the lib needs an explicit container), height is a
 // Tailwind class so it can shrink on phones — a fixed 600px map dominates
 // a small screen. 60vh leaves room to scroll the page past the map.
-const MAP_CONTAINER_STYLE = { width: '100%' }
-const MAP_HEIGHT_CLASS = 'w-full h-[60vh] sm:h-[600px]'
+const MAP_CONTAINER_STYLE = { width: '100%', height: '100%' }
+const MAP_HEIGHT_CLASS = 'w-full h-full'
+const MAP_PANEL_HEIGHT = 'h-[60vh] sm:h-[calc(100vh-180px)]'
 const MAP_OPTIONS = {
   disableDefaultUI: false,
   streetViewControl: false,
@@ -146,6 +148,8 @@ export default function NavTab() {
   const [error,     setError]     = useState('')
   const [activePin, setActivePin] = useState(null)  // wo object whose InfoWindow is open
   const [editingWo, setEditingWo] = useState(null)  // wo passed to EditCoordinatesModal
+  const [previewWo, setPreviewWo] = useState(null)  // WO for PDF preview below map
+  const [previewUrl, setPreviewUrl] = useState(null)
 
   const [contFilt,    setContFilt]    = useState(() => new Set())
   const [boroughFilt, setBoroughFilt] = useState(() => new Set())
@@ -272,42 +276,84 @@ export default function NavTab() {
         )}
       </div>
 
-      {/* Map */}
-      <div className="card overflow-hidden">
-        {!isLoaded ? (
-          <div className={`flex items-center justify-center ${MAP_HEIGHT_CLASS}`}>
-            <div className="w-9 h-9 border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
-          </div>
-        ) : (
-          <GoogleMap
-            mapContainerStyle={MAP_CONTAINER_STYLE}
-            mapContainerClassName={MAP_HEIGHT_CLASS}
-            center={NYC_CENTER}
-            zoom={NYC_ZOOM}
-            options={MAP_OPTIONS}
-            onLoad={onMapLoad}
-          >
-            {filteredMapped.map(w => (
-              <MarkerF
-                key={w.woId}
-                position={{ lat: w.lat, lng: w.lng }}
-                icon={buildPinIcon(w.status, !!w.geocodeWarning, w.woId, !!w.has_preform)}
-                onClick={() => setActivePin(w)}
-              />
-            ))}
-
-            {activePin && (
-              <InfoWindowF
-                position={{ lat: activePin.lat, lng: activePin.lng }}
-                onCloseClick={() => setActivePin(null)}
-              >
-                <PinPopover
-                  wo={activePin}
-                  onEditCoords={() => { setEditingWo(activePin); setActivePin(null) }}
+      {/* Map + PDF split view — side by side on desktop, stacked on mobile */}
+      <div className={`flex flex-col sm:flex-row gap-3 ${MAP_PANEL_HEIGHT}`}>
+        {/* Map panel — full width when no PDF, shrinks to left when PDF open */}
+        <div className={`card overflow-hidden flex-shrink-0 transition-all ${previewUrl ? 'sm:w-[55%] h-[40vh] sm:h-auto' : 'w-full'}`}>
+          {!isLoaded ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="w-9 h-9 border-[3px] border-slate-200 border-t-navy rounded-full animate-spin" />
+            </div>
+          ) : (
+            <GoogleMap
+              mapContainerStyle={MAP_CONTAINER_STYLE}
+              mapContainerClassName={MAP_HEIGHT_CLASS}
+              center={NYC_CENTER}
+              zoom={NYC_ZOOM}
+              options={MAP_OPTIONS}
+              onLoad={onMapLoad}
+            >
+              {filteredMapped.map(w => (
+                <MarkerF
+                  key={w.woId}
+                  position={{ lat: w.lat, lng: w.lng }}
+                  icon={buildPinIcon(w.status, !!w.geocodeWarning, w.woId, !!w.has_preform)}
+                  onClick={() => {
+                    setActivePin(w)
+                    // If split view is already open, auto-load this pin's PDF
+                    if (previewWo && w.scanFileKey) {
+                      setPreviewWo(w)
+                      fetch(`/api/wos/${encodeURIComponent(w.id)}/files`)
+                        .then(r => r.json())
+                        .then(d => setPreviewUrl(d.scan?.url || null))
+                        .catch(() => setPreviewUrl(null))
+                    }
+                  }}
                 />
-              </InfoWindowF>
-            )}
-          </GoogleMap>
+              ))}
+
+              {activePin && (
+                <InfoWindowF
+                  position={{ lat: activePin.lat, lng: activePin.lng }}
+                  onCloseClick={() => setActivePin(null)}
+                >
+                  <PinPopover
+                    wo={activePin}
+                    onEditCoords={() => { setEditingWo(activePin); setActivePin(null) }}
+                    onViewPdf={() => {
+                      const wo = activePin
+                      setPreviewWo(wo)
+                      setActivePin(null)
+                      fetch(`/api/wos/${encodeURIComponent(wo.id)}/files`)
+                        .then(r => r.json())
+                        .then(d => setPreviewUrl(d.scan?.url || null))
+                        .catch(() => setPreviewUrl(null))
+                    }}
+                  />
+                </InfoWindowF>
+              )}
+            </GoogleMap>
+          )}
+        </div>
+
+        {/* PDF panel — slides in from right when a pin's PDF is opened */}
+        {previewWo && previewUrl && (
+          <div className="flex-1 min-w-0">
+            <PdfViewer
+              url={previewUrl}
+              filename={`${previewWo.woNumber || previewWo.woId} Scan`}
+              collapsed={false}
+              onToggle={() => {}}
+              onClose={() => { setPreviewWo(null); setPreviewUrl(null) }}
+              onRefresh={async () => {
+                const r = await fetch(`/api/wos/${encodeURIComponent(previewWo.id)}/files`)
+                const d = await r.json()
+                const freshUrl = d.scan?.url || null
+                setPreviewUrl(freshUrl)
+                return freshUrl
+              }}
+            />
+          </div>
         )}
       </div>
 
@@ -374,7 +420,7 @@ export default function NavTab() {
 // (WO #, Contractor, Contract #, Borough, Location, From → To,
 // Priority, Due Date, Status, marking-item count) plus a link to
 // Field Report and an Edit Coordinates trigger.
-function PinPopover({ wo, onEditCoords }) {
+function PinPopover({ wo, onEditCoords, onViewPdf }) {
   const dueDate = wo.dueDate || '—'
   const fromTo = [wo.fromStreet, wo.toStreet].filter(Boolean).join(' → ') || '—'
   const total  = wo.marking_item_count || 0
@@ -417,15 +463,25 @@ function PinPopover({ wo, onEditCoords }) {
           className="flex-1 text-center text-xs font-bold px-2 py-1.5 rounded-lg
                      bg-navy text-white hover:opacity-90"
         >
-          View Field Report
+          Field Report
         </Link>
+        {wo.scanFileKey && (
+          <button
+            type="button"
+            onClick={onViewPdf}
+            className="text-xs font-bold px-2 py-1.5 rounded-lg
+                       bg-white text-navy border border-slate-200 hover:bg-slate-50"
+          >
+            View PDF
+          </button>
+        )}
         <button
           type="button"
           onClick={onEditCoords}
           className="text-xs font-bold px-2 py-1.5 rounded-lg
                      bg-white text-slate-700 border border-slate-200 hover:bg-slate-50"
         >
-          Edit Coords
+          Coords
         </button>
       </div>
     </div>

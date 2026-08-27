@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import StatusBadge      from '../components/StatusBadge'
 import ConfirmModal     from '../components/ConfirmModal'
 import MarkingFormModal from '../components/MarkingFormModal'
 import RowKebab         from '../components/RowKebab'
+import PdfViewer        from '../components/PdfViewer'
 import {
   UNIT_OPTIONS, unitForCategory, unitIsLocked,
   pickLayout, rowIsCompletable, rowRequiresColor, displayCategory,
@@ -479,7 +480,7 @@ function formatDueDate(raw) {
   }).format(d)
 }
 
-function WOPanel({ wo }) {
+function WOPanel({ wo, onViewScan, hasScan }) {
   return (
     <div className="bg-slate-50 rounded-xl p-3 border border-slate-200 space-y-1.5">
       <div className="flex items-center justify-between mb-1">
@@ -499,20 +500,16 @@ function WOPanel({ wo }) {
           <span className="text-sm text-slate-700 font-medium">{v}</span>
         </div>
       ))}
-      {/* Quick-access link to the WO's Drive folder — same destination
-          as the 📁 icon on the WO Tracker tab. Hidden if the folder URL
-          isn't cached on the row yet (Apps Script falls back to null). */}
-      {wo.folderUrl && (
+      {hasScan && (
         <div className="pt-1.5">
-          <a
-            href={wo.folderUrl}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            type="button"
+            onClick={onViewScan}
             className="inline-flex items-center gap-1.5 text-xs font-bold text-navy
                        hover:underline"
           >
-            View WO <span aria-hidden>📁</span>
-          </a>
+            View WO Scan <span aria-hidden>📄</span>
+          </button>
         </div>
       )}
     </div>
@@ -1043,6 +1040,9 @@ export default function FieldReport() {
   const [workDate,      setWorkDate]       = useState(opToday())
   const [markingItems,  setMarkingItems]   = useState([])   // loaded from /api/wos/:woId
   const [markingsLoading, setMarkingsLoading] = useState(false)
+  const [scanPdfUrl, setScanPdfUrl]   = useState(null)
+  const [scanPdfOpen, setScanPdfOpen] = useState(false)
+  const [scanFilename, setScanFilename] = useState('')
   const [crewChief,     setCrewChief]      = useState('')   // required — drives per-crew tagging
   const [employees,     setEmployees]      = useState([])   // Employee Registry, for crew chief picker
   const [issues,        setIssues]         = useState('')
@@ -1352,11 +1352,24 @@ export default function FieldReport() {
     inFlightRef.current.clear()
 
     if (!selectedWOId) {
+      setScanPdfUrl(null)
+      setScanPdfOpen(false)
       return
     }
 
     let cancelled = false
     setMarkingsLoading(true)
+
+    // Fetch scan PDF URL in parallel with markings
+    fetch(`/api/wos/${encodeURIComponent(selectedWOId)}/files`)
+      .then(r => r.json())
+      .then(d => {
+        if (cancelled) return
+        setScanPdfUrl(d.scan?.url || null)
+        setScanFilename(d.scan?.filename || '')
+      })
+      .catch(() => { if (!cancelled) setScanPdfUrl(null) })
+
     fetch(`/api/wos/${encodeURIComponent(selectedWOId)}/markings`)
       .then(r => r.json())
       .then(d => {
@@ -2173,8 +2186,25 @@ export default function FieldReport() {
               disabledTitle="Cancel or save the current edit before switching work orders."
             />
           </Field>
-          {selectedWO && <WOPanel wo={selectedWO} />}
+          {selectedWO && <WOPanel wo={selectedWO} onViewScan={() => setScanPdfOpen(o => !o)} hasScan={!!scanPdfUrl} />}
         </div>
+
+        {/* Inline WO scan PDF viewer */}
+        {selectedWO && scanPdfUrl && (
+          <PdfViewer
+            url={scanPdfUrl}
+            filename={scanFilename || `${selectedWO.woNumber} Scan`}
+            collapsed={!scanPdfOpen}
+            onToggle={() => setScanPdfOpen(o => !o)}
+            onRefresh={async () => {
+              const r = await fetch(`/api/wos/${encodeURIComponent(selectedWOId)}/files`)
+              const d = await r.json()
+              const freshUrl = d.scan?.url || null
+              setScanPdfUrl(freshUrl)
+              return freshUrl
+            }}
+          />
+        )}
 
         {/* Completed-WO banner — view mode + edit mode states.
             Shown only when the loaded WO has status === 'Completed'.

@@ -13,7 +13,7 @@
 import { eq, and, desc } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { jobs } from '../db/schema.js';
-import { createWorkOrder, getWorkOrderByNumber } from '../db/queries/workOrders.js';
+import { createWorkOrder, getWorkOrderByNumber, updateWorkOrder } from '../db/queries/workOrders.js';
 import { createMarkingItemsBulk } from '../db/queries/markingItems.js';
 import { createAuditEntry } from '../db/queries/audit.js';
 
@@ -183,6 +183,39 @@ export async function processScanResult(
 
   if (markingRows.length > 0) {
     await createMarkingItemsBulk(db, orgId, wo.id, markingRows);
+  }
+
+  // Auto-geocode the WO location for the map.
+  // Port of Code.js geocodeWO_ — builds an address from location + from_street,
+  // geocodes it via Google Maps, and saves lat/lng on the WO.
+  try {
+    const { googleMapsGeocoding } = await import('../integrations/geocoding/googleMaps.js');
+    const location = scanResult.location || '';
+    const fromStreet = scanResult.fromStreet || '';
+    if (location && fromStreet) {
+      // NYC borough names for address context
+      const boroughNames: Record<string, string> = {
+        BK: 'Brooklyn', M: 'Manhattan', BX: 'Bronx', QU: 'Queens', SI: 'Staten Island',
+      };
+      const borough = boroughNames[scanResult.regionCode || ''] || '';
+      const address = `${location} & ${fromStreet}, ${borough}, New York, NY`;
+      const result = await googleMapsGeocoding.geocode(address, {
+        // Bias to NYC bounds
+        bounds: { south: 40.49, west: -74.26, north: 40.92, east: -73.70 },
+      });
+      if (result) {
+        await updateWorkOrder(db, orgId, wo.id, {
+          latitude: String(result.lat),
+          longitude: String(result.lng),
+        });
+      } else {
+        await updateWorkOrder(db, orgId, wo.id, {
+          geocodeWarning: `Could not geocode: ${address}`,
+        });
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Scan] Geocoding failed for ${scanResult.workOrderId}:`, err.message);
   }
 
   return { woId: wo.id, duplicate: false };
