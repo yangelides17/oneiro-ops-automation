@@ -93,7 +93,7 @@ export async function processScanResult(
   });
 
   // Seed marking items from scan data
-  const markingRows: { category: string; woSection: string; description?: string; intersection?: string; direction?: string; addedBy: string }[] = [];
+  const markingRows: { category: string; woSection: string; description?: string; intersection?: string; direction?: string; addedBy: string; quantity?: string; unit?: string }[] = [];
 
   // Top markings → marking items
   if (scanResult.topMarkings) {

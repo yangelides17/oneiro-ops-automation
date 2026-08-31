@@ -16,7 +16,7 @@ import {
 
 export async function enqueueFillJob(type: string, payload: FillJobPayload) {
   try {
-    const job = await enqueueJob(payload.orgId, type, payload as Record<string, unknown>);
+    const job = await enqueueJob(payload.orgId, type, payload as unknown as Record<string, unknown>);
     console.log(`[Queue] Fill job enqueued: ${type} (${job.id})`);
     return job;
   } catch (err: any) {
@@ -27,7 +27,7 @@ export async function enqueueFillJob(type: string, payload: FillJobPayload) {
 
 export async function enqueueScanJob(payload: ScanJobPayload) {
   try {
-    return await enqueueJob(payload.orgId, JOB_TYPES.SCAN_WORK_ORDER, payload as Record<string, unknown>);
+    return await enqueueJob(payload.orgId, JOB_TYPES.SCAN_WORK_ORDER, payload as unknown as Record<string, unknown>);
   } catch (err: any) {
     console.error('[Queue] Failed to enqueue scan job:', err.message);
     return null;
@@ -36,7 +36,7 @@ export async function enqueueScanJob(payload: ScanJobPayload) {
 
 export async function enqueueEmailJob(payload: EmailJobPayload) {
   try {
-    return await enqueueJob(payload.orgId, JOB_TYPES.SEND_EMAIL, payload as Record<string, unknown>);
+    return await enqueueJob(payload.orgId, JOB_TYPES.SEND_EMAIL, payload as unknown as Record<string, unknown>);
   } catch (err: any) {
     console.error('[Queue] Failed to enqueue email job:', err.message);
     return null;
@@ -45,7 +45,7 @@ export async function enqueueEmailJob(payload: EmailJobPayload) {
 
 export async function enqueueDriveSyncJob(payload: DriveSyncJobPayload) {
   try {
-    return await enqueueJob(payload.orgId, JOB_TYPES.SYNC_TO_DRIVE, payload as Record<string, unknown>);
+    return await enqueueJob(payload.orgId, JOB_TYPES.SYNC_TO_DRIVE, payload as unknown as Record<string, unknown>);
   } catch (err: any) {
     console.error('[Queue] Failed to enqueue Drive sync job:', err.message);
     return null;

@@ -61,6 +61,7 @@ export interface RevenueData {
   daily: DailyRevenue[];
   byContractor: ContractorRevenue[];
   needsPricingItems: NeedsPricingItem[];
+  byWo: { woNumber: string; contractorName: string; location: string; revenue: number; items: number }[];
   laborDaily: DailyLabor[];
   laborTotals: { total: number };
 }

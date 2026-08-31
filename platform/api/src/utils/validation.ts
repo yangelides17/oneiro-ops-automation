@@ -48,6 +48,7 @@ export const woStatusSchema = z.enum([
 export const createWoSchema = z.object({
   woNumber: z.string().min(1),
   contractorId: z.string().uuid(),
+  contractId: z.string().optional(),
   contractNum: z.string().optional(),
   regionCode: z.string().optional(),
   location: z.string().optional(),

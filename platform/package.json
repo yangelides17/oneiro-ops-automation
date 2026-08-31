@@ -1,0 +1,8 @@
+{
+  "name": "oneiro-platform",
+  "private": true,
+  "scripts": {
+    "build": "cd web && npm install && npm run build && cd ../api && npm install && npm run build",
+    "start": "cd api && node dist/index.js"
+  }
+}

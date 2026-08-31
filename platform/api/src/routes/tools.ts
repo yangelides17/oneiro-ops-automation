@@ -5,7 +5,7 @@ import { db } from '../db/client.js';
 import { getOrgId } from '../middleware/tenant.js';
 import { requireRole } from '../middleware/roles.js';
 import { createAuditEntry } from '../db/queries/audit.js';
-import { enqueueScanJob } from '../jobs/producers.js';
+import { enqueueScanJob, enqueueFillJob } from '../jobs/producers.js';
 import { r2Storage } from '../integrations/storage/r2.js';
 import { generateDailyDocuments, generateCertifiedPayroll } from '../services/docGeneration.js';
 import { getScanJobStatuses } from '../services/woScanning.js';
