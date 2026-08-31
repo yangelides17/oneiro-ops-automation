@@ -259,6 +259,17 @@ router.post('/accept-invite', async (req: Request, res: Response) => {
       .set({ acceptedAt: new Date() })
       .where(eq(invitations.id, invite.id));
 
+    // Auto-create linked employee record for crew/foreman users
+    // so they appear in crew chief dropdowns and sign-in sheets
+    if (invite.role === 'crew' || invite.role === 'foreman') {
+      const { employees } = await import('../db/schema.js');
+      await tx.insert(employees).values({
+        orgId: invite.orgId,
+        userId: user.id,
+        name: user.name,
+      }).onConflictDoNothing();
+    }
+
     return user;
   });
 

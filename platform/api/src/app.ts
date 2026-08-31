@@ -75,11 +75,23 @@ export function createApp() {
     res.json({ connected: false, reason: 'not_configured' });
   });
 
-  // /api/employees — FieldReport uses this for crew chief dropdown
+  // /api/employees — all active employees (for sign-in sheets, payroll)
   app.get('/api/employees', async (req, res) => {
     const { listEmployees } = await import('./db/queries/settings.js');
     const emps = await listEmployees(db, getOrgId(req));
     res.json({ employees: emps.map((e: any) => ({ name: e.name })) });
+  });
+
+  // /api/crew-chiefs — employees with linked user accounts (crew chief dropdown)
+  app.get('/api/crew-chiefs', async (req, res) => {
+    const { employees: empTable } = await import('./db/schema.js');
+    const { eq: eqOp, and: andOp, isNotNull } = await import('drizzle-orm');
+    const orgId = getOrgId(req);
+    const chiefs = await db.select({ id: empTable.id, name: empTable.name, userId: empTable.userId })
+      .from(empTable)
+      .where(andOp(eqOp(empTable.orgId, orgId), eqOp(empTable.isActive, true), isNotNull(empTable.userId)))
+      .orderBy(empTable.name);
+    res.json({ employees: chiefs.map((e: any) => ({ name: e.name, userId: e.userId })) });
   });
 
   // /api/qb/invoice/:woId — QB deferred, stub

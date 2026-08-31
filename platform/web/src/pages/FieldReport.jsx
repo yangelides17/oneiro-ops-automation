@@ -1313,10 +1313,10 @@ export default function FieldReport() {
   // Best-effort; on failure the picker just renders empty and the user
   // gets blocked at submit with a clear "pick a Crew Chief" error.
   useEffect(() => {
-    fetch('/api/employees')
+    fetch('/api/crew-chiefs')
       .then(r => r.json())
       .then(d => setEmployees(Array.isArray(d.employees) ? d.employees : []))
-      .catch(err => console.warn('employees fetch failed:', err))
+      .catch(err => console.warn('crew-chiefs fetch failed:', err))
   }, [])
 
   // Deep-link from the Dashboard: /field-report?wo=RM-43282 pre-selects

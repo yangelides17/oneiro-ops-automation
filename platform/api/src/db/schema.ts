@@ -173,6 +173,7 @@ export const billingRemaps = pgTable('billing_remaps', {
 export const employees = pgTable('employees', {
   id: uuid('id').primaryKey().defaultRandom(),
   orgId: uuid('org_id').notNull().references(() => organizations.id),
+  userId: uuid('user_id').references(() => users.id),
   name: text('name').notNull(),
   address: text('address'),
   ssnLast4: text('ssn_last4'),
@@ -182,6 +183,7 @@ export const employees = pgTable('employees', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   uniq: uniqueIndex('uq_employees_org_name').on(t.orgId, t.name),
+  userIdx: uniqueIndex('uq_employees_user').on(t.userId),
 }));
 
 export const contractLookup = pgTable('contract_lookup', {
