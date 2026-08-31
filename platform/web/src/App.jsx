@@ -11,6 +11,8 @@ import Login       from './pages/Login'
 import Signup      from './pages/Signup'
 import AcceptInvite from './pages/AcceptInvite'
 import Settings    from './pages/Settings'
+import WOAssignment from './pages/WOAssignment'
+import MyWork      from './pages/MyWork'
 import {
   PendingCountsProvider,
   usePendingCounts,
@@ -77,6 +79,8 @@ const NAV_ITEMS = [
   { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/nav',          label: 'Nav',          end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
   { to: '/files',        label: 'Files',        end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
+  { to: '/my-work',      label: 'My Work',      end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
+  { to: '/assign',       label: 'Assign WOs',  end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman']           },
   { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review', roles: ['owner', 'admin']                      },
   { to: '/field-report', label: 'Field Report', end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
@@ -174,6 +178,8 @@ function AuthenticatedApp() {
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/nav" element={<NavTab />} />
                 <Route path="/files" element={<FileBrowser />} />
+                <Route path="/my-work" element={<MyWork />} />
+                <Route path="/assign" element={<WOAssignment />} />
                 <Route path="/scan-wo" element={<ScanWO />} />
                 <Route path="/approvals" element={<Approvals />} />
                 <Route path="/field-report" element={<FieldReport />} />
@@ -184,18 +190,20 @@ function AuthenticatedApp() {
               <>
                 <Route path="/nav" element={<NavTab />} />
                 <Route path="/files" element={<FileBrowser />} />
+                <Route path="/my-work" element={<MyWork />} />
                 <Route path="/scan-wo" element={<ScanWO />} />
                 <Route path="/field-report" element={<FieldReport />} />
                 <Route path="/sign-in" element={<SignIn />} />
-                <Route path="*" element={<Navigate to="/field-report" replace />} />
+                <Route path="*" element={<Navigate to="/my-work" replace />} />
               </>
             ) : (
               <>
                 <Route path="/nav" element={<NavTab />} />
                 <Route path="/files" element={<FileBrowser />} />
+                <Route path="/my-work" element={<MyWork />} />
                 <Route path="/field-report" element={<FieldReport />} />
                 <Route path="/sign-in" element={<SignIn />} />
-                <Route path="*" element={<Navigate to="/field-report" replace />} />
+                <Route path="*" element={<Navigate to="/my-work" replace />} />
               </>
             )}
           </Routes>
