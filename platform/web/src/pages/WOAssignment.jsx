@@ -45,7 +45,7 @@ function resolveColor(wo, crewColorMap) {
   const s = String(wo.status || '').toLowerCase()
   if (s === 'completed') return '#d1d5db'
   if (wo.assignedTo && crewColorMap.has(wo.assignedTo)) return crewColorMap.get(wo.assignedTo)
-  if (wo.assignedTo) return CREW_COLORS[0] // assigned to someone not in map (e.g., owner)
+  if (wo.assignedTo) return CREW_COLORS[0]
   return UNASSIGNED_COLOR
 }
 
@@ -58,7 +58,7 @@ function buildAssignPin(wo, crewColorMap) {
     path: shape.path,
     fillColor: color,
     fillOpacity: 1,
-    strokeColor: wo.assignedTo ? '#0f172a' : '#64748b', // navy border for assigned, lighter for unassigned
+    strokeColor: wo.assignedTo ? '#0f172a' : '#64748b',
     strokeWeight: wo.assignedTo ? 1.5 : 0.8,
     scale: PIN_SCALE,
     anchor: shape.anchor,
@@ -75,9 +75,9 @@ export default function WOAssignment() {
   const [crewLeaders, setCrewLeaders] = useState([])
   const [loading, setLoading] = useState(true)
   const [activePin, setActivePin] = useState(null)
-  const [workTypeFilter, setWorkTypeFilter] = useState('') // '' | 'Thermo' | 'MMA'
+  const [workTypeFilter, setWorkTypeFilter] = useState('')
+  const [mobileView, setMobileView] = useState('panel') // 'panel' | 'map'
 
-  // Load WOs and crew leaders
   const loadData = useCallback(async () => {
     setLoading(true)
     try {
@@ -87,7 +87,6 @@ export default function WOAssignment() {
       ])
       const allWos = [...(mapRes.mapped || []), ...(mapRes.unmapped || [])]
       setWos(allWos)
-      // Crew leaders = users with role crew or foreman
       const leaders = (Array.isArray(usersRes) ? usersRes : [])
         .filter(u => u.role === 'crew' || u.role === 'foreman')
       setCrewLeaders(leaders)
@@ -100,14 +99,12 @@ export default function WOAssignment() {
 
   useEffect(() => { loadData() }, [loadData])
 
-  // Build crew color map — includes all users who have assignments
+  // Build crew color map
   const crewColorMap = useMemo(() => {
     const map = new Map()
-    // Crew leaders get first colors
     crewLeaders.forEach((cl, i) => {
       map.set(cl.id, CREW_COLORS[i % CREW_COLORS.length])
     })
-    // Any WO assigned to a non-crew user (e.g., owner testing) also gets a color
     wos.forEach(wo => {
       if (wo.assignedTo && !map.has(wo.assignedTo)) {
         map.set(wo.assignedTo, CREW_COLORS[map.size % CREW_COLORS.length])
@@ -136,7 +133,6 @@ export default function WOAssignment() {
       } else if (byCrewMap.has(wo.assignedTo)) {
         byCrewMap.get(wo.assignedTo).wos.push(wo)
       } else {
-        // Assigned to someone not in crew leaders list — treat as unassigned
         unassigned.push(wo)
       }
     }
@@ -147,7 +143,6 @@ export default function WOAssignment() {
     }
   }, [filteredWos, crewLeaders])
 
-  // Assign a WO
   const assignWo = async (woId, userId) => {
     await fetch('/api/wos/assign', {
       method: 'POST',
@@ -158,34 +153,57 @@ export default function WOAssignment() {
     loadData()
   }
 
-  // Unassign a WO
   const unassignWo = (woId) => assignWo(woId, null)
 
   return (
     <div className="h-[calc(100vh-56px)] flex flex-col">
-      {/* Top bar */}
-      <div className="flex items-center justify-between gap-3 px-4 py-2 border-b border-slate-200 bg-white flex-shrink-0">
-        <h1 className="text-lg font-black text-navy">WO Assignment</h1>
+      {/* ── Top bar ────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between gap-2 px-4 py-2 border-b border-slate-200 bg-white flex-shrink-0">
+        <h1 className="text-lg font-black text-navy">Assign WOs</h1>
         <div className="flex items-center gap-2">
-          <select
-            value={workTypeFilter}
-            onChange={e => setWorkTypeFilter(e.target.value)}
-            className="field-input text-sm"
-          >
-            <option value="">All Work Types</option>
+          {/* Mobile view toggle */}
+          <div className="sm:hidden flex bg-slate-100 rounded-lg p-0.5">
+            <button
+              onClick={() => setMobileView('panel')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                mobileView === 'panel' ? 'bg-white text-navy shadow-sm' : 'text-slate-500'
+              }`}
+            >
+              Panel
+            </button>
+            <button
+              onClick={() => setMobileView('map')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                mobileView === 'map' ? 'bg-white text-navy shadow-sm' : 'text-slate-500'
+              }`}
+            >
+              Map
+            </button>
+          </div>
+          <select value={workTypeFilter} onChange={e => setWorkTypeFilter(e.target.value)}
+                  className="field-input text-sm w-auto">
+            <option value="">All Types</option>
             <option value="Thermo">Thermo</option>
             <option value="MMA">MMA</option>
           </select>
-          <button onClick={loadData} disabled={loading} className="btn-outline text-xs px-3 py-1.5">
-            ↻ Refresh
+          <button onClick={loadData} disabled={loading}
+                  className="p-2 rounded-lg hover:bg-slate-100 active:bg-slate-200 transition-colors"
+                  title="Refresh">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
+                 className={`text-slate-500 ${loading ? 'animate-spin' : ''}`}>
+              <path d="M21 12a9 9 0 11-6.219-8.56" /><path d="M21 3v6h-6" />
+            </svg>
           </button>
         </div>
       </div>
 
-      {/* Main split: map + panel */}
-      <div className="flex-1 flex min-h-0">
-        {/* Map */}
-        <div className="flex-1 min-w-0">
+      {/* ── Main split: map + panel ────────────────────────────── */}
+      <div className="flex-1 flex flex-col sm:flex-row min-h-0">
+        {/* Map — full screen on mobile (map view), flex-1 on desktop */}
+        <div className={`
+          ${mobileView === 'map' ? 'flex-1' : 'hidden'}
+          sm:block sm:flex-1 min-h-0 min-w-0
+        `}>
           {isLoaded ? (
             <GoogleMap
               mapContainerStyle={{ width: '100%', height: '100%' }}
@@ -223,8 +241,12 @@ export default function WOAssignment() {
           )}
         </div>
 
-        {/* Assignment panel */}
-        <div className="w-[340px] border-l border-slate-200 bg-white overflow-y-auto flex-shrink-0">
+        {/* Assignment panel — full screen on mobile (panel view), fixed width on desktop */}
+        <div className={`
+          ${mobileView === 'panel' ? 'flex-1' : 'hidden'}
+          sm:block sm:w-[340px] sm:flex-none
+          border-l border-slate-200 bg-white overflow-y-auto min-h-0
+        `}>
           {/* Legend */}
           <div className="px-3 py-2 border-b border-slate-100">
             <div className="flex flex-wrap gap-2 text-[10px]">
@@ -252,18 +274,18 @@ export default function WOAssignment() {
               <p className="px-3 py-3 text-xs text-slate-400 italic">All work orders assigned</p>
             )}
             {grouped.unassigned.map(wo => (
-              <WORow
-                key={wo.id}
-                wo={wo}
-                onClickPin={() => setActivePin(wo)}
-              />
+              <WORow key={wo.id} wo={wo}
+                     crewLeaders={crewLeaders} crewColorMap={crewColorMap}
+                     onAssign={assignWo}
+                     onClickPin={() => { setActivePin(wo); setMobileView('map') }} />
             ))}
           </div>
 
           {/* Crew sections */}
           {grouped.crews.map(c => (
             <div key={c.leader.id} className="border-b border-slate-100">
-              <div className="px-3 py-2 flex items-center justify-between" style={{ backgroundColor: crewColorMap.get(c.leader.id) + '15' }}>
+              <div className="px-3 py-2 flex items-center justify-between"
+                   style={{ backgroundColor: crewColorMap.get(c.leader.id) + '15' }}>
                 <span className="flex items-center gap-2">
                   <span className="w-3 h-3 rounded-full" style={{ background: crewColorMap.get(c.leader.id) }} />
                   <span className="text-xs font-bold text-slate-700">{c.leader.name}</span>
@@ -271,17 +293,13 @@ export default function WOAssignment() {
                 <span className="text-[10px] text-slate-400">{c.wos.length} WO{c.wos.length === 1 ? '' : 's'}</span>
               </div>
               {c.wos.map(wo => (
-                <WORow
-                  key={wo.id}
-                  wo={wo}
-                  onUnassign={() => unassignWo(wo.id)}
-                  onClickPin={() => setActivePin(wo)}
-                />
+                <WORow key={wo.id} wo={wo}
+                       onUnassign={() => unassignWo(wo.id)}
+                       onClickPin={() => { setActivePin(wo); setMobileView('map') }} />
               ))}
             </div>
           ))}
 
-          {/* Add crew leader hint */}
           {crewLeaders.length === 0 && (
             <div className="px-3 py-4 text-xs text-slate-400 italic text-center">
               No crew leaders found. Invite users with the "crew" or "foreman" role in Settings.
@@ -295,35 +313,68 @@ export default function WOAssignment() {
 
 // ─── WO Row in assignment panel ───────────────────────────────
 
-function WORow({ wo, onUnassign, onClickPin }) {
+function WORow({ wo, onUnassign, onClickPin, crewLeaders, crewColorMap, onAssign }) {
+  const [showAssign, setShowAssign] = useState(false)
   const loc = wo.location || ''
-  const streets = [wo.fromStreet, wo.toStreet].filter(Boolean).join(' → ')
+  const streets = [wo.fromStreet, wo.toStreet].filter(Boolean).join(' \u2192 ')
 
   return (
-    <div
-      className="flex items-center gap-2 px-3 py-2 hover:bg-slate-50 cursor-pointer border-b border-slate-50"
-      onClick={onClickPin}
-    >
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-bold text-slate-700 truncate">{wo.woId || wo.woNumber}</p>
-        <p className="text-[10px] text-slate-400 truncate">{loc}{streets ? ` (${streets})` : ''}</p>
+    <div className="border-b border-slate-50">
+      <div
+        className="flex items-center gap-2 px-3 py-2.5 sm:py-2 hover:bg-slate-50 active:bg-slate-100 cursor-pointer transition-colors"
+        onClick={onClickPin}
+      >
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-bold text-slate-700 truncate">{wo.woId || wo.woNumber}</p>
+          <p className="text-[10px] text-slate-400 truncate">{loc}{streets ? ` (${streets})` : ''}</p>
+        </div>
+        {wo.workType && (
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full flex-shrink-0 ${
+            wo.workType === 'Thermo' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'
+          }`}>
+            {wo.workType}
+          </span>
+        )}
+        {/* Assign button (for unassigned WOs on mobile) */}
+        {crewLeaders && crewLeaders.length > 0 && (
+          <button
+            type="button"
+            onClick={e => { e.stopPropagation(); setShowAssign(v => !v) }}
+            className="text-[10px] font-bold px-2 py-1 rounded-lg bg-navy/10 text-navy flex-shrink-0 active:bg-navy/20"
+          >
+            Assign
+          </button>
+        )}
+        {onUnassign && (
+          <button
+            type="button"
+            onClick={e => { e.stopPropagation(); onUnassign() }}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-300 hover:text-red-500 hover:bg-red-50 active:bg-red-100 text-sm flex-shrink-0 transition-colors"
+            title="Unassign"
+          >
+            &times;
+          </button>
+        )}
       </div>
-      {wo.workType && (
-        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full flex-shrink-0 ${
-          wo.workType === 'Thermo' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'
-        }`}>
-          {wo.workType}
-        </span>
-      )}
-      {onUnassign && (
-        <button
-          type="button"
-          onClick={e => { e.stopPropagation(); onUnassign() }}
-          className="text-slate-300 hover:text-red-500 text-xs flex-shrink-0"
-          title="Unassign"
-        >
-          ×
-        </button>
+      {/* Inline assign picker */}
+      {showAssign && crewLeaders && (
+        <div className="px-3 pb-2 flex flex-wrap gap-1.5">
+          {crewLeaders.map(cl => (
+            <button
+              key={cl.id}
+              type="button"
+              onClick={() => { onAssign(wo.id, cl.id); setShowAssign(false) }}
+              className="text-[11px] font-bold px-3 py-1.5 rounded-lg border active:opacity-80"
+              style={{
+                borderColor: crewColorMap.get(cl.id),
+                color: crewColorMap.get(cl.id),
+                backgroundColor: crewColorMap.get(cl.id) + '15',
+              }}
+            >
+              {cl.name}
+            </button>
+          ))}
+        </div>
       )}
     </div>
   )
@@ -332,18 +383,18 @@ function WORow({ wo, onUnassign, onClickPin }) {
 // ─── Pin Popover with assign dropdown ─────────────────────────
 
 function AssignPopover({ wo, crewLeaders, crewColorMap, onAssign, onUnassign }) {
-  const fromTo = [wo.fromStreet, wo.toStreet].filter(Boolean).join(' → ') || '—'
+  const fromTo = [wo.fromStreet, wo.toStreet].filter(Boolean).join(' \u2192 ') || '\u2014'
 
   return (
-    <div className="space-y-2 max-w-[260px]" style={{ minWidth: 200 }}>
+    <div className="space-y-2" style={{ minWidth: 220, maxWidth: 280 }}>
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono font-bold text-navy text-sm">{wo.woId || wo.woNumber}</span>
         <StatusBadge status={wo.status} />
       </div>
 
       <div className="text-xs space-y-0.5">
-        <p><span className="text-slate-400">Location:</span> {wo.location || '—'}</p>
-        <p><span className="text-slate-400">From → To:</span> {fromTo}</p>
+        <p><span className="text-slate-400">Location:</span> {wo.location || '\u2014'}</p>
+        <p><span className="text-slate-400">From \u2192 To:</span> {fromTo}</p>
         {wo.workType && <p><span className="text-slate-400">Type:</span> {wo.workType}</p>}
       </div>
 
@@ -358,21 +409,21 @@ function AssignPopover({ wo, crewLeaders, crewColorMap, onAssign, onUnassign }) 
           <button
             type="button"
             onClick={() => onUnassign(wo.id)}
-            className="text-[10px] font-bold px-2 py-1 rounded-lg text-red-600 bg-red-50 hover:bg-red-100"
+            className="text-[10px] font-bold px-2 py-1.5 rounded-lg text-red-600 bg-red-50 hover:bg-red-100 active:bg-red-200"
           >
             Unassign
           </button>
         </div>
       ) : (
         <div className="pt-1">
-          <p className="text-[10px] text-slate-400 mb-1">Assign to:</p>
-          <div className="flex flex-wrap gap-1">
+          <p className="text-[10px] text-slate-400 mb-1.5">Assign to:</p>
+          <div className="flex flex-wrap gap-1.5">
             {crewLeaders.map(cl => (
               <button
                 key={cl.id}
                 type="button"
                 onClick={() => onAssign(wo.id, cl.id)}
-                className="text-[11px] font-bold px-2 py-1 rounded-lg border hover:opacity-80"
+                className="text-[11px] font-bold px-3 py-1.5 rounded-lg border active:opacity-80"
                 style={{
                   borderColor: crewColorMap.get(cl.id),
                   color: crewColorMap.get(cl.id),

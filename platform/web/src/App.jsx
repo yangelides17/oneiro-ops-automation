@@ -77,13 +77,13 @@ function isAdmin(role) { return role === 'owner' || role === 'admin' }
 
 const NAV_ITEMS = [
   { to: '/',             label: 'Dashboard',    end: true,  badgeKey: null,               roles: ['owner', 'admin']                      },
-  { to: '/nav',          label: 'Nav',          end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
-  { to: '/files',        label: 'Files',        end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
+  { to: '/nav',          label: 'Nav',          end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
+  { to: '/files',        label: 'Files',        end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/my-work',      label: 'My Work',      end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
   { to: '/assign',       label: 'Assign WOs',  end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
-  { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman']           },
+  { to: '/scan-wo',      label: 'Scan WO',      end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/approvals',    label: 'Approvals',    end: false, badgeKey: 'approvals_review', roles: ['owner', 'admin']                      },
-  { to: '/field-report', label: 'Field Report', end: false, badgeKey: null,               roles: ['owner', 'admin', 'foreman', 'crew']   },
+  { to: '/field-report', label: 'Field Report', end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
   { to: '/sign-in',      label: 'Sign-In',      end: false, badgeKey: 'signins_pending',  roles: ['owner', 'admin', 'foreman', 'crew']   },
   { to: '/settings',     label: 'Settings',     end: false, badgeKey: null,               roles: ['owner', 'admin']                      },
 ]
@@ -186,23 +186,12 @@ function AuthenticatedApp() {
                 <Route path="/sign-in" element={<SignIn />} />
                 <Route path="/settings" element={<Settings />} />
               </>
-            ) : role === 'foreman' ? (
-              <>
-                <Route path="/nav" element={<NavTab />} />
-                <Route path="/files" element={<FileBrowser />} />
-                <Route path="/my-work" element={<MyWork />} />
-                <Route path="/scan-wo" element={<ScanWO />} />
-                <Route path="/field-report" element={<FieldReport />} />
-                <Route path="/sign-in" element={<SignIn />} />
-                <Route path="*" element={<Navigate to="/my-work" replace />} />
-              </>
             ) : (
+              /* Crew & Foreman: focused mobile experience */
               <>
-                <Route path="/nav" element={<NavTab />} />
-                <Route path="/files" element={<FileBrowser />} />
                 <Route path="/my-work" element={<MyWork />} />
-                <Route path="/field-report" element={<FieldReport />} />
                 <Route path="/sign-in" element={<SignIn />} />
+                <Route path="/field-report" element={<FieldReport />} />
                 <Route path="*" element={<Navigate to="/my-work" replace />} />
               </>
             )}
