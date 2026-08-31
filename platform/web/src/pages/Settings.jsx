@@ -178,26 +178,34 @@ function UsersTab() {
   const [inviteRole, setInviteRole] = useState('crew')
   const [inviting, setInviting] = useState(false)
   const [msg, setMsg] = useState('')
+  const [inviteLink, setInviteLink] = useState('')
 
   const users = Array.isArray(data) ? data : []
 
   const handleInvite = async () => {
     setInviting(true)
     setMsg('')
+    setInviteLink('')
     const r = await fetch('/api/settings/users/invite', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: inviteEmail, role: inviteRole }),
     })
+    const d = await r.json().catch(() => ({}))
     if (r.ok) {
-      setMsg(`Invitation sent to ${inviteEmail}`)
+      setMsg(`Invite created for ${inviteEmail}`)
+      setInviteLink(d.inviteUrl || '')
       setInviteEmail('')
       refresh()
     } else {
-      const d = await r.json().catch(() => ({}))
-      setMsg(d.error || 'Failed to send invite')
+      setMsg(d.error || 'Failed to create invite')
     }
     setInviting(false)
+  }
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(inviteLink)
+    setMsg('Link copied!')
   }
 
   return (
@@ -225,6 +233,24 @@ function UsersTab() {
           </button>
         </div>
         {msg && <p className="text-sm text-emerald-600 mt-2">{msg}</p>}
+        {inviteLink && (
+          <div className="mt-3 p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
+            <p className="text-xs text-slate-500">Share this link with them to join:</p>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                readOnly
+                value={inviteLink}
+                className="field-input text-xs flex-1 font-mono bg-white"
+                onClick={e => e.target.select()}
+              />
+              <button onClick={copyLink} className="btn-primary text-xs px-3 whitespace-nowrap">
+                Copy
+              </button>
+            </div>
+            <p className="text-[10px] text-slate-400">Link expires in 7 days</p>
+          </div>
+        )}
       </div>
 
       <h3 className="section-label">Team members</h3>

@@ -48,8 +48,12 @@ router.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     expiresAt,
   });
 
-  // Send invite email
-  const inviteUrl = `${config.isProd ? 'https://app.oneiro.com' : 'http://localhost:5173'}/accept-invite?token=${token}`;
+  // Build invite URL using the request's origin
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:5173';
+  const inviteUrl = `${protocol}://${host}/accept-invite?token=${token}`;
+
+  // Try to send email (best-effort — may not be configured)
   try {
     await resendEmail.send(getOrgId(req), {
       to: email,
@@ -60,10 +64,11 @@ router.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     });
   } catch (e) {
     // Email failure shouldn't block invite creation
-    console.error('Failed to send invite email:', e);
+    console.error('Failed to send invite email (non-fatal):', e);
   }
 
-  res.status(201).json({ ok: true, email });
+  // Always return the invite URL so the admin can copy/share it manually
+  res.status(201).json({ ok: true, email, inviteUrl });
 });
 
 // M-29: Delete a user from the org (owner only)
