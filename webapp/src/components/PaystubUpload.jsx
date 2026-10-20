@@ -35,21 +35,23 @@ const fmtDay = (iso) => {
 
 // Regular / OT hours from a stub's earnings lines, for the preview table.
 // Mirrors _cpPaystubHours_ in Code.js (which runs the actual check) — keep
-// the code lists in step. Ignored codes win: WAOT repeats the OT hours as a
-// premium, and REG TRAVEL would otherwise match the regular bucket.
+// the code lists in step. REGULAR UN carries ALL hours worked (ST + OT);
+// OVT carries just the OT hours, so ST = regular − OVT. Ignored codes win:
+// WAOT repeats the OT hours as a premium, and REG TRAVEL would otherwise
+// match the regular bucket.
 const IGNORED_HOURS_CODES  = ['WAOT', 'TRAVEL', 'BONUS', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK']
 const REGULAR_HOURS_CODES  = ['REGULAR', 'REG UNION']
 const OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME']
 const stubHours = (lines) => {
   const has = (code, list) => list.some(c => code.includes(c))
-  let st = 0, ot = 0, found = false
+  let total = 0, ot = 0, found = false
   for (const l of Array.isArray(lines) ? lines : []) {
     const code = String(l?.code || '').toUpperCase()
     if (l?.hours == null || !code || has(code, IGNORED_HOURS_CODES)) continue
-    if (has(code, REGULAR_HOURS_CODES))       { st += Number(l.hours) || 0; found = true }
-    else if (has(code, OVERTIME_HOURS_CODES)) { ot += Number(l.hours) || 0; found = true }
+    if (has(code, REGULAR_HOURS_CODES))       { total += Number(l.hours) || 0; found = true }
+    else if (has(code, OVERTIME_HOURS_CODES)) { ot += Number(l.hours) || 0 }
   }
-  return found ? { st, ot } : null
+  return found ? { st: total - ot, ot } : null
 }
 const fmtHours = h => (h == null ? '—' : String(Math.round(h * 100) / 100))
 

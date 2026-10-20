@@ -3229,9 +3229,9 @@ function _payPeriodHoursForEmployee_(signInData, empName, weekStart, weekEnd) {
 // check. Matched as a case-insensitive substring of the printed code.
 //
 // IGNORED is checked first, so it wins over the other two:
-//   WAOT   — weekend/additional OT premium. It repeats the hours already on
-//            the OVT line (e.g. OVT UNION 3.5 @47 + WAOT 3.5 @23.5), so
-//            counting it would double the OT hours.
+//   WAOT   — weekend/additional OT premium (older stub format). It repeats
+//            the hours already on the OVT line, so counting it would
+//            double the OT hours.
 //   TRAVEL — "REG TRAVEL" is travel time, not field hours, and would
 //            otherwise match the regular bucket.
 //   The rest carry dollars only (fund pass-throughs, flat bonus).
@@ -3244,12 +3244,18 @@ const CP_OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME'];
 /**
  * Regular and overtime hours printed on a paystub, from its Earnings lines.
  *
- * Returns { st, ot, unknown: [{code, hours}], usable }. `usable` is false
- * when the stub has no regular/OT hour lines at all (e.g. a Pre-Check
- * Register, which doesn't itemize) — the caller then can't verify hours.
+ * The regular line (REGULAR UN) carries ALL hours worked in the period —
+ * straight time and overtime together, every hour paid at the straight
+ * rate. The OVT line carries just the overtime hours, paid at the half-time
+ * premium on top (e.g. REGULAR UN 34.00 @47 + OVT 3.50 @23.50 = 30.5 ST
+ * + 3.5 OT at 1.5×). So OT = OVT hours and ST = regular hours − OVT hours.
+ *
+ * Returns { st, ot, total, unknown: [{code, hours}], usable }. `usable` is
+ * false when the stub has no regular hour line (e.g. a Pre-Check Register,
+ * which doesn't itemize) — the caller then can't verify hours.
  */
 function _cpPaystubHours_(ps) {
-  const out = { st: 0, ot: 0, unknown: [], usable: false };
+  const out = { st: 0, ot: 0, total: 0, unknown: [], usable: false };
   const lines = (ps && Array.isArray(ps.earnings_lines)) ? ps.earnings_lines : [];
   const has = (upper, list) => list.some(c => upper.indexOf(c) !== -1);
   lines.forEach(l => {
@@ -3258,10 +3264,13 @@ function _cpPaystubHours_(ps) {
     if (!code || l.hours == null || !isFinite(hours)) return;
     const upper = code.toUpperCase();
     if (has(upper, CP_IGNORED_HOURS_CODES)) return;
-    if (has(upper, CP_REGULAR_HOURS_CODES))  { out.st += hours; out.usable = true; return; }
-    if (has(upper, CP_OVERTIME_HOURS_CODES)) { out.ot += hours; out.usable = true; return; }
+    if (has(upper, CP_REGULAR_HOURS_CODES))  { out.total += hours; out.usable = true; return; }
+    if (has(upper, CP_OVERTIME_HOURS_CODES)) { out.ot += hours; return; }
     if (hours !== 0) out.unknown.push({ code: code, hours: hours });
   });
+  // Not clamped: OVT exceeding the regular line is itself a sign of a
+  // misread or a payroll error, and should surface as a mismatch.
+  out.st = out.total - out.ot;
   return out;
 }
 
@@ -3608,7 +3617,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
           if (!psHrs.usable) {
             warnedNames[normName(empName)] = true;
             _psWarn('hours_unverified',
-              empName + ': no regular or overtime hours were found on the paystub, so hours could not be checked.');
+              empName + ': no REGULAR hours line was found on the paystub, so hours could not be checked.');
           } else if (!hoursOk) {
             warnedNames[normName(empName)] = true;
             let note = '';
@@ -3733,7 +3742,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
           const h = hoursCheckByName[n];
           let hoursTxt;
           if (!h) hoursTxt = 'hours not checked (no rate row — employee skipped)';
-          else if (!h.ps.usable) hoursTxt = '⚠️ hours UNVERIFIED (no REG/OVT hour lines on paystub)';
+          else if (!h.ps.usable) hoursTxt = '⚠️ hours UNVERIFIED (no REGULAR hours line on paystub)';
           else hoursTxt = (h.ok ? '✅' : '⚠️') + ' hours sign-in ST ' + fmtH(h.sys.st) + ' / OT ' + fmtH(h.sys.ot) +
                           ' vs paystub ST ' + fmtH(h.ps.st) + ' / OT ' + fmtH(h.ps.ot) +
                           (h.ps.unknown.length
