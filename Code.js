@@ -3302,6 +3302,9 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   }
   const warnedNames   = {};   // dedupe hours warnings across a person's multiple classification rows
   const idWarnedNames = {};   // same, for employee-number corroboration
+  const hoursCheckByName = {};  // paystub hours check result per person: { sys, ps, ok }
+  const fmtH = h => String(Math.round(h * 100) / 100);
+  const fmt$ = v => '$' + Number(v).toFixed(2);
   const _psWarn = (type, message) => {
     if (opts && Array.isArray(opts.warningsOut)) opts.warningsOut.push({ type: type, message: message });
   };
@@ -3593,16 +3596,20 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         // bonuses and fund lines out of it — if the hours agree, the hours
         // were recorded correctly. Warn once per employee; always still
         // fill the values.
-        if (!warnedNames[normName(empName)]) {
+        // Computed once per person per run (cached for the sanity-check log
+        // below), so the warning also fires once.
+        if (!hoursCheckByName[normName(empName)]) {
           const sys    = _payPeriodHoursForEmployee_(data, empName, weekStart, weekEnd);
           const psHrs  = _cpPaystubHours_(ps);
           const tolHrs = 0.01;
-          const fmtH   = h => String(Math.round(h * 100) / 100);
+          const hoursOk = psHrs.usable &&
+            Math.abs(sys.st - psHrs.st) <= tolHrs && Math.abs(sys.ot - psHrs.ot) <= tolHrs;
+          hoursCheckByName[normName(empName)] = { sys: sys, ps: psHrs, ok: hoursOk };
           if (!psHrs.usable) {
             warnedNames[normName(empName)] = true;
             _psWarn('hours_unverified',
               empName + ': no regular or overtime hours were found on the paystub, so hours could not be checked.');
-          } else if (Math.abs(sys.st - psHrs.st) > tolHrs || Math.abs(sys.ot - psHrs.ot) > tolHrs) {
+          } else if (!hoursOk) {
             warnedNames[normName(empName)] = true;
             let note = '';
             if (psHrs.unknown.length) {
@@ -3711,6 +3718,39 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         });
       }
     });
+
+    // Paystub sanity-check summary for this contract — one line per
+    // employee, passes included, so the full result can be read in the
+    // Apps Script Executions log regardless of how the UI renders warnings.
+    if (Object.keys(paystubByName).length) {
+      const lines = sortedEntries
+        .map(e => e.name)
+        .filter((name, i, arr) => arr.findIndex(x => normName(x) === normName(name)) === i)
+        .map(name => {
+          const n  = normName(name);
+          const ps = paystubByName[n];
+          if (!ps) return '  ⚪ ' + name + ' — not on the paystub (Total Gross, Withholdings & Net Pay left blank)';
+          const h = hoursCheckByName[n];
+          let hoursTxt;
+          if (!h) hoursTxt = 'hours not checked (no rate row — employee skipped)';
+          else if (!h.ps.usable) hoursTxt = '⚠️ hours UNVERIFIED (no REG/OVT hour lines on paystub)';
+          else hoursTxt = (h.ok ? '✅' : '⚠️') + ' hours sign-in ST ' + fmtH(h.sys.st) + ' / OT ' + fmtH(h.sys.ot) +
+                          ' vs paystub ST ' + fmtH(h.ps.st) + ' / OT ' + fmtH(h.ps.ot) +
+                          (h.ps.unknown.length
+                            ? ' (unrecognized: ' + h.ps.unknown.map(x => x.code + ' ' + fmtH(x.hours) + 'h').join(', ') + ')'
+                            : '');
+          const psGross = Number(ps.gross_pay);
+          const proj    = projectGrossByName[n];
+          let grossTxt;
+          if (!isFinite(psGross)) grossTxt = '⚠️ gross: paystub gross unreadable';
+          else if (proj == null) grossTxt = 'gross: n/a';
+          else grossTxt = (proj - psGross <= 0.02 ? '✅' : '⚠️') + ' gross project ' + fmt$(proj) +
+                          (proj - psGross <= 0.02 ? ' ≤ ' : ' > ') + 'paystub ' + fmt$(psGross);
+          return '  ' + name + ' — ' + hoursTxt + ' · ' + grossTxt;
+        });
+      Logger.log('🔎 Paystub sanity check — ' + contractNum + '/' + borough + ', week of ' +
+                 Utilities.formatDate(weekStart, CONFIG.TIMEZONE, 'yyyy-MM-dd') + '\n' + lines.join('\n'));
+    }
 
     // ── JSON export for local PDF filler ─────────────────────────────────────
     const weekEndFormatted = Utilities.formatDate(weekEnd, CONFIG.TIMEZONE, 'MM/dd/yyyy');
