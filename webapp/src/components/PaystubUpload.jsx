@@ -3,8 +3,8 @@ import { useState } from 'react'
 // Optional "Upload Paystub" affordance shown inside the Certified Payroll
 // Generate modal. Reads a payrollforconstruction.com paystub via Claude
 // vision and hands the parsed payload back to the parent, which forwards it
-// into the CP generation request so the Withholdings & Net Pay columns fill
-// automatically.
+// into the CP generation request so the Total Gross (All Work), Withholdings
+// & Net Pay columns fill automatically.
 //
 // Two layouts are supported:
 //   register — Pre-Check Register: one page, every employee.
@@ -32,6 +32,26 @@ const fmtDay = (iso) => {
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
   return `${MONTHS[Number(m[2]) - 1]} ${Number(m[3])}`
 }
+
+// Regular / OT hours from a stub's earnings lines, for the preview table.
+// Mirrors _cpPaystubHours_ in Code.js (which runs the actual check) — keep
+// the code lists in step. Ignored codes win: WAOT repeats the OT hours as a
+// premium, and REG TRAVEL would otherwise match the regular bucket.
+const IGNORED_HOURS_CODES  = ['WAOT', 'TRAVEL', 'BONUS', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK']
+const REGULAR_HOURS_CODES  = ['REGULAR', 'REG UNION']
+const OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME']
+const stubHours = (lines) => {
+  const has = (code, list) => list.some(c => code.includes(c))
+  let st = 0, ot = 0, found = false
+  for (const l of Array.isArray(lines) ? lines : []) {
+    const code = String(l?.code || '').toUpperCase()
+    if (l?.hours == null || !code || has(code, IGNORED_HOURS_CODES)) continue
+    if (has(code, REGULAR_HOURS_CODES))       { st += Number(l.hours) || 0; found = true }
+    else if (has(code, OVERTIME_HOURS_CODES)) { ot += Number(l.hours) || 0; found = true }
+  }
+  return found ? { st, ot } : null
+}
+const fmtHours = h => (h == null ? '—' : String(Math.round(h * 100) / 100))
 
 export default function PaystubUpload({ onParsed, expectedWeekStart }) {
   const [status, setStatus]   = useState('idle')   // 'idle' | 'parsing' | 'done' | 'error'
@@ -143,6 +163,8 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
             <thead className="text-slate-400">
               <tr className="text-left">
                 <th className="font-medium py-0.5 pr-2">Employee</th>
+                <th className="font-medium py-0.5 px-1 text-right">Reg h</th>
+                <th className="font-medium py-0.5 px-1 text-right">OT h</th>
                 <th className="font-medium py-0.5 px-1 text-right">Gross</th>
                 {anyBonus && <th className="font-medium py-0.5 px-1 text-right">Bonus</th>}
                 <th className="font-medium py-0.5 px-1 text-right">Deduct.</th>
@@ -150,12 +172,16 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
               </tr>
             </thead>
             <tbody className="text-slate-600">
-              {employees.map((e, i) => (
+              {employees.map((e, i) => {
+                const hrs = stubHours(e.earnings_lines)
+                return (
                 <tr key={i} className="border-t border-slate-100">
                   <td className="py-0.5 pr-2 truncate max-w-[130px]">
                     {isStubs && e.page != null && <span className="text-slate-300 mr-1">p{e.page}</span>}
                     {e.name}
                   </td>
+                  <td className="py-0.5 px-1 text-right tabular-nums">{fmtHours(hrs?.st)}</td>
+                  <td className="py-0.5 px-1 text-right tabular-nums">{fmtHours(hrs?.ot)}</td>
                   <td className="py-0.5 px-1 text-right tabular-nums">{fmtMoney(e.gross_pay)}</td>
                   {anyBonus && (
                     <td className="py-0.5 px-1 text-right tabular-nums text-slate-400">
@@ -165,13 +191,14 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
                   <td className="py-0.5 px-1 text-right tabular-nums">{fmtMoney(e.deductions)}</td>
                   <td className="py-0.5 pl-1 text-right tabular-nums">{fmtMoney(e.net_pay)}</td>
                 </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         </div>
         <p className="text-[10px] text-slate-400">
-          Withholdings &amp; Net Pay will fill from these values. Gross is cross-checked against
-          recorded hours, with bonus and travel time subtracted first.
+          Total Gross (All Work), Withholdings &amp; Net Pay will fill from these values. Regular
+          and OT hours are cross-checked against the week’s sign-in records.
         </p>
       </div>
     )
@@ -186,7 +213,7 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
         <p className="text-[13px] font-semibold text-navy">Upload paystub <span className="font-normal text-slate-400">(optional)</span></p>
         <p className="text-[11px] text-slate-500 mt-0.5">
           Pre-Check Register, or a multi-page PDF with one employee per page.
-          Auto-fills Withholdings &amp; Net Pay.
+          Auto-fills Total Gross, Withholdings &amp; Net Pay.
         </p>
       </label>
       {status === 'error' && error && (

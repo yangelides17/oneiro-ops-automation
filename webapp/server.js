@@ -390,9 +390,10 @@ app.post('/api/tools/generate-cp-for-doc', async (req, res) => {
     //   { employees: [{ name, gross_pay, net_pay, deductions, bonus,
     //                   earnings_lines: [{ code, hours, amount }], ... }],
     //     pay_period: { start, end }, layout, page_count }
-    // Apps Script uses it to auto-fill Withholdings & Net Pay, to refuse a
-    // wrong-week paystub, and to run the gross-pay verification (which
-    // subtracts non-field-hours earnings lines before comparing).
+    // Apps Script uses it to auto-fill Total Gross (All Work), Withholdings &
+    // Net Pay, to refuse a wrong-week paystub, and to check the paystub's
+    // regular/OT hours against the sign-in hours and its gross against this
+    // project's gross.
     const data = await callAppsScript('generate_cp_for_doc', { doc_id, paystub })
     if (data && data.error) return res.status(400).json(data)
     res.json(data)
@@ -1805,17 +1806,17 @@ Rules:
  * First M" register spelling maps to the exact registry name the CP data
  * joins on.
  *
- * Every line of the Earnings block comes back verbatim in `earnings_lines`.
- * That is what lets the CP gross check subtract non-field-hours earnings
- * (bonus, regular travel) before comparing — see CP_EXCLUDED_EARNINGS_CODES
- * in Code.js. This endpoint deliberately does NOT classify those lines; it
- * only transcribes them.
+ * Every line of the Earnings block comes back verbatim in `earnings_lines`,
+ * with its hours. That is what the CP hours check reads: regular and OT hour
+ * lines are summed and compared against the sign-in hours — see
+ * CP_REGULAR_HOURS_CODES / CP_OVERTIME_HOURS_CODES in Code.js. This endpoint
+ * deliberately does NOT classify those lines; it only transcribes them.
  *
  * Rejects (400) two things that are never legitimate for one CP week: the
  * same employee appearing twice, and a file spanning multiple pay periods.
  *
  * Returns { employees: [{ name, employee_number, gross_pay, net_pay,
- * deductions, bonus, earnings_lines, page, pay_period_start,
+ * deductions, bonus, total_hours, earnings_lines, page, pay_period_start,
  * pay_period_end }], filename, layout, page_count, pay_period, warnings }.
  * No persistence — the caller passes the result straight into POST
  * /api/tools/generate-cp-for-doc.
@@ -1931,8 +1932,13 @@ Some lines carry a Year To Date figure but leave the Current amount BLANK (commo
 CASH FRING). For those, return amount 0. NEVER fill a blank Current amount from the Year To
 Date column, and never from the "Taxes & Deductions" block on the right side of the page —
 those are different numbers entirely.
-Self-check: the earnings_lines amounts must sum to gross_pay. If they do not, you have
-missed or misread a line — re-read the Earnings block before answering.
+Hours: read each line's hours from the Hours block's CURRENT column, on the same row as
+the line's code. A line with a blank Current hours cell has hours null.
+total_hours: the "Gross Pay" row of the Hours block → Current hours (e.g. 37.50), or null
+when it isn't printed.
+Self-check: the earnings_lines amounts must sum to gross_pay, and the earnings_lines hours
+must sum to total_hours. If either does not, you have missed or misread a line — re-read the
+Earnings block before answering.
 On a "register" layout, if individual earnings lines are not itemized, return an empty
 earnings_lines array rather than inventing lines.
 
@@ -2004,6 +2010,7 @@ Numbers:
                       net_pay:          { type: 'number' },
                       deductions:       { type: 'number' },
                       bonus:            { type: 'number' },
+                      total_hours:      { anyOf: [{ type: 'number' }, { type: 'null' }] },
                       page:             { anyOf: [{ type: 'integer' }, { type: 'null' }] },
                       pay_period_start: { anyOf: [{ type: 'string' }, { type: 'null' }] },
                       pay_period_end:   { anyOf: [{ type: 'string' }, { type: 'null' }] },
@@ -2023,7 +2030,7 @@ Numbers:
                     },
                     required: [
                       'name', 'employee_number', 'gross_pay', 'net_pay', 'deductions',
-                      'bonus', 'page', 'pay_period_start', 'pay_period_end', 'earnings_lines',
+                      'bonus', 'total_hours', 'page', 'pay_period_start', 'pay_period_end', 'earnings_lines',
                     ],
                     additionalProperties: false,
                   },
@@ -2074,6 +2081,7 @@ Numbers:
         net_pay:         num(e.net_pay),
         deductions:      num(e.deductions),
         bonus:           num(e.bonus) || 0,
+        total_hours:     num(e.total_hours),
         page:            Number.isInteger(e.page) ? e.page : null,
         pay_period_start: isoDate(e.pay_period_start),
         pay_period_end:   isoDate(e.pay_period_end),
@@ -2176,13 +2184,22 @@ Numbers:
         warnings.push('Some stubs had no readable pay period — the week could not be verified for those.')
       }
     }
-    // The earnings breakdown drives the CP gross check, so flag any row where
-    // it does not reconcile to the gross printed on the stub.
+    // Read-quality checks on the earnings breakdown. The hours drive the CP
+    // hours check, and gross_pay fills Total Gross (All Work) on the CP, so
+    // flag any row whose lines don't add up to the totals printed on the stub.
     employees.forEach(e => {
-      if (!e.earnings_lines.length || e.gross_pay == null) return
-      const sum = e.earnings_lines.reduce((t, l) => t + (l.amount || 0), 0)
-      if (Math.abs(sum - e.gross_pay) > 0.02) {
-        warnings.push(`${e.name}: earnings lines total $${sum.toFixed(2)} but gross pay reads $${e.gross_pay.toFixed(2)} — the breakdown may be incomplete.`)
+      if (!e.earnings_lines.length) return
+      if (e.gross_pay != null) {
+        const sum = e.earnings_lines.reduce((t, l) => t + (l.amount || 0), 0)
+        if (Math.abs(sum - e.gross_pay) > 0.02) {
+          warnings.push(`${e.name}: earnings lines total $${sum.toFixed(2)} but gross pay reads $${e.gross_pay.toFixed(2)} — the breakdown may be incomplete.`)
+        }
+      }
+      if (e.total_hours != null) {
+        const hrs = e.earnings_lines.reduce((t, l) => t + (l.hours || 0), 0)
+        if (Math.abs(hrs - e.total_hours) > 0.01) {
+          warnings.push(`${e.name}: earnings lines total ${+hrs.toFixed(2)} hours but the stub's total reads ${e.total_hours} — some hours may have been misread.`)
+        }
       }
     })
 

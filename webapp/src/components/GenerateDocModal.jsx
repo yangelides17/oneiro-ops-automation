@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 
-// Warnings come back from Apps Script as tagged objects. The gross-pay
-// mismatch has a bespoke numeric layout; everything else renders from a
-// plain `message`. The fallback is deliberate — it lets Apps Script start
-// emitting a new warning type without a coupled webapp deploy.
-const isGrossWarning = w => w && (w.type === 'gross' || (w.type == null && w.expected != null))
+// Warnings come back from Apps Script as tagged objects. The paystub hours
+// mismatch and the paystub-gross-below-project-gross check have bespoke
+// numeric layouts; everything else renders from a plain `message`. The
+// fallback is deliberate — it lets Apps Script start emitting a new warning
+// type without a coupled webapp deploy.
+const isHoursWarning = w => w && w.type === 'hours'
+const isGrossExceedsWarning = w => w && w.type === 'gross_exceeds'
 const warningText = w => {
   if (typeof w === 'string') return w
   if (!w) return ''
@@ -87,8 +89,9 @@ export default function GenerateDocModal({
 
   if (!open) return null
 
-  const grossWarnings = warnings.filter(isGrossWarning)
-  const otherWarnings = warnings.filter(w => !isGrossWarning(w))
+  const hoursWarnings = warnings.filter(isHoursWarning)
+  const grossWarnings = warnings.filter(isGrossExceedsWarning)
+  const otherWarnings = warnings.filter(w => !isHoursWarning(w) && !isGrossExceedsWarning(w))
 
   const handleConfirm = async () => {
     if (state === 'submitting') return
@@ -156,20 +159,37 @@ export default function GenerateDocModal({
                   {files.map((f, i) => <li key={i} className="truncate">• {f}</li>)}
                 </ul>
               )}
+              {hoursWarnings.length > 0 && (
+                <div className="text-left bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1">
+                  <p className="text-[12px] font-bold text-amber-700">
+                    ⚠ Hours didn’t match the paystub for {hoursWarnings.length} employee{hoursWarnings.length === 1 ? '' : 's'}
+                  </p>
+                  <p className="text-[10px] text-amber-600">
+                    Totals are for the whole week across all contracts. Net Pay &amp; Withholdings were still filled — check that this week’s sign-in hours are recorded correctly.
+                  </p>
+                  <ul className="text-[11px] text-amber-800 space-y-0.5 max-h-[120px] overflow-y-auto">
+                    {hoursWarnings.map((w, i) => (
+                      <li key={i} className="tabular-nums">
+                        <span className="font-semibold">{w.name}</span>: sign-in ST {w.system?.st} / OT {w.system?.ot} vs paystub ST {w.paystub?.st} / OT {w.paystub?.ot}
+                        {w.note && <span className="block text-[10px] text-amber-500">{w.note}</span>}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               {grossWarnings.length > 0 && (
                 <div className="text-left bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1">
                   <p className="text-[12px] font-bold text-amber-700">
-                    ⚠ Gross pay didn’t match the paystub for {grossWarnings.length} employee{grossWarnings.length === 1 ? '' : 's'}
+                    ⚠ Paystub gross is below this project’s gross for {grossWarnings.length} employee{grossWarnings.length === 1 ? '' : 's'}
                   </p>
                   <p className="text-[10px] text-amber-600">
-                    Net Pay &amp; Withholdings were still filled. Check that this week’s hours are recorded correctly.
+                    The paystub covers the whole week, so it should be at least this contract’s gross — check rates and hours.
                   </p>
                   <ul className="text-[11px] text-amber-800 space-y-0.5 max-h-[120px] overflow-y-auto">
                     {grossWarnings.map((w, i) => (
                       <li key={i} className="tabular-nums">
-                        <span className="font-semibold">{w.name}</span>: computed ${w.expected} vs paystub ${w.paystub}
+                        <span className="font-semibold">{w.name}</span>: project ${w.project_gross} vs paystub (all work) ${w.paystub_gross}
                         <span className="text-amber-500"> (Δ ${w.delta})</span>
-                        {w.note && <span className="block text-[10px] text-amber-500">{w.note}</span>}
                       </li>
                     ))}
                   </ul>

@@ -3172,29 +3172,6 @@ function validateSignInData(dateStr) {
  * @param {string} weekStartStr - Sunday date in MM/DD/YYYY format
  */
 /**
- * Total gross pay for an employee across ALL projects for a SINGLE
- * Sun–Sat pay period (weekStart..weekEnd). This is the "Total Gross
- * Pay (All Work)" figure on the certified payroll form — every hour the
- * employee worked that week on any contract, not a year-to-date total.
- * Trusts the per-row col 11 (Overtime Hours) written by
- * handleSubmitSignIn_, which already applies the day-of-week OT rule
- * with same-day cross-group lookback. Deriving OT here would silently
- * disagree with col 11 if anyone hand-edits a row's OT contribution.
- *
- * Hours are bucketed per classification and priced with the rate
- * effective on the week's end date, so an employee who worked more than
- * one classification in the same week (e.g. some days LP, some SAT)
- * gets each bucket priced at the matching rate. Supplementals are paid
- * the same hours as wages (ST hours pair with ST supp, OT hours pair
- * with OT supp).
- *
- * signInData:   full Daily Sign-In Data getValues() (incl. header row).
- * empName:      employee name as written in Sign-In Data col 6.
- * payrollRates: result of _loadPayrollRates_(ss). Empty array → 0.
- * weekStart:    Date object marking start of the payroll week (Sunday 00:00).
- * weekEnd:      Date object marking end of the payroll week (Saturday 23:59).
- */
-/**
  * Round a dollar amount to whole cents, half-UP on the third decimal
  * (.005 and above rounds the cent up). Uses a tiny epsilon nudge so an
  * exact half that floating-point stores a hair low (e.g. 104.285 held as
@@ -3207,142 +3184,84 @@ function _roundCents_(n) {
   return s * Math.round((Math.abs(v) + 1e-9) * 100) / 100;
 }
 
-function computePayPeriodGrossForEmployee_(signInData, empName, payrollRates, weekStart, weekEnd) {
+/**
+ * Straight-time and overtime hours for an employee across ALL projects for
+ * a SINGLE Sun–Sat pay period (weekStart..weekEnd). This is what the
+ * paystub hours check compares against — the paystub covers every hour the
+ * employee worked that week on any contract.
+ * Trusts the per-row col 11 (Overtime Hours) written by
+ * handleSubmitSignIn_, which already applies the day-of-week OT rule
+ * with same-day cross-group lookback. Deriving OT here would silently
+ * disagree with col 11 if anyone hand-edits a row's OT contribution.
+ *
+ * Same row filters as the CP's own per-contract grouping (named employee,
+ * non-blank classification), so the two can't disagree on what counts.
+ *
+ * signInData:   full Daily Sign-In Data getValues() (incl. header row).
+ * empName:      employee name as written in Sign-In Data col 6.
+ * weekStart:    Date object marking start of the payroll week (Sunday 00:00).
+ * weekEnd:      Date object marking end of the payroll week (Saturday 23:59).
+ * Returns { st, ot } in hours.
+ */
+function _payPeriodHoursForEmployee_(signInData, empName, weekStart, weekEnd) {
   const normName = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const target   = normName(empName);
-  if (!target) return 0;
-  if (!Array.isArray(payrollRates) || payrollRates.length === 0) return 0;
-
-  // Week-end date used to resolve the rate schedule effective this week.
-  const weekEndKey = (d) => {
-    // Days until upcoming Saturday (inclusive). For Saturday itself, 0.
-    const daysToSat = 6 - d.getDay();
-    const we = new Date(d.getFullYear(), d.getMonth(), d.getDate() + daysToSat, 23, 59, 59);
-    return { key: Utilities.formatDate(we, CONFIG.TIMEZONE, 'yyyy-MM-dd'), date: we };
-  };
-
-  // Key by classification so a week with mixed classifications gets one
-  // rate-resolved bucket per classification.
-  const byClass = {};
+  const out = { st: 0, ot: 0 };
+  if (!target) return out;
   signInData.slice(1).forEach(row => {
     if (!row[0]) return;
     const rowDate = new Date(row[0]);
     if (isNaN(rowDate.getTime())) return;
     if (rowDate < weekStart || rowDate > weekEnd) return;
     if (normName(row[6]) !== target) return;
-    const cls = String(row[7] || '').trim();
-    if (!cls) return;
+    if (!String(row[7] || '').trim()) return;
     const hours = Number(row[10]) || 0;
     if (hours <= 0) return;
     const ot = Number(row[11]) || 0;
-    const st = Math.max(0, hours - ot);
-    const { key, date: we } = weekEndKey(rowDate);
-    const clsKey = key + '|||' + cls;
-    if (!byClass[clsKey]) {
-      byClass[clsKey] = { weekEnd: we, classification: cls, st: 0, ot: 0 };
-    }
-    byClass[clsKey].st += st;
-    byClass[clsKey].ot += ot;
+    out.st += Math.max(0, hours - ot);
+    out.ot += ot;
   });
-
-  let total = 0;
-  Object.values(byClass).forEach(({ weekEnd: we, classification: cls, st, ot }) => {
-    const rate = _resolvePayrollRate_(payrollRates, cls, we);
-    if (!rate) return; // No rate effective for this (week, classification) — skip silently
-    total += st * ((rate.st_rate || 0) + (rate.st_supp || 0))
-           + ot * ((rate.ot_rate || 0) + (rate.ot_supp || 0));
-  });
-  return _roundCents_(total);
+  return out;
 }
 
 
-// Earnings codes that are NOT field hours at the prevailing-wage rate, and
-// therefore are not part of what Certified Payroll computes. They are real
-// pay — they stay in Net Pay and Withholdings — but they must come out of
-// the paystub's gross before it is compared against our hours-based gross.
+// Paystub earnings codes, sorted by what their HOURS mean for the CP hours
+// check. Matched as a case-insensitive substring of the printed code.
 //
-//   BONUS  — flat production bonus, not attributable to hours.
-//   TRAVEL — travel time, paid at a different rate than field hours.
-//
-// Matched as a case-insensitive substring of the printed code, so "BONUS"
-// catches "BONUS EARN" and "TRAVEL" catches "REG TRAVEL". Codes NOT listed
-// here stay in the comparison — see _cpComparablePaystubGross_ for why.
-const CP_EXCLUDED_EARNINGS_CODES = ['BONUS', 'TRAVEL'];
-
-// Earnings codes known to be part of the prevailing-wage gross (base wages
-// plus the supplemental/fringe lines that our st_supp / ot_supp already
-// fold in). Used only to decide whether a code is "recognized" — anything
-// in neither list warns so the lists can be kept current.
-const CP_INCLUDED_EARNINGS_CODES = [
-  'REGULAR', 'REG UNION', 'OVT', 'OT', 'WAOT', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK',
-];
+// IGNORED is checked first, so it wins over the other two:
+//   WAOT   — weekend/additional OT premium. It repeats the hours already on
+//            the OVT line (e.g. OVT UNION 3.5 @47 + WAOT 3.5 @23.5), so
+//            counting it would double the OT hours.
+//   TRAVEL — "REG TRAVEL" is travel time, not field hours, and would
+//            otherwise match the regular bucket.
+//   The rest carry dollars only (fund pass-throughs, flat bonus).
+// Any other code that carries hours is reported as unrecognized so these
+// lists can be kept current.
+const CP_IGNORED_HOURS_CODES  = ['WAOT', 'TRAVEL', 'BONUS', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK'];
+const CP_REGULAR_HOURS_CODES  = ['REGULAR', 'REG UNION'];
+const CP_OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME'];
 
 /**
- * Paystub gross, adjusted for comparison against our hours-based gross.
+ * Regular and overtime hours printed on a paystub, from its Earnings lines.
  *
- * Anchors on the Gross Pay figure printed on the stub and subtracts only the
- * earnings lines we positively recognize as non-field-hours. Deliberately
- * NOT "sum the included lines": if a line were ever missed or mis-read, that
- * approach would silently shrink the total, whereas subtracting from the
- * printed anchor leaves it in and lets it surface as a visible mismatch.
- *
- * Unknown codes are left IN for the same reason — an unknown line that
- * should have been excluded shows up as a warning the user can act on,
- * while defaulting to exclude could mask a genuine discrepancy.
- *
- * Returns { gross, excluded: [{code, amount}], unknown: [{code, amount}] }.
+ * Returns { st, ot, unknown: [{code, hours}], usable }. `usable` is false
+ * when the stub has no regular/OT hour lines at all (e.g. a Pre-Check
+ * Register, which doesn't itemize) — the caller then can't verify hours.
  */
-function _cpComparablePaystubGross_(ps) {
-  const gross = Number(ps && ps.gross_pay);
-  const out = { gross: gross, excluded: [], unknown: [] };
-  if (!isFinite(gross)) { out.gross = NaN; return out; }
+function _cpPaystubHours_(ps) {
+  const out = { st: 0, ot: 0, unknown: [], usable: false };
   const lines = (ps && Array.isArray(ps.earnings_lines)) ? ps.earnings_lines : [];
-
-  // No breakdown available (e.g. a register that doesn't itemize): fall back
-  // to the `bonus` convenience field so bonus weeks still compare correctly.
-  if (lines.length === 0) {
-    const bonus = Number(ps && ps.bonus);
-    if (isFinite(bonus) && bonus > 0) {
-      out.excluded.push({ code: 'BONUS', amount: bonus });
-      out.gross = _roundCents_(gross - bonus);
-    }
-    return out;
-  }
-
-  // The breakdown has to reconcile to the printed gross before we trust it
-  // to drive a subtraction. A read that doesn't add up (a misread column, a
-  // dropped line) could otherwise subtract a wrong amount and quietly move
-  // the comparison. Fall back to the `bonus` field and say so.
-  const lineSum = lines.reduce((t, l) => {
-    const a = Number(l && l.amount);
-    return t + (isFinite(a) ? a : 0);
-  }, 0);
-  if (Math.abs(lineSum - gross) > 0.02) {
-    out.unreliable = true;
-    const bonus = Number(ps && ps.bonus);
-    if (isFinite(bonus) && bonus > 0) {
-      out.excluded.push({ code: 'BONUS', amount: bonus });
-      out.gross = _roundCents_(gross - bonus);
-    }
-    return out;
-  }
-
-  let deduct = 0;
+  const has = (upper, list) => list.some(c => upper.indexOf(c) !== -1);
   lines.forEach(l => {
-    const code = String(l && l.code || '').trim();
-    const amt  = Number(l && l.amount);
-    if (!code || !isFinite(amt)) return;
+    const code  = String(l && l.code || '').trim();
+    const hours = Number(l && l.hours);
+    if (!code || l.hours == null || !isFinite(hours)) return;
     const upper = code.toUpperCase();
-    const isExcluded = CP_EXCLUDED_EARNINGS_CODES.some(c => upper.indexOf(c) !== -1);
-    if (isExcluded) {
-      deduct += amt;
-      out.excluded.push({ code: code, amount: amt });
-      return;
-    }
-    const isKnown = CP_INCLUDED_EARNINGS_CODES.some(c => upper.indexOf(c) !== -1);
-    if (!isKnown) out.unknown.push({ code: code, amount: amt });
+    if (has(upper, CP_IGNORED_HOURS_CODES)) return;
+    if (has(upper, CP_REGULAR_HOURS_CODES))  { out.st += hours; out.usable = true; return; }
+    if (has(upper, CP_OVERTIME_HOURS_CODES)) { out.ot += hours; out.usable = true; return; }
+    if (hours !== 0) out.unknown.push({ code: code, hours: hours });
   });
-  out.gross = _roundCents_(gross - deduct);
   return out;
 }
 
@@ -3357,12 +3276,14 @@ function generateCertifiedPayroll(weekStartStr, opts) {
   const weekEnd   = new Date(Number(parts[2]), Number(parts[0]) - 1, Number(parts[1]) + 6, 23, 59, 59); // Saturday 23:59, end of Sun–Sat week
 
   // Optional paystub auto-fill (from the CP Generate modal's "Upload
-  // Paystub" step). When present, each employee's Withholdings &
-  // Deductions + Net Pay are filled from the paystub instead of left
-  // blank, and their computed all-work gross is cross-checked against
-  // the paystub gross — a discrepancy warns (via opts.warningsOut) but
-  // never blocks generation. Values are week-level per person and repeat
-  // on each of that person's classification rows.
+  // Paystub" step). When present, each employee's Total Gross Pay (All
+  // Work), Withholdings & Deductions and Net Pay are filled from the
+  // paystub instead of left blank. Two checks warn (via opts.warningsOut)
+  // but never block generation: the paystub's regular/OT hours vs the
+  // sign-in hours for the week, and the paystub gross vs this contract's
+  // gross (the week's pay can't be less than one project's share of it).
+  // Values are week-level per person and repeat on each of that person's
+  // classification rows.
   //
   // Duplicate names are rejected upstream (both in the parse endpoint and
   // in handleGenerateCPForDoc_), so a collision here means a caller
@@ -3379,7 +3300,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
       paystubByName[n] = e;
     });
   }
-  const warnedNames   = {};   // dedupe gross warnings across a person's multiple classification rows
+  const warnedNames   = {};   // dedupe hours warnings across a person's multiple classification rows
   const idWarnedNames = {};   // same, for employee-number corroboration
   const _psWarn = (type, message) => {
     if (opts && Array.isArray(opts.warningsOut)) opts.warningsOut.push({ type: type, message: message });
@@ -3591,6 +3512,9 @@ function generateCertifiedPayroll(weekStartStr, opts) {
       const nameCmp = a.name.localeCompare(b.name);
       return nameCmp !== 0 ? nameCmp : a.classification.localeCompare(b.classification);
     });
+    // This contract's gross per employee, summed across their classification
+    // rows — checked against the paystub gross once every row is built.
+    const projectGrossByName = {};
     sortedEntries.forEach(info => {
       const empName = info.name;
       // Address + SSN4 still come from Employee Registry (personal info).
@@ -3618,17 +3542,6 @@ function generateCertifiedPayroll(weekStartStr, opts) {
       const stSupp = rateRow.st_supp || 0;
       const otSupp = rateRow.ot_supp || 0;
 
-      // Total gross across all projects for THIS pay period (Sun–Sat).
-      // Used to fill the "Total Gross Pay (All Work)" column on the
-      // certified payroll form — every hour worked that week on any
-      // contract, not year-to-date. Resolves rates per-classification so
-      // a week with mixed classifications reflects the actual rates paid.
-      // Same value goes on each of an employee's CP entries (per-person
-      // week total, not per-class).
-      const allWorkGross = computePayPeriodGrossForEmployee_(
-        data, empName, payrollRates, weekStart, weekEnd
-      );
-
       // Sum this contract's per-day ST/OT from the col-10/col-11 split
       // already computed at submission time. Weekend (all OT) and
       // >8/day rules are enforced upstream in handleSubmitSignIn_;
@@ -3649,70 +3562,64 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         totalOT += ot;
       }
 
-      // Gross pay = ST hours × (st_rate + st_supp) + OT hours × (ot_rate + ot_supp).
-      // Supplementals are paid per-hour-worked, ST hours always pair
-      // with ST supp, OT hours always pair with OT supp. Rounded half-up
-      // to cents (.005 → up) so the sheet + form print the same value.
-      const grossPay = _roundCents_((totalST * (stRate + stSupp)) + (totalOT * (otRate + otSupp)));
+      // Gross pay = ST hours × st_rate + OT hours × ot_rate — base wages
+      // only. Supplementals are NOT part of gross; they're reported on
+      // their own in the form's Benefit Contributions column. Rounded
+      // half-up to cents (.005 → up) so the sheet + form print the same value.
+      const grossPay = _roundCents_((totalST * stRate) + (totalOT * otRate));
+      projectGrossByName[normName(empName)] =
+        _roundCents_((projectGrossByName[normName(empName)] || 0) + grossPay);
 
-      // Paystub auto-fill for this employee (week-level: net pay &
-      // withholdings, same on each of the person's classification rows).
+      // Paystub auto-fill for this employee (week-level: total gross, net
+      // pay & withholdings, same on each of the person's classification rows).
       const ps = paystubByName[normName(empName)];
       let netPayStr     = '';
       let deductionsStr = '';
+      let totalGrossStr = '';   // blank without a paystub — filled by hand, like net pay
       if (ps) {
         const psNet   = Number(ps.net_pay);
         const psGross = Number(ps.gross_pay);
         let   psDed   = Number(ps.deductions);
         if (!isFinite(psDed) && isFinite(psGross) && isFinite(psNet)) psDed = psGross - psNet;
-        if (isFinite(psNet)) netPayStr     = psNet.toFixed(2);
-        if (isFinite(psDed)) deductionsStr = psDed.toFixed(2);
+        if (isFinite(psNet))   netPayStr     = psNet.toFixed(2);
+        if (isFinite(psDed))   deductionsStr = psDed.toFixed(2);
+        // Total Gross Pay (All Work) is the printed paystub gross as-is —
+        // the real pay for the whole week, bonus and fund lines included.
+        if (isFinite(psGross)) totalGrossStr = psGross.toFixed(2);
 
-        // Gross verification: computed all-work gross vs the paystub gross
-        // (a proxy for hours being recorded correctly).
-        //
-        // Certified Payroll counts only field hours at the prevailing-wage
-        // rate, so the paystub gross is first adjusted down by any earnings
-        // line that isn't field hours (bonus, travel — see
-        // CP_EXCLUDED_EARNINGS_CODES). Without that, every bonus week would
-        // warn spuriously. Note the fills above are NOT adjusted: the
-        // employee really was paid the bonus, so Net Pay and Withholdings
-        // stay exactly as printed. Only the comparison changes.
-        //
-        // Tolerance is a couple cents so tiny rounding differences between
-        // our system and the payroll software don't warn, while any real
-        // hour discrepancy (≥ a fraction of an hour × rate = dollars) still
-        // does. Warn once per employee; always still fill the values.
-        if (isFinite(psGross) && !warnedNames[normName(empName)]) {
-          const adj = _cpComparablePaystubGross_(ps);
-          const tol = 0.02;
-          if (isFinite(adj.gross) && Math.abs(allWorkGross - adj.gross) > tol) {
+        // Hours verification: the paystub's regular/OT hours vs the
+        // week's sign-in hours across ALL contracts (the paystub covers the
+        // whole week). Checking hours rather than dollars keeps rates,
+        // bonuses and fund lines out of it — if the hours agree, the hours
+        // were recorded correctly. Warn once per employee; always still
+        // fill the values.
+        if (!warnedNames[normName(empName)]) {
+          const sys    = _payPeriodHoursForEmployee_(data, empName, weekStart, weekEnd);
+          const psHrs  = _cpPaystubHours_(ps);
+          const tolHrs = 0.01;
+          const fmtH   = h => String(Math.round(h * 100) / 100);
+          if (!psHrs.usable) {
+            warnedNames[normName(empName)] = true;
+            _psWarn('hours_unverified',
+              empName + ': no regular or overtime hours were found on the paystub, so hours could not be checked.');
+          } else if (Math.abs(sys.st - psHrs.st) > tolHrs || Math.abs(sys.ot - psHrs.ot) > tolHrs) {
             warnedNames[normName(empName)] = true;
             let note = '';
-            if (adj.excluded.length) {
-              note = 'Paystub gross $' + psGross.toFixed(2) + ' less ' +
-                     adj.excluded.map(x => x.code + ' $' + Number(x.amount).toFixed(2)).join(', ') +
-                     ' = $' + adj.gross.toFixed(2) + ' compared.';
-            }
-            if (adj.unreliable) {
-              note += (note ? ' ' : '') +
-                      'The paystub\'s earnings breakdown did not add up to its gross, so it was not ' +
-                      'used — only the bonus figure was subtracted. Re-upload the paystub if this delta looks wrong.';
-            }
-            if (adj.unknown.length) {
-              note += (note ? ' ' : '') + 'Unrecognized earnings line' +
-                      (adj.unknown.length === 1 ? '' : 's') + ': ' +
-                      adj.unknown.map(x => x.code + ' $' + Number(x.amount).toFixed(2)).join(', ') +
-                      ' — left in the comparison; tell us if it should be excluded.';
+            if (psHrs.unknown.length) {
+              note = 'Unrecognized earnings line' + (psHrs.unknown.length === 1 ? '' : 's') +
+                     ' with hours: ' +
+                     psHrs.unknown.map(x => x.code + ' ' + fmtH(x.hours) + 'h').join(', ') +
+                     ' — not counted; tell us if it should be.';
             }
             if (opts && Array.isArray(opts.warningsOut)) {
               opts.warningsOut.push({
-                type:     'gross',
-                name:     empName,
-                expected: allWorkGross.toFixed(2),
-                paystub:  adj.gross.toFixed(2),
-                delta:    (allWorkGross - adj.gross).toFixed(2),
-                note:     note,
+                type:    'hours',
+                name:    empName,
+                system:  { st: fmtH(sys.st),   ot: fmtH(sys.ot) },
+                paystub: { st: fmtH(psHrs.st), ot: fmtH(psHrs.ot) },
+                note:    note,
+                message: empName + ': sign-in hours ST ' + fmtH(sys.st) + ' / OT ' + fmtH(sys.ot) +
+                         ' vs paystub ST ' + fmtH(psHrs.st) + ' / OT ' + fmtH(psHrs.ot) + '.',
               });
             }
           }
@@ -3748,7 +3655,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         stRate, otRate, grossPay,
         // Total gross (all work), withholdings, net — filled from the
         // uploaded paystub when provided, else left blank for manual entry.
-        (ps ? allWorkGross.toFixed(2) : ''), deductionsStr, netPayStr,
+        totalGrossStr, deductionsStr, netPayStr,
         stSupp, otSupp,
         (ps && !warnedNames[normName(empName)] ? 'Verified (paystub)' : 'Pending Verification'), '', // Match status
         'No', ''   // Sent status
@@ -3764,21 +3671,45 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         ot_hours:        otHours,
         total_st:        String(totalST),
         total_ot:        String(totalOT),
-        // "Hourly Rate of Pay" on the form folds the supplemental
-        // (fringe) rate into the cash rate per NYC convention — total
-        // prevailing-wage rate per hour. The "Hourly Contributions to
-        // Benefit Funds or Accounts" column still shows the supp
-        // breakdown via supp_st / supp_ot below.
-        rate_st:         (stRate + stSupp).toFixed(2),
-        rate_ot:         (otRate + otSupp).toFixed(2),
+        // "Hourly Rate of Pay" is the base wage rate only, so Rate × Hours
+        // = Gross Pay This Project on the form. The supplemental shows on
+        // its own in "Hourly Contributions to Benefit Funds or Accounts"
+        // via supp_st / supp_ot below.
+        rate_st:         stRate.toFixed(2),
+        rate_ot:         otRate.toFixed(2),
         supp_st:         stSupp.toFixed(2),
         supp_ot:         otSupp.toFixed(2),
         gross_pay:       grossPay.toFixed(2),
-        total_gross_pay: allWorkGross.toFixed(2),   // this pay period, all projects
+        total_gross_pay: totalGrossStr,             // printed paystub gross (all work); blank without one
         net_pay:         netPayStr,                 // from uploaded paystub when provided
         deductions:      deductionsStr,             // from uploaded paystub when provided
         annualized_rate: ''
       });
+    });
+
+    // Paystub gross vs this contract's gross. The paystub covers the whole
+    // week's work, so it should never be less than one project's share of
+    // it — DOT reads Total Gross (All Work) ≥ Gross Pay This Project. A
+    // shortfall means rates or hours disagree with payroll. Warns
+    // independently of the hours check; never blocks or changes a value.
+    Object.keys(projectGrossByName).forEach(n => {
+      const ps = paystubByName[n];
+      const psGross = Number(ps && ps.gross_pay);
+      if (!ps || !isFinite(psGross)) return;
+      const projGross = projectGrossByName[n];
+      if (projGross - psGross <= 0.02) return;
+      const shown = (sortedEntries.find(e => normName(e.name) === n) || {}).name || ps.name || n;
+      if (opts && Array.isArray(opts.warningsOut)) {
+        opts.warningsOut.push({
+          type:          'gross_exceeds',
+          name:          shown,
+          project_gross: projGross.toFixed(2),
+          paystub_gross: psGross.toFixed(2),
+          delta:         (projGross - psGross).toFixed(2),
+          message:       shown + ': paystub gross $' + psGross.toFixed(2) + ' (all work) is less than ' +
+                         'this project\'s gross $' + projGross.toFixed(2) + '.',
+        });
+      }
     });
 
     // ── JSON export for local PDF filler ─────────────────────────────────────
@@ -3836,7 +3767,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     `Week of ${weekStartStr}`,
     `${contractCount} contract groups processed`,
     'Generated',
-    'Total Gross Pay, Withholdings, and Net Pay need payroll software verification',
+    'Total Gross Pay, Withholdings, and Net Pay fill from the paystub when one is uploaded — otherwise enter them from payroll software',
     'Yes — Cross-check with payrollforconstruction.com and complete missing fields'
   ]);
 
@@ -10360,7 +10291,7 @@ function handleGenerateCPForDoc_(body) {
     const groupCount = generateCertifiedPayroll(weekStartMmDd, {
       contractFilter: { contractNum: parsed.contractNum, borough: parsed.borough },
       paystub:     d.paystub || null,   // optional { employees: [...] } from the Upload Paystub step
-      warningsOut,                       // mutated with gross-discrepancy warnings
+      warningsOut,                       // mutated with paystub hours / gross warnings
     });
     if (!groupCount) {
       return jsonResponse_({
@@ -10376,7 +10307,7 @@ function handleGenerateCPForDoc_(body) {
                parsed.borough + ' (week of ' + parsed.anchor +
                '). Review the filled PDF in the Approvals tab — Done flips automatically when archived.',
       contract_groups: groupCount,
-      warnings: warningsOut,   // gross-pay discrepancies flagged during paystub auto-fill
+      warnings: warningsOut,   // paystub hours / gross warnings flagged during auto-fill
     });
   } catch (err) {
     return jsonResponse_({ error: String(err && err.message || err) }, 500);
