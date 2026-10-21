@@ -1,52 +1,6 @@
 import { useEffect, useState } from 'react'
 import SignaturePad from './SignaturePad'
-
-// Mirrors _crop_to_ink in workers/fill_signin.py — crops a PNG data URL
-// to its non-transparent bounding box (with an 8-px margin) so the
-// server-side pdf-lib overlay doesn't scale a bunch of empty canvas.
-// Returns a fresh PNG data URL; falls back to the input on any error.
-async function cropPngToInk(dataUrl, marginPx = 8) {
-  if (!dataUrl) return dataUrl
-  try {
-    const img = await new Promise((resolve, reject) => {
-      const i = new Image()
-      i.onload = () => resolve(i)
-      i.onerror = reject
-      i.src = dataUrl
-    })
-    const c   = document.createElement('canvas')
-    c.width   = img.width
-    c.height  = img.height
-    const ctx = c.getContext('2d')
-    ctx.drawImage(img, 0, 0)
-    const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height)
-    let minX = width, minY = height, maxX = -1, maxY = -1
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        if (data[(y * width + x) * 4 + 3] > 0) {
-          if (x < minX) minX = x
-          if (y < minY) minY = y
-          if (x > maxX) maxX = x
-          if (y > maxY) maxY = y
-        }
-      }
-    }
-    if (maxX < 0) return dataUrl  // fully transparent → pass through
-    minX = Math.max(0, minX - marginPx)
-    minY = Math.max(0, minY - marginPx)
-    maxX = Math.min(width  - 1, maxX + marginPx)
-    maxY = Math.min(height - 1, maxY + marginPx)
-    const cw = maxX - minX + 1
-    const ch = maxY - minY + 1
-    const out = document.createElement('canvas')
-    out.width  = cw
-    out.height = ch
-    out.getContext('2d').drawImage(c, minX, minY, cw, ch, 0, 0, cw, ch)
-    return out.toDataURL('image/png')
-  } catch {
-    return dataUrl
-  }
-}
+import { cropPngToInk } from '../lib/signatureImage'
 
 /**
  * Opens before a Sign-In document gets approved. Collects the

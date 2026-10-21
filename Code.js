@@ -4425,6 +4425,12 @@ function doPost(e) {
       return handleApproveDoc_(body);
     } else if (action === 'approve_signin_with_bytes') {
       return handleApproveSignInWithBytes_(body);
+    } else if (action === 'list_principal_signers') {
+      return handleListPrincipalSigners_(body);
+    } else if (action === 'save_principal_signer') {
+      return handleSavePrincipalSigner_(body);
+    } else if (action === 'delete_principal_signer') {
+      return handleDeletePrincipalSigner_(body);
     } else if (action === 'reupload_pending_approval') {
       return handleReuploadPendingApproval_(body);
     } else if (action === 'regenerate_pending_doc') {
@@ -5447,6 +5453,125 @@ function handleApproveDoc_(body) {
   } catch (err) {
     Logger.log(`❌ handleApproveDoc_ failed at step=${step}: ${err}\n${err && err.stack || ''}`);
     return jsonResponse_({ error: `[step=${step}] ${err && err.message || err}` }, 500);
+  }
+}
+
+
+// ── actions: list / save / delete_principal_signer ────────────
+//
+// Saved principal signatures for the Certified Payroll "Approve & Sign"
+// modal ("Sign As …"). Metadata lives in the PRINCIPAL_SIGNERS script
+// property as JSON [{ id, name, title, file_id, updated_at }]; each
+// signature PNG (transparent background, cropped to ink by the webapp)
+// lives in ⚙️ Templates / ✍️ Principal Signatures. A handful of signers
+// at a few KB of metadata fits comfortably under the 9KB/property cap.
+const PRINCIPAL_SIGNERS_PROP_ = 'PRINCIPAL_SIGNERS';
+
+function _readPrincipalSigners_() {
+  const raw = PropertiesService.getScriptProperties().getProperty(PRINCIPAL_SIGNERS_PROP_);
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function _writePrincipalSigners_(signers) {
+  PropertiesService.getScriptProperties()
+    .setProperty(PRINCIPAL_SIGNERS_PROP_, JSON.stringify(signers));
+}
+
+function _principalSignaturesFolder_() {
+  const templatesId = PropertiesService.getScriptProperties().getProperty('TEMPLATES_ID');
+  if (!templatesId) throw new Error('TEMPLATES_ID script property is not set');
+  return getOrCreateSubfolder_(DriveApp.getFolderById(templatesId), '✍️ Principal Signatures');
+}
+
+// Returns every signer WITH its PNG inlined as base64 — signatures are
+// small (tens of KB) and Express caches this list, so signing a CP never
+// needs a second round-trip to fetch the image.
+function handleListPrincipalSigners_(body) {
+  const signers = _readPrincipalSigners_().map(s => {
+    try {
+      const bytes = DriveApp.getFileById(s.file_id).getBlob().getBytes();
+      return Object.assign({}, s, { png_b64: Utilities.base64Encode(bytes) });
+    } catch (e) {
+      return Object.assign({}, s, { png_b64: '', error: 'Signature image unreadable' });
+    }
+  });
+  return jsonResponse_({ signers: signers });
+}
+
+// body.data = { id?, name, title, png_b64? }
+//   No id      → create (png_b64 required).
+//   id + png   → replace that signer's image + name/title.
+//   id, no png → rename / retitle only.
+function handleSavePrincipalSigner_(body) {
+  const d     = body.data || {};
+  const id    = String(d.id    || '').trim();
+  const name  = String(d.name  || '').trim();
+  const title = String(d.title || '').trim();
+  const b64   = String(d.png_b64 || '').replace(/^data:image\/png;base64,/, '');
+  if (!name)  return jsonResponse_({ error: 'Missing name' }, 400);
+  if (!title) return jsonResponse_({ error: 'Missing title' }, 400);
+  if (!id && !b64) return jsonResponse_({ error: 'Missing signature image' }, 400);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const signers = _readPrincipalSigners_();
+    const idx = id ? signers.findIndex(s => s.id === id) : -1;
+    if (id && idx < 0) return jsonResponse_({ error: 'Signer not found' }, 404);
+
+    let fileId = idx >= 0 ? signers[idx].file_id : '';
+    if (b64) {
+      const safeName = name.replace(/[^a-zA-Z0-9 _-]/g, '');
+      const blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/png',
+                                     safeName + '_signature.png');
+      const file = _principalSignaturesFolder_().createFile(blob);
+      if (fileId) {
+        try { DriveApp.getFileById(fileId).setTrashed(true); } catch (e) { /* already gone */ }
+      }
+      fileId = file.getId();
+    }
+
+    const entry = {
+      id:         idx >= 0 ? signers[idx].id : Utilities.getUuid().slice(0, 8),
+      name:       name,
+      title:      title,
+      file_id:    fileId,
+      updated_at: new Date().toISOString(),
+    };
+    if (idx >= 0) signers[idx] = entry; else signers.push(entry);
+    _writePrincipalSigners_(signers);
+    _logAutomation_('Principal Signer', idx >= 0 ? 'Updated' : 'Added', '',
+      `${name} — ${title}${b64 ? ' (new image)' : ''}`, 'Success', 'No');
+    return jsonResponse_({ success: true, signer: entry });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// body.data = { id }
+function handleDeletePrincipalSigner_(body) {
+  const id = String((body.data || {}).id || '').trim();
+  if (!id) return jsonResponse_({ error: 'Missing id' }, 400);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const signers = _readPrincipalSigners_();
+    const victim  = signers.find(s => s.id === id);
+    if (!victim) return jsonResponse_({ error: 'Signer not found' }, 404);
+    try { DriveApp.getFileById(victim.file_id).setTrashed(true); } catch (e) { /* already gone */ }
+    _writePrincipalSigners_(signers.filter(s => s.id !== id));
+    _logAutomation_('Principal Signer', 'Removed', '',
+      `${victim.name} — ${victim.title}`, 'Success', 'No');
+    return jsonResponse_({ success: true });
+  } finally {
+    lock.releaseLock();
   }
 }
 

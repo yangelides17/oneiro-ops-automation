@@ -1470,6 +1470,102 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
   }
 })
 
+// ── Saved principal signers ("Sign As …" on CP Approve & Sign) ──
+// Unlike the rest of /api/*, these require the admin access cookie: a
+// stored signature image — and the power to sign with it — must not be
+// reachable by anyone who merely knows the URL. Only the admin UI calls
+// them, so nothing server-to-server breaks.
+function requireAdmin(req, res, next) {
+  if (roleForCode(readCookie(req, ACCESS_COOKIE)) === 'admin') return next()
+  res.status(403).json({ error: 'Admin access required' })
+}
+
+// Apps Script returns signers WITH their PNG bytes inlined, so caching
+// the list here means signing a CP costs no extra Apps Script call.
+const SIGNERS_TTL_MS = 10 * 60 * 1000
+let signersCache = null   // { at, signers }
+
+async function loadPrincipalSigners({ fresh = false } = {}) {
+  if (!fresh && signersCache && Date.now() - signersCache.at < SIGNERS_TTL_MS) {
+    return signersCache.signers
+  }
+  const data = await callAppsScript('list_principal_signers')
+  if (!data || data.error) throw new Error(data?.error || 'Couldn’t load saved signers')
+  signersCache = { at: Date.now(), signers: data.signers || [] }
+  return signersCache.signers
+}
+
+/**
+ * GET /api/principal-signers
+ * Saved signers for the Sign As dropdown. Response:
+ *   { signers: [{ id, name, title, png_b64, updated_at }] }
+ */
+app.get('/api/principal-signers', requireAdmin, async (_req, res) => {
+  try {
+    const signers = await loadPrincipalSigners()
+    res.json({
+      signers: signers.map(({ id, name, title, png_b64, updated_at, error }) =>
+        ({ id, name, title, png_b64, updated_at, error })),
+    })
+  } catch (err) {
+    console.error('GET /api/principal-signers error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/**
+ * POST /api/principal-signers
+ * Add a signer, or update one when `id` is given (png_b64 optional on
+ * update — omit it to change only the name/title).
+ * Body: { id?, name, title, png_b64? }
+ */
+app.post('/api/principal-signers', requireAdmin, express.json({ limit: '5mb' }), async (req, res) => {
+  try {
+    const { id, name, title, png_b64 } = req.body || {}
+    const data = await callAppsScript('save_principal_signer', {
+      id:      id || '',
+      name:    String(name  || '').trim(),
+      title:   String(title || '').trim(),
+      png_b64: png_b64 || '',
+    })
+    if (!data || data.error) return res.status(400).json({ error: data?.error || 'Save failed' })
+    signersCache = null
+    res.json(data)   // { success, signer }
+  } catch (err) {
+    console.error('POST /api/principal-signers error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+/** DELETE /api/principal-signers/:id */
+app.delete('/api/principal-signers/:id', requireAdmin, async (req, res) => {
+  try {
+    const data = await callAppsScript('delete_principal_signer', { id: req.params.id })
+    if (!data || data.error) return res.status(400).json({ error: data?.error || 'Delete failed' })
+    signersCache = null
+    res.json(data)
+  } catch (err) {
+    console.error(`DELETE /api/principal-signers/${req.params.id} error:`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// "YYYY-MM-DD" → CP signature-line parts, built from the string's own
+// components (never new Date(str), which parses as UTC midnight and can
+// shift the day). Returns null on anything that isn't a real date.
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+                'August', 'September', 'October', 'November', 'December']
+function cpSignDateParts(isoDate) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate || ''))
+  if (!m) return null
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const check = new Date(Date.UTC(y, mo - 1, d))
+  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) {
+    return null
+  }
+  return { dateStr: `${MONTHS[mo - 1]} ${d}`, yearStr: String(y).slice(-2) }
+}
+
 /**
  * POST /api/approvals/:fileId/approve-cert-payroll
  * Certified-Payroll-specific approval: same modal-driven flow as
@@ -1478,20 +1574,35 @@ app.post('/api/approvals/:fileId/approve-signin', express.json({ limit: '5mb' })
  * the Signature_Block rect added in Acrobat.
  *
  * Date format on the CP signature line is "<Month> <D>, 20YY"
- * (e.g. "May 2, 2026"). The form has the literal "20" pre-printed
+ * (e.g. "May 2, 2026"). The form has the literal ",20" pre-printed
  * between the DATE and YEAR fields, so:
- *   - DATE field gets "<Full Month> <Day>,"   e.g. "May 2,"
+ *   - DATE field gets "<Full Month> <Day>"    e.g. "May 2"
  *   - YEAR field gets the 2-digit year         e.g. "26"
  *
- * Body: { signature_b64: string, name: string, title: string }
+ * Body: { signer_id | signature_b64, name, title, sign_date: "YYYY-MM-DD" }
+ *   signer_id     — a saved principal signer; the server supplies the PNG
+ *                   (admin cookie required, like /api/principal-signers)
+ *   signature_b64 — a signature drawn in the modal instead
  */
 app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5mb' }), async (req, res) => {
   const fileId = req.params.fileId
   try {
-    const { signature_b64, name, title } = req.body || {}
-    if (!signature_b64) return res.status(400).json({ error: 'Missing signature_b64' })
+    const { signer_id, name, title, sign_date } = req.body || {}
+    let { signature_b64 } = req.body || {}
+    if (signer_id) {
+      if (roleForCode(readCookie(req, ACCESS_COOKIE)) !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required' })
+      }
+      const signer = (await loadPrincipalSigners()).find(s => s.id === signer_id)
+      if (!signer)         return res.status(400).json({ error: 'Saved signer not found' })
+      if (!signer.png_b64) return res.status(500).json({ error: 'Saved signature image is unreadable' })
+      signature_b64 = signer.png_b64
+    }
+    if (!signature_b64) return res.status(400).json({ error: 'Missing signature' })
     if (!name || !String(name).trim())   return res.status(400).json({ error: 'Missing name' })
     if (!title || !String(title).trim()) return res.status(400).json({ error: 'Missing title' })
+    const signDate = cpSignDateParts(sign_date)
+    if (!signDate) return res.status(400).json({ error: 'Missing or invalid sign date' })
 
     // 1. Fetch original PDF bytes + filename from Drive
     const fetched = await callAppsScript('get_drive_file_bytes', { file_id: fileId })
@@ -1519,17 +1630,9 @@ app.post('/api/approvals/:fileId/approve-cert-payroll', express.json({ limit: '5
     const form   = pdfDoc.getForm()
     const helv   = await pdfDoc.embedFont(StandardFonts.Helvetica)
 
-    // Date: today in America/New_York. Same TZ rationale as the sign-in
-    // route — without the override Node runs in UTC and rolls over at 20:00 ET.
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone:  'America/New_York',
-      month:     'long',
-      day:       'numeric',
-      year:      '2-digit',
-    }).formatToParts(new Date())
-    const pick = (t) => parts.find(p => p.type === t)?.value || ''
-    const dateStr = `${pick('month')} ${pick('day')},`
-    const yearStr = pick('year')
+    // Date: chosen in the modal (defaults to today in America/New_York
+    // client-side), validated above.
+    const { dateStr, yearStr } = signDate
 
     // Helper: locate a field's widget rect + page.
     const locateField = (fieldName) => {
