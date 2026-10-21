@@ -3233,7 +3233,9 @@ function _payPeriodHoursForEmployee_(signInData, empName, weekStart, weekEnd) {
 //            the hours already on the OVT line, so counting it would
 //            double the OT hours.
 //   TRAVEL — "REG TRAVEL" is travel time, not field hours, and would
-//            otherwise match the regular bucket.
+//            otherwise match the regular bucket. Its hours are kept aside
+//            (see _cpPaystubHours_) because payroll may fold some or all
+//            of them into OVT — _cpCompareHours_ accounts for that.
 //   The rest carry dollars only (fund pass-throughs, flat bonus).
 // Any other code that carries hours is reported as unrecognized so these
 // lists can be kept current.
@@ -3250,12 +3252,18 @@ const CP_OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME'];
  * premium on top (e.g. REGULAR UN 34.00 @47 + OVT 3.50 @23.50 = 30.5 ST
  * + 3.5 OT at 1.5×). So OT = OVT hours and ST = regular hours − OVT hours.
  *
- * Returns { st, ot, total, unknown: [{code, hours}], usable }. `usable` is
- * false when the stub has no regular hour line (e.g. a Pre-Check Register,
- * which doesn't itemize) — the caller then can't verify hours.
+ * Travel hours (REG TRAVEL) are NOT field hours and are not in the regular
+ * line, but payroll may count some or all of them as overtime, in which
+ * case they are included in the OVT hours. They are returned as `travel`
+ * so the comparison can account for that.
+ *
+ * Returns { st, ot, total, travel, unknown: [{code, hours}], usable }.
+ * `usable` is false when the stub has no regular hour line (e.g. a
+ * Pre-Check Register, which doesn't itemize) — the caller then can't
+ * verify hours.
  */
 function _cpPaystubHours_(ps) {
-  const out = { st: 0, ot: 0, total: 0, unknown: [], usable: false };
+  const out = { st: 0, ot: 0, total: 0, travel: 0, unknown: [], usable: false };
   const lines = (ps && Array.isArray(ps.earnings_lines)) ? ps.earnings_lines : [];
   const has = (upper, list) => list.some(c => upper.indexOf(c) !== -1);
   lines.forEach(l => {
@@ -3263,6 +3271,7 @@ function _cpPaystubHours_(ps) {
     const hours = Number(l && l.hours);
     if (!code || l.hours == null || !isFinite(hours)) return;
     const upper = code.toUpperCase();
+    if (upper.indexOf('TRAVEL') !== -1) { out.travel += hours; return; }
     if (has(upper, CP_IGNORED_HOURS_CODES)) return;
     if (has(upper, CP_REGULAR_HOURS_CODES))  { out.total += hours; out.usable = true; return; }
     if (has(upper, CP_OVERTIME_HOURS_CODES)) { out.ot += hours; return; }
@@ -3271,6 +3280,47 @@ function _cpPaystubHours_(ps) {
   // Not clamped: OVT exceeding the regular line is itself a sign of a
   // misread or a payroll error, and should surface as a mismatch.
   out.st = out.total - out.ot;
+  return out;
+}
+
+/**
+ * Compare sign-in hours ({st, ot}) with paystub hours (_cpPaystubHours_).
+ *
+ * The total must match first: the regular line holds every FIELD hour, so
+ * it should equal sign-in ST + OT however travel was paid. Once it does,
+ * the only unknown is how many travel hours payroll folded into OVT. For
+ * the split to match, that must be t = paystub OVT − sign-in OT:
+ *   t = 0              → plain match ('ok')
+ *   0 < t ≤ travel     → matches if t travel hours were paid as OT ('travel')
+ *   t < 0 or t > travel → travel can't explain it ('mismatch')
+ * With no travel on the stub this reduces to the plain ST/OT comparison.
+ *
+ * Returns { status: 'unverified'|'ok'|'travel'|'mismatch', ok, travelOt,
+ * reason }. `ok` is true for 'ok' and 'travel'. `travelOt` (hours) is set
+ * for 'travel'. `reason` explains a mismatch, else ''.
+ */
+function _cpCompareHours_(sys, psHrs) {
+  const tol  = 0.01;
+  const fmt  = h => String(Math.round(h * 100) / 100);
+  const out  = { status: 'mismatch', ok: false, travelOt: 0, reason: '' };
+  if (!psHrs || !psHrs.usable) { out.status = 'unverified'; return out; }
+  const travel   = psHrs.travel || 0;
+  const sysTotal = sys.st + sys.ot;
+  if (Math.abs(sysTotal - psHrs.total) > tol) {
+    out.reason = 'total field hours differ (sign-in ' + fmt(sysTotal) + ' h vs paystub regular line ' +
+                 fmt(psHrs.total) + ' h)' +
+                 (travel > tol ? '; the ' + fmt(travel) + ' travel h on the stub are not part of that total' : '');
+    return out;
+  }
+  const t = psHrs.ot - sys.ot;
+  if (Math.abs(t) <= tol) { out.status = 'ok'; out.ok = true; return out; }
+  if (t > 0 && t <= travel + tol) {
+    out.status = 'travel'; out.ok = true; out.travelOt = Math.min(t, travel);
+    return out;
+  }
+  out.reason = travel > tol
+    ? 'the ' + fmt(travel) + ' travel h on the stub can\'t account for the OT difference of ' + fmt(t) + ' h'
+    : 'OT differs by ' + fmt(t) + ' h';
   return out;
 }
 
@@ -3608,21 +3658,26 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         // Computed once per person per run (cached for the sanity-check log
         // below), so the warning also fires once.
         if (!hoursCheckByName[normName(empName)]) {
-          const sys    = _payPeriodHoursForEmployee_(data, empName, weekStart, weekEnd);
-          const psHrs  = _cpPaystubHours_(ps);
-          const tolHrs = 0.01;
-          const hoursOk = psHrs.usable &&
-            Math.abs(sys.st - psHrs.st) <= tolHrs && Math.abs(sys.ot - psHrs.ot) <= tolHrs;
-          hoursCheckByName[normName(empName)] = { sys: sys, ps: psHrs, ok: hoursOk };
-          if (!psHrs.usable) {
+          const sys   = _payPeriodHoursForEmployee_(data, empName, weekStart, weekEnd);
+          const psHrs = _cpPaystubHours_(ps);
+          const cmp   = _cpCompareHours_(sys, psHrs);
+          hoursCheckByName[normName(empName)] = { sys: sys, ps: psHrs, ok: cmp.ok, cmp: cmp };
+          if (cmp.status === 'unverified') {
             warnedNames[normName(empName)] = true;
             _psWarn('hours_unverified',
               empName + ': no REGULAR hours line was found on the paystub, so hours could not be checked.');
-          } else if (!hoursOk) {
+          } else if (cmp.status === 'travel') {
+            // Counts as verified — the numbers reconcile — but the travel
+            // split is inferred, so say so.
+            _psWarn('hours_travel',
+              empName + ': hours match if ' + fmtH(cmp.travelOt) + ' of the ' + fmtH(psHrs.travel) +
+              ' travel hours on the paystub were paid as overtime (included in OVT). We think travel ' +
+              'accounts for the difference, but we may be wrong — worth a double-check.');
+          } else if (!cmp.ok) {
             warnedNames[normName(empName)] = true;
-            let note = '';
+            let note = cmp.reason ? cmp.reason.charAt(0).toUpperCase() + cmp.reason.slice(1) + '.' : '';
             if (psHrs.unknown.length) {
-              note = 'Unrecognized earnings line' + (psHrs.unknown.length === 1 ? '' : 's') +
+              note += (note ? ' ' : '') + 'Unrecognized earnings line' + (psHrs.unknown.length === 1 ? '' : 's') +
                      ' with hours: ' +
                      psHrs.unknown.map(x => x.code + ' ' + fmtH(x.hours) + 'h').join(', ') +
                      ' — not counted; tell us if it should be.';
@@ -3635,7 +3690,8 @@ function generateCertifiedPayroll(weekStartStr, opts) {
                 paystub: { st: fmtH(psHrs.st), ot: fmtH(psHrs.ot) },
                 note:    note,
                 message: empName + ': sign-in hours ST ' + fmtH(sys.st) + ' / OT ' + fmtH(sys.ot) +
-                         ' vs paystub ST ' + fmtH(psHrs.st) + ' / OT ' + fmtH(psHrs.ot) + '.',
+                         ' vs paystub ST ' + fmtH(psHrs.st) + ' / OT ' + fmtH(psHrs.ot) + '.' +
+                         (note ? ' ' + note : ''),
               });
             }
           }
@@ -3745,6 +3801,11 @@ function generateCertifiedPayroll(weekStartStr, opts) {
           else if (!h.ps.usable) hoursTxt = '⚠️ hours UNVERIFIED (no REGULAR hours line on paystub)';
           else hoursTxt = (h.ok ? '✅' : '⚠️') + ' hours sign-in ST ' + fmtH(h.sys.st) + ' / OT ' + fmtH(h.sys.ot) +
                           ' vs paystub ST ' + fmtH(h.ps.st) + ' / OT ' + fmtH(h.ps.ot) +
+                          (h.ps.travel ? ', travel ' + fmtH(h.ps.travel) + 'h' : '') +
+                          (h.cmp.status === 'travel'
+                            ? ' (matches if ' + fmtH(h.cmp.travelOt) + ' travel h were paid as OT — inferred, double-check)'
+                            : '') +
+                          (!h.ok && h.cmp.reason ? ' — ' + h.cmp.reason : '') +
                           (h.ps.unknown.length
                             ? ' (unrecognized: ' + h.ps.unknown.map(x => x.code + ' ' + fmtH(x.hours) + 'h').join(', ') + ')'
                             : '');

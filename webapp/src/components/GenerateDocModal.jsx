@@ -7,6 +7,9 @@ import { useEffect, useState } from 'react'
 // type without a coupled webapp deploy.
 const isHoursWarning = w => w && w.type === 'hours'
 const isGrossExceedsWarning = w => w && w.type === 'gross_exceeds'
+// Informational, not a failure: hours reconciled once some travel hours
+// were assumed to be paid as OT. Shown apart from the amber blocks.
+const isTravelNote = w => w && w.type === 'hours_travel'
 const warningText = w => {
   if (typeof w === 'string') return w
   if (!w) return ''
@@ -91,7 +94,8 @@ export default function GenerateDocModal({
 
   const hoursWarnings = warnings.filter(isHoursWarning)
   const grossWarnings = warnings.filter(isGrossExceedsWarning)
-  const otherWarnings = warnings.filter(w => !isHoursWarning(w) && !isGrossExceedsWarning(w))
+  const travelNotes   = warnings.filter(isTravelNote)
+  const otherWarnings = warnings.filter(w => !isHoursWarning(w) && !isGrossExceedsWarning(w) && !isTravelNote(w))
 
   const handleConfirm = async () => {
     if (state === 'submitting') return
@@ -174,6 +178,16 @@ export default function GenerateDocModal({
                         {w.note && <span className="block text-[10px] text-amber-500">{w.note}</span>}
                       </li>
                     ))}
+                  </ul>
+                </div>
+              )}
+              {travelNotes.length > 0 && (
+                <div className="text-left bg-sky-50 border border-sky-200 rounded-lg p-2.5 space-y-1">
+                  <p className="text-[12px] font-bold text-sky-700">
+                    ℹ Travel time may explain the overtime for {travelNotes.length} employee{travelNotes.length === 1 ? '' : 's'}
+                  </p>
+                  <ul className="text-[11px] text-sky-800 space-y-0.5 max-h-[120px] overflow-y-auto">
+                    {travelNotes.map((w, i) => <li key={i}>{warningText(w)}</li>)}
                   </ul>
                 </div>
               )}

@@ -38,20 +38,24 @@ const fmtDay = (iso) => {
 // the code lists in step. REGULAR UN carries ALL hours worked (ST + OT);
 // OVT carries just the OT hours, so ST = regular − OVT. Ignored codes win:
 // WAOT repeats the OT hours as a premium, and REG TRAVEL would otherwise
-// match the regular bucket.
+// match the regular bucket. Travel hours are returned separately: payroll may
+// fold some of them into OVT, which only the CP check (with the sign-in
+// hours) can sort out, so the preview just flags them.
 const IGNORED_HOURS_CODES  = ['WAOT', 'TRAVEL', 'BONUS', 'VACATION', 'CASH FRING', 'HOLIDAY', 'SICK']
 const REGULAR_HOURS_CODES  = ['REGULAR', 'REG UNION']
 const OVERTIME_HOURS_CODES = ['OVT', 'OVERTIME']
 const stubHours = (lines) => {
   const has = (code, list) => list.some(c => code.includes(c))
-  let total = 0, ot = 0, found = false
+  let total = 0, ot = 0, travel = 0, found = false
   for (const l of Array.isArray(lines) ? lines : []) {
     const code = String(l?.code || '').toUpperCase()
-    if (l?.hours == null || !code || has(code, IGNORED_HOURS_CODES)) continue
+    if (l?.hours == null || !code) continue
+    if (code.includes('TRAVEL')) { travel += Number(l.hours) || 0; continue }
+    if (has(code, IGNORED_HOURS_CODES)) continue
     if (has(code, REGULAR_HOURS_CODES))       { total += Number(l.hours) || 0; found = true }
     else if (has(code, OVERTIME_HOURS_CODES)) { ot += Number(l.hours) || 0 }
   }
-  return found ? { st: total - ot, ot } : null
+  return found ? { st: total - ot, ot, travel } : null
 }
 const fmtHours = h => (h == null ? '—' : String(Math.round(h * 100) / 100))
 
@@ -183,7 +187,14 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
                     {e.name}
                   </td>
                   <td className="py-0.5 px-1 text-right tabular-nums">{fmtHours(hrs?.st)}</td>
-                  <td className="py-0.5 px-1 text-right tabular-nums">{fmtHours(hrs?.ot)}</td>
+                  <td className="py-0.5 px-1 text-right tabular-nums">
+                    {fmtHours(hrs?.ot)}
+                    {hrs?.travel > 0 && (
+                      <span className="block text-[9px] text-sky-600" title="Some travel hours may be included in OT — checked against sign-in hours on Generate">
+                        +{fmtHours(hrs.travel)} travel
+                      </span>
+                    )}
+                  </td>
                   <td className="py-0.5 px-1 text-right tabular-nums">{fmtMoney(e.gross_pay)}</td>
                   {anyBonus && (
                     <td className="py-0.5 px-1 text-right tabular-nums text-slate-400">
