@@ -343,6 +343,13 @@ export default function SignIn() {
   // Per-queue draft state — switching between entries doesn't wipe progress.
   const [drafts, setDrafts] = useState(() => new Map())
   const [submitting, setSubmitting] = useState(false)
+  // Synchronous double-submit guard. `submitting` state alone can't stop
+  // a double tap: both clicks run against the same render (submitting
+  // still false) before React re-renders, and handleSubmit awaits the
+  // continuation check before submitting — a ~2-3s window. A double tap
+  // there once sent two concurrent submit_signin calls and duplicated
+  // every crew row in Daily Sign-In Data. Taken before the first await.
+  const submitLockRef = useRef(false)
   const [toast, setToast] = useState({ message: '', kind: 'success' })
   const toastTimer = useRef(null)
 
@@ -659,8 +666,8 @@ export default function SignIn() {
   }
 
   // ── Submit ───────────────────────────────────────────────────
+  // Callers must hold submitLockRef (handleSubmit / resolveContinuation).
   const submitWithDate = async (crewClean, dateToSend) => {
-    setSubmitting(true)
     try {
       const res = await fetch('/api/signin', {
         method: 'POST',
@@ -727,13 +734,22 @@ export default function SignIn() {
       )
     } catch (err) {
       showToast(err.message || 'Submit failed', 'error')
-    } finally {
-      setSubmitting(false)
     }
   }
 
+  const acquireSubmitLock = () => {
+    if (submitLockRef.current) return false
+    submitLockRef.current = true
+    setSubmitting(true)
+    return true
+  }
+  const releaseSubmitLock = () => {
+    submitLockRef.current = false
+    setSubmitting(false)
+  }
+
   const handleSubmit = async () => {
-    if (!selected || !draft || submitting) return
+    if (!selected || !draft || submitLockRef.current) return
 
     const crewClean = draft.crew.filter(m => m.name && m.name.trim())
     if (crewClean.length === 0) {
@@ -753,44 +769,54 @@ export default function SignIn() {
     // of last night's shift. Prompt them to confirm before submit.
     // The user's kebab override (shiftDateEdited=true) skips the check
     // entirely — they've explicitly chosen the date.
-    if (!draft.shiftDateEdited) {
-      try {
-        const checkRes = await fetch('/api/signin-queue/check-continuation', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            time_in:      crewClean[0].timeIn,
-            default_date: effectiveDate,
-          }),
-        })
-        const checkJson = await checkRes.json()
-        if (checkJson && checkJson.continuation) {
-          // Open the prompt; resume on user choice.
-          setContinuationPrompt({
-            previousDate:     checkJson.previous_date,
-            previousContract: checkJson.previous_contract,
-            previousTimeOut:  checkJson.previous_time_out,
-            gapMinutes:       checkJson.gap_minutes,
-            crewClean,
+    if (!acquireSubmitLock()) return
+    try {
+      if (!draft.shiftDateEdited) {
+        try {
+          const checkRes = await fetch('/api/signin-queue/check-continuation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              time_in:      crewClean[0].timeIn,
+              default_date: effectiveDate,
+            }),
           })
-          return
+          const checkJson = await checkRes.json()
+          if (checkJson && checkJson.continuation) {
+            // Open the prompt; resume on user choice.
+            setContinuationPrompt({
+              previousDate:     checkJson.previous_date,
+              previousContract: checkJson.previous_contract,
+              previousTimeOut:  checkJson.previous_time_out,
+              gapMinutes:       checkJson.gap_minutes,
+              crewClean,
+            })
+            return
+          }
+        } catch (err) {
+          // Sanity check is best-effort; failures shouldn't block submit.
+          console.warn('check-continuation failed; proceeding with default date:', err)
         }
-      } catch (err) {
-        // Sanity check is best-effort; failures shouldn't block submit.
-        console.warn('check-continuation failed; proceeding with default date:', err)
       }
-    }
 
-    await submitWithDate(crewClean, effectiveDate)
+      await submitWithDate(crewClean, effectiveDate)
+    } finally {
+      releaseSubmitLock()
+    }
   }
 
   // Resolved by the continuation modal. yes = use previous_date; no = use effectiveDate.
   const resolveContinuation = async (useChoice) => {
     if (!continuationPrompt) return
+    if (!acquireSubmitLock()) return
     const { crewClean, previousDate } = continuationPrompt
     const chosen = useChoice === 'yes' ? previousDate : effectiveDate
     setContinuationPrompt(null)
-    await submitWithDate(crewClean, chosen)
+    try {
+      await submitWithDate(crewClean, chosen)
+    } finally {
+      releaseSubmitLock()
+    }
   }
 
   // ── Render ───────────────────────────────────────────────────

@@ -6305,24 +6305,6 @@ function handleListSignInQueue_(body) {
 function handleSubmitSignIn_(body) {
   const d = body.data || {};
 
-  // Idempotency cache. Client sends a stable `submit_id` per draft;
-  // we cache the response under that id for 10 minutes. A retry after
-  // a perceived failure (network blip, slow response, etc) hits the
-  // cache and returns the original success — no duplicate rows in
-  // Daily Sign-In Data.
-  const submitId = String(d.submit_id || '').trim();
-  const _cache = submitId ? CacheService.getScriptCache() : null;
-  if (_cache) {
-    const cached = _cache.get('signin_submit_' + submitId);
-    if (cached) {
-      try {
-        const obj = JSON.parse(cached);
-        return jsonResponse_({ ...obj, duplicate: true });
-      } catch (e) { /* fall through, recompute */ }
-    }
-  }
-
-
   if (!d.date)            return jsonResponse_({ error: 'Missing date' }, 400);
   if (!d.contract_number) return jsonResponse_({ error: 'Missing contract_number' }, 400);
   if (!d.borough)         return jsonResponse_({ error: 'Missing borough' }, 400);
@@ -6343,6 +6325,49 @@ function handleSubmitSignIn_(body) {
   if (source === 'uploaded' && !d.upload_blob_b64) {
     return jsonResponse_({ error: 'upload_blob_b64 required when source=uploaded' }, 400);
   }
+
+  // Idempotency cache. Client sends a stable `submit_id` per draft;
+  // we cache the response under that id for 10 minutes. A retry after
+  // a perceived failure (network blip, slow response, etc) hits the
+  // cache and returns the original success — no duplicate rows in
+  // Daily Sign-In Data.
+  //
+  // The result is only cached on success, so on its own this misses a
+  // CONCURRENT duplicate: a double tap sent two identical submits that
+  // ran side by side, both found the cache empty, and both appended
+  // every crew row. So claim the id as in-flight first, under a script
+  // lock so check-and-claim is atomic; a second copy arriving while the
+  // first runs is turned away before it writes anything.
+  const submitId = String(d.submit_id || '').trim();
+  const _cache = submitId ? CacheService.getScriptCache() : null;
+  const _cacheKey = 'signin_submit_' + submitId;
+  const SUBMIT_INFLIGHT = '__inflight__';
+  if (_cache) {
+    const lock = LockService.getScriptLock();
+    try { lock.waitLock(20000); } catch (e) {
+      return jsonResponse_({ error: 'Could not acquire lock — try again' }, 503);
+    }
+    try {
+      const cached = _cache.get(_cacheKey);
+      if (cached === SUBMIT_INFLIGHT) {
+        return jsonResponse_({ error: 'This sign-in is already being submitted — refresh in a moment to confirm it went through.' }, 409);
+      }
+      if (cached) {
+        try {
+          const obj = JSON.parse(cached);
+          return jsonResponse_({ ...obj, duplicate: true });
+        } catch (e) { /* fall through, recompute */ }
+      }
+      _cache.put(_cacheKey, SUBMIT_INFLIGHT, 600);
+    } finally {
+      lock.releaseLock();
+    }
+  }
+  // Every exit below must replace the in-flight marker: the success
+  // result on success, removal otherwise so a genuine retry can proceed.
+  const _releaseClaim = () => {
+    if (_cache) { try { _cache.remove(_cacheKey); } catch (e) { /* best-effort */ } }
+  };
 
   let step = 'init';
   try {
@@ -6654,11 +6679,12 @@ function handleSubmitSignIn_(body) {
 
     const result = { success: true, filename: writtenName, source };
     if (_cache) {
-      try { _cache.put('signin_submit_' + submitId, JSON.stringify(result), 600); }
+      try { _cache.put(_cacheKey, JSON.stringify(result), 600); }
       catch (e) { /* cache write best-effort */ }
     }
     return jsonResponse_(result);
   } catch (err) {
+    _releaseClaim();
     const msg = (err && err.message) ? err.message : String(err);
     const wrapped = new Error(`[step=${step}] ${msg}`);
     wrapped.stack = err && err.stack ? err.stack : wrapped.stack;
