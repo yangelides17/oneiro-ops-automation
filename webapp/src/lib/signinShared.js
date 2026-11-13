@@ -8,7 +8,8 @@
 // Mirrors the dropdown validation on Daily Sign-In Data → Classification.
 // Keep in sync with the sheet validation, or submissions fail with
 // "Invalid Entry".
-export const CLASSIFICATIONS = ['LP', 'SAT']
+// LP = Line Person, SAT = Striping Assistant, OP = Operator.
+export const CLASSIFICATIONS = ['LP', 'SAT', 'OP']
 
 // Day-of-week-aware hours/OT for a single row. Sat/Sun → all OT; weekday
 // over 8h → OT. `workDateIso` is the SHIFT START date (YYYY-MM-DD),

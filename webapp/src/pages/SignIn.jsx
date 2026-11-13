@@ -494,8 +494,8 @@ export default function SignIn() {
       employees.forEach(e => { normIdx[normName(e.name)] = e.name })
 
       const crewMembers = (crewIn.length ? crewIn : [{}]).map(c => {
-        const cls = (c.classification === 'LP' || c.classification === 'SAT')
-          ? c.classification : CLASSIFICATIONS[0]
+        const ocrCls = String(c.classification || '').trim().toUpperCase()
+        const cls = CLASSIFICATIONS.includes(ocrCls) ? ocrCls : CLASSIFICATIONS[0]
         const m = newCrew()
         const rawName = String(c.name || '').trim()
         const matched = rawName ? normIdx[normName(rawName)] : ''

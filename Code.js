@@ -565,6 +565,13 @@ function setupContractPricing() {
 
 
 /**
+ * Employee classification codes accepted on sign-in rows and Payroll
+ * Rates. Keep in sync with webapp/src/lib/signinShared.js CLASSIFICATIONS
+ * and the Daily Sign-In Data → Classification dropdown.
+ */
+const SIGNIN_CLASSIFICATIONS_ = ['LP', 'SAT', 'OP'];
+
+/**
  * Payroll Rates: prevailing-wage schedule keyed by employee
  * classification with an effective-date column. Mirrors the Contract
  * Pricing pattern — newest dated row whose Effective Date <= the
@@ -593,9 +600,9 @@ function setupPayrollRates() {
   sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
   sheet.setFrozenRows(1);
 
-  // Classification dropdown (LP/SAT) on col A.
+  // Classification dropdown on col A.
   const classRule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(['LP', 'SAT'], true)
+    .requireValueInList(SIGNIN_CLASSIFICATIONS_, true)
     .setAllowInvalid(false)
     .build();
   sheet.getRange(2, 1, 999, 1).setDataValidation(classRule);
@@ -7369,8 +7376,9 @@ function handleSaveSignInRowEdits_(body) {
     Object.keys(editByRow).forEach(riStr => {
       const row = data[Number(riStr) - 1];
       const e   = editByRow[riStr];
-      const cls = (e.classification === 'LP' || e.classification === 'SAT')
-        ? e.classification : String(row[7] || '').trim();
+      const editCls = String(e.classification || '').trim().toUpperCase();
+      const cls = SIGNIN_CLASSIFICATIONS_.indexOf(editCls) !== -1
+        ? editCls : String(row[7] || '').trim();
       const tin  = String(e.time_in  || '').trim();
       const tout = String(e.time_out || '').trim();
       row[7]  = cls;
@@ -10984,7 +10992,7 @@ function _resolveRateRow_(rates, contractor, contractNum, borough, dateIso) {
  * effective_date as a Date (or null when the cell is blank).
  *
  * Returns: [{
- *   classification: 'LP'|'SAT',
+ *   classification: 'LP'|'SAT'|'OP',
  *   effective_date: Date|null,
  *   st_rate, ot_rate, st_supp, ot_supp: number,
  *   notes: string,

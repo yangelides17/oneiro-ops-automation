@@ -1790,7 +1790,7 @@ Schema:
   "crew": [
     {
       "name":           "<EXACTLY one name from the Employee Registry below — see Name matching rules.>",
-      "classification": "<Either \\"LP\\" or \\"SAT\\". LP = Line Person/Crew Chief. SAT = Stripe Assistant Technician. Return null if blank.>",
+      "classification": "<One of \\"LP\\", \\"SAT\\", or \\"OP\\". LP = Line Person/Crew Chief. SAT = Stripe Assistant Technician. OP = Operator. Return null if blank.>",
       "time_in":        "<24-hour HH:MM from the \\"Time In\\" column. See \\"Time interpretation\\" below. null if unreadable.>",
       "time_out":       "<24-hour HH:MM from the \\"Time Out\\" column. See \\"Time interpretation\\" below. null if unreadable.>"
     }
@@ -1824,7 +1824,7 @@ Column layout (CRITICAL — must not be confused):
 
 Rules:
 - Skip rows that are entirely blank. Only include crew rows that have at least one filled cell (name, time, or classification).
-- Classification: only "LP" or "SAT". If the sheet uses other codes, pick the closest match; otherwise null.
+- Classification: only "LP", "SAT", or "OP". If the sheet uses other codes, pick the closest match; otherwise null.
 - Never wrap the JSON in markdown fences.`
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
