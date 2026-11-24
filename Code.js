@@ -15752,6 +15752,13 @@ function _buildDocStatusPayload_(monthIso) {
   const monthEndIsDue = (monIso) =>
     todayIso >= addDaysIso(monthLastWeekStartIso(monIso), 7) ||
     (/^\d{4}-\d{2}$/.test(_meForceThrough) && monIso <= _meForceThrough);
+  // Same override for Certified Payroll: a week is released early when it
+  // falls on/before the forced month's last payroll week (the week holding
+  // the month's last day — matching which weeks feed that month's docs).
+  const cpIsDue = (weekStartIso) =>
+    todayIso >= addDaysIso(weekStartIso, 11) ||
+    (/^\d{4}-\d{2}$/.test(_meForceThrough) &&
+      weekStartIso <= monthLastWeekStartIso(_meForceThrough));
 
   // Walk Work Day Log → group at TWO granularities:
   //   contractorDays[dateIso|contractor|crewChief] = per-crew PL shell
@@ -16101,7 +16108,7 @@ function _buildDocStatusPayload_(monthIso) {
     const cp = logById[cpId];
     const cpDone = cp && cp.done;
     const cpSent = cp && cp.sent;
-    const cpDue  = todayIso >= addDaysIso(w.week_start, 11);
+    const cpDue  = cpIsDue(w.week_start);
     if (!cpDone && cpDue) pushPending(w, 'week', w.week_start, cpId, ['CP Done']);
     if (cpDone && !cpSent) pushPending(w, 'week', w.week_start, cpId, ['CP Sent']);
   });
