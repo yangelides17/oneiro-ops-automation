@@ -72,7 +72,7 @@ const BIKE_GLYPH =
 // every pin. (PT orders never carry preform thermo, so no badge there.)
 function buildPinIcon(status, hasWarning, woId, hasPreform) {
   const color = PIN_COLOR[(status || '').toLowerCase()] || '#94a3b8'  // slate fallback
-  const isPT = (woId || '').trim().toUpperCase().startsWith('PT')
+  const isPT = /^(PT|PF)-/i.test((woId || '').trim())  // paint/MMA WOs — mirrors _isPaintWoId_ in Code.js
   const shape = isPT ? PIN_SHAPE.square : PIN_SHAPE.teardrop
   const strokeColor = hasWarning ? '#dc2626' : '#0f172a'  // red-600 or navy
   const strokeWeight = hasWarning ? 2.5 : 1.2

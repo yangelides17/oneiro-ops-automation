@@ -339,7 +339,7 @@ function LaborCostChart({ laborDaily }) {
         </ResponsiveContainer>
       ) : (
         <p className="text-sm text-slate-400 py-12 text-center">
-          No labor recorded in range — needs Daily Sign-In Data with PT-/RM- work
+          No labor recorded in range — needs Daily Sign-In Data with PT-/PF-/RM- work
           orders and matching Payroll Rates.
         </p>
       )}

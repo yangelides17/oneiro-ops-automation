@@ -645,14 +645,14 @@ def normalize_wo_data(raw: dict) -> dict:
 
     # ── WO-number prefix override (authoritative) ─────────────────
     # The WO number prefix is a reliable work-type signal:
-    #   PT-XXXXX = Paint → Color Surface / MMA work
+    #   PT-XXXXX / PF-XXXXX = Paint → Color Surface / MMA work
     #   RM-XXXXX = Road Markings → Thermo work
-    # It overrides the heuristic above. For PT we also flag waterblasting
+    # It overrides the heuristic above. For PT/PF we also flag waterblasting
     # (Yes - MMA) so the Field Report's MMA gate requires confirmation
     # before submit; confirmed stays 'Yes' only if WB SQFT was on the form.
     # Any other prefix leaves the heuristic result untouched.
     wo_prefix = (raw.get('work_order_id') or '').strip().upper().split('-')[0]
-    if wo_prefix == 'PT':
+    if wo_prefix in ('PT', 'PF'):
         work_type             = 'MMA'
         water_blast_required  = 'Yes - MMA'
         water_blast_confirmed = 'Yes' if wb_sqft else 'No'

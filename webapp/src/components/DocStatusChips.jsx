@@ -37,10 +37,10 @@ const PICS_DOC_TYPE = {
     + 'after-work-complete) are uploaded before marking Done',
 }
 
-// PT-XXXXX = Paint/MMA work order — the only WO type the DOT photo
-// requirement applies to. Mirrors the isPaintWO check in Code.js.
+// PT-XXXXX / PF-XXXXX = Paint/MMA work orders — the only WO types the DOT
+// photo requirement applies to. Mirrors _isPaintWoId_ in Code.js.
 function isPTWo(woId) {
-  return String(woId || '').toUpperCase().startsWith('PT-')
+  return /^(PT|PF)-/i.test(String(woId || '').trim())
 }
 
 // Lifecycle state → visual style. Three states only: not done, done

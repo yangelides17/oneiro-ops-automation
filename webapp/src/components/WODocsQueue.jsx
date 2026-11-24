@@ -20,9 +20,9 @@ import FilterBar from './FilterBar'
  */
 const isCompleted = (wo) => String(wo?.status || '').toLowerCase() === 'completed'
 const docFull = (d) => !!(d && d.done && d.sent)
-// PT-XXXXX = Paint/MMA WO — the only type the DOT proof-of-work photo
-// requirement applies to. Mirrors the isPaintWO check in Code.js.
-const isPTWo = (id) => String(id || '').toUpperCase().startsWith('PT-')
+// PT-XXXXX / PF-XXXXX = Paint/MMA WOs — the only types the DOT proof-of-work
+// photo requirement applies to. Mirrors _isPaintWoId_ in Code.js.
+const isPTWo = (id) => /^(PT|PF)-/i.test(String(id || '').trim())
 
 // Completed WO whose CFR or Invoice isn't fully done+sent — or, for PT
 // (paint/MMA) WOs, whose PICS proof-of-work photos aren't done+sent.

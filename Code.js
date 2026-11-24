@@ -1531,6 +1531,38 @@ function _approvedDocsHasWork_() {
   }
 }
 
+/**
+ * Pull the WO # out of a generated doc's filename.
+ *
+ * WO numbers are a two-letter prefix (PT / PF / RM / PM / …), a dash,
+ * digits, and an optional single-letter split suffix (RM-50874-A). The old
+ * hard-coded /(PT|RM|PM)[-_]?\d+/ dropped PF- WOs entirely and truncated
+ * RM-50874-A to RM-50874, so their CFRs landed in Archive Errors.
+ *
+ * Structured names (`CFR_<WO>_<date>`, `Contractor_Field_Report_<WO>_<date>`)
+ * are parsed positionally so whatever the tracker holds round-trips
+ * exactly; anything else falls back to the generic token match.
+ * Returns '' when nothing WO-shaped is found.
+ */
+function _woIdFromFilename_(fileName) {
+  const s = String(fileName || '').replace(/^📨\s*/, '');
+  const structured = s.match(/^(?:CFR|Contractor_Field_Report)_(.+?)_\d{4}-\d{2}-\d{2}/);
+  if (structured) return structured[1];
+  const m = s.match(/(?:^|[^A-Za-z0-9])([A-Za-z]{2}-\d+(?:-[A-Za-z])?)(?=$|[^A-Za-z0-9])/);
+  return m ? m[1] : '';
+}
+
+/**
+ * Paint / MMA work order? PT-XXXXX and PF-XXXXX are both colored-surface
+ * (MMA) WOs and get identical treatment: Color Surface seeding, the DOT
+ * proof-of-work PICS requirement, and the MMA labor bucket. Mirrored in
+ * webapp DocStatusChips.jsx / WODocsQueue.jsx / NavTab.jsx and
+ * workers/parse_work_order.py — keep them in sync.
+ */
+function _isPaintWoId_(woId) {
+  return /^(PT|PF)-/i.test(String(woId || '').trim());
+}
+
 function _processApprovedDocumentsImpl_() {
   const props = PropertiesService.getScriptProperties();
   const approvedId = props.getProperty('APPROVED_SENT_ID');
@@ -1566,8 +1598,8 @@ function _processApprovedDocumentsImpl_() {
     const fileName = file.getName();
 
     // Determine document type and extract WO info from filename.
-    // WO # covers the three prefixes the parser supports (PT/RM/PM).
-    const WO_REGEX = /(PT|RM|PM)[-_]?\d+/i;
+    // WO # extraction lives in _woIdFromFilename_ (any 2-letter prefix,
+    // optional -A/-B split suffix).
     let docType = 'Unknown';
     let woId = '';
 
@@ -1582,12 +1614,10 @@ function _processApprovedDocumentsImpl_() {
       fileName.includes('Field_Report') || fileName.startsWith('CFR_')
     ) {
       docType = 'Field Report';
-      const match = fileName.match(WO_REGEX);
-      if (match) woId = match[0];
+      woId = _woIdFromFilename_(fileName);
     } else if (fileName.includes('Invoice')) {
       docType = 'Invoice';
-      const match = fileName.match(WO_REGEX);
-      if (match) woId = match[0];
+      woId = _woIdFromFilename_(fileName);
     } else if (fileName.includes('Certified_Payroll')) {
       docType = 'Certified Payroll';
     } else if (_parseMonthEndSignedFilename_(fileName)) {
@@ -1599,14 +1629,13 @@ function _processApprovedDocumentsImpl_() {
     } else if (fileName.includes('SignIn') || fileName.includes('Sign_In') || fileName.includes('Sign-In')) {
       docType = 'Sign-In';
       // New multi-WO pattern: SignIn_<contractNum>_<borough>_<YYYY-MM-DD>[_MANUAL].pdf.
-      // The contract number (e.g. "PT-11930") matches WO_REGEX too, so we
+      // The contract number (e.g. "PT-11930") looks WO-shaped too, so we
       // explicitly detect the multi-WO shape and skip the regex extraction
       // there — archiveDocument_ falls back to contract+date lookup when
       // woId is empty.
       const isMultiWOPattern = /^SignIn_[^_]+_[^_]+_\d{4}-\d{2}-\d{2}/.test(fileName);
       if (!isMultiWOPattern) {
-        const match = fileName.match(WO_REGEX);
-        if (match) woId = match[0];
+        woId = _woIdFromFilename_(fileName);
       }
     }
     
@@ -4879,9 +4908,9 @@ function _docTypeFromSubfolderName_(name) {
 function _approvalSubtitleFromFilename_(docType, filename) {
   const s = String(filename || '');
   // WO # pattern, used by signin + CFR + any single-WO doc
-  const woMatch = s.match(/(PT|PM|RM)-\d+/i);
+  const woId = _woIdFromFilename_(s);
   if (docType === 'signin' || docType === 'field_report') {
-    return woMatch ? woMatch[0] : s.replace(/\.pdf$/i, '');
+    return woId || s.replace(/\.pdf$/i, '');
   }
   if (docType === 'production_log') {
     // e.g. "Production_Log_2026-04-21_FILLED.pdf" → "2026-04-21"
@@ -7801,6 +7830,50 @@ function archiveWOFile_(fileId, d) {
   }
 }
 
+
+/**
+ * One-off recovery (Nov 2026) — CFRs for PF- and -A/-B suffixed WOs were
+ * approved but failed archiving (old WO regex dropped PF / truncated the
+ * suffix) and sit in ⚠️ Archive Errors. Run from the Apps Script editor
+ * AFTER the _woIdFromFilename_ fix is deployed: moves the newest CFR per
+ * listed WO back into ✅ Approved Docs and runs the normal archive pass,
+ * which files it into the WO folder and sets CFR Done. Older duplicates
+ * are left in Archive Errors untouched. Safe to re-run — a WO with no CFR
+ * left in Archive Errors is simply reported as not found.
+ */
+function retryArchiveErrorCFRs() {
+  const WO_IDS = ['RM-50874-A', 'RM-50874-B', 'PF-10834', 'PF-10848', 'PF-10873'];
+
+  const approvedId = PropertiesService.getScriptProperties().getProperty('APPROVED_SENT_ID');
+  if (!approvedId) throw new Error('APPROVED_SENT_ID not set');
+  const approvedFolder = DriveApp.getFolderById(approvedId);
+  const errorsFolder   = getOrCreateArchiveErrorsFolder_();
+  if (!errorsFolder) throw new Error('Archive Errors folder unavailable');
+
+  // Newest CFR file per target WO.
+  const newest = {};
+  const files = errorsFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.isTrashed() || f.getMimeType() !== 'application/pdf') continue;
+    const name = f.getName();
+    if (!/^CFR_/.test(name)) continue;
+    const woId = _woIdFromFilename_(name);
+    if (WO_IDS.indexOf(woId) === -1) continue;
+    if (!newest[woId] || f.getDateCreated() > newest[woId].getDateCreated()) newest[woId] = f;
+  }
+
+  WO_IDS.forEach(woId => {
+    const f = newest[woId];
+    if (!f) { Logger.log(`⚠️ ${woId}: no CFR in Archive Errors — skipped`); return; }
+    f.moveTo(approvedFolder);
+    Logger.log(`↩️ ${woId}: moved ${f.getName()} back to Approved Docs`);
+  });
+
+  const result = processApprovedDocuments();
+  Logger.log('Archive pass: ' + JSON.stringify(result));
+  return result;
+}
 
 /**
  * One-off helper — run from the Apps Script editor to retry archiving
@@ -11364,7 +11437,7 @@ function seedMarkingItems_(ss, d) {
   const bikeMarks   = d.bike_lane_markings  || [];
   // PT-XXXXX = Paint → Color Surface / MMA WO; gets one auto-seeded Color
   // Surface item even when no other markings were parsed off the form.
-  const isPaintWO   = String(d.work_order_id || '').toUpperCase().startsWith('PT-');
+  const isPaintWO   = _isPaintWoId_(d.work_order_id);
   if (topMarkings.length === 0 && grid.length === 0 && bikeMarks.length === 0 && !isPaintWO) return 0;
 
   const markingSheet = ss.getSheetByName('Marking Items');
@@ -14034,9 +14107,9 @@ function _buildRevenuePayload_(startIso, endIso) {
       const dateIso = fmt(row[0]);
       if (!dateIso || dateIso < startIso || dateIso > endIso) continue;
 
-      const m = String(row[1] || '').match(/(PT|RM)-/i);
+      const m = String(row[1] || '').match(/(PT|PF|RM)-/i);
       if (!m) continue;   // no recognizable work-type prefix — skip
-      const workType = m[1].toUpperCase() === 'PT' ? 'mma' : 'thermo';
+      const workType = m[1].toUpperCase() === 'RM' ? 'thermo' : 'mma';
 
       const cls  = String(row[7] || '').trim().toUpperCase();
       const rate = _resolvePayrollRate_(payrollRates, cls, dateIso);
@@ -14903,7 +14976,7 @@ function handleListDocumentsForBatch_(body) {
       // Only enforced in unsent mode — that's the flow that actually sends
       // docs out; wo_numbers/date_range pulls are ad hoc/internal and stay
       // unaffected. See isPaintWO precedent at Code.js:10260.
-      const isPTWo = /^PT-/i.test(w.wo_id);
+      const isPTWo = _isPaintWoId_(w.wo_id);
       if (mode === 'unsent' && isPTWo && !w.done['PICS']) {
         missing.push({ wo_id: w.wo_id, doc_type: 'CFR',
           reason: 'PICS not verified yet — mark the PICS chip Done before this CFR can be sent' });
