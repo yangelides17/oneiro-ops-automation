@@ -15742,6 +15742,16 @@ function _buildDocStatusPayload_(monthIso) {
     d.setDate(d.getDate() + n);
     return Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
   };
+  // Is a month's EU / Certificates set due (Generate buttons shown)? Normally
+  // the Sunday after its last payroll week. Script Property
+  // MONTH_END_FORCE_DUE_THROUGH = 'YYYY-MM' releases that month (and every
+  // earlier one) early — e.g. end of season, when the remaining paperwork
+  // gets filed before the usual date. Unset/blank = normal behavior.
+  const _meForceThrough = String(PropertiesService.getScriptProperties()
+    .getProperty('MONTH_END_FORCE_DUE_THROUGH') || '').trim();
+  const monthEndIsDue = (monIso) =>
+    todayIso >= addDaysIso(monthLastWeekStartIso(monIso), 7) ||
+    (/^\d{4}-\d{2}$/.test(_meForceThrough) && monIso <= _meForceThrough);
 
   // Walk Work Day Log → group at TWO granularities:
   //   contractorDays[dateIso|contractor|crewChief] = per-crew PL shell
@@ -15954,7 +15964,7 @@ function _buildDocStatusPayload_(monthIso) {
   // bullets show from the first day worked. The pending PROMPT is still
   // gated (above) to the Sunday after the month's last payroll week; the
   // heavy Employee-Utilization read below stays gated to that same date.
-  const monthEndPendingDue = todayIso >= addDaysIso(monthLastWeekStartIso(monthIso), 7);
+  const monthEndPendingDue = monthEndIsDue(monthIso);
   const buildMEBreakdown = (monIso) => Object.values(monthTuples)
     .filter(mt => mt.month === monIso)
     .map(mt => ({
@@ -15994,7 +16004,7 @@ function _buildDocStatusPayload_(monthIso) {
   const [_meY, _meM] = monthIso.split('-').map(Number);
   const prevMonthIso  = Utilities.formatDate(new Date(_meY, _meM - 2, 1), CONFIG.TIMEZONE, 'yyyy-MM');
   const prevBreakdown = buildMEBreakdown(prevMonthIso);
-  const prevDue       = todayIso >= addDaysIso(monthLastWeekStartIso(prevMonthIso), 7);
+  const prevDue       = monthEndIsDue(prevMonthIso);
 
   // Employee Utilization counts for the popover. These accumulate all month
   // (like the contract breakdown) — NOT gated on the due date — so the last
@@ -16105,7 +16115,7 @@ function _buildDocStatusPayload_(monthIso) {
     // Not due until the month's last payroll week is COMPLETE — the Sunday
     // after that week ends (mws + 7) — so a contract worked on the final
     // Saturday is captured before we prompt. "Sent" stays ungated.
-    const meDue = todayIso >= addDaysIso(mws, 7);
+    const meDue = monthEndIsDue(mt.month);
     MONTH_END_DOCS_.forEach(md => {
       const id  = _monthEndDocId_(md.key, mt.month, mt.contract_num, mt.borough, mt.contractor);
       const rec = logById[id];
