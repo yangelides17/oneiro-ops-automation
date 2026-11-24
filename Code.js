@@ -3404,6 +3404,26 @@ function generateCertifiedPayroll(weekStartStr, opts) {
     if (opts && Array.isArray(opts.warningsOut)) opts.warningsOut.push({ type: type, message: message });
   };
 
+  // A paystub can span more than this week (payroll run for two weeks at
+  // once; accepted upstream by _paystubCoversWeek_). Its totals go on this
+  // week's CP unsplit, and its hours are checked against sign-ins for its
+  // whole pay period rather than this week alone.
+  let hoursFrom = weekStart, hoursTo = weekEnd;
+  const psPeriod = opts && opts.paystub && opts.paystub.pay_period;
+  if (Object.keys(paystubByName).length && psPeriod && psPeriod.start && psPeriod.end) {
+    const s = psPeriod.start.split('-').map(Number), e = psPeriod.end.split('-').map(Number);
+    const from = new Date(s[0], s[1] - 1, s[2], 0, 0, 0);
+    const to   = new Date(e[0], e[1] - 1, e[2], 23, 59, 59);
+    if (from < weekStart || to > weekEnd) {
+      hoursFrom = from;
+      hoursTo   = to;
+      _psWarn('multi_week',
+        'This paystub covers ' + psPeriod.start + ' to ' + psPeriod.end + ', more than this week. ' +
+        'Total Gross, Withholdings & Net Pay are its full totals for that period, and hours were ' +
+        'checked against sign-ins for the whole period.');
+    }
+  }
+
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const signInSheet = ss.getSheetByName('Daily Sign-In Data');
   const data = signInSheet.getDataRange().getValues();
@@ -3694,7 +3714,7 @@ function generateCertifiedPayroll(weekStartStr, opts) {
         // Computed once per person per run (cached for the sanity-check log
         // below), so the warning also fires once.
         if (!hoursCheckByName[normName(empName)]) {
-          const sys   = _payPeriodHoursForEmployee_(data, empName, weekStart, weekEnd);
+          const sys   = _payPeriodHoursForEmployee_(data, empName, hoursFrom, hoursTo);
           const psHrs = _cpPaystubHours_(ps);
           const cmp   = _cpCompareHours_(sys, psHrs);
           hoursCheckByName[normName(empName)] = { sys: sys, ps: psHrs, ok: cmp.ok, cmp: cmp };
@@ -10575,6 +10595,23 @@ function _validateAllCPForWeek_(ss, weekStartIso) {
  *
  * body.data = { doc_id: 'CP_YYYY-MM-DD_<contractnum>_<borough>' }
  */
+/**
+ * Whether a paystub's pay period ({ start, end } as YYYY-MM-DD) can be used
+ * for the Certified Payroll week starting weekStartIso (a Sunday, YYYY-MM-DD).
+ * Yes when it starts that day, or when it spans the whole Sun–Sat week (a
+ * multi-week payroll run, e.g. 11/08–11/21 covers the weeks of 11/08 and
+ * 11/15). Each such week's CP takes the stub's full totals, unsplit.
+ */
+function _paystubCoversWeek_(period, weekStartIso) {
+  if (!period || !period.start) return false;
+  if (period.start === weekStartIso) return true;
+  if (!period.end) return false;
+  const p = weekStartIso.split('-').map(Number);
+  const sat = new Date(Date.UTC(p[0], p[1] - 1, p[2] + 6));
+  const weekEndIso = sat.toISOString().slice(0, 10);
+  return period.start <= weekStartIso && period.end >= weekEndIso;
+}
+
 function handleGenerateCPForDoc_(body) {
   const d     = body.data || {};
   const docId = String(d.doc_id || '').trim();
@@ -10597,12 +10634,15 @@ function handleGenerateCPForDoc_(body) {
   // pass, since the payload could reach here by another route.
   if (d.paystub) {
     // Wrong week. A paystub from a different week fills plausible but wrong
-    // Net Pay & Withholdings, so this blocks rather than warns.
+    // Net Pay & Withholdings, so this blocks rather than warns. A stub whose
+    // pay period spans this whole week (payroll run for two weeks at once)
+    // is accepted: see _paystubCoversWeek_.
     const psPeriod = d.paystub.pay_period;
-    if (psPeriod && psPeriod.start && psPeriod.start !== parsed.anchor) {
+    if (psPeriod && psPeriod.start && !_paystubCoversWeek_(psPeriod, parsed.anchor)) {
       return jsonResponse_({
-        error: 'That paystub covers the week of ' + psPeriod.start + ', but this Certified Payroll ' +
-               'is the week of ' + parsed.anchor + '. Upload the matching week\'s paystub, or generate without one.',
+        error: 'That paystub covers ' + psPeriod.start + (psPeriod.end ? ' to ' + psPeriod.end : '') +
+               ', which doesn\'t include the whole Certified Payroll week of ' + parsed.anchor +
+               '. Upload a paystub that covers this week, or generate without one.',
         error_code: 'PAYSTUB_WEEK_MISMATCH',
       }, 400);
     }

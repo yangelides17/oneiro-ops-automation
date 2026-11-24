@@ -118,9 +118,16 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
     const isStubs   = result.layout === 'stubs'
     const period    = result.pay_period
     const warnings  = Array.isArray(result.warnings) ? result.warnings : []
-    // Wrong-week guard. Apps Script blocks this too, but flagging it here
-    // means the user never gets as far as pressing Generate.
-    const weekMismatch = !!(expectedWeekStart && period?.start && period.start !== expectedWeekStart)
+    // Wrong-week guard. Apps Script blocks this too (_paystubCoversWeek_), but
+    // flagging it here means the user never gets as far as pressing Generate.
+    // A stub spanning the whole CP week (a two-week payroll run) is accepted.
+    const weekEnd = expectedWeekStart
+      ? new Date(new Date(expectedWeekStart + 'T00:00:00Z').getTime() + 6 * 86400000).toISOString().slice(0, 10)
+      : null
+    const coversWeek = period?.start === expectedWeekStart ||
+      !!(period?.start && period?.end && period.start <= expectedWeekStart && period.end >= weekEnd)
+    const weekMismatch = !!(expectedWeekStart && period?.start && !coversWeek)
+    const multiWeek = !!(expectedWeekStart && coversWeek && period?.end && period.end > weekEnd)
     const anyBonus = employees.some(e => Number(e.bonus) > 0)
 
     return (
@@ -152,8 +159,17 @@ export default function PaystubUpload({ onParsed, expectedWeekStart }) {
               ⚠ Wrong week — this paystub won’t be accepted
             </p>
             <p className="text-[10px] text-red-600 mt-0.5">
-              These stubs cover the week of {fmtDay(period.start)}, but this Certified Payroll is
-              the week of {fmtDay(expectedWeekStart)}. Upload the matching week’s paystub.
+              These stubs cover {fmtDay(period.start)}{period.end ? ` – ${fmtDay(period.end)}` : ''}, which doesn’t include
+              the whole Certified Payroll week of {fmtDay(expectedWeekStart)}. Upload a paystub that covers this week.
+            </p>
+          </div>
+        )}
+
+        {multiWeek && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-2">
+            <p className="text-[10px] text-amber-800">
+              ⚠ These stubs cover more than this week ({fmtDay(period.start)} – {fmtDay(period.end)}). Their full
+              totals go on this week’s Certified Payroll, and hours are checked against the whole period.
             </p>
           </div>
         )}
